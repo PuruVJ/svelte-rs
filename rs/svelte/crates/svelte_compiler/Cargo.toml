@@ -17,3 +17,6 @@ svelte_preprocess = { workspace = true }
 svelte_migrate = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

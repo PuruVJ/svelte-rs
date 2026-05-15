@@ -1064,6 +1064,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "svelte_ast",
  "svelte_compiler",
 ]
 

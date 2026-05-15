@@ -40,16 +40,34 @@ cargo test -p svelte_ast
 `svelte_test_harness` binary shells out to `probe/run.mjs` which runs the
 upstream JS compiler against any fixture under `packages/svelte/tests/`.
 
-**Phase 1** — in progress.
-- `svelte_diagnostics` ✅ 270 diagnostic functions (187 errors + 83 warnings)
+**Phase 1** — done.
+- `svelte_diagnostics` — 270 diagnostic functions (187 errors + 83 warnings)
   generated at build time from `packages/svelte/messages/**/*.md` (the same
-  source the upstream `scripts/process-messages/index.js` consumes). 13-case
+  source the upstream `scripts/process-messages/index.js` consumes). A 13-case
   differential test asserts byte-equal message strings vs. the JS `errors.js`.
-- `svelte_ast` 🟡 core node shapes only (`Root`, `Fragment`, `Text`,
-  `Comment`, `Script`, `JsComment`). Serde wire format matches what
-  `parse(source, { modern: true })` emits after `to_public_ast` cleans
-  internal metadata. Remaining work: ~40 more node variants
-  (tags, elements, blocks, directives, attributes, CSS subtree, ESTree subtree).
+- `svelte_ast` — full template AST: Root, Fragment, Text, Comment, Script,
+  JsComment, all 6 tag kinds, all 14 element kinds (Component, RegularElement,
+  SlotElement, TitleElement, plus svelte:body/boundary/component/document/
+  element/fragment/head/options/self/window), all 5 block kinds, all 8
+  directive kinds, Attribute, SpreadAttribute. **All 24 parser-modern
+  fixtures roundtrip cleanly** through serde — Rust deserializes the live
+  JS parser output and re-serializes byte-equivalent JSON.
+- `svelte_compiler` facade — `CompileOptions`, `ModuleCompileOptions`,
+  `ParseOptions`, including `experimental.async` (Svelte 5.36+). JSON
+  shape matches the upstream camelCase contract.
+- `svelte_test_harness` — runs both Rust and JS in one shot and prints
+  a unified diff. `cargo run -p svelte_test_harness -- all-parser-modern`
+  exercises the full parser-modern suite.
 
-Run `cargo test --workspace` to see all green.
+**Phase 2** — in progress.
+- `svelte_parse` scaffold + utility helpers (`is_whitespace`, BOM stripping,
+  cursor advance) + text + HTML comment readers. The `svelte_compiler::parse`
+  facade now delegates to the real parser; all 24 parser-modern fixtures
+  still diverge (because elements / tags / scripts / styles are not yet
+  implemented), but the empty-input and pure-text cases produce correct AST.
+
+Run `cargo test --workspace` to see all green (31 tests).
+Run `cargo run -q -p svelte_test_harness -- all-parser-modern` to see the
+parser-modern suite status (currently: 0 match, 24 diverge — diff plumbing
+fully working).
 

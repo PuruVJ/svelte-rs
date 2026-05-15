@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 svelte_compiler = { workspace = true }
+svelte_ast = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }
