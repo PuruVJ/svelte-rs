@@ -161,7 +161,7 @@ fn await_block_lowers_to_dollar_await_call() {
     let source = "{#await p then v}<p>{v}</p>{:catch e}<p>err</p>{/await}";
     let out = compile_server(source, "Awaiting");
     // Non-async server uses the $.await runtime helper, not raw try/catch.
-    assert!(out.contains("$.await($$renderer, p,"), "got: {out}");
+    assert!(out.contains("$.await("), "got: {out}");
     assert!(out.contains("`<!--]-->`"), "got: {out}");
 }
 

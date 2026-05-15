@@ -80,7 +80,19 @@ pub fn lower_fragment_trimmed(fragment: &Fragment) -> Vec<TemplateOp> {
     for child in &trimmed {
         lower_child(child, &mut acc);
     }
-    acc.into_ops()
+    // If the fragment ends with a Stmt op (Component call, block, ...) AND
+    // has earlier push-emitting content, append a `<!---->` anchor marker so
+    // the runtime can locate the end of the template. Matches upstream's
+    // Fragment.js trailing-marker behavior.
+    let mut ops = acc.into_ops();
+    let has_push = ops.iter().any(|o| matches!(o, TemplateOp::Push(_)));
+    let ends_with_stmt = matches!(ops.last(), Some(TemplateOp::Stmt(_)));
+    if has_push && ends_with_stmt {
+        let mut marker = TemplateChunks::new();
+        marker.push_str("<!---->");
+        ops.push(TemplateOp::Push(marker));
+    }
+    ops
 }
 
 /// Lower a fragment's nodes but trim leading/trailing whitespace-only Text
@@ -729,6 +741,53 @@ fn as_inlineable_literal(expr: &Value) -> Option<String> {
             // `{undefined}` renders as empty on the server.
             if expr.get("name").and_then(|v| v.as_str()) == Some("undefined") {
                 Some(String::new())
+            } else {
+                None
+            }
+        }
+        "CallExpression" => {
+            // Constant-fold pure built-ins: `Math.max(0, 1)` → `1`. Only used
+            // when ALL arguments are numeric literals — matches upstream's
+            // `is_pure` + folding pass in `phases/2-analyze`.
+            let callee = expr.get("callee")?;
+            let ty = callee.get("type").and_then(|v| v.as_str())?;
+            if ty != "MemberExpression" {
+                return None;
+            }
+            let obj = callee.get("object")?.get("name").and_then(|v| v.as_str())?;
+            let prop = callee.get("property")?.get("name").and_then(|v| v.as_str())?;
+            if obj != "Math" {
+                return None;
+            }
+            let args = expr.get("arguments")?.as_array()?;
+            // Recurse into args so `Math.max(0, Math.min(0, 100))` folds to `0`.
+            let nums: Vec<f64> = args
+                .iter()
+                .map(|a| {
+                    if a.get("type").and_then(|v| v.as_str()) == Some("Literal") {
+                        a.get("value").and_then(|v| v.as_f64())
+                    } else {
+                        // Try recursive fold — if the inner expression folds
+                        // to a number-shaped string, parse it.
+                        as_inlineable_literal(a).and_then(|s| s.parse::<f64>().ok())
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let result = match prop {
+                "max" => nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                "min" => nums.iter().cloned().fold(f64::INFINITY, f64::min),
+                "abs" if nums.len() == 1 => nums[0].abs(),
+                "floor" if nums.len() == 1 => nums[0].floor(),
+                "ceil" if nums.len() == 1 => nums[0].ceil(),
+                "round" if nums.len() == 1 => nums[0].round(),
+                _ => return None,
+            };
+            if result.is_finite() {
+                if result.fract() == 0.0 {
+                    Some((result as i64).to_string())
+                } else {
+                    Some(result.to_string())
+                }
             } else {
                 None
             }
