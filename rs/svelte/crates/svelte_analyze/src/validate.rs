@@ -138,6 +138,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
         FragmentChild::DebugTag(t) => visit_debug_tag(t, state),
         FragmentChild::ConstTag(t) => visit_const_tag(t, state),
         FragmentChild::RegularElement(el) => {
+            state.warnings.extend(crate::a11y::check_regular_element(el));
             visit_attributes(node, &el.attributes, state);
             visit_fragment(&el.fragment, state);
         }
@@ -160,6 +161,14 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             visit_fragment(&el.fragment, state);
         }
         FragmentChild::SvelteElement(el) => {
+            // SvelteElement also gets a11y checks if the tag is statically known.
+            // For now we only check `autofocus` here since the tag is dynamic;
+            // most other a11y rules need a concrete tag name.
+            if el.attributes.iter().any(|a| matches!(a, ElementAttribute::Attribute(svelte_ast::Attribute { name, .. }) if name == "autofocus")) {
+                state
+                    .warnings
+                    .push(warnings::a11y_autofocus(Some((el.start, el.end))));
+            }
             visit_attributes(node, &el.attributes, state);
             visit_fragment(&el.fragment, state);
         }

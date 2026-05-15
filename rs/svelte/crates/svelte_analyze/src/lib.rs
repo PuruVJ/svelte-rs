@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod a11y;
 pub mod analysis;
 pub mod bindings;
 pub mod css_analyze;
