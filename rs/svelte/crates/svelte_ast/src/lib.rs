@@ -27,6 +27,7 @@
 
 pub mod attributes;
 pub mod blocks;
+pub mod css;
 pub mod elements;
 pub mod fragment;
 pub mod position;
@@ -35,6 +36,8 @@ pub mod tags;
 
 pub use attributes::*;
 pub use blocks::*;
+// Don't glob-export `css::*` — it has its own type names that clash with
+// the top-level template `Block`, `Comment`, etc. Use `svelte_ast::css::Foo`.
 pub use elements::*;
 pub use fragment::*;
 pub use position::*;

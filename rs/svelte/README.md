@@ -70,9 +70,75 @@ upstream JS compiler against any fixture under `packages/svelte/tests/`.
 - 2d-2g pending: mustache tag parsing (`{expr}`, `{#if}`, etc.) + OXC
   integration for JS expressions + `<script>` + `<style>`.
 
-Run `cargo test --workspace` to see all green (45 tests).
-Run `cargo run -q -p svelte_test_harness -- all-parser-modern` to see the
-parser-modern suite status — currently 0 match / 18 diverge / 6 error
-(every fixture exercises a feature still pending; diff plumbing is fully
-working, so once 2d-2g land, fixtures will go green in waves).
+Run `cargo test --workspace` to see all green (83 tests).
+Run `cargo run -q -p svelte_test_harness -- all-parser-modern` and
+`-- all-parser-legacy` to see the fixture-suite status. Combined:
+
+- **parser-modern**: **20 match / 0 diverge / 4 error** out of 24.
+  All four remaining errors are loose-mode error-recovery fixtures.
+- **parser-legacy**: **75 match / 2 diverge / 6 error** out of 83.
+  Remaining diverges: `javascript-comments` (trailing-comments on
+  expressions) and `unusual-identifier` (UTF-16 encoding mismatch).
+  Remaining errors are 5 loose-mode + 1 known JS-side parse error
+  (`implicitly-closed-li-block`).
+- **Combined: 95 / 107 fixtures (89%)**.
+
+Phase 2 coverage:
+- **2d** (mustache `{expr}`, `{@html}`, `{@attach}`, `{@render}`) done — backed
+  by an OXC bridge (`oxc_bridge.rs`) that converts OXC's estree output to the
+  acorn/Svelte wire shape via position shifting, `loc` injection,
+  ParenthesizedExpression unwrapping, TS empty-default stripping,
+  leadingComments attachment, and TemplateElement-bound normalization
+  (OXC includes the backtick / `${` markers; acorn doesn't).
+- **2e** — all block kinds done: `{#if}`/`{:else if}`/`{:else}`/`{/if}`,
+  `{#key}`, `{#each}` (with destructuring patterns), `{#snippet}` (with
+  generic TS params), `{#await}` / `{:then}` / `{:catch}` chain.
+- **2f** — `<script>` hoisting to `Root.instance/module` with parsed
+  `Program` body, including the upstream quirk where the preceding HTML
+  comment's text is reattached as `Program.leadingComments` (the
+  `svelte-ignore` warning marker). `<svelte:options>` hoisting to
+  `Root.options` with `runes` and `customElement.tag` extraction. All
+  svelte:* meta tags routed to their dedicated AST variants
+  (`SvelteBody/Boundary/Document/Fragment/Head/Options/Self/Window`).
+- Attribute parsing: bare, quoted (with mustache interpolations),
+  unquoted, `{...spread}`, `{name}` shorthand. `=/>` special-case for
+  legacy `<a href=/>`. JS-style `//` and `/* */` comments between
+  attributes pushed onto `Root.comments` with `loc.character` populated.
+  Static-attribute path for `<script>`/`<style>` (suppresses mustache
+  interpretation, allowing `<script generics="T extends { foo: number }">`).
+- Directive parsing: all of `on:`/`bind:`/`use:`/`class:`/`style:`/
+  `transition:`/`in:`/`out:`/`animate:`/`let:`. Quoted-string directive
+  values (`on:click="{handler}"`) are unwrapped to the inner ExpressionTag,
+  matching upstream's legacy form.
+- Context-aware `<slot>` parsing: inside a `<template shadowrootmode>`
+  ancestor, `<slot>` is a `RegularElement`, not a `SlotElement`.
+- Pattern parsing (used by `{#each ... as PATTERN}` / `{:then PATTERN}` /
+  `{:catch PATTERN}`) uses upstream's `(<pattern> = 1)` synthetic-source
+  trick for `{...}`/`[...]` patterns; identifier patterns short-circuit to
+  a hand-built `Identifier` (so their `loc` reflects original-source
+  line/column via `LineMap`, matching `state.locator` in upstream).
+- HTML entity decoding (`&amp;`, `&nbsp;`, `&quot;`, etc. plus decimal /
+  hex numeric refs `&#NNN;` / `&#xHH;`). Attribute-value-specific rule for
+  unterminated entities followed by `=` or alphanum.
+- Component detection (`is_component_name`): uppercase ASCII start, or
+  identifier-start with at least one `.` (e.g. `<Lib.Modal>`).
+- `<svelte:component>` / `<svelte:element>` route to their dedicated
+  variants with `this` attribute extracted to `expression` / `tag`.
+- `<textarea>` body is parsed as a Text+ExpressionTag sequence (no nested
+  elements); close tag uses the relaxed `</textarea(\s[^>]*)?>` regex.
+- HTML implicit close: `<li><li>` closes the first `<li>` automatically;
+  same for `<p>`, `<dt>`/`<dd>`, `<tr>`/`<td>`/`<th>`, etc. Uses
+  `closing_tag_omitted` (ported from upstream `html-tree-validation.js`).
+- JS comments inside mustache expressions: `{ /* comment */ a + b }` is
+  parsed correctly via `skip_whitespace_and_js_comments` (which collects
+  comments to `Root.comments` and skips them past `{`/before `}`).
+- **2g** done. `svelte_css_parser` is a recursive-descent port of
+  `read/style.js` (~650 LOC). Produces the full Svelte CSS AST:
+  `StyleSheet`, `Atrule`, `Rule`, `SelectorList`, `ComplexSelector`,
+  `RelativeSelector`, all `SimpleSelector` variants (Type/Id/Class/Attribute/
+  PseudoElement/PseudoClass/Percentage/Nth/Nesting), `Combinator`, `Block`,
+  `Declaration`. Handles `:nth-of-type(... of <selector-list>)`, `url(...)`,
+  string-aware value reading, CSS escapes (`\HHHHHH` Unicode + `\<char>`),
+  and `<!-- -->` / `/* */` comments. CSS AST types live in
+  [`svelte_ast::css`](crates/svelte_ast/src/css.rs).
 

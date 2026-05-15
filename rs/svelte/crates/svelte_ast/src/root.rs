@@ -15,7 +15,7 @@ use crate::position::{Offset, SourceLocation};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Root {
-    pub css: Option<Value>, // CSS::StyleSheet — placeholder until svelte_css_parser lands.
+    pub css: Option<crate::css::StyleSheet>,
     pub js: Vec<Value>,     // Wire field present in parser output; not in template.d.ts.
     pub start: Offset,
     pub end: Offset,

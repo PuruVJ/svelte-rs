@@ -37,6 +37,17 @@ pinned commit. The Rust ports under `crates/` mirror **these** versions.
 | `magic-string` | `^0.30.11` | `svelte_magic_string` | pending |
 | `zimmerframe` | `^1.1.2` | (per-crate visitor traits — no shared crate) | n/a |
 
+### Open question — CSS parser choice
+
+Plan R5 said "hand-port `read/style.js` to `svelte_css_parser`; don't use
+lightningcss". That decision was made without measurement. **Revisit at Phase 2g.**
+The concern was that lightningcss's selector AST might be too lossy for
+Svelte's per-`RelativeSelector` / per-`SimpleSelector` scope-pruning needs.
+But `parcel_selectors` may be composable enough to drive selector parsing
+ourselves and only use lightningcss for `@rule`/declaration bodies — which
+would save several hundred LOC and inherit a battle-tested CSS3+ parser.
+Spike before committing.
+
 ## Codebase size snapshot (LOC)
 
 These are taken from the pinned revision so we can detect drift after updates.

@@ -7,11 +7,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod hoist;
+pub mod oxc_bridge;
 pub mod parser;
 pub mod state;
 pub mod utils;
 
-use svelte_ast::{Fragment, FragmentChild, FragmentKind, Root, RootKind};
+use svelte_ast::{
+    Fragment, FragmentChild, FragmentKind, JsComment, JsCommentKind, Position, Root, RootKind,
+    SourceLocation,
+};
 use svelte_diagnostics::CompileDiagnostic;
 
 pub use parser::Parser;
@@ -37,18 +42,14 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
             continue;
         }
         if parser.match_str("{") {
-            // TODO(2d): mustache tag parsing — `{expr}`, `{#if}`, etc.
-            // Skip one byte to avoid an infinite loop. The harness diff will
-            // surface the divergence on mustache-bearing fixtures.
-            let ch = parser.template[parser.index..].chars().next().unwrap();
-            parser.index += ch.len_utf8();
+            nodes.push(state::tag::read_tag(&mut parser)?);
             continue;
         }
         let t = state::text::read_text(&mut parser);
         nodes.push(FragmentChild::Text(t));
     }
 
-    Ok(Root {
+    let mut root = Root {
         css: None,
         js: vec![],
         start: 0,
@@ -67,7 +68,56 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
         comments: vec![],
         instance: None,
         module: None,
-    })
+    };
+
+    // Hoist <script> and <style> children to Root.instance / module / css.
+    // Mirrors the post-parse step at the bottom of upstream's parse() in
+    // `phases/1-parse/index.js:153-168`.
+    hoist::hoist_scripts_and_styles(&mut root, source, &parser.line_map, parser.ts)?;
+
+    // Flush parser-collected comments (from `{expression}` mustaches and
+    // element-attribute expressions) into `Root.comments`. Script-internal
+    // comments are added by `hoist::build_script` separately.
+    for c in std::mem::take(&mut parser.comments) {
+        root.comments.push(raw_to_js_comment(&c, &parser.line_map));
+    }
+
+    Ok(root)
+}
+
+fn raw_to_js_comment(
+    c: &crate::oxc_bridge::RawComment,
+    line_map: &crate::utils::locator::LineMap,
+) -> JsComment {
+    let (sl, sc) = line_map.locate(c.start as usize);
+    let (el, ec) = line_map.locate(c.end as usize);
+    let (start_char, end_char) = if c.with_character {
+        (Some(c.start), Some(c.end))
+    } else {
+        (None, None)
+    };
+    JsComment {
+        kind: if c.line {
+            JsCommentKind::Line
+        } else {
+            JsCommentKind::Block
+        },
+        value: c.value.clone(),
+        start: c.start,
+        end: c.end,
+        loc: SourceLocation {
+            start: Position {
+                line: sl,
+                column: sc,
+                character: start_char,
+            },
+            end: Position {
+                line: el,
+                column: ec,
+                character: end_char,
+            },
+        },
+    }
 }
 
 #[cfg(test)]

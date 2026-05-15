@@ -8,3 +8,5 @@ description = "Selector + rule parser for Svelte's <style> blocks. Ported from p
 
 [dependencies]
 serde = { workspace = true }
+svelte_ast = { path = "../svelte_ast" }
+svelte_diagnostics = { path = "../svelte_diagnostics" }

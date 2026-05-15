@@ -52,14 +52,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 
-# OXC family (JS/TS parser, AST, semantic). Pinned to a recent compatible set.
-# We add them to crates that need them via { workspace = true }.
-oxc_allocator = "0.34"
-oxc_ast = "0.34"
-oxc_parser = "0.34"
-oxc_span = "0.34"
-oxc_semantic = "0.34"
-oxc_syntax = "0.34"
+# OXC family (JS/TS parser, AST, semantic). Pinned to 0.130 — the 0.34 line
+# has a broken `serialize` feature (uses removed serde internals). 0.130
+# provides `oxc_estree` with a clean ESTree-shaped JSON output we can post-
+# process into the acorn shape Svelte's AST expects.
+oxc_allocator = "0.130"
+oxc_ast = { version = "0.130", features = ["serialize"] }
+oxc_estree = { version = "0.130", features = ["serialize"] }
+oxc_parser = "0.130"
+oxc_span = "0.130"
+oxc_semantic = "0.130"
+oxc_syntax = "0.130"
 
 # Source maps
 sourcemap = "9"

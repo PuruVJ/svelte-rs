@@ -143,11 +143,19 @@ fn list_fixtures(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn run_all_parser_modern(root: &Path) -> ExitCode {
-    let dir = root.join("packages/svelte/tests/parser-modern/samples");
+    run_suite(root, "parser-modern")
+}
+
+fn run_all_parser_legacy(root: &Path) -> ExitCode {
+    run_suite(root, "parser-legacy")
+}
+
+fn run_suite(root: &Path, suite: &str) -> ExitCode {
+    let dir = root.join(format!("packages/svelte/tests/{suite}/samples"));
     let fixtures = match list_fixtures(&dir) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("could not list parser-modern samples: {e}");
+            eprintln!("could not list {suite} samples: {e}");
             return ExitCode::from(2);
         }
     };
@@ -160,21 +168,25 @@ fn run_all_parser_modern(root: &Path) -> ExitCode {
         match run_single(root, "parse", fx) {
             Ok(true) => {
                 matched += 1;
-                println!("ok      parser-modern/{name}");
+                println!("ok      {suite}/{name}");
             }
             Ok(false) => {
                 diverged += 1;
-                println!("diff    parser-modern/{name}");
+                println!("diff    {suite}/{name}");
             }
             Err(e) => {
                 errored += 1;
-                println!("error   parser-modern/{name} — {e}");
+                // Truncate multi-line error messages to a single line for the
+                // suite walker — full diagnostics are available via the
+                // single-fixture mode.
+                let one_line = e.lines().next().unwrap_or("").to_string();
+                println!("error   {suite}/{name} — {one_line}");
             }
         }
     }
     println!();
     println!(
-        "{} total: {matched} match, {diverged} diverge, {errored} error",
+        "{suite}: {} total: {matched} match, {diverged} diverge, {errored} error",
         fixtures.len()
     );
     if diverged == 0 && errored == 0 {
@@ -187,7 +199,9 @@ fn run_all_parser_modern(root: &Path) -> ExitCode {
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  svelte_test_harness <mode> <fixture-path>");
+    eprintln!("  svelte_test_harness rust <mode> <fixture-path>     (print Rust output only)");
     eprintln!("  svelte_test_harness all-parser-modern");
+    eprintln!("  svelte_test_harness all-parser-legacy");
     eprintln!();
     eprintln!("modes: parse");
     std::process::exit(2)
@@ -198,6 +212,21 @@ fn main() -> ExitCode {
     let root = repo_root();
     match args.as_slice() {
         [single] if single == "all-parser-modern" => run_all_parser_modern(&root),
+        [single] if single == "all-parser-legacy" => run_all_parser_legacy(&root),
+        [cmd, mode, fixture] if cmd == "rust" => {
+            let fixture = PathBuf::from(fixture);
+            let (_p, source) = match load_source(&root, &fixture) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{e}"); return ExitCode::from(2); }
+            };
+            match run_rust(mode, &source) {
+                Ok(v) => {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => { eprintln!("{e}"); ExitCode::from(2) }
+            }
+        }
         [mode, fixture] => {
             let fixture = PathBuf::from(fixture);
             match run_single(&root, mode, &fixture) {

@@ -65,6 +65,15 @@ pub enum AttributeValuePart {
     ExpressionTag(ExpressionTag),
 }
 
+impl AttributeValuePart {
+    pub fn start_pos(&self) -> Offset {
+        match self {
+            AttributeValuePart::Text(t) => t.start,
+            AttributeValuePart::ExpressionTag(e) => e.start,
+        }
+    }
+}
+
 /// `{...rest}` (`template.d.ts:559-566`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpreadAttribute {
@@ -125,8 +134,10 @@ pub struct ClassDirective {
     pub kind: ClassDirectiveKind,
     pub start: Offset,
     pub end: Offset,
-    /// Always literally `"class"` per `template.d.ts:228`.
-    pub name: ClassDirectiveName,
+    /// Despite `template.d.ts:228` typing this as the literal `"class"`,
+    /// the parser emits the part AFTER the colon (e.g. `"foo"` for
+    /// `class:foo={isFoo}`).
+    pub name: String,
     pub name_loc: Option<SourceLocation>,
     pub expression: Value,
     pub modifiers: Vec<String>,
@@ -135,12 +146,6 @@ pub struct ClassDirective {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ClassDirectiveKind {
     ClassDirective,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ClassDirectiveName {
-    Class,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

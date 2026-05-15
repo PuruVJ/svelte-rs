@@ -44,6 +44,61 @@ pub fn is_valid_tag_name(name: &str) -> bool {
     true
 }
 
+/// Returns true if seeing `next` as a child of `current` implicitly closes
+/// `current`. Mirrors `closing_tag_omitted` in
+/// `packages/svelte/src/html-tree-validation.js:63`.
+///
+/// Two flavours of relationship:
+/// - "direct": child is auto-closed only when the next sibling is one of
+///   these names. E.g. `<li>` is closed by another `<li>` sibling.
+/// - "descendant": child is auto-closed when any descendant has one of these
+///   names. E.g. `<p>` is closed by any block-level descendant.
+pub fn closing_tag_omitted(current: &str, next: &str) -> bool {
+    match current {
+        "li" => matches!(next, "li"),
+        "dt" | "dd" => matches!(next, "dt" | "dd"),
+        "p" => matches!(
+            next,
+            "address"
+                | "article"
+                | "aside"
+                | "blockquote"
+                | "div"
+                | "dl"
+                | "fieldset"
+                | "footer"
+                | "form"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "header"
+                | "hgroup"
+                | "hr"
+                | "main"
+                | "menu"
+                | "nav"
+                | "ol"
+                | "p"
+                | "pre"
+                | "section"
+                | "table"
+                | "ul"
+        ),
+        "rt" | "rp" => matches!(next, "rt" | "rp"),
+        "optgroup" => matches!(next, "optgroup"),
+        "option" => matches!(next, "option" | "optgroup"),
+        "thead" => matches!(next, "tbody" | "tfoot"),
+        "tbody" => matches!(next, "tbody" | "tfoot"),
+        "tfoot" => matches!(next, "tbody"),
+        "tr" => matches!(next, "tr" | "tbody"),
+        "td" | "th" => matches!(next, "td" | "th" | "tr"),
+        _ => false,
+    }
+}
+
 /// Identifies a `svelte:foo` meta-tag name.
 pub fn is_svelte_meta_name(name: &str) -> bool {
     name.starts_with("svelte:")
