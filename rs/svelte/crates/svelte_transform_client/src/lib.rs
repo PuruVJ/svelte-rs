@@ -31,10 +31,16 @@ pub use template::serialize_static_html;
 ///   }
 pub fn client_component(root: &Root, component_name: &str) -> Value {
     let html = template::serialize_static_html(&root.fragment);
+    let runes_mode = uses_runes(root);
 
     let mut program_body: Vec<Value> = Vec::new();
     program_body.push(import_side_effect("svelte/internal/disclose-version"));
-    program_body.push(import_side_effect("svelte/internal/flags/legacy"));
+    if !runes_mode {
+        // The legacy flag activates the pre-runes reactivity runtime path —
+        // emitted only when no rune calls are present. Matches upstream
+        // `transform-client.js` import injection.
+        program_body.push(import_side_effect("svelte/internal/flags/legacy"));
+    }
     program_body.push(b::import_all("$", "svelte/internal/client"));
 
     // Hoisted instance imports
@@ -100,6 +106,36 @@ fn import_side_effect(source: &str) -> Value {
         "specifiers": [],
         "source": b::literal_str(source)
     })
+}
+
+/// Detect whether the component uses runes. Mirrors upstream's analysis:
+/// any `$state`, `$derived`, `$effect`, `$props`, `$bindable`, `$inspect`,
+/// `$host` call in the instance script enables runes mode.
+fn uses_runes(root: &Root) -> bool {
+    let Some(instance) = &root.instance else {
+        return false;
+    };
+    let json = instance.content.to_string();
+    for rune in [
+        "\"$state\"",
+        "\"$state.raw\"",
+        "\"$derived\"",
+        "\"$derived.by\"",
+        "\"$effect\"",
+        "\"$effect.pre\"",
+        "\"$effect.root\"",
+        "\"$props\"",
+        "\"$props.id\"",
+        "\"$bindable\"",
+        "\"$inspect\"",
+        "\"$inspect.trace\"",
+        "\"$host\"",
+    ] {
+        if json.contains(rune) {
+            return true;
+        }
+    }
+    false
 }
 
 fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Option<String> {
