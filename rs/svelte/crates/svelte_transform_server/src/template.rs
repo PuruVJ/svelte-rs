@@ -152,10 +152,14 @@ fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
         FragmentChild::Text(t) => acc.push_str(&collapse_whitespace(&t.data)),
         FragmentChild::RegularElement(el) => lower_regular_element(el, acc),
         FragmentChild::ExpressionTag(tag) => {
-            // Constant folding: `{'literal'}` becomes the literal characters
-            // directly in the template. Mirrors upstream's `ExpressionTag.js`
-            // when the expression is a static Literal string.
-            if let Some(s) = as_string_literal(&tag.expression) {
+            // Constant folding: literal expressions get inlined as text.
+            //  `{'literal'}`  → text "literal"
+            //  `{null}`       → text "" (renders as empty server-side)
+            //  `{undefined}`  → text ""
+            //  `{42}`         → text "42"
+            //  `{true}`       → text "true"
+            // Mirrors upstream's `ExpressionTag.js` constant-folding path.
+            if let Some(s) = as_inlineable_literal(&tag.expression) {
                 acc.push_str(&s);
             } else {
                 let escaped = b::call(
@@ -661,15 +665,52 @@ pub fn ops_to_statements(ops: Vec<TemplateOp>) -> Vec<Value> {
     out
 }
 
-/// If `expr` is an acorn `Literal` with a string `value`, return that string.
-/// Used for constant-folding `{'foo'}` to inline text in the template.
-fn as_string_literal(expr: &Value) -> Option<String> {
-    if expr.get("type").and_then(|v| v.as_str()) != Some("Literal") {
-        return None;
+/// If `expr` is a constant literal that can be inlined as raw text, return its
+/// rendered form. Handles string/number/boolean/null/Identifier-undefined plus
+/// nullish-coalescing / logical fold-through (`literal ?? x` → `literal` if
+/// non-null; `0 || x` → `x`).
+fn as_inlineable_literal(expr: &Value) -> Option<String> {
+    let ty = expr.get("type").and_then(|v| v.as_str())?;
+    match ty {
+        "Literal" => {
+            let value = expr.get("value")?;
+            match value {
+                Value::String(s) => Some(s.clone()),
+                Value::Null => Some(String::new()),
+                Value::Bool(b) => Some(b.to_string()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        }
+        "Identifier" => {
+            // `{undefined}` renders as empty on the server.
+            if expr.get("name").and_then(|v| v.as_str()) == Some("undefined") {
+                Some(String::new())
+            } else {
+                None
+            }
+        }
+        "LogicalExpression" => {
+            let op = expr.get("operator").and_then(|v| v.as_str())?;
+            let left = expr.get("left")?;
+            // For `??`: if LHS is a non-null literal, the whole expression is LHS.
+            if op == "??" {
+                if let Some(s) = as_inlineable_literal(left) {
+                    let lv = left.get("value");
+                    let is_null = matches!(lv, Some(Value::Null));
+                    let is_undef = left.get("type").and_then(|v| v.as_str()) == Some("Identifier")
+                        && left.get("name").and_then(|v| v.as_str()) == Some("undefined");
+                    if !is_null && !is_undef {
+                        return Some(s);
+                    }
+                    // Otherwise fall through to RHS.
+                    return as_inlineable_literal(expr.get("right")?);
+                }
+            }
+            None
+        }
+        _ => None,
     }
-    expr.get("value")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
 }
 
 /// `{@render snippet(args)}` — prepend `$$renderer` to the call's argument
