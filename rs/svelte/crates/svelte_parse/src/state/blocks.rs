@@ -98,12 +98,30 @@ fn read_each_block(
         let context = read_pattern_with_advance(parser)?;
         (expression, Some(context), parser.index)
     } else {
-        // No `as` — read expression up to `,` / `}` / `(` (any of which marks
-        // the end of the each-expression in the no-context form). We can let
-        // OXC consume until it can't, then take its span.
-        let (expression, expr_end_pos) = parser.parse_expression_at(expr_start)?;
-        parser.index = expr_end_pos;
-        (expression, None, expr_end_pos)
+        // No `as` — read expression up to a top-level `,` (which separates
+        // the iterated expression from the index name) or `}` (end of tag).
+        // OXC would otherwise greedy-consume `EXPR, INDEX` as a single
+        // SequenceExpression, so bound the slice before handing to OXC.
+        let stop_pos = find_top_level_comma_or_close(parser.template, expr_start);
+        // Trim trailing whitespace
+        let mut expr_end = stop_pos;
+        while expr_end > expr_start {
+            let b = parser.template.as_bytes()[expr_end - 1];
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                expr_end -= 1;
+            } else {
+                break;
+            }
+        }
+        let expression = parse_expression(
+            parser.template,
+            &parser.line_map,
+            expr_start,
+            expr_end,
+            parser.ts,
+        )?;
+        parser.index = stop_pos;
+        (expression, None, stop_pos)
     };
 
     parser.allow_whitespace();
@@ -595,6 +613,35 @@ fn find_top_level_as(template: &str, from: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Find the position of the first top-level `,` or `}` (whichever comes
+/// first) starting from `from`. Used by the no-`as` each-block branch to
+/// bound the iterated expression before handing it to OXC.
+fn find_top_level_comma_or_close(template: &str, from: usize) -> usize {
+    let bytes = template.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' | b'"' => i = skip_string_byte(bytes, i + 1, b),
+            b'`' => i = skip_template_literal(bytes, i + 1),
+            b'(' | b'[' | b'{' => {
+                let template_str = match std::str::from_utf8(bytes) {
+                    Ok(s) => s,
+                    Err(_) => return i,
+                };
+                let nested_end = match find_matching_bracket(template_str, i) {
+                    Some(e) => e,
+                    None => return i,
+                };
+                i = nested_end + 1;
+            }
+            b',' | b'}' => return i,
+            _ => i += 1,
+        }
+    }
+    i
 }
 
 /// Find where a destructuring pattern ends. Handles identifier names and

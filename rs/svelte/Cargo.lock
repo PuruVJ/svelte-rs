@@ -956,8 +956,7 @@ dependencies = [
 name = "svelte_codegen_js"
 version = "0.0.0"
 dependencies = [
- "oxc_ast",
- "oxc_span",
+ "serde_json",
  "sourcemap",
 ]
 
@@ -969,6 +968,7 @@ dependencies = [
  "serde_json",
  "svelte_analyze",
  "svelte_ast",
+ "svelte_codegen_js",
  "svelte_diagnostics",
  "svelte_migrate",
  "svelte_parse",
@@ -1071,11 +1071,13 @@ version = "0.0.0"
 dependencies = [
  "oxc_ast",
  "oxc_span",
+ "serde_json",
  "svelte_analyze",
  "svelte_ast",
  "svelte_codegen_js",
  "svelte_diagnostics",
  "svelte_magic_string",
+ "svelte_parse",
  "svelte_transform_shared",
 ]
 
@@ -1085,12 +1087,14 @@ version = "0.0.0"
 dependencies = [
  "oxc_ast",
  "oxc_span",
+ "serde_json",
  "svelte_analyze",
  "svelte_ast",
  "svelte_codegen_js",
  "svelte_devalue",
  "svelte_diagnostics",
  "svelte_magic_string",
+ "svelte_parse",
  "svelte_transform_shared",
 ]
 
@@ -1100,6 +1104,7 @@ version = "0.0.0"
 dependencies = [
  "oxc_ast",
  "oxc_span",
+ "serde_json",
  "svelte_analyze",
  "svelte_ast",
  "svelte_diagnostics",
@@ -1111,8 +1116,10 @@ name = "svelte_wasm"
 version = "0.0.0"
 dependencies = [
  "js-sys",
+ "serde",
  "serde-wasm-bindgen",
  "svelte_compiler",
+ "svelte_preprocess",
  "wasm-bindgen",
 ]
 

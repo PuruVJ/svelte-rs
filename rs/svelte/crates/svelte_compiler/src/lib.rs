@@ -27,6 +27,49 @@ pub fn parse(source: &str, options: ParseOptions) -> Result<Root, CompileDiagnos
     svelte_parse::parse(source, options.loose)
 }
 
+/// Output of `compile()` — mirrors upstream's `{ js, css, warnings, ast, stats }`.
+/// Pruned to the fields currently produced by the port; the rest land alongside
+/// their producing crate.
+#[derive(Debug, Clone)]
+pub struct CompileResult {
+    pub js: String,
+    pub warnings: Vec<svelte_diagnostics::CompileDiagnostic>,
+}
+
+/// `compile(source, options)` — parse, analyze, transform, codegen.
+///
+/// Status: minimal end-to-end pipeline. Server `generate: 'server'` produces
+/// template + script lowering matching the simplest snapshot fixtures.
+/// Client generation is not yet wired (Phase 6).
+pub fn compile(
+    source: &str,
+    component_name: &str,
+    options: CompileOptions,
+) -> Result<CompileResult, CompileDiagnostic> {
+    let root = svelte_parse::parse(source, false)?;
+    let _analysis =
+        svelte_analyze::analyze_component(root.clone(), options.module.filename.as_deref())?;
+
+    let program = match options.module.generate {
+        Some(Generate::Server) => svelte_transform_server::server_component(&root, component_name),
+        Some(Generate::Client) | None => {
+            svelte_transform_client::client_component(&root, component_name)
+        }
+    };
+
+    let result = svelte_codegen_js::print(
+        &program,
+        &svelte_codegen_js::default_visitors(),
+        &svelte_codegen_js::PrintOptions::default(),
+    );
+
+    Ok(CompileResult {
+        js: result.code,
+        warnings: Vec::new(),
+    })
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +127,26 @@ mod tests {
         assert!(!opts.disclose_version);
         assert_eq!(opts.fragments, FragmentsStrategy::Tree);
         assert_eq!(opts.css, CssMode::Injected);
+    }
+
+    #[test]
+    fn compile_hello_world_server_byte_equal() {
+        let source = "<h1>hello world</h1>";
+        let mut opts = CompileOptions::default();
+        opts.module.generate = Some(Generate::Server);
+        let result = compile(source, "Hello_world", opts).expect("compile should succeed");
+        let expected = "import * as $ from 'svelte/internal/server';\n\nexport default function Hello_world($$renderer) {\n\t$$renderer.push(`<h1>hello world</h1>`);\n}";
+        assert_eq!(result.js, expected);
+    }
+
+    #[test]
+    fn compile_hello_world_client_byte_equal() {
+        let source = "<h1>hello world</h1>";
+        let mut opts = CompileOptions::default();
+        opts.module.generate = Some(Generate::Client);
+        let result = compile(source, "Hello_world", opts).expect("compile should succeed");
+        let expected = "import 'svelte/internal/disclose-version';\nimport 'svelte/internal/flags/legacy';\nimport * as $ from 'svelte/internal/client';\n\nvar root = $.from_html(`<h1>hello world</h1>`);\n\nexport default function Hello_world($$anchor) {\n\tvar h1 = root();\n\n\t$.append($$anchor, h1);\n}";
+        assert_eq!(result.js, expected);
     }
 
     /// The Rust empty-Root serializes to JSON with the same key set as the JS
