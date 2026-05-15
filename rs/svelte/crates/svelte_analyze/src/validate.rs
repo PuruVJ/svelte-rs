@@ -914,16 +914,20 @@ fn visit_labeled_statement(
     if label_name != Some("$") {
         return;
     }
-    // Upstream only treats `$:` as a reactive statement when its parent is
-    // the Program. We approximate by checking `is_instance` — top-level
-    // labels in the instance script. The walker we wrote here only
-    // surfaces labels at the program top, so this gate works.
+    let start = node.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let end = node.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    // `$:` is only valid as a top-level statement in the *instance* script.
+    // - In module script (or any non-instance program): emit
+    //   `reactive_declaration_invalid_placement` warning.
+    // - In instance + runes mode: hard error (legacy_reactive_statement_invalid).
+    // Otherwise: valid reactive statement (handled in transform phase).
     if !is_instance {
+        state
+            .warnings
+            .push(warnings::reactive_declaration_invalid_placement(Some((start, end))));
         return;
     }
     if state.is_runes {
-        let start = node.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let end = node.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         state
             .errors
             .push(errors::legacy_reactive_statement_invalid(Some((start, end))));
