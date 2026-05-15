@@ -22,19 +22,31 @@ pub use template::{ops_to_statements, TemplateChunks, TemplateOp};
 /// Transform an analyzed `Root` into an acorn-shaped JSON `Program` ready for
 /// `svelte_codegen_js::print()`.
 pub fn server_component(root: &Root, component_name: &str) -> Value {
-    // Top-level fragment: trim edge whitespace so blank lines between
-    // `</script>` and the first element (or after the last element) don't
-    // appear as empty `$$renderer.push(\`\\n\\n\`)` calls.
-    let template_ops = template::lower_fragment_trimmed(&root.fragment);
-    let mut function_body: Vec<Value> = Vec::new();
-
-    // Instance script body — runs each render. Strips imports/exports (hoisted)
-    // and erases runes (`$state`/`$derived`/`$effect`/...).
+    // Collect derived bindings up front so the template-expression rewriter
+    // can call them as thunks.
+    let mut rewritten_instance: Option<Value> = None;
+    let mut derived_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(instance) = &root.instance {
         let rewritten = rewrite::rewrite_program(instance.content.clone());
-        let (hoisted, body) = split_script_body(&rewritten);
+        derived_names = rewrite::collect_derived_names(&rewritten);
+        rewritten_instance = Some(rewritten);
+    }
+
+    // Lower the template, then rewrite derived references in every embedded
+    // expression so `{counter.count}` becomes `${$.escape(counter().count)}`
+    // when `counter` is a derived binding.
+    let mut root_with_rewritten_template: Root = root.clone();
+    if !derived_names.is_empty() {
+        rewrite_fragment_derived_refs(&mut root_with_rewritten_template.fragment, &derived_names);
+    }
+    let template_ops = template::lower_fragment_trimmed(&root_with_rewritten_template.fragment);
+    let mut function_body: Vec<Value> = Vec::new();
+
+    // Instance script body — runs each render. Strips imports/exports (hoisted).
+    if let Some(rewritten) = &rewritten_instance {
+        let (hoisted, body) = split_script_body(rewritten);
         function_body.extend(body);
-        let _ = hoisted; // collected in build_program below
+        let _ = hoisted;
     }
 
     function_body.extend(template::ops_to_statements(template_ops));
@@ -71,9 +83,8 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
     if let Some(module_script) = &root.module {
         program_body.extend(extract_program_body(&module_script.content));
     }
-    if let Some(instance) = &root.instance {
-        let rewritten = rewrite::rewrite_program(instance.content.clone());
-        let (hoisted, _body) = split_script_body(&rewritten);
+    if let Some(rewritten) = &rewritten_instance {
+        let (hoisted, _body) = split_script_body(rewritten);
         program_body.extend(hoisted);
     }
 
@@ -187,6 +198,113 @@ fn instance_has_top_level_await(program: &Value) -> bool {
         }
     }
     walk(program)
+}
+
+/// Walk a `Fragment` rewriting every embedded expression so identifiers in
+/// `deriveds` become `name()` calls. Used for server's `$derived` getter
+/// invocation pattern.
+fn rewrite_fragment_derived_refs(
+    f: &mut svelte_ast::Fragment,
+    deriveds: &std::collections::HashSet<String>,
+) {
+    use svelte_ast::fragment::FragmentChild;
+    for node in f.nodes.iter_mut() {
+        match node {
+            FragmentChild::ExpressionTag(t) => {
+                rewrite::rewrite_derived_refs(&mut t.expression, deriveds);
+            }
+            FragmentChild::HtmlTag(t) => {
+                rewrite::rewrite_derived_refs(&mut t.expression, deriveds);
+            }
+            FragmentChild::ConstTag(t) => {
+                rewrite::rewrite_derived_refs(&mut t.declaration, deriveds);
+            }
+            FragmentChild::RenderTag(t) => {
+                rewrite::rewrite_derived_refs(&mut t.expression, deriveds);
+            }
+            FragmentChild::IfBlock(b) => {
+                rewrite::rewrite_derived_refs(&mut b.test, deriveds);
+                rewrite_fragment_derived_refs(&mut b.consequent, deriveds);
+                if let Some(alt) = b.alternate.as_mut() {
+                    rewrite_fragment_derived_refs(alt, deriveds);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                rewrite::rewrite_derived_refs(&mut b.expression, deriveds);
+                rewrite_fragment_derived_refs(&mut b.body, deriveds);
+                if let Some(fb) = b.fallback.as_mut() {
+                    rewrite_fragment_derived_refs(fb, deriveds);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                rewrite::rewrite_derived_refs(&mut b.expression, deriveds);
+                rewrite_fragment_derived_refs(&mut b.fragment, deriveds);
+            }
+            FragmentChild::AwaitBlock(b) => {
+                rewrite::rewrite_derived_refs(&mut b.expression, deriveds);
+                if let Some(f) = b.pending.as_mut() {
+                    rewrite_fragment_derived_refs(f, deriveds);
+                }
+                if let Some(f) = b.then.as_mut() {
+                    rewrite_fragment_derived_refs(f, deriveds);
+                }
+                if let Some(f) = b.catch_.as_mut() {
+                    rewrite_fragment_derived_refs(f, deriveds);
+                }
+            }
+            FragmentChild::SnippetBlock(b) => {
+                rewrite_fragment_derived_refs(&mut b.body, deriveds);
+            }
+            FragmentChild::RegularElement(el) => {
+                rewrite_attrs_derived_refs(&mut el.attributes, deriveds);
+                rewrite_fragment_derived_refs(&mut el.fragment, deriveds);
+            }
+            FragmentChild::Component(c) => {
+                rewrite_attrs_derived_refs(&mut c.attributes, deriveds);
+                rewrite_fragment_derived_refs(&mut c.fragment, deriveds);
+            }
+            FragmentChild::SvelteElement(el) => {
+                rewrite::rewrite_derived_refs(&mut el.tag, deriveds);
+                rewrite_attrs_derived_refs(&mut el.attributes, deriveds);
+                rewrite_fragment_derived_refs(&mut el.fragment, deriveds);
+            }
+            FragmentChild::SvelteHead(el) => rewrite_fragment_derived_refs(&mut el.fragment, deriveds),
+            FragmentChild::SvelteFragment(el) => rewrite_fragment_derived_refs(&mut el.fragment, deriveds),
+            FragmentChild::TitleElement(el) => rewrite_fragment_derived_refs(&mut el.fragment, deriveds),
+            _ => {}
+        }
+    }
+}
+
+fn rewrite_attrs_derived_refs(
+    attrs: &mut Vec<svelte_ast::ElementAttribute>,
+    deriveds: &std::collections::HashSet<String>,
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for a in attrs.iter_mut() {
+        match a {
+            ElementAttribute::Attribute(attr) => match &mut attr.value {
+                AttributeValue::Single(tag) => {
+                    rewrite::rewrite_derived_refs(&mut tag.expression, deriveds);
+                }
+                AttributeValue::Many(parts) => {
+                    for p in parts.iter_mut() {
+                        if let AttributeValuePart::ExpressionTag(t) = p {
+                            rewrite::rewrite_derived_refs(&mut t.expression, deriveds);
+                        }
+                    }
+                }
+                AttributeValue::Empty(_) => {}
+            },
+            ElementAttribute::BindDirective(bd) => {
+                rewrite::rewrite_derived_refs(&mut bd.expression, deriveds);
+            }
+            ElementAttribute::SpreadAttribute(sa) => {
+                rewrite::rewrite_derived_refs(&mut sa.expression, deriveds);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Pull `body[]` out of a parsed ESTree Program JSON value.

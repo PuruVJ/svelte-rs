@@ -15,6 +15,138 @@ pub fn rewrite_program(mut program: Value) -> Value {
     program
 }
 
+/// Walk a JSON AST and return the set of names bound to `$derived(...)` /
+/// `$derived.by(...)` initializers. These names need `name()` call sites in
+/// template expressions (server-side, the derived getter is a thunk).
+pub fn collect_derived_names(program: &Value) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(node: &Value, out: &mut std::collections::HashSet<String>) {
+        match node {
+            Value::Array(arr) => {
+                for v in arr {
+                    walk(v, out);
+                }
+            }
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    if let Some(init) = obj.get("init") {
+                        if is_derived_call(init) {
+                            if let Some(name) = obj
+                                .get("id")
+                                .and_then(|i| i.get("name"))
+                                .and_then(|v| v.as_str())
+                            {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+                for v in obj.values() {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(program, &mut out);
+    out
+}
+
+fn is_derived_call(v: &Value) -> bool {
+    if v.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let callee = match v.get("callee") {
+        Some(c) => c,
+        None => return false,
+    };
+    // Detect `$.derived(...)` (post-rewrite).
+    if callee.get("type").and_then(|v| v.as_str()) == Some("MemberExpression") {
+        let obj = callee
+            .get("object")
+            .and_then(|o| o.get("name"))
+            .and_then(|v| v.as_str());
+        let prop = callee
+            .get("property")
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str());
+        return obj == Some("$") && prop == Some("derived");
+    }
+    false
+}
+
+/// Rewrite an expression so that any Identifier whose name is in `deriveds`
+/// becomes `name()`. Used to turn `<p>{count}</p>` where `count` is a
+/// derived binding into `<p>${$.escape(count())}</p>`.
+pub fn rewrite_derived_refs(expr: &mut Value, deriveds: &std::collections::HashSet<String>) {
+    rewrite_derived(expr, deriveds, true);
+}
+
+fn rewrite_derived(node: &mut Value, deriveds: &std::collections::HashSet<String>, allow_self_call: bool) {
+    let ty = node
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match ty.as_str() {
+        "Identifier" => {
+            if !allow_self_call {
+                return;
+            }
+            let name = node
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if deriveds.contains(&name) {
+                let id = node.clone();
+                *node = serde_json::json!({
+                    "type": "CallExpression",
+                    "callee": id,
+                    "arguments": [],
+                    "optional": false
+                });
+            }
+        }
+        "MemberExpression" => {
+            // Walk object — `counter.count` where `counter` is derived should
+            // become `counter().count`. But don't recurse into the property
+            // (which is itself an Identifier but used as a member name).
+            if let Some(obj) = node.get_mut("object") {
+                rewrite_derived(obj, deriveds, true);
+            }
+            let computed = node
+                .get("computed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if computed {
+                if let Some(prop) = node.get_mut("property") {
+                    rewrite_derived(prop, deriveds, true);
+                }
+            }
+        }
+        // Don't recurse into function bodies — derived refs inside `$derived(() => x)`
+        // are already inside the closure, calling them creates infinite loops.
+        "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration" => {}
+        _ => {
+            // Generic recursion.
+            if let Some(obj) = node.as_object_mut() {
+                for (_, v) in obj.iter_mut() {
+                    match v {
+                        Value::Array(arr) => {
+                            for v in arr.iter_mut() {
+                                rewrite_derived(v, deriveds, allow_self_call);
+                            }
+                        }
+                        Value::Object(_) => rewrite_derived(v, deriveds, allow_self_call),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn walk(node: &mut Value) {
     match node {
         Value::Array(arr) => {
