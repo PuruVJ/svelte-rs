@@ -54,8 +54,8 @@ fn static_attribute_serializes() {
 fn bare_attribute_serializes() {
     let source = "<input disabled>";
     let out = compile_server(source, "Bare");
-    // Self-closing void serialization
-    assert!(out.contains("`<input disabled/>`"), "got: {out}");
+    // Upstream emits `disabled=""` (empty-string form) per HTML5 spec.
+    assert!(out.contains(r#"`<input disabled=""/>`"#), "got: {out}");
 }
 
 #[test]

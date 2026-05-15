@@ -204,6 +204,7 @@ fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
         FragmentChild::SvelteHead(el) => lower_svelte_head(el, acc),
         FragmentChild::SvelteBody(el) => lower_svelte_body(el, acc),
         FragmentChild::SvelteFragment(el) => lower_svelte_fragment(el, acc),
+        FragmentChild::SvelteElement(el) => lower_svelte_element(el, acc),
         FragmentChild::TitleElement(el) => lower_title_element(el, acc),
         FragmentChild::Comment(_) => {
             // HTML comments are stripped server-side by default.
@@ -258,8 +259,11 @@ fn lower_attribute(attr: &ElementAttribute, acc: &mut Accumulator) {
     }
     match value {
         AttributeValue::Empty(true) => {
+            // Upstream's server emits `name=""` (empty-string form), not bare
+            // `name`. Matches HTML5 attribute serialization spec.
             acc.push_char(' ');
             acc.push_str(name);
+            acc.push_str("=\"\"");
         }
         AttributeValue::Empty(false) => {}
         AttributeValue::Many(parts) => {
@@ -330,6 +334,27 @@ fn lower_svelte_fragment(el: &svelte_ast::SvelteFragment, acc: &mut Accumulator)
     for child in &el.fragment.nodes {
         lower_child(child, acc);
     }
+}
+
+fn lower_svelte_element(el: &svelte_ast::SvelteElement, acc: &mut Accumulator) {
+    // `<svelte:element this={tag}>...</svelte:element>` → `$.element($$renderer, tag)` for
+    // the simplest case. With children, body becomes a callback.
+    // Mirrors `phases/3-transform/server/visitors/SvelteElement.js`.
+    let has_children = !el.fragment.nodes.is_empty()
+        && el
+            .fragment
+            .nodes
+            .iter()
+            .any(|n| !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()));
+    let mut args: Vec<Value> = vec![b::id("$$renderer"), el.tag.clone()];
+    if has_children {
+        let body = ops_to_statements(lower_fragment_trimmed(&el.fragment));
+        args.push(b::arrow(vec![b::id("$$renderer")], b::block(body), false));
+    }
+    acc.stmt(b::stmt(b::call(
+        b::member(b::id("$"), b::id("element"), false, false),
+        args,
+    )));
 }
 
 fn lower_title_element(el: &svelte_ast::TitleElement, acc: &mut Accumulator) {
