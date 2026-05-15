@@ -45,13 +45,59 @@ fn try_rune_rewrite(obj: &serde_json::Map<String, Value>) -> Option<Value> {
     let rune_name = rune_call_name(callee)?;
     let args = obj.get("arguments").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     match rune_name.as_str() {
-        // $state(x) / $state.raw(x) / $derived(x) / $derived.by(x) → x
-        // $state() / $derived() → undefined
-        "$state" | "$state.raw" | "$derived" | "$derived.by" => Some(
+        // $state(x) / $state.raw(x) — server-erased to bare value.
+        // $state() / $state.raw() → undefined
+        "$state" | "$state.raw" => Some(
             args.into_iter()
                 .next()
                 .unwrap_or_else(|| serde_json::json!({ "type": "Identifier", "name": "undefined" })),
         ),
+        // $derived(x) → $.derived(() => x); $derived.by(fn) → $.derived(fn).
+        // Server still needs laziness so the value is computed when read.
+        "$derived" => {
+            let inner = args
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| serde_json::json!({ "type": "Identifier", "name": "undefined" }));
+            let arrow = serde_json::json!({
+                "type": "ArrowFunctionExpression",
+                "async": false,
+                "generator": false,
+                "params": [],
+                "body": inner,
+                "expression": true
+            });
+            Some(serde_json::json!({
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$" },
+                    "property": { "type": "Identifier", "name": "derived" },
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [arrow],
+                "optional": false
+            }))
+        }
+        "$derived.by" => {
+            let fn_arg = args
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| serde_json::json!({ "type": "Identifier", "name": "undefined" }));
+            Some(serde_json::json!({
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$" },
+                    "property": { "type": "Identifier", "name": "derived" },
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [fn_arg],
+                "optional": false
+            }))
+        }
         // $effect / $effect.pre / $inspect — server-side no-op. Replace with `undefined`.
         "$effect" | "$effect.pre" | "$effect.root" | "$inspect" | "$inspect.trace" => Some(
             serde_json::json!({ "type": "Identifier", "name": "undefined" }),
@@ -155,6 +201,34 @@ mod tests {
     }
 
     #[test]
+    fn nested_derived_call_wraps_in_arrow() {
+        // $derived(y) → $.derived(() => y) — server keeps laziness via thunk.
+        let prog = json!({
+            "type": "Program",
+            "body": [{
+                "type": "VariableDeclaration",
+                "kind": "let",
+                "declarations": [{
+                    "type": "VariableDeclarator",
+                    "id": { "type": "Identifier", "name": "x" },
+                    "init": {
+                        "type": "CallExpression",
+                        "callee": { "type": "Identifier", "name": "$derived" },
+                        "arguments": [{ "type": "Identifier", "name": "y" }]
+                    }
+                }]
+            }]
+        });
+        let rewritten = rewrite_program(prog);
+        let init = &rewritten["body"][0]["declarations"][0]["init"];
+        assert_eq!(init["type"], "CallExpression");
+        assert_eq!(init["callee"]["property"]["name"], "derived");
+        assert_eq!(init["arguments"][0]["type"], "ArrowFunctionExpression");
+        assert_eq!(init["arguments"][0]["body"]["type"], "Identifier");
+        assert_eq!(init["arguments"][0]["body"]["name"], "y");
+    }
+
+    #[test]
     fn nested_state_call_erased() {
         let prog = json!({
             "type": "Program",
@@ -169,7 +243,7 @@ mod tests {
                         "operator": "+",
                         "left": {
                             "type": "CallExpression",
-                            "callee": { "type": "Identifier", "name": "$derived" },
+                            "callee": { "type": "Identifier", "name": "$state" },
                             "arguments": [{ "type": "Identifier", "name": "y" }]
                         },
                         "right": { "type": "Literal", "raw": "1", "value": 1 }
@@ -179,7 +253,7 @@ mod tests {
         });
         let rewritten = rewrite_program(prog);
         let init = &rewritten["body"][0]["declarations"][0]["init"];
-        // $derived(y) becomes y, so init becomes `y + 1` — left should be the Identifier `y`.
+        // $state(y) → y, so left is the Identifier `y`.
         assert_eq!(init["left"]["type"], "Identifier");
         assert_eq!(init["left"]["name"], "y");
     }

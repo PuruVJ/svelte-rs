@@ -274,13 +274,13 @@ fn snapshot_each_index_non_null_fixture() {
 }
 
 #[test]
-fn runes_erased_server_side() {
+fn runes_lowered_server_side() {
     let source = "<script>\n\tlet x = $state(1);\n\tlet y = $derived(x * 2);\n\t$effect(() => console.log(x));\n</script>\n<p>{x}/{y}</p>";
     let out = compile_server(source, "Runes");
     // $state(1) → 1
     assert!(out.contains("let x = 1;"), "got: {out}");
-    // $derived(x * 2) → x * 2
-    assert!(out.contains("let y = x * 2;"), "got: {out}");
+    // $derived(x * 2) → $.derived(() => x * 2)
+    assert!(out.contains("$.derived(() => x * 2)"), "got: {out}");
     // $effect(...) → undefined as a side-effect statement
     assert!(!out.contains("$effect"), "got: {out}");
     // Template still references x and y via $.escape
