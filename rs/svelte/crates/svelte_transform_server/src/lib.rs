@@ -56,6 +56,16 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
     // Module script body — runs once. All of its statements are hoisted to the
     // top of the Program (after the `$` import).
     let mut program_body: Vec<Value> = Vec::new();
+    if uses_async(root) {
+        // `import 'svelte/internal/flags/async';` as a side-effect — matches
+        // upstream's `if (options.experimental.async)` injection in
+        // transform-server.js:388-390.
+        program_body.push(serde_json::json!({
+            "type": "ImportDeclaration",
+            "specifiers": [],
+            "source": b::literal_str("svelte/internal/flags/async")
+        }));
+    }
     program_body.push(b::import_all("$", "svelte/internal/server"));
 
     if let Some(module_script) = &root.module {
@@ -81,6 +91,73 @@ fn uses_props(root: &Root) -> bool {
     };
     let json = instance.content.to_string();
     json.contains("\"$props\"") || json.contains("\"$$props\"")
+}
+
+/// Whether the component uses async features — top-level `await` in instance
+/// script, any `{#await}` block, or any AwaitExpression inside template
+/// tags. Drives the `svelte/internal/flags/async` side-effect import.
+fn uses_async(root: &Root) -> bool {
+    use svelte_ast::fragment::{Fragment, FragmentChild};
+    fn json_has_await(v: &Value) -> bool {
+        v.to_string().contains("\"AwaitExpression\"")
+    }
+    fn fragment_uses_async(f: &Fragment) -> bool {
+        for n in &f.nodes {
+            match n {
+                FragmentChild::AwaitBlock(_) => return true,
+                FragmentChild::ExpressionTag(t) if json_has_await(&t.expression) => return true,
+                FragmentChild::HtmlTag(t) if json_has_await(&t.expression) => return true,
+                FragmentChild::ConstTag(t) if json_has_await(&t.declaration) => return true,
+                FragmentChild::RenderTag(t) if json_has_await(&t.expression) => return true,
+                FragmentChild::RegularElement(el) => {
+                    if fragment_uses_async(&el.fragment) {
+                        return true;
+                    }
+                }
+                FragmentChild::IfBlock(b) => {
+                    if json_has_await(&b.test) || fragment_uses_async(&b.consequent) {
+                        return true;
+                    }
+                    if let Some(alt) = &b.alternate {
+                        if fragment_uses_async(alt) {
+                            return true;
+                        }
+                    }
+                }
+                FragmentChild::EachBlock(b) => {
+                    if json_has_await(&b.expression) || fragment_uses_async(&b.body) {
+                        return true;
+                    }
+                }
+                FragmentChild::KeyBlock(b) => {
+                    if json_has_await(&b.expression) || fragment_uses_async(&b.fragment) {
+                        return true;
+                    }
+                }
+                FragmentChild::Component(c) => {
+                    if fragment_uses_async(&c.fragment) {
+                        return true;
+                    }
+                }
+                FragmentChild::SvelteElement(el) => {
+                    if fragment_uses_async(&el.fragment) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    if fragment_uses_async(&root.fragment) {
+        return true;
+    }
+    if let Some(instance) = &root.instance {
+        if json_has_await(&instance.content) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Pull `body[]` out of a parsed ESTree Program JSON value.
