@@ -123,8 +123,15 @@ pub fn property_definition(node: &Value, ctx: &mut Context) {
     }
     if let Some(val) = node.get("value") {
         if !val.is_null() {
-            ctx.write(" = ", None);
-            ctx.visit(val);
+            // Treat `Identifier("undefined")` as "no init" — matches upstream's
+            // behavior where `#b = $state()` (which rune-erasure turns into
+            // `#b = undefined`) emits as `#b;`.
+            let is_undefined_id = val.get("type").and_then(|v| v.as_str()) == Some("Identifier")
+                && val.get("name").and_then(|v| v.as_str()) == Some("undefined");
+            if !is_undefined_id {
+                ctx.write(" = ", None);
+                ctx.visit(val);
+            }
         }
     }
     ctx.write(";", None);

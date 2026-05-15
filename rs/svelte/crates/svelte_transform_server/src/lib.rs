@@ -51,17 +51,39 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
 
     function_body.extend(template::ops_to_statements(template_ops));
 
-    let needs_props = uses_props(&root);
+    let needs_context = component_needs_context(&root);
+    let needs_props = uses_props(&root) || needs_context;
     let mut params = vec![b::id("$$renderer")];
     if needs_props {
         params.push(b::id("$$props"));
     }
 
-    let component_block = b::block(function_body);
+    // When the component needs context (class fields with $state, full
+    // `let props = $props()` rebind without destructuring, etc.), wrap the
+    // body in `$$renderer.component(($$renderer) => { ... })`. Mirrors
+    // upstream's `should_inject_context` path in `transform-server.js:259-269`.
+    let body_value = if needs_context {
+        // Rewrite `let X = $$props` (which came from `let X = $props()` via
+        // the rune erasure) to the destructured form
+        // `let { $$slots, $$events, ...X } = $$props;`.
+        let function_body = rewrite_full_props_rebind(function_body);
+        let wrapped = b::block(vec![b::stmt(b::call(
+            b::member(b::id("$$renderer"), b::id("component"), false, false),
+            vec![b::arrow(
+                vec![b::id("$$renderer")],
+                b::block(function_body),
+                false,
+            )],
+        ))]);
+        wrapped
+    } else {
+        b::block(function_body)
+    };
+
     let component_fn = b::function_declaration(
         b::id(component_name),
         params,
-        component_block,
+        body_value,
         false,
     );
 
@@ -104,12 +126,123 @@ fn uses_props(root: &Root) -> bool {
     json.contains("\"$props\"") || json.contains("\"$$props\"")
 }
 
-/// Whether the component uses `experimental.async` features. This isn't a
-/// pure source-code check — upstream gates it on `compileOptions.experimental.async`
-/// which the per-fixture `_config.js` controls. As a heuristic when we don't
-/// have that config available, treat top-level await (in script or template
-/// tags) as a strong signal. `{#await}` blocks alone don't trigger this —
-/// they work in non-async mode too.
+/// Decide whether the component needs the `$$renderer.component(...)` wrapper.
+/// Activates when:
+/// - The instance script has `let X = $props()` (full-rebind, no destructuring).
+/// - A class contains `$state`/`$derived` fields.
+/// Mirrors upstream's `analysis.needs_context` set in `phases/2-analyze/index.js`.
+fn component_needs_context(root: &Root) -> bool {
+    let Some(instance) = &root.instance else {
+        return false;
+    };
+    let json = instance.content.to_string();
+    if (json.contains("\"ClassDeclaration\"") || json.contains("\"ClassExpression\""))
+        && json.contains("\"$state\"")
+    {
+        return true;
+    }
+    has_full_props_rebind(&instance.content)
+}
+
+/// `let X = $props()` (no destructuring) — walks the parsed program.
+fn has_full_props_rebind(program: &Value) -> bool {
+    fn walk(node: &Value) -> bool {
+        match node {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    let id_is_identifier = obj
+                        .get("id")
+                        .and_then(|v| v.get("type"))
+                        .and_then(|v| v.as_str())
+                        == Some("Identifier");
+                    let init = obj.get("init");
+                    let init_is_props = init
+                        .and_then(|v| v.get("type"))
+                        .and_then(|v| v.as_str())
+                        == Some("CallExpression")
+                        && init
+                            .and_then(|v| v.get("callee"))
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            == Some("$props");
+                    if id_is_identifier && init_is_props {
+                        return true;
+                    }
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(program)
+}
+
+/// Rewrite `let X = $$props;` (the result of `let X = $props()` after rune
+/// erasure) into `let { $$slots, $$events, ...X } = $$props;` so the context
+/// wrapper can pull off slots/events. Mirrors upstream's full-rebind path.
+fn rewrite_full_props_rebind(body: Vec<Value>) -> Vec<Value> {
+    body.into_iter()
+        .map(|stmt| {
+            if stmt.get("type").and_then(|v| v.as_str()) != Some("VariableDeclaration") {
+                return stmt;
+            }
+            let mut stmt = stmt;
+            if let Some(decls) = stmt.get_mut("declarations").and_then(|v| v.as_array_mut()) {
+                for d in decls.iter_mut() {
+                    let is_init_props = d
+                        .get("init")
+                        .and_then(|v| v.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some("$$props");
+                    let id_is_ident = d
+                        .get("id")
+                        .and_then(|v| v.get("type"))
+                        .and_then(|v| v.as_str())
+                        == Some("Identifier");
+                    if is_init_props && id_is_ident {
+                        let name = d
+                            .get("id")
+                            .and_then(|v| v.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("props")
+                            .to_string();
+                        d["id"] = serde_json::json!({
+                            "type": "ObjectPattern",
+                            "properties": [
+                                {
+                                    "type": "Property",
+                                    "kind": "init",
+                                    "key": { "type": "Identifier", "name": "$$slots" },
+                                    "value": { "type": "Identifier", "name": "$$slots" },
+                                    "computed": false,
+                                    "shorthand": true,
+                                    "method": false
+                                },
+                                {
+                                    "type": "Property",
+                                    "kind": "init",
+                                    "key": { "type": "Identifier", "name": "$$events" },
+                                    "value": { "type": "Identifier", "name": "$$events" },
+                                    "computed": false,
+                                    "shorthand": true,
+                                    "method": false
+                                },
+                                {
+                                    "type": "RestElement",
+                                    "argument": { "type": "Identifier", "name": name }
+                                }
+                            ]
+                        });
+                    }
+                }
+            }
+            stmt
+        })
+        .collect()
+}
+
+/// Whether the component uses `experimental.async` features.
 fn uses_async(root: &Root) -> bool {
     use svelte_ast::fragment::{Fragment, FragmentChild};
     fn json_has_await(v: &Value) -> bool {
