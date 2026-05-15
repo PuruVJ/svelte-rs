@@ -197,6 +197,13 @@ fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
         FragmentChild::KeyBlock(blk) => lower_key_block(blk, acc),
         FragmentChild::AwaitBlock(blk) => lower_await_block(blk, acc),
         FragmentChild::SnippetBlock(blk) => lower_snippet_block(blk, acc),
+        FragmentChild::SvelteHead(el) => lower_svelte_head(el, acc),
+        FragmentChild::SvelteBody(el) => lower_svelte_body(el, acc),
+        FragmentChild::SvelteFragment(el) => lower_svelte_fragment(el, acc),
+        FragmentChild::TitleElement(el) => lower_title_element(el, acc),
+        FragmentChild::Comment(_) => {
+            // HTML comments are stripped server-side by default.
+        }
         // Components, snippets, key/await blocks, svelte:*, etc. — TODO.
         _ => {}
     }
@@ -282,6 +289,51 @@ fn lower_attribute(attr: &ElementAttribute, acc: &mut Accumulator) {
             acc.push_expression(attr_call);
         }
     }
+}
+
+fn lower_svelte_head(el: &svelte_ast::SvelteHead, acc: &mut Accumulator) {
+    // `<svelte:head>...</svelte:head>` lowers to `$$renderer.head($$renderer => {
+    // ...body... })`. Anything inside gets emitted via a nested $$renderer.
+    let body = ops_to_statements(lower_fragment_trimmed(&el.fragment));
+    let call = b::call(
+        b::member(b::id("$$renderer"), b::id("head"), false, false),
+        vec![b::arrow(vec![b::id("$$renderer")], b::block(body), false)],
+    );
+    acc.stmt(b::stmt(call));
+}
+
+fn lower_svelte_body(el: &svelte_ast::SvelteBody, acc: &mut Accumulator) {
+    // `<svelte:body>` is a no-op for SSR (no DOM to attach to). Attributes
+    // (like `bind:visibilityState`) and event handlers can be ignored.
+    let _ = el;
+    let _ = acc;
+}
+
+fn lower_svelte_fragment(el: &svelte_ast::SvelteFragment, acc: &mut Accumulator) {
+    // `<svelte:fragment slot="...">...</svelte:fragment>` — for server, just
+    // emit the body. The slot fill is handled at component-call time.
+    for child in &el.fragment.nodes {
+        lower_child(child, acc);
+    }
+}
+
+fn lower_title_element(el: &svelte_ast::TitleElement, acc: &mut Accumulator) {
+    // `<title>...</title>` produces `$$renderer.title(\`<title>{content}</title>\`)`.
+    let trimmed = trim_fragment_edges(&el.fragment);
+    let mut inner_acc = Accumulator::new();
+    inner_acc.push_str("<title>");
+    for child in &trimmed {
+        lower_child(child, &mut inner_acc);
+    }
+    inner_acc.push_str("</title>");
+    let ops = inner_acc.into_ops();
+    let stmts = ops_to_statements(ops);
+    // wrap the push() in a $$renderer.title() invocation
+    let title_call = b::call(
+        b::member(b::id("$$renderer"), b::id("title"), false, false),
+        vec![b::arrow(vec![b::id("$$renderer")], b::block(stmts), false)],
+    );
+    acc.stmt(b::stmt(title_call));
 }
 
 fn lower_component(c: &Component, acc: &mut Accumulator) {
