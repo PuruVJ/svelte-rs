@@ -32,6 +32,19 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
             _ => None,
         })
         .collect();
+    // Legacy event directives (`on:click={...}`) — equivalent to `onclick={...}`.
+    let directive_event_names: Vec<String> = el
+        .attributes
+        .iter()
+        .filter_map(|a| match a {
+            ElementAttribute::OnDirective(d) => Some(format!("on{}", d.name)),
+            _ => None,
+        })
+        .collect();
+    let has_event = |name: &str| -> bool {
+        attrs.iter().any(|(n, _)| *n == name)
+            || directive_event_names.iter().any(|s| s == name)
+    };
     let span = Some((el.start, el.end));
 
     // 1. a11y_distracting_elements — `<marquee>` / `<blink>`
@@ -131,19 +144,16 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
     }
 
     // 7. a11y_click_events_have_key_events — onclick without keyboard equivalent.
-    let has_onclick = attrs.iter().any(|(n, _)| *n == "onclick");
-    let has_key_event = attrs
-        .iter()
-        .any(|(n, _)| matches!(*n, "onkeydown" | "onkeyup" | "onkeypress"));
+    let has_onclick = has_event("onclick");
+    let has_key_event =
+        has_event("onkeydown") || has_event("onkeyup") || has_event("onkeypress");
     if has_onclick && !has_key_event && is_interactive_role_eligible(&el.name) {
         diags.push(warnings::a11y_click_events_have_key_events(span));
     }
 
     // 8. a11y_mouse_events_have_key_events — onmouseover/out without focus/blur.
     for (mouse_evt, key_evt) in [("onmouseover", "onfocus"), ("onmouseout", "onblur")] {
-        let has_mouse = attrs.iter().any(|(n, _)| *n == mouse_evt);
-        let has_key = attrs.iter().any(|(n, _)| *n == key_evt);
-        if has_mouse && !has_key {
+        if has_event(mouse_evt) && !has_event(key_evt) {
             diags.push(warnings::a11y_mouse_events_have_key_events(
                 span,
                 mouse_evt,
