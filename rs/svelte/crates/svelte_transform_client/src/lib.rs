@@ -37,35 +37,51 @@ pub fn client_component(root: &Root, component_name: &str) -> Value {
     program_body.push(import_side_effect("svelte/internal/flags/legacy"));
     program_body.push(b::import_all("$", "svelte/internal/client"));
 
-    // var root = $.from_html(`...`)
-    program_body.push(b::declaration(
-        "var",
-        vec![b::declarator(
-            b::id("root"),
-            Some(b::call(
-                b::member(b::id("$"), b::id("from_html"), false, false),
-                vec![b::template_literal(vec![&html], vec![])],
-            )),
-        )],
-    ));
-
-    let single_root_name = guess_single_root_var(&root.fragment.nodes);
+    // Hoisted instance imports
+    if let Some(instance) = &root.instance {
+        let body = instance
+            .content
+            .get("body")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for stmt in body {
+            if stmt.get("type").and_then(|v| v.as_str()) == Some("ImportDeclaration") {
+                program_body.push(stmt);
+            }
+        }
+    }
 
     let mut fn_body: Vec<Value> = Vec::new();
-    if let Some(top_name) = single_root_name {
-        fn_body.push(b::declaration(
+
+    if !html.is_empty() {
+        program_body.push(b::declaration(
             "var",
-            vec![b::declarator(b::id(&top_name), Some(b::call(b::id("root"), vec![])))],
+            vec![b::declarator(
+                b::id("root"),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("from_html"), false, false),
+                    vec![b::template_literal(vec![&html], vec![])],
+                )),
+            )],
         ));
-        fn_body.push(b::stmt(b::call(
-            b::member(b::id("$"), b::id("append"), false, false),
-            vec![b::id("$$anchor"), b::id(&top_name)],
-        )));
-    } else {
-        fn_body.push(b::stmt(b::call(
-            b::member(b::id("$"), b::id("append"), false, false),
-            vec![b::id("$$anchor"), b::call(b::id("root"), vec![])],
-        )));
+
+        let single_root_name = guess_single_root_var(&root.fragment.nodes);
+        if let Some(top_name) = single_root_name {
+            fn_body.push(b::declaration(
+                "var",
+                vec![b::declarator(b::id(&top_name), Some(b::call(b::id("root"), vec![])))],
+            ));
+            fn_body.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("append"), false, false),
+                vec![b::id("$$anchor"), b::id(&top_name)],
+            )));
+        } else {
+            fn_body.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("append"), false, false),
+                vec![b::id("$$anchor"), b::call(b::id("root"), vec![])],
+            )));
+        }
     }
 
     program_body.push(b::export_default(b::function_declaration(

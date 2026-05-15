@@ -19,3 +19,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 svelte_parse = { workspace = true }
+svelte_diagnostics = { workspace = true }

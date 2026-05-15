@@ -25,6 +25,12 @@ fn snapshot_hello_world_client_fixture() {
     assert_snapshot_eq("hello-world", "<h1>hello world</h1>", "Hello_world");
 }
 
+#[test]
+fn snapshot_imports_in_modules_client_fixture() {
+    let source = "<script>\n\timport { random } from './module.svelte';\n</script>\n";
+    assert_snapshot_eq("imports-in-modules", source, "Imports_in_modules");
+}
+
 // hmr client fixture intentionally not asserted byte-equal yet — it requires
 // HMR wrapper emission (`function Hmr(...) { ... } if (import.meta.hot) {
 // Hmr = $.hmr(Hmr); ... } export default Hmr;`) which the minimal client
