@@ -229,7 +229,111 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         }
     }
 
+    // 17. a11y_accesskey — `accesskey` attribute (avoid).
+    if has_attr("accesskey") {
+        diags.push(warnings::a11y_accesskey(span));
+    }
+
+    // 18. a11y_unknown_role — `role="foobar"` not in the WAI-ARIA list.
+    if let Some(role) = attr_static_string(attr_get("role")) {
+        if !is_known_role(&role) && !is_abstract_role(&role) {
+            diags.push(warnings::a11y_unknown_role(span, &role, None));
+        }
+    }
+
+    // 19. a11y_unknown_aria_attribute — `aria-foo=...` with foo not in spec.
+    for (n, _) in &attrs {
+        if let Some(stripped) = n.strip_prefix("aria-") {
+            if !is_known_aria_attribute(stripped) {
+                diags.push(warnings::a11y_unknown_aria_attribute(span, n, None));
+            }
+        }
+    }
+
+    // 20. a11y_media_has_caption — `<video>` without `<track kind="captions">`.
+    if el.name == "video"
+        && !has_attr("muted")
+        && !fragment_has_caption_track(&el.fragment)
+    {
+        diags.push(warnings::a11y_media_has_caption(span));
+    }
+
+    // 21. a11y_figcaption_parent — `<figcaption>` must be a direct child of `<figure>`.
+    //     (Approximated — we don't have parent context here. Skipped.)
+
     diags
+}
+
+/// WAI-ARIA 1.2 role list (subset — the most common roles). Mirrors
+/// upstream's `aria-query`-backed check.
+fn is_known_role(role: &str) -> bool {
+    matches!(
+        role,
+        // Document structure
+        "article" | "banner" | "complementary" | "contentinfo" | "definition"
+        | "directory" | "document" | "feed" | "figure" | "form" | "group"
+        | "heading" | "img" | "list" | "listitem" | "main" | "math" | "navigation"
+        | "none" | "note" | "presentation" | "region" | "row" | "rowgroup"
+        | "rowheader" | "search" | "separator" | "table" | "term" | "toolbar"
+        | "tooltip"
+        // Widget roles
+        | "button" | "checkbox" | "combobox" | "gridcell" | "link" | "menuitem"
+        | "menuitemcheckbox" | "menuitemradio" | "option" | "progressbar"
+        | "radio" | "scrollbar" | "searchbox" | "slider" | "spinbutton"
+        | "switch" | "tab" | "tabpanel" | "textbox" | "treeitem"
+        // Composite widgets
+        | "grid" | "listbox" | "menu" | "menubar" | "radiogroup"
+        | "tablist" | "tree" | "treegrid"
+        // Landmark
+        | "application" | "alert" | "alertdialog" | "dialog" | "log" | "marquee"
+        | "status" | "timer" | "columnheader"
+        // Live regions
+        | "code" | "deletion" | "emphasis" | "insertion" | "paragraph"
+        | "strong" | "subscript" | "superscript" | "time" | "blockquote"
+        | "caption" | "cell" | "generic" | "meter"
+    )
+}
+
+/// WAI-ARIA 1.2 `aria-*` attribute list (subset).
+fn is_known_aria_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "activedescendant" | "atomic" | "autocomplete" | "busy" | "checked"
+        | "colcount" | "colindex" | "colspan" | "controls" | "current"
+        | "describedby" | "details" | "disabled" | "dropeffect" | "errormessage"
+        | "expanded" | "flowto" | "grabbed" | "haspopup" | "hidden" | "invalid"
+        | "keyshortcuts" | "label" | "labelledby" | "level" | "live" | "modal"
+        | "multiline" | "multiselectable" | "orientation" | "owns" | "placeholder"
+        | "posinset" | "pressed" | "readonly" | "relevant" | "required"
+        | "roledescription" | "rowcount" | "rowindex" | "rowspan" | "selected"
+        | "setsize" | "sort" | "valuemax" | "valuemin" | "valuenow" | "valuetext"
+        | "braillelabel" | "brailleroledescription"
+    )
+}
+
+fn fragment_has_caption_track(f: &Fragment) -> bool {
+    for n in &f.nodes {
+        if let FragmentChild::RegularElement(el) = n {
+            if el.name == "track" {
+                let kind = el.attributes.iter().find_map(|a| match a {
+                    ElementAttribute::Attribute(Attribute { name, value, .. })
+                        if name == "kind" =>
+                    {
+                        Some(value)
+                    }
+                    _ => None,
+                });
+                if let Some(v) = kind {
+                    if let Some(s) = attr_static_string(Some(v)) {
+                        if s == "captions" {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Extract the static string value of an Attribute. Returns None for missing,
