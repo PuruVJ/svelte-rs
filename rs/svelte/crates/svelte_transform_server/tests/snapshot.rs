@@ -73,11 +73,11 @@ fn expression_tag_wraps_in_escape() {
 }
 
 #[test]
-fn html_tag_passes_through() {
+fn html_tag_wraps_in_html_helper() {
     let source = "<div>{@html content}</div>";
     let out = compile_server(source, "Raw");
-    // `{@html content}` should emit as `<div>${content}</div>` (no escape).
-    assert!(out.contains("`<div>${content}</div>`"), "got: {out}");
+    // `{@html content}` should emit as `<div>${$.html(content)}</div>`.
+    assert!(out.contains("`<div>${$.html(content)}</div>`"), "got: {out}");
 }
 
 #[test]

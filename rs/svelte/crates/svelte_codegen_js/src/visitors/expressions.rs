@@ -246,10 +246,6 @@ pub fn object_expression(node: &Value, ctx: &mut Context) {
 
 pub fn property(node: &Value, ctx: &mut Context) {
     let kind = node.get("kind").and_then(|v| v.as_str()).unwrap_or("init");
-    let shorthand = node
-        .get("shorthand")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     let computed = node
         .get("computed")
         .and_then(|v| v.as_bool())
@@ -259,16 +255,48 @@ pub fn property(node: &Value, ctx: &mut Context) {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Detect shorthand: `{ x }` is shorter for `{ x: x }`. Mirrors upstream
+    // `ts/index.js:1325-1338` — the explicit `shorthand` flag is *advisory*,
+    // we recompute from the key/value identity so builders that don't set it
+    // still produce shorthand output where applicable.
+    let key = &node["key"];
+    let value = &node["value"];
+    // `AssignmentPattern` values mask as `value.left` (default-with-shorthand)
+    let value_for_compare = if value.get("type").and_then(|v| v.as_str()) == Some("AssignmentPattern") {
+        &value["left"]
+    } else {
+        value
+    };
+    let key_name = key.get("name").and_then(|v| v.as_str());
+    let value_name = value_for_compare.get("name").and_then(|v| v.as_str());
+    let shorthand_detected = !computed
+        && kind == "init"
+        && type_of(key) == "Identifier"
+        && type_of(value_for_compare) == "Identifier"
+        && key_name.is_some()
+        && key_name == value_name;
+    let shorthand = node
+        .get("shorthand")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(shorthand_detected)
+        || shorthand_detected;
+
+    if shorthand {
+        // Whole `value` includes the default for AssignmentPattern shorthand.
+        ctx.visit(value);
+        return;
+    }
+
     if kind == "get" || kind == "set" {
         ctx.write(kind, None);
         ctx.write(" ", None);
     }
     if computed {
         ctx.write("[", None);
-        ctx.visit(&node["key"]);
+        ctx.visit(key);
         ctx.write("]", None);
     } else {
-        ctx.visit(&node["key"]);
+        ctx.visit(key);
     }
     if method || kind == "get" || kind == "set" {
         let val = &node["value"];
@@ -278,17 +306,12 @@ pub fn property(node: &Value, ctx: &mut Context) {
             .cloned()
             .unwrap_or_default();
         ctx.write("(", None);
-        for (i, p) in params.iter().enumerate() {
-            if i > 0 {
-                ctx.write(", ", None);
-            }
-            ctx.visit(p);
-        }
+        crate::visitors::programs::sequence(ctx, &params, false);
         ctx.write(") ", None);
         ctx.visit(&val["body"]);
-    } else if !shorthand {
+    } else {
         ctx.write(": ", None);
-        ctx.visit(&node["value"]);
+        ctx.visit(value);
     }
 }
 
@@ -310,17 +333,10 @@ pub fn arrow_function_expression(node: &Value, ctx: &mut Context) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    if params.len() == 1
-        && type_of(&params[0]) == "Identifier"
-        && params[0].get("typeAnnotation").is_none()
-    {
-        ctx.visit(&params[0]);
-    } else {
-        ctx.write("(", None);
-        crate::visitors::programs::sequence(ctx, &params, false);
-        ctx.write(")", None);
-    }
-    ctx.write(" => ", None);
+    // Always parenthesize arrow params — matches upstream esrap (`ts/index.js:859`).
+    ctx.write("(", None);
+    crate::visitors::programs::sequence(ctx, &params, false);
+    ctx.write(") => ", None);
     let body = &node["body"];
     if type_of(body) == "BlockStatement" {
         ctx.visit(body);

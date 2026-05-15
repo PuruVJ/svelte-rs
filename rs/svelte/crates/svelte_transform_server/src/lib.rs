@@ -22,7 +22,10 @@ pub use template::{ops_to_statements, TemplateChunks, TemplateOp};
 /// Transform an analyzed `Root` into an acorn-shaped JSON `Program` ready for
 /// `svelte_codegen_js::print()`.
 pub fn server_component(root: &Root, component_name: &str) -> Value {
-    let template_ops = template::lower_fragment(&root.fragment);
+    // Top-level fragment: trim edge whitespace so blank lines between
+    // `</script>` and the first element (or after the last element) don't
+    // appear as empty `$$renderer.push(\`\\n\\n\`)` calls.
+    let template_ops = template::lower_fragment_trimmed(&root.fragment);
     let mut function_body: Vec<Value> = Vec::new();
 
     // Instance script body — runs each render. Strips imports/exports (hoisted)

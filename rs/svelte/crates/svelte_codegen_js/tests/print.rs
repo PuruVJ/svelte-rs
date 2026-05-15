@@ -89,7 +89,9 @@ fn call_with_member_callee() {
 }
 
 #[test]
-fn arrow_single_param_no_parens() {
+fn arrow_single_param_with_parens() {
+    // Upstream esrap always parenthesizes arrow params, even when there's
+    // exactly one Identifier (`ts/index.js:859`).
     let ast = json!({
         "type": "ArrowFunctionExpression",
         "async": false,
@@ -101,7 +103,7 @@ fn arrow_single_param_no_parens() {
             "right": { "type": "Literal", "raw": "2" }
         }
     });
-    assert_eq!(render(&ast), "x => x * 2");
+    assert_eq!(render(&ast), "(x) => x * 2");
 }
 
 #[test]

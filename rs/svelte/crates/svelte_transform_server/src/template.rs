@@ -72,6 +72,18 @@ pub fn lower_fragment(fragment: &Fragment) -> Vec<TemplateOp> {
 }
 
 /// Lower a fragment's nodes but trim leading/trailing whitespace-only Text
+/// children. Used at the top level — `</script>\n\n<Component />` shouldn't
+/// emit a `$$renderer.push(\`\\n\\n\`)` for the inter-tag whitespace.
+pub fn lower_fragment_trimmed(fragment: &Fragment) -> Vec<TemplateOp> {
+    let trimmed = trim_fragment_edges(fragment);
+    let mut acc = Accumulator::new();
+    for child in &trimmed {
+        lower_child(child, &mut acc);
+    }
+    acc.into_ops()
+}
+
+/// Lower a fragment's nodes but trim leading/trailing whitespace-only Text
 /// children, and prepend `<!---->` if the body contains any dynamic content.
 /// Used for each/if/key/await block bodies — see upstream `clean_nodes` /
 /// the per-iteration anchor-comment behaviour in `Fragment.js`.
@@ -92,7 +104,7 @@ pub fn lower_fragment_with_marker(fragment: &Fragment) -> Vec<TemplateOp> {
     if has_dynamic {
         acc.push_str("<!---->");
     }
-    for child in trimmed {
+    for child in &trimmed {
         lower_child(child, &mut acc);
     }
     acc.into_ops()
@@ -137,7 +149,7 @@ impl Accumulator {
 
 fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
     match child {
-        FragmentChild::Text(t) => acc.push_str(&t.data),
+        FragmentChild::Text(t) => acc.push_str(&collapse_whitespace(&t.data)),
         FragmentChild::RegularElement(el) => lower_regular_element(el, acc),
         FragmentChild::ExpressionTag(tag) => {
             // Constant folding: `{'literal'}` becomes the literal characters
@@ -154,8 +166,13 @@ fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
             }
         }
         FragmentChild::HtmlTag(tag) => {
-            // `{@html expr}` — pass through verbatim, no escape.
-            acc.push_expression(tag.expression.clone());
+            // `{@html expr}` → `${$.html(expr)}` server-side. The runtime
+            // helper coerces non-string values and bypasses escape.
+            let call = b::call(
+                b::member(b::id("$"), b::id("html"), false, false),
+                vec![tag.expression.clone()],
+            );
+            acc.push_expression(call);
         }
         FragmentChild::ConstTag(tag) => {
             // `{@const x = expr}` — emit the variable declaration as a JS stmt.
@@ -196,7 +213,10 @@ fn lower_regular_element(el: &RegularElement, acc: &mut Accumulator) {
         return;
     }
     acc.push_char('>');
-    for child in &el.fragment.nodes {
+    // Trim leading/trailing whitespace inside the element so `<div>\n\t<p>...</p>\n</div>`
+    // becomes `<div><p>...</p></div>`. Mirrors upstream's `clean_nodes` collapse pass.
+    let trimmed = trim_fragment_edges(&el.fragment);
+    for child in &trimmed {
         lower_child(child, acc);
     }
     acc.push_str("</");
@@ -268,7 +288,9 @@ fn lower_component(c: &Component, acc: &mut Accumulator) {
     // Server `<Foo prop={x} />` lowering (simplified from `Component.js`):
     //   Foo($$renderer, { prop: x })
     // Directives (bind:, on:, etc.) are dropped server-side. Spread (`{...obj}`)
-    // becomes a SpreadElement in the props object.
+    // becomes a SpreadElement in the props object. Children content (the
+    // component's slot fragment) gets wrapped as a `children: ($$renderer) =>
+    // { ... }` callback plus a `$$slots: { default: true }` flag.
     let mut props: Vec<Value> = Vec::new();
     for attr in &c.attributes {
         match attr {
@@ -322,6 +344,26 @@ fn lower_component(c: &Component, acc: &mut Accumulator) {
             _ => {}
         }
     }
+
+    // If the component has children, add `children: ($$renderer) => { ... }` and
+    // `$$slots: { default: true }`. Matches upstream `Component.js`.
+    let has_children = !c.fragment.nodes.is_empty()
+        && c.fragment
+            .nodes
+            .iter()
+            .any(|n| !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()));
+    if has_children {
+        let children_body = ops_to_statements(lower_fragment_with_marker(&c.fragment));
+        props.push(b::init(
+            "children",
+            b::arrow(vec![b::id("$$renderer")], b::block(children_body), false),
+        ));
+        props.push(b::init(
+            "$$slots",
+            b::object(vec![b::init("default", b::literal_bool(true))]),
+        ));
+    }
+
     acc.stmt(b::stmt(b::call(
         b::id(&c.name),
         vec![b::id("$$renderer"), b::object(props)],
@@ -350,12 +392,12 @@ fn lower_if_block(blk: &IfBlock, acc: &mut Accumulator) {
     acc.push_str("<!--]-->");
 }
 
-/// Heuristic: walk a fragment's children, dropping the leading/trailing
-/// whitespace-only Text nodes that result from formatting a block over
-/// multiple lines. Mirrors upstream's `clean_nodes` (`utils.js`) which trims
-/// edges of each/if/await/key bodies.
-fn trim_fragment_edges(fragment: &Fragment) -> Vec<&FragmentChild> {
-    let mut nodes: Vec<&FragmentChild> = fragment.nodes.iter().collect();
+/// Trim leading/trailing whitespace-only Text nodes from a fragment, and
+/// strip leading whitespace from the first remaining text + trailing
+/// whitespace from the last remaining text. Mirrors `clean_nodes` from
+/// upstream `utils.js`.
+fn trim_fragment_edges(fragment: &Fragment) -> Vec<FragmentChild> {
+    let mut nodes: Vec<FragmentChild> = fragment.nodes.clone();
     while nodes
         .first()
         .map(|n| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
@@ -369,6 +411,15 @@ fn trim_fragment_edges(fragment: &Fragment) -> Vec<&FragmentChild> {
         .unwrap_or(false)
     {
         nodes.pop();
+    }
+    // Strip leading whitespace from the first text node (if any), trailing
+    // whitespace from the last text node (if any). This handles e.g.
+    // `\n\tclicks: {count}\n` → `clicks: {count}`.
+    if let Some(FragmentChild::Text(t)) = nodes.first_mut() {
+        t.data = t.data.trim_start().to_string();
+    }
+    if let Some(FragmentChild::Text(t)) = nodes.last_mut() {
+        t.data = t.data.trim_end().to_string();
     }
     nodes
 }
@@ -582,6 +633,27 @@ fn inject_renderer_into_call(expr: &Value) -> Value {
     } else {
         b::call(expr.clone(), vec![b::id("$$renderer")])
     }
+}
+
+/// Collapse runs of whitespace in text content to a single space. Matches
+/// upstream's default `preserveWhitespace = false` text-node behavior — see
+/// `phases/3-transform/server/visitors/shared/utils.js` and
+/// `Fragment.js`'s `clean_nodes` text-collapse pass.
+fn collapse_whitespace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out
 }
 
 fn escape_attribute_value(s: &str) -> String {
