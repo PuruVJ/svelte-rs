@@ -1,0 +1,14 @@
+[package]
+name = "svelte_ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Svelte template AST + serde estree-shape output. Mirrors packages/svelte/src/compiler/types/template.d.ts and the runtime shapes produced by phases/nodes.js."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_span = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "svelte_parse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Phase 1: parse a .svelte source file into a Svelte AST. Mirrors packages/svelte/src/compiler/phases/1-parse/."
+
+[dependencies]
+svelte_ast = { workspace = true }
+svelte_diagnostics = { workspace = true }
+svelte_css_parser = { workspace = true }
+oxc_allocator = { workspace = true }
+oxc_ast = { workspace = true }
+oxc_parser = { workspace = true }
+oxc_span = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

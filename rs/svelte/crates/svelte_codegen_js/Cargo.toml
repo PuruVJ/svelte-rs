@@ -1,0 +1,12 @@
+[package]
+name = "svelte_codegen_js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Port of `esrap`: estree (OXC AST) → formatted JavaScript string + source map."
+
+[dependencies]
+oxc_ast = { workspace = true }
+oxc_span = { workspace = true }
+sourcemap = { workspace = true }
