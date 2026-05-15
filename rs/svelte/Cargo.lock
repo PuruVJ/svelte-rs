@@ -924,11 +924,14 @@ dependencies = [
  "oxc_semantic",
  "oxc_span",
  "oxc_syntax",
+ "serde",
+ "serde_json",
  "svelte_aria_data",
  "svelte_ast",
  "svelte_css_parser",
  "svelte_diagnostics",
  "svelte_is_reference",
+ "svelte_parse",
 ]
 
 [[package]]

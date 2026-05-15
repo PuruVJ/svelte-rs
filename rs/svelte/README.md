@@ -59,7 +59,7 @@ upstream JS compiler against any fixture under `packages/svelte/tests/`.
   a unified diff. `cargo run -p svelte_test_harness -- all-parser-modern`
   exercises the full parser-modern suite.
 
-**Phase 2** — in progress.
+**Phase 2** — done.
 - 2a/2b: `svelte_parse` scaffold + utility helpers (`is_whitespace`, BOM
   strip, cursor advance, `LineMap` for line/column), text reader, HTML
   comment reader.
@@ -70,7 +70,7 @@ upstream JS compiler against any fixture under `packages/svelte/tests/`.
 - 2d-2g pending: mustache tag parsing (`{expr}`, `{#if}`, etc.) + OXC
   integration for JS expressions + `<script>` + `<style>`.
 
-Run `cargo test --workspace` to see all green (83 tests).
+Run `cargo test --workspace` to see all green (152 tests).
 Run `cargo run -q -p svelte_test_harness -- all-parser-modern` and
 `-- all-parser-legacy` to see the fixture-suite status. Combined:
 
@@ -132,6 +132,93 @@ Phase 2 coverage:
 - JS comments inside mustache expressions: `{ /* comment */ a + b }` is
   parsed correctly via `skip_whitespace_and_js_comments` (which collects
   comments to `Root.comments` and skips them past `{`/before `}`).
+**Phase 3** — in progress. Scope chain + binding classification are in
+place; reference resolution, CSS analyze/prune/warn, and the 60+ validator
+visitors are next.
+- `svelte_analyze` provides `Analysis`, `Scope` (reference-counted, with
+  parent + block-scope tracking), `Binding`, `ScopeRoot`, `BindingKind`,
+  `DeclarationKind`.
+- `analyze_component(root, filename)` walks both `<script>` blocks and:
+  - builds nested scopes for function bodies, arrow functions, blocks,
+    `for`/`for-in`/`for-of`, `try`/`catch`, `switch`, class bodies.
+  - declares variables (`var` / `let` / `const` / function / class /
+    import / `export` re-exports), walking destructuring patterns
+    recursively. Variables hoist (`var` + function) are pre-declared before
+    other statements.
+  - classifies each binding by initializer: `let foo = $state(...)` →
+    `State`; `$state.raw(...)` → `RawState`; `$derived(...) / .by(...)` →
+    `Derived`; `let { foo } = $props()` → `Prop`; `let { ...rest } =
+    $props()` → `RestProp`; `let { x = $bindable() } = $props()` →
+    `BindableProp`. Uses a port of upstream's `get_rune` / `get_global_keypath`
+    helpers from scope.js:1429-1480.
+  - sets `runes: bool` if any rune call is present.
+  - resolves every Identifier reference across the scope chain via
+    `Scope::reference_chain` (matches the upstream `Scope.reference`
+    algorithm: walks parents until a binding is found or the root is
+    reached, attaching to `binding.references` along the way and to
+    `ScopeRoot.conflicts` when unresolved).
+- CSS analyze (port of `phases/2-analyze/css/css-analyze.js`): walks the
+  parsed `StyleSheet` and tags each Rule / ComplexSelector / RelativeSelector
+  with metadata. Identifies `:global(...)` and bare `:global` selectors as
+  global, `:root` / `:host` / `::view-transition*` as global-like, `:global { }`
+  block rules, and `@keyframes` declarations (with `-global-` prefix
+  detection). Metadata is sidecar (keyed by `(start, end)`) — the CSS AST
+  itself stays immutable. `Analysis.css_meta` exposes the maps; the prune
+  pass reads them to decide which selectors to scope.
+- CSS prune (full parity port of `phases/2-analyze/css/css-prune.js`):
+  `template_elements::collect` builds an indexed tree of every renderable
+  element with parent / prev / next sibling pointers, statically-known
+  class / id / attribute values, plus an `Existence` value (Probable
+  inside `{#if}` / `{#each}` / `{#await}`, Definite otherwise). Per-node
+  `NodeKind` carries the upstream type discriminant so adjacent-sibling
+  matching can special-case `Component` / `SlotElement` / `RenderTag` per
+  css-prune.js:332-339. `css_prune::prune` walks each ComplexSelector
+  through `apply_selector` → `apply_combinator`, mirrors all four
+  combinators with PROB/DEF walk-through for `+`, recursive `:is` /
+  `:where` / `:not` (with multi-chain scoping) / `:has` (with
+  include_self in global contexts) / NestingSelector handling, the full
+  `attribute_matches` (BindDirective / StyleDirective / ClassDirective /
+  SpreadAttribute special-cases + `class` / `style` directive
+  fall-throughs), `test_attribute` with all 6 operators + `i` /
+  HTML5-case-insensitive attribute defaults +
+  `whitelist_attribute_selector` (`<details open>`, `<dialog open>`),
+  `gather_possible_values` for class={Literal | ConditionalExpression |
+  LogicalExpression | ArrayExpression | ObjectExpression}, `truncate`
+  of trailing `:global(...)`, implicit `&` injection for nested rules
+  in `get_relative_selectors`, the `every_is_global` fallback,
+  `has_definite_elements` gating, and `scoped_elements` tracking for
+  the transform phase.
+- CSS warn (port of `phases/2-analyze/css/css-warn.js`): emits a
+  `css_unused_selector` warning for each ComplexSelector that the prune
+  pass didn't mark `used`. Skips `:global { ... }` block preludes,
+  `@keyframes` preludes, and the prelude of `:is(...)` / `:where(...)`.
+- Template + JS validator (Phase 3h, partial): `validate::validate()` walks
+  the template and `<script>` content emitting warnings/errors per node —
+  mirrors `phases/2-analyze/visitors/`. ~26 visitors / checks ported:
+  - **Special elements**: SvelteWindow / SvelteBody / SvelteDocument /
+    SvelteHead / SvelteSelf / SvelteBoundary / SvelteFragment, TitleElement
+  - **Tags**: HtmlTag, DebugTag, ConstTag (placement check)
+  - **Blocks**: IfBlock / EachBlock / AwaitBlock / KeyBlock / SnippetBlock
+    (`block_empty` warning + `snippet_invalid_rest_parameter` error)
+  - **Directives**: LetDirective (parent-element check), StyleDirective
+    (modifier check), OnDirective (runes-mode deprecation), BindDirective
+    (DOM property catalog lookup with `valid_elements` /
+    `invalid_elements` constraints from
+    `phases/bindings.js` — full table of 50+ DOM bindings ported to
+    `svelte_analyze::bindings::binding_properties()`)
+  - **Components**: SvelteComponent (runes-mode deprecation)
+  - **JS-side**: ImportDeclaration (forbidden `svelte/internal*` and
+    `beforeUpdate`/`afterUpdate` from `svelte` in runes mode),
+    LabeledStatement (legacy `$:` reactive statement → error in runes mode)
+  
+  `analyze_component()` returns `Err` on the first validation error,
+  matching upstream's `InternalCompileError` fast-fail.
+
+- Pending follow-ups: combinator-aware CSS prune polish; the remaining
+  40-ish validator visitors; legacy
+  `$:` reactive handling; identifier resolution inside template
+  expressions (currently only walks `<script>` content).
+
 - **2g** done. `svelte_css_parser` is a recursive-descent port of
   `read/style.js` (~650 LOC). Produces the full Svelte CSS AST:
   `StyleSheet`, `Atrule`, `Rule`, `SelectorList`, `ComplexSelector`,
