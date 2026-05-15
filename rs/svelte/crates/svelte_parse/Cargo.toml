@@ -17,3 +17,6 @@ oxc_parser = { workspace = true }
 oxc_span = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+svelte_analyze = { workspace = true }

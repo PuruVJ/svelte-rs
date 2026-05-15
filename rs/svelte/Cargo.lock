@@ -1040,6 +1040,7 @@ dependencies = [
  "oxc_span",
  "serde",
  "serde_json",
+ "svelte_analyze",
  "svelte_ast",
  "svelte_css_parser",
  "svelte_diagnostics",

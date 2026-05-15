@@ -161,11 +161,13 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         }
     }
 
-    // 10. a11y_consider_explicit_label — `<button>` with no text/label/aria-label.
-    if el.name == "button"
+    // 10. a11y_consider_explicit_label — `<button>` / `<a>` with no text/label.
+    if matches!(el.name.as_str(), "button" | "a")
         && !has_attr("aria-label")
         && !has_attr("aria-labelledby")
         && !has_attr("title")
+        && !is_aria_hidden(&attrs)
+        && !has_attr("inert")
         && !fragment_has_text(&el.fragment)
     {
         diags.push(warnings::a11y_consider_explicit_label(span));
