@@ -157,12 +157,12 @@ fn key_block_renders_body() {
 }
 
 #[test]
-fn await_block_renders_try_catch() {
+fn await_block_lowers_to_dollar_await_call() {
     let source = "{#await p then v}<p>{v}</p>{:catch e}<p>err</p>{/await}";
     let out = compile_server(source, "Awaiting");
-    assert!(out.contains("try {"), "got: {out}");
-    assert!(out.contains("const v = await p"), "got: {out}");
-    assert!(out.contains("catch (e)"), "got: {out}");
+    // Non-async server uses the $.await runtime helper, not raw try/catch.
+    assert!(out.contains("$.await($$renderer, p,"), "got: {out}");
+    assert!(out.contains("`<!--]-->`"), "got: {out}");
 }
 
 #[test]

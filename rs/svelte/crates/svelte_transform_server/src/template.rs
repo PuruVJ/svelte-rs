@@ -601,58 +601,65 @@ fn lower_key_block(blk: &KeyBlock, acc: &mut Accumulator) {
 }
 
 fn lower_await_block(blk: &AwaitBlock, acc: &mut Accumulator) {
-    // `{#await promise then v}then-body{:catch e}catch-body{/await}` — server emits:
-    //   $$renderer.push(`<!--[-->`)
-    //   try {
-    //     const v = await promise;
-    //     <then-body>
-    //   } catch (e) {
-    //     <catch-body>
-    //   }
+    // Server `{#await promise then v}then-body{:catch e}catch-body{/await}`
+    // lowers (non-async mode) to:
+    //   $.await($$renderer, promise, pending_cb, then_cb, catch_cb?)
     //   $$renderer.push(`<!--]-->`)
-    // Pending branch is also wrapped in a Promise.race race against a resolved
-    // pending, but the simplest approximation just renders the `then` branch.
-    acc.push_str("<!--[-->");
-
-    let mut try_body: Vec<Value> = Vec::new();
-    if let Some(v) = &blk.value {
-        try_body.push(b::declaration(
-            "const",
-            vec![b::declarator(
-                v.clone(),
-                Some(serde_json::json!({
-                    "type": "AwaitExpression",
-                    "argument": blk.expression.clone()
-                })),
-            )],
-        ));
-    } else {
-        try_body.push(b::stmt(serde_json::json!({
-            "type": "AwaitExpression",
-            "argument": blk.expression.clone()
-        })));
-    }
-    if let Some(then_frag) = &blk.then {
-        try_body.extend(ops_to_statements(lower_fragment(then_frag)));
-    }
-
-    let catch_body = blk
-        .catch_
+    // The `$.await` runtime emits the `<!--[-->` marker itself.
+    // Matches `phases/3-transform/server/visitors/AwaitBlock.js`.
+    let pending_body = blk
+        .pending
         .as_ref()
-        .map(|f| ops_to_statements(lower_fragment(f)))
+        .map(|f| ops_to_statements(lower_fragment_with_marker(f)))
         .unwrap_or_default();
+    let pending_cb = b::arrow(
+        vec![b::id("$$renderer")],
+        b::block(pending_body),
+        false,
+    );
 
-    let try_stmt = serde_json::json!({
-        "type": "TryStatement",
-        "block": b::block(try_body),
-        "handler": {
-            "type": "CatchClause",
-            "param": blk.error.clone().unwrap_or(b::id("$$error")),
-            "body": b::block(catch_body)
-        },
-        "finalizer": serde_json::Value::Null
-    });
-    acc.stmt(try_stmt);
+    let then_value = blk
+        .value
+        .clone()
+        .unwrap_or_else(|| b::id("$$value"));
+    let then_body = blk
+        .then
+        .as_ref()
+        .map(|f| ops_to_statements(lower_fragment_with_marker(f)))
+        .unwrap_or_default();
+    let then_cb = b::arrow(
+        vec![b::id("$$renderer"), then_value],
+        b::block(then_body),
+        false,
+    );
+
+    let mut args: Vec<Value> = vec![
+        b::id("$$renderer"),
+        blk.expression.clone(),
+        pending_cb,
+        then_cb,
+    ];
+    if blk.catch_.is_some() {
+        let catch_param = blk
+            .error
+            .clone()
+            .unwrap_or_else(|| b::id("$$error"));
+        let catch_body = blk
+            .catch_
+            .as_ref()
+            .map(|f| ops_to_statements(lower_fragment_with_marker(f)))
+            .unwrap_or_default();
+        args.push(b::arrow(
+            vec![b::id("$$renderer"), catch_param],
+            b::block(catch_body),
+            false,
+        ));
+    }
+
+    acc.stmt(b::stmt(b::call(
+        b::member(b::id("$"), b::id("await"), false, false),
+        args,
+    )));
     acc.push_str("<!--]-->");
 }
 

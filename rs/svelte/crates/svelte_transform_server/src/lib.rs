@@ -93,9 +93,12 @@ fn uses_props(root: &Root) -> bool {
     json.contains("\"$props\"") || json.contains("\"$$props\"")
 }
 
-/// Whether the component uses async features — top-level `await` in instance
-/// script, any `{#await}` block, or any AwaitExpression inside template
-/// tags. Drives the `svelte/internal/flags/async` side-effect import.
+/// Whether the component uses `experimental.async` features. This isn't a
+/// pure source-code check — upstream gates it on `compileOptions.experimental.async`
+/// which the per-fixture `_config.js` controls. As a heuristic when we don't
+/// have that config available, treat top-level await (in script or template
+/// tags) as a strong signal. `{#await}` blocks alone don't trigger this —
+/// they work in non-async mode too.
 fn uses_async(root: &Root) -> bool {
     use svelte_ast::fragment::{Fragment, FragmentChild};
     fn json_has_await(v: &Value) -> bool {
@@ -104,7 +107,6 @@ fn uses_async(root: &Root) -> bool {
     fn fragment_uses_async(f: &Fragment) -> bool {
         for n in &f.nodes {
             match n {
-                FragmentChild::AwaitBlock(_) => return true,
                 FragmentChild::ExpressionTag(t) if json_has_await(&t.expression) => return true,
                 FragmentChild::HtmlTag(t) if json_has_await(&t.expression) => return true,
                 FragmentChild::ConstTag(t) if json_has_await(&t.declaration) => return true,
@@ -153,11 +155,38 @@ fn uses_async(root: &Root) -> bool {
         return true;
     }
     if let Some(instance) = &root.instance {
-        if json_has_await(&instance.content) {
+        // Top-level await in instance script — must be experimental.async.
+        if instance_has_top_level_await(&instance.content) {
             return true;
         }
     }
     false
+}
+
+/// Walk only top-level statements of `program.body[]` (not into nested
+/// FunctionDeclaration / ArrowFunctionExpression / FunctionExpression bodies)
+/// to detect an await that requires `experimental.async`.
+fn instance_has_top_level_await(program: &Value) -> bool {
+    fn walk(node: &Value) -> bool {
+        match node {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty == "AwaitExpression" {
+                    return true;
+                }
+                if matches!(
+                    ty,
+                    "FunctionDeclaration" | "FunctionExpression" | "ArrowFunctionExpression"
+                ) {
+                    return false;
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(program)
 }
 
 /// Pull `body[]` out of a parsed ESTree Program JSON value.
