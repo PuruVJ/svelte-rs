@@ -60,14 +60,19 @@ upstream JS compiler against any fixture under `packages/svelte/tests/`.
   exercises the full parser-modern suite.
 
 **Phase 2** — in progress.
-- `svelte_parse` scaffold + utility helpers (`is_whitespace`, BOM stripping,
-  cursor advance) + text + HTML comment readers. The `svelte_compiler::parse`
-  facade now delegates to the real parser; all 24 parser-modern fixtures
-  still diverge (because elements / tags / scripts / styles are not yet
-  implemented), but the empty-input and pure-text cases produce correct AST.
+- 2a/2b: `svelte_parse` scaffold + utility helpers (`is_whitespace`, BOM
+  strip, cursor advance, `LineMap` for line/column), text reader, HTML
+  comment reader.
+- 2c: Element parsing — `RegularElement`, attributes (bare, quoted-string,
+  unquoted), nested fragments, void elements, self-closing tags. `name_loc`
+  with line/column/character via `LineMap`. `{...}` blocks inside opening
+  tags are skipped (placeholder until 2d's real mustache parsing).
+- 2d-2g pending: mustache tag parsing (`{expr}`, `{#if}`, etc.) + OXC
+  integration for JS expressions + `<script>` + `<style>`.
 
-Run `cargo test --workspace` to see all green (31 tests).
+Run `cargo test --workspace` to see all green (45 tests).
 Run `cargo run -q -p svelte_test_harness -- all-parser-modern` to see the
-parser-modern suite status (currently: 0 match, 24 diverge — diff plumbing
-fully working).
+parser-modern suite status — currently 0 match / 18 diverge / 6 error
+(every fixture exercises a feature still pending; diff plumbing is fully
+working, so once 2d-2g land, fixtures will go green in waves).
 

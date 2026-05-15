@@ -31,15 +31,15 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
     let mut nodes: Vec<FragmentChild> = Vec::new();
 
     while parser.index < parser.template.len() {
-        if parser.match_str("<!--") {
-            let c = state::comment::read_comment(&mut parser)?;
-            nodes.push(FragmentChild::Comment(c));
+        if parser.match_str("<") {
+            // `<!--` is dispatched inside `read_element_or_comment`.
+            nodes.push(state::element::read_element_or_comment(&mut parser)?);
             continue;
         }
-        if parser.match_str("<") || parser.match_str("{") {
-            // TODO(2c, 2d): element and tag parsing.
-            // Until those land, treat unrecognized markup as text so we don't
-            // infinite-loop. The harness diff will surface the divergence.
+        if parser.match_str("{") {
+            // TODO(2d): mustache tag parsing — `{expr}`, `{#if}`, etc.
+            // Skip one byte to avoid an infinite loop. The harness diff will
+            // surface the divergence on mustache-bearing fixtures.
             let ch = parser.template[parser.index..].chars().next().unwrap();
             parser.index += ch.len_utf8();
             continue;
