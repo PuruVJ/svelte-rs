@@ -220,7 +220,9 @@ fn lower_regular_element(el: &RegularElement, acc: &mut Accumulator) {
         lower_attribute(attr, acc);
     }
     if is_void_element(&el.name) {
-        acc.push_char('>');
+        // Upstream emits void elements with the self-closing slash. Mirrors
+        // `phases/3-transform/server/visitors/RegularElement.js`'s output.
+        acc.push_str("/>");
         return;
     }
     acc.push_char('>');
@@ -236,12 +238,21 @@ fn lower_regular_element(el: &RegularElement, acc: &mut Accumulator) {
 }
 
 fn lower_attribute(attr: &ElementAttribute, acc: &mut Accumulator) {
-    let ElementAttribute::Attribute(Attribute { name, value, .. }) = attr else {
-        // Directives (bind:, use:, transition:, etc.) are stripped server-side.
-        return;
+    // `bind:value={x}` etc. on form elements lower to a regular dynamic
+    // attribute server-side. Other binds (bind:this, bind:innerHTML) drop.
+    let (name, value): (&str, &AttributeValue) = match attr {
+        ElementAttribute::Attribute(Attribute { name, value, .. }) => (name.as_str(), value),
+        ElementAttribute::BindDirective(bd) if is_bindable_value_attribute(&bd.name) => {
+            // Emit `${$.attr('value', expr)}` directly for the bind case.
+            let attr_call = b::call(
+                b::member(b::id("$"), b::id("attr"), false, false),
+                vec![b::literal_str(&bd.name), bd.expression.clone()],
+            );
+            acc.push_expression(attr_call);
+            return;
+        }
+        _ => return,
     };
-    // Event-handler attributes (`onclick`, `onkeydown`, …) are dropped on the
-    // server — there's no DOM to attach them to.
     if is_event_attribute(name) {
         return;
     }
@@ -759,6 +770,16 @@ fn escape_attribute_value(s: &str) -> String {
         }
     }
     out
+}
+
+/// Names of `bind:` directives that should lower to a server-side dynamic
+/// attribute (because the value affects the rendered HTML). Other binds
+/// (`bind:this`, `bind:innerHTML`, `bind:textContent`, ...) are stripped.
+fn is_bindable_value_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "value" | "checked" | "group" | "files"
+    )
 }
 
 /// Matches `on*` event handler attribute names that the server should drop.

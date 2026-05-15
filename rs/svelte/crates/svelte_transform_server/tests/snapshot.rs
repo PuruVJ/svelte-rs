@@ -39,8 +39,8 @@ fn nested_elements_server() {
 fn void_element_self_closing_in_html() {
     let source = "<br/>";
     let out = compile_server(source, "Void_test");
-    // Void elements emit as `<br>` not `<br/>` per HTML serialization rules.
-    assert!(out.contains("`<br>`"), "got: {out}");
+    // Matches upstream: void elements emit with the self-closing slash `<br/>`.
+    assert!(out.contains("`<br/>`"), "got: {out}");
 }
 
 #[test]
@@ -54,7 +54,8 @@ fn static_attribute_serializes() {
 fn bare_attribute_serializes() {
     let source = "<input disabled>";
     let out = compile_server(source, "Bare");
-    assert!(out.contains("`<input disabled>`"), "got: {out}");
+    // Self-closing void serialization
+    assert!(out.contains("`<input disabled/>`"), "got: {out}");
 }
 
 #[test]
