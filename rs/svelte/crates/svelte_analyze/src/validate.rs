@@ -192,9 +192,45 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             }
         }
         FragmentChild::AwaitBlock(b) => {
-            validate_block_not_empty(b.pending.as_ref(), state);
-            validate_block_not_empty(b.then.as_ref(), state);
-            validate_block_not_empty(b.catch_.as_ref(), state);
+            // Upstream's parser produces `pending: null` for whitespace-only
+            // content between `{#await ...}` and `{:catch}` / `{:then}`. Our
+            // parser emits `Some(Fragment { nodes: [Text("\n")] })`. Skip the
+            // check when pending is just whitespace-only single Text — the
+            // user didn't actually write a pending body.
+            let pending_meaningful = b
+                .pending
+                .as_ref()
+                .map(|p| {
+                    !(p.nodes.len() == 1
+                        && matches!(&p.nodes[0], FragmentChild::Text(t) if t.raw.trim().is_empty()))
+                })
+                .unwrap_or(false);
+            if pending_meaningful {
+                validate_block_not_empty(b.pending.as_ref(), state);
+            }
+            // Same for then/catch — only check if user wrote explicit body.
+            let then_meaningful = b
+                .then
+                .as_ref()
+                .map(|p| {
+                    !(p.nodes.len() == 1
+                        && matches!(&p.nodes[0], FragmentChild::Text(t) if t.raw.trim().is_empty()))
+                })
+                .unwrap_or(false);
+            if then_meaningful {
+                validate_block_not_empty(b.then.as_ref(), state);
+            }
+            let catch_meaningful = b
+                .catch_
+                .as_ref()
+                .map(|p| {
+                    !(p.nodes.len() == 1
+                        && matches!(&p.nodes[0], FragmentChild::Text(t) if t.raw.trim().is_empty()))
+                })
+                .unwrap_or(false);
+            if catch_meaningful {
+                validate_block_not_empty(b.catch_.as_ref(), state);
+            }
             if let Some(f) = &b.pending {
                 visit_fragment(f, state);
             }
@@ -812,9 +848,10 @@ fn visit_let_directive(
     }
 }
 
-/// `validate_block_not_empty` — shared/utils.js. Emits `block_empty` if
-/// a block fragment has exactly one Text child whose raw content is
-/// blank. Skips when the fragment is `None`.
+/// `validate_block_not_empty` — port of upstream's check
+/// (`phases/2-analyze/visitors/shared/utils.js`):
+/// - `nodes.length === 0` → skip (mid-typing); no warning.
+/// - `nodes.length === 1 && Text && raw is blank` → emit warning.
 fn validate_block_not_empty(fragment: Option<&Fragment>, state: &mut ValidateState) {
     let Some(fragment) = fragment else { return };
     if fragment.nodes.len() == 1 {
