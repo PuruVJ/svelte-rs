@@ -1425,73 +1425,137 @@ fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Optio
 fn transform_async_script(
     body: Vec<Value>,
 ) -> (Vec<Value>, std::collections::HashMap<String, usize>) {
-    let mut var_decls: Vec<Value> = Vec::new();
-    let mut run_callbacks: Vec<Value> = Vec::new();
-    let mut other_stmts: Vec<Value> = Vec::new();
-    let mut var_last_idx: std::collections::HashMap<String, usize> = Default::default();
-
+    // Classify each statement as one of: AsyncDecl (let X = await Y),
+    // SyncDecl (let X = sync init), Inspect ($.inspect(...)), or Other.
+    // Consecutive SyncDecl + Inspect statements group into ONE \$.run callback
+    // (to preserve sync-tick observable ordering — upstream's rule).
+    enum Kind {
+        AsyncDecl(String, Value), // X = await Y
+        SyncDecl(String, Value),  // X = sync expr
+        Inspect(Vec<String>),     // names read by $.inspect
+        Other,
+    }
+    let mut items: Vec<(Kind, Value)> = Vec::new();
     for stmt in body {
         let ty = stmt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        if ty == "VariableDeclaration" {
-            let decls = stmt
-                .get("declarations")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
-            if decls.len() == 1 {
-                let d = &decls[0];
-                let name_opt = d
-                    .get("id")
-                    .and_then(|i| i.get("name"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                if let (Some(name), Some(init)) = (name_opt, d.get("init")) {
-                    if init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
-                        // `var X;`
-                        var_decls.push(b::declaration(
-                            "var",
-                            vec![b::declarator(b::id(&name), None)],
-                        ));
-                        let assign = b::assignment("=", b::id(&name), init.clone());
-                        let arrow = b::arrow(vec![], assign, true);
-                        let idx = run_callbacks.len();
-                        run_callbacks.push(arrow);
-                        var_last_idx.insert(name, idx);
+        match ty {
+            "VariableDeclaration" => {
+                let decls = stmt
+                    .get("declarations")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if decls.len() == 1 {
+                    let d = &decls[0];
+                    let name = d
+                        .get("id")
+                        .and_then(|i| i.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let init = d.get("init").cloned();
+                    if let (Some(name), Some(init)) = (name, init) {
+                        let is_await =
+                            init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression");
+                        if is_await {
+                            items.push((Kind::AsyncDecl(name, init), stmt));
+                        } else {
+                            items.push((Kind::SyncDecl(name, init), stmt));
+                        }
                         continue;
                     }
                 }
+                items.push((Kind::Other, stmt));
             }
-            other_stmts.push(stmt);
-        } else if ty == "ExpressionStatement" {
-            if let Some(e) = stmt.get("expression") {
-                if is_dollar_inspect_call(e) {
-                    // $.inspect(X) → `() => void 0` (production no-op). Update
-                    // var_last_idx for each identifier read by the call args,
-                    // so template_effect deps point at this callback (since
-                    // the template render must wait for the inspect to run).
-                    let arg_names = collect_identifier_names(e);
-                    let void_expr = serde_json::json!({
+            "ExpressionStatement" => {
+                let expr = stmt.get("expression");
+                if let Some(e) = expr {
+                    if is_dollar_inspect_call(e) {
+                        items.push((Kind::Inspect(collect_identifier_names(e)), stmt));
+                        continue;
+                    }
+                }
+                items.push((Kind::Other, stmt));
+            }
+            _ => items.push((Kind::Other, stmt)),
+        }
+    }
+
+    let mut var_names: Vec<String> = Vec::new();
+    let mut run_callbacks: Vec<Value> = Vec::new();
+    let mut other_stmts: Vec<Value> = Vec::new();
+    let mut var_last_idx: std::collections::HashMap<String, usize> = Default::default();
+    let mut i = 0;
+    while i < items.len() {
+        match &items[i].0 {
+            Kind::AsyncDecl(name, init) => {
+                var_names.push(name.clone());
+                let assign = b::assignment("=", b::id(name), init.clone());
+                let arrow = b::arrow(vec![], assign, true);
+                let idx = run_callbacks.len();
+                run_callbacks.push(arrow);
+                var_last_idx.insert(name.clone(), idx);
+                i += 1;
+            }
+            Kind::SyncDecl(_, _) | Kind::Inspect(_) => {
+                // Group consecutive SyncDecl / Inspect items into one callback.
+                let mut group_stmts: Vec<Value> = Vec::new();
+                let mut group_names: Vec<String> = Vec::new();
+                while i < items.len() {
+                    match &items[i].0 {
+                        Kind::SyncDecl(name, init) => {
+                            var_names.push(name.clone());
+                            group_stmts.push(b::stmt(b::assignment(
+                                "=",
+                                b::id(name),
+                                init.clone(),
+                            )));
+                            group_names.push(name.clone());
+                            i += 1;
+                        }
+                        Kind::Inspect(reads) => {
+                            group_names.extend(reads.clone());
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                let idx = run_callbacks.len();
+                // If the group is solely an Inspect (no sync decls), emit
+                // `() => void 0`. Otherwise emit `() => { ...stmts }`.
+                let arrow_body = if group_stmts.is_empty() {
+                    serde_json::json!({
                         "type": "UnaryExpression",
                         "operator": "void",
                         "prefix": true,
                         "argument": { "type": "Literal", "value": 0, "raw": "0" }
-                    });
-                    let idx = run_callbacks.len();
-                    run_callbacks.push(b::arrow(vec![], void_expr, false));
-                    for n in arg_names {
-                        var_last_idx.insert(n, idx);
-                    }
-                    continue;
+                    })
+                } else if group_stmts.len() == 1 {
+                    // Single statement → expression body of arrow.
+                    let s = group_stmts.into_iter().next().unwrap();
+                    s.get("expression").cloned().unwrap_or(s)
+                } else {
+                    b::block(group_stmts)
+                };
+                run_callbacks.push(b::arrow(vec![], arrow_body, false));
+                for n in group_names {
+                    var_last_idx.insert(n, idx);
                 }
             }
-            other_stmts.push(stmt);
-        } else {
-            other_stmts.push(stmt);
+            Kind::Other => {
+                other_stmts.push(items[i].1.clone());
+                i += 1;
+            }
         }
     }
 
     let mut combined: Vec<Value> = Vec::new();
-    combined.extend(var_decls);
+    if !var_names.is_empty() {
+        let declarators: Vec<Value> = var_names
+            .iter()
+            .map(|n| b::declarator(b::id(n), None))
+            .collect();
+        combined.push(b::declaration("var", declarators));
+    }
     if !run_callbacks.is_empty() {
         combined.push(b::declaration(
             "var",

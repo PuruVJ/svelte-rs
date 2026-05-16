@@ -122,3 +122,12 @@ fn diff_async_top_level_inspect_server() {
         "Async_top_level_inspect_server",
     );
 }
+
+#[test]
+#[ignore]
+fn diff_async_top_level_group_sync_run() {
+    diff(
+        "async-top-level-group-sync-run",
+        "Async_top_level_group_sync_run",
+    );
+}
