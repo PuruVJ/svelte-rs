@@ -157,6 +157,19 @@ pub fn client_component_with_options(
                 b::member(b::id("$"), b::id("append"), false, false),
                 vec![b::id("$$anchor"), b::id("fragment")],
             )));
+        } else if let Some(blk) = find_single_each_block(&root.fragment.nodes) {
+            // Single `{#each}` block at root.
+            let (prog_extras, fn_stmts) = build_each_block_client(blk);
+            for s in prog_extras {
+                program_body.push(s);
+            }
+            for stmt in fn_stmts {
+                fn_body.push(stmt);
+            }
+        } else if let Some(blk) = find_single_if_block(&root.fragment.nodes) {
+            for stmt in build_if_block_client(blk) {
+                fn_body.push(stmt);
+            }
         }
     }
 
@@ -323,6 +336,437 @@ fn body_uses_identifier(stmts: &[Value], name: &str) -> bool {
         }
     }
     stmts.iter().any(|s| walk(s, name))
+}
+
+fn find_single_each_block(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Option<&svelte_ast::blocks::EachBlock> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut blk: Option<&svelte_ast::blocks::EachBlock> = None;
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::EachBlock(b) => {
+                if blk.is_some() {
+                    return None;
+                }
+                blk = Some(b);
+            }
+            _ => return None,
+        }
+    }
+    blk
+}
+
+fn find_single_if_block(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Option<&svelte_ast::blocks::IfBlock> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut blk: Option<&svelte_ast::blocks::IfBlock> = None;
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::IfBlock(b) => {
+                if blk.is_some() {
+                    return None;
+                }
+                blk = Some(b);
+            }
+            _ => return None,
+        }
+    }
+    blk
+}
+
+/// Build the client lowering for a top-level `{#each}` block. Returns
+/// (program-level extras, function-body statements).
+fn build_each_block_client(
+    blk: &svelte_ast::blocks::EachBlock,
+) -> (Vec<Value>, Vec<Value>) {
+    use svelte_ast::fragment::FragmentChild;
+    let mut program_extras: Vec<Value> = Vec::new();
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("fragment"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("comment"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("node"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("first_child"), false, false),
+                vec![b::id("fragment")],
+            )),
+        )],
+    ));
+
+    // Build the each callback. The callback params depend on whether the
+    // user provided a context binding and/or an index. When an index is
+    // supplied without context, upstream uses `$$item` as a placeholder.
+    let mut params: Vec<Value> = vec![b::id("$$anchor")];
+    match (&blk.context, &blk.index) {
+        (Some(ctx), Some(idx)) => {
+            params.push(ctx.clone());
+            params.push(b::id(idx));
+        }
+        (Some(ctx), None) => {
+            params.push(ctx.clone());
+        }
+        (None, Some(idx)) => {
+            params.push(b::id("$$item"));
+            params.push(b::id(idx));
+        }
+        (None, None) => {}
+    }
+
+    // Build the body. Currently supports two patterns:
+    //   (1) text/expression-only (emit $.text() + $.template_effect)
+    //   (2) single RegularElement with text content (emit var X = root_1();
+    //       X.textContent = ...)
+    let mut body_stmts: Vec<Value> = Vec::new();
+    let body_trimmed = trim_body_edges(&blk.body.nodes);
+    if let Some(single_el) = find_single_text_only_element(&body_trimmed) {
+        return build_each_with_element_body(blk, single_el, params);
+    }
+    body_stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("next"), false, false),
+        vec![],
+    )));
+
+    // Trim whitespace-only Text nodes at fragment edges (matches upstream's
+    // clean_nodes pass).
+    let mut body_nodes: Vec<&FragmentChild> = blk.body.nodes.iter().collect();
+    while body_nodes
+        .first()
+        .map(|n| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
+        .unwrap_or(false)
+    {
+        body_nodes.remove(0);
+    }
+    while body_nodes
+        .last()
+        .map(|n| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
+        .unwrap_or(false)
+    {
+        body_nodes.pop();
+    }
+
+    // Gather quasis + expressions for `$.set_text(text, \`...\`)`. For the
+    // first/last text nodes, also trim leading/trailing whitespace of the
+    // text content itself (matches `text.data.trim()` upstream behavior).
+    let mut quasis: Vec<String> = vec![String::new()];
+    let mut expressions: Vec<Value> = Vec::new();
+    let mut is_purely_static = true;
+    let last_idx = body_nodes.len().saturating_sub(1);
+    for (i, n) in body_nodes.iter().enumerate() {
+        match n {
+            FragmentChild::Text(t) => {
+                let mut data = collapse_ws(&t.data);
+                if i == 0 {
+                    data = data.trim_start().to_string();
+                }
+                if i == last_idx {
+                    data = data.trim_end().to_string();
+                }
+                quasis.last_mut().unwrap().push_str(&data);
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                if let Some(s) = constant_folded_literal(&tag.expression) {
+                    quasis.last_mut().unwrap().push_str(&s);
+                } else {
+                    expressions.push(tag.expression.clone());
+                    quasis.push(String::new());
+                    is_purely_static = false;
+                }
+            }
+            _ => return (Vec::new(), Vec::new()),
+        }
+    }
+
+    body_stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("text"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("text"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+
+    if is_purely_static {
+        // Static text — emit `text.nodeValue = '...'` (one-time assignment).
+        let joined: String = quasis.join("");
+        body_stmts.push(b::stmt(b::assignment(
+            "=",
+            b::member(b::id("text"), b::id("nodeValue"), false, false),
+            b::literal_str(&joined),
+        )));
+    } else {
+        // Build the template literal `${e0 ?? ''}${e1 ?? ''}...`.
+        let mut tpl_quasis: Vec<String> = vec![quasis[0].clone()];
+        let mut tpl_exprs: Vec<Value> = Vec::new();
+        for (i, expr) in expressions.iter().enumerate() {
+            tpl_exprs.push(b::logical("??", expr.clone(), b::literal_str("")));
+            tpl_quasis.push(quasis[i + 1].clone());
+        }
+        let quasi_refs: Vec<&str> = tpl_quasis.iter().map(|s| s.as_str()).collect();
+        let tpl = b::template_literal(quasi_refs, tpl_exprs);
+        body_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("template_effect"), false, false),
+            vec![b::arrow(
+                vec![],
+                b::call(
+                    b::member(b::id("$"), b::id("set_text"), false, false),
+                    vec![b::id("text"), tpl],
+                ),
+                false,
+            )],
+        )));
+    }
+
+    body_stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("text")],
+    )));
+
+    let collection_thunk = b::arrow(vec![], blk.expression.clone(), false);
+    let each_flags = b::literal_num(0.0);
+    let index_kind = b::member(b::id("$"), b::id("index"), false, false);
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("each"), false, false),
+        vec![
+            b::id("node"),
+            each_flags,
+            collection_thunk,
+            index_kind,
+            b::arrow(params, b::block(body_stmts), false),
+        ],
+    )));
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("fragment")],
+    )));
+    (program_extras, out)
+}
+
+fn trim_body_edges(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Vec<&svelte_ast::fragment::FragmentChild> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut out: Vec<&FragmentChild> = nodes.iter().collect();
+    while out
+        .first()
+        .map(|n| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
+        .unwrap_or(false)
+    {
+        out.remove(0);
+    }
+    while out
+        .last()
+        .map(|n| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
+        .unwrap_or(false)
+    {
+        out.pop();
+    }
+    out
+}
+
+/// If a body contains a single RegularElement whose children are only Text/
+/// ExpressionTag, return it. Used to emit the "var p = root_1(); p.textContent
+/// = …" pattern.
+fn find_single_text_only_element<'a>(
+    nodes: &[&'a svelte_ast::fragment::FragmentChild],
+) -> Option<&'a svelte_ast::elements::RegularElement> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut el: Option<&svelte_ast::elements::RegularElement> = None;
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::RegularElement(e) => {
+                if el.is_some() {
+                    return None;
+                }
+                // Body must be text/expr only
+                for c in &e.fragment.nodes {
+                    if !matches!(c, FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)) {
+                        return None;
+                    }
+                }
+                // No attributes (for now)
+                if !e.attributes.is_empty() {
+                    return None;
+                }
+                el = Some(e);
+            }
+            _ => return None,
+        }
+    }
+    el
+}
+
+/// Build the each-block lowering when the body is a single RegularElement
+/// with text/expr content. Emits a separate program-level template var.
+fn build_each_with_element_body(
+    blk: &svelte_ast::blocks::EachBlock,
+    el: &svelte_ast::elements::RegularElement,
+    params: Vec<Value>,
+) -> (Vec<Value>, Vec<Value>) {
+    use svelte_ast::fragment::FragmentChild;
+    let mut program_extras: Vec<Value> = Vec::new();
+
+    // Inner element HTML for the template var.
+    let inner_html = format!("<{name}></{name}>", name = el.name);
+    program_extras.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("root_1"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("from_html"), false, false),
+                vec![b::template_literal(vec![&inner_html], vec![])],
+            )),
+        )],
+    ));
+
+    // Build body content: var p = root_1(); p.textContent = `template literal`;
+    // $.append($$anchor, p);
+    let local_name = el.name.clone();
+    let mut body_stmts: Vec<Value> = Vec::new();
+    body_stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id(&local_name),
+            Some(b::call(b::id("root_1"), vec![])),
+        )],
+    ));
+
+    // Build template literal from inner text/expressions.
+    let mut quasis: Vec<String> = vec![String::new()];
+    let mut expressions: Vec<Value> = Vec::new();
+    let mut is_purely_static = true;
+    let inner_nodes: Vec<&FragmentChild> = el.fragment.nodes.iter().collect();
+    let last = inner_nodes.len().saturating_sub(1);
+    for (i, n) in inner_nodes.iter().enumerate() {
+        match n {
+            FragmentChild::Text(t) => {
+                let mut data = collapse_ws(&t.data);
+                if i == 0 {
+                    data = data.trim_start().to_string();
+                }
+                if i == last {
+                    data = data.trim_end().to_string();
+                }
+                quasis.last_mut().unwrap().push_str(&data);
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                if let Some(s) = constant_folded_literal(&tag.expression) {
+                    quasis.last_mut().unwrap().push_str(&s);
+                } else {
+                    expressions.push(tag.expression.clone());
+                    quasis.push(String::new());
+                    is_purely_static = false;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    let quasi_refs: Vec<&str> = quasis.iter().map(|s| s.as_str()).collect();
+    let tpl = b::template_literal(quasi_refs, expressions);
+    body_stmts.push(b::stmt(b::assignment(
+        "=",
+        b::member(b::id(&local_name), b::id("textContent"), false, false),
+        tpl,
+    )));
+    body_stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id(&local_name)],
+    )));
+    let _ = is_purely_static;
+
+    // The outer fn-body for the each-block scaffolding.
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("fragment"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("comment"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("node"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("first_child"), false, false),
+                vec![b::id("fragment")],
+            )),
+        )],
+    ));
+    let collection_thunk = b::arrow(vec![], blk.expression.clone(), false);
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("each"), false, false),
+        vec![
+            b::id("node"),
+            b::literal_num(0.0),
+            collection_thunk,
+            b::member(b::id("$"), b::id("index"), false, false),
+            b::arrow(params, b::block(body_stmts), false),
+        ],
+    )));
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("fragment")],
+    )));
+    (program_extras, out)
+}
+
+fn build_if_block_client(blk: &svelte_ast::blocks::IfBlock) -> Vec<Value> {
+    let _ = blk;
+    // Stub — full if-block client lowering needs `$.if(node, condition,
+    // consequent, alternate)` with proper anchor management. Not yet ported.
+    Vec::new()
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out
+}
+
+fn constant_folded_literal(expr: &Value) -> Option<String> {
+    let ty = expr.get("type").and_then(|v| v.as_str())?;
+    if ty != "Literal" {
+        return None;
+    }
+    let val = expr.get("value")?;
+    match val {
+        Value::String(s) => Some(s.clone()),
+        Value::Null => Some(String::new()),
+        _ => None,
+    }
 }
 
 fn find_single_svelte_element(
