@@ -51,12 +51,20 @@ pub fn client_component_with_options(
     }
     program_body.push(b::import_all("$", "svelte/internal/client"));
 
+    // Collect template-side reassignments (e.g. `onclick={()=>count++}`)
+    // so the rewrite pass doesn't incorrectly unwrap `$.state` as
+    // never-reassigned.
+    let template_reassignments = collect_template_reassignments(&root.fragment);
+
     // Hoisted instance imports + state-name collection (for template-side
     // expression rewriting).
     let (rewritten_instance, state_names): (Option<Value>, std::collections::HashSet<String>) =
         match root.instance.as_ref() {
             Some(i) => {
-                let (prog, names) = rewrite::rewrite_program_with_state(i.content.clone());
+                let (prog, names) = rewrite::rewrite_program_with_state_and_hints(
+                    i.content.clone(),
+                    &template_reassignments,
+                );
                 (Some(prog), names)
             }
             None => (None, Default::default()),
@@ -140,6 +148,41 @@ pub fn client_component_with_options(
                     Some(b::call(b::id("root"), vec![])),
                 )],
             ));
+            // If the single root element has dynamic ExpressionTag children
+            // (no static text), emit the $.child + $.reset + $.template_effect
+            // pattern.
+            if let Some(el) = find_single_dynamic_text_element(&root.fragment.nodes) {
+                let exprs: Vec<Value> = el
+                    .fragment
+                    .nodes
+                    .iter()
+                    .filter_map(|n| match n {
+                        svelte_ast::fragment::FragmentChild::ExpressionTag(t) => {
+                            Some(t.expression.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !exprs.is_empty() {
+                    fn_body.push(b::declaration(
+                        "var",
+                        vec![b::declarator(
+                            b::id("text"),
+                            Some(b::call(
+                                b::member(b::id("$"), b::id("child"), false, false),
+                                vec![b::id(&top_name)],
+                            )),
+                        )],
+                    ));
+                    fn_body.push(b::stmt(b::call(
+                        b::member(b::id("$"), b::id("reset"), false, false),
+                        vec![b::id(&top_name)],
+                    )));
+                    fn_body.push(b::stmt(build_template_effect_set_text(
+                        "text", &exprs,
+                    )));
+                }
+            }
             fn_body.push(b::stmt(b::call(
                 b::member(b::id("$"), b::id("append"), false, false),
                 vec![b::id("$$anchor"), b::id(&top_name)],
@@ -207,6 +250,23 @@ pub fn client_component_with_options(
     }
 
     let delegated_events = collect_delegated_event_names(&fn_body);
+
+    // In runes mode, certain features need `$.push($$props, true)` /
+    // `$.pop()` wrapping (mirrors upstream's `should_inject_context`).
+    let needs_push_pop = runes_mode && body_needs_context(&fn_body);
+    if needs_push_pop {
+        fn_body.insert(
+            0,
+            b::stmt(b::call(
+                b::member(b::id("$"), b::id("push"), false, false),
+                vec![b::id("$$props"), b::literal_bool(true)],
+            )),
+        );
+        fn_body.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("pop"), false, false),
+            vec![],
+        )));
+    }
 
     // Detect $$props usage in body (via fn_body's identifiers) so we know
     // whether to include the parameter.
@@ -354,10 +414,28 @@ fn collect_delegated_event_names(stmts: &[Value]) -> std::collections::HashSet<S
 /// applying the HMR wrapper when needed. Used by early-return paths.
 fn finalize_program(
     mut program_body: Vec<Value>,
-    fn_body: Vec<Value>,
+    mut fn_body: Vec<Value>,
     component_name: &str,
     options: &ClientOptions,
 ) -> Value {
+    // Apply runes-mode $.push/$.pop wrapping if needed. (Runes-mode is
+    // inferred from the body: presence of $.get/$.set or $$props use that
+    // requires context tracking.)
+    let runes_mode = body_has_runes(&fn_body);
+    let needs_push_pop = runes_mode && body_needs_context(&fn_body);
+    if needs_push_pop {
+        fn_body.insert(
+            0,
+            b::stmt(b::call(
+                b::member(b::id("$"), b::id("push"), false, false),
+                vec![b::id("$$props"), b::literal_bool(true)],
+            )),
+        );
+        fn_body.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("pop"), false, false),
+            vec![],
+        )));
+    }
     let uses_props = body_uses_identifier(&fn_body, "$$props");
     let mut params = vec![b::id("$$anchor")];
     if uses_props {
@@ -424,6 +502,17 @@ fn finalize_program(
     } else {
         program_body.push(b::export_default(component_fn));
     }
+    let delegated_events = collect_delegated_event_names(&program_body);
+    if !delegated_events.is_empty() {
+        let mut event_names: Vec<String> = delegated_events.into_iter().collect();
+        event_names.sort();
+        program_body.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("delegate"), false, false),
+            vec![b::array(
+                event_names.iter().map(|s| b::literal_str(s)).collect(),
+            )],
+        )));
+    }
     b::program(program_body)
 }
 
@@ -461,9 +550,54 @@ fn try_multi_root_static(
         }
         match r {
             FragmentChild::RegularElement(el) => {
-                if !el.attributes.is_empty() {
-                    return None;
+                // Categorize attributes.
+                let mut static_attrs: Vec<(String, String)> = Vec::new();
+                let mut bind_value: Option<&Value> = None;
+                let mut events: Vec<(String, Value)> = Vec::new();
+                let mut dyn_attrs: Vec<(String, Value)> = Vec::new();
+                for a in &el.attributes {
+                    match a {
+                        ElementAttribute::Attribute(Attribute { name, value, .. }) => {
+                            if is_event_attribute(name) {
+                                if let AttributeValue::Single(tag) = value {
+                                    events.push((name.clone(), tag.expression.clone()));
+                                }
+                                continue;
+                            }
+                            match value {
+                                AttributeValue::Empty(true) => {
+                                    static_attrs.push((name.clone(), String::new()));
+                                }
+                                AttributeValue::Single(tag) => {
+                                    dyn_attrs.push((name.clone(), tag.expression.clone()));
+                                }
+                                AttributeValue::Many(parts) => {
+                                    let mut text = String::new();
+                                    let mut all_text = true;
+                                    for p in parts {
+                                        match p {
+                                            AttributeValuePart::Text(t) => text.push_str(&t.data),
+                                            _ => {
+                                                all_text = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !all_text {
+                                        return None;
+                                    }
+                                    static_attrs.push((name.clone(), text));
+                                }
+                                AttributeValue::Empty(false) => {}
+                            }
+                        }
+                        ElementAttribute::BindDirective(bd) if bd.name == "value" => {
+                            bind_value = Some(&bd.expression);
+                        }
+                        _ => return None,
+                    }
                 }
+
                 let mut text = String::new();
                 let mut has_expression = false;
                 let mut runtime_expr: Option<Value> = None;
@@ -497,19 +631,31 @@ fn try_multi_root_static(
                 }
                 html.push('<');
                 html.push_str(&el.name);
-                html.push('>');
-                // Embed text in HTML only when there were NO expression tags
-                // (pure static Text content).
-                if !has_expression {
-                    html.push_str(&text);
+                for (n, v) in &static_attrs {
+                    if v.is_empty() {
+                        html.push(' ');
+                        html.push_str(n);
+                    } else {
+                        html.push_str(&format!(" {n}=\"{}\"", html_escape_attr(v)));
+                    }
                 }
-                html.push_str("</");
-                html.push_str(&el.name);
-                html.push('>');
+                let is_void = matches!(
+                    el.name.as_str(),
+                    "area" | "base" | "br" | "col" | "embed" | "hr" | "img"
+                    | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+                );
+                if is_void {
+                    html.push_str("/>");
+                } else {
+                    html.push('>');
+                    if !has_expression {
+                        html.push_str(&text);
+                    }
+                    html.push_str(&format!("</{}>", el.name));
+                }
                 let content = if let Some(expr) = runtime_expr {
                     MultiRootContent::PureNonReactive(expr)
                 } else if has_expression {
-                    // Const-folded literal — assign as string at runtime.
                     MultiRootContent::ConstFolded(text.clone())
                 } else {
                     MultiRootContent::Static
@@ -518,6 +664,10 @@ fn try_multi_root_static(
                     name: el.name.clone(),
                     content,
                     static_text: text,
+                    is_input: el.name == "input",
+                    dyn_attrs,
+                    events,
+                    bind_value: bind_value.cloned(),
                 });
             }
             FragmentChild::Component(c) => {
@@ -580,7 +730,10 @@ fn try_multi_root_static(
         }
 
         // Apply content for elements with non-static content.
-        if let MultiRootSlot::Element { content, .. } = slot {
+        if let MultiRootSlot::Element {
+            content, is_input, ..
+        } = slot
+        {
             match content {
                 MultiRootContent::PureNonReactive(expr) => {
                     out.push(b::stmt(b::assignment(
@@ -597,6 +750,49 @@ fn try_multi_root_static(
                     )));
                 }
                 MultiRootContent::Static => {}
+            }
+            if *is_input {
+                out.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("remove_input_defaults"), false, false),
+                    vec![b::id(&local)],
+                )));
+            }
+        }
+    }
+
+    // After all declarations, emit dynamic attributes, bind_value, delegated.
+    for (idx, slot) in slots.iter().enumerate() {
+        if let MultiRootSlot::Element {
+            dyn_attrs,
+            events,
+            bind_value,
+            ..
+        } = slot
+        {
+            let local = &local_names[idx];
+            for (attr_name, expr) in dyn_attrs {
+                out.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("set_attribute"), false, false),
+                    vec![b::id(local), b::literal_str(attr_name), expr.clone()],
+                )));
+            }
+            if let Some(bv) = bind_value {
+                // $.bind_value(node, () => $.get(name), ($$value) => $.set(name, $$value))
+                // The expression `bv` is the binding identifier; apply state rewrite to
+                // get $.get(name); the setter is constructed from the same name.
+                let getter = b::arrow(vec![], rewrite_for_bind_get(bv), false);
+                let setter = build_bind_setter(bv);
+                out.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("bind_value"), false, false),
+                    vec![b::id(local), getter, setter],
+                )));
+            }
+            for (event_name, handler) in events {
+                let stripped = event_name.strip_prefix("on").unwrap_or(event_name);
+                out.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("delegated"), false, false),
+                    vec![b::literal_str(stripped), b::id(local), handler.clone()],
+                )));
             }
         }
     }
@@ -656,6 +852,10 @@ enum MultiRootSlot<'a> {
         name: String,
         content: MultiRootContent,
         static_text: String,
+        is_input: bool,
+        dyn_attrs: Vec<(String, Value)>,
+        events: Vec<(String, Value)>,
+        bind_value: Option<Value>,
     },
     Component(&'a svelte_ast::elements::Component),
 }
@@ -665,6 +865,59 @@ enum MultiRootContent {
     Static,
     PureNonReactive(Value),
     ConstFolded(String),
+}
+
+/// Getter body for `bind:value` — the expression is already state-rewritten
+/// (e.g. `$.get(str)` for state `str`). Return a clone as-is.
+fn rewrite_for_bind_get(expr: &Value) -> Value {
+    expr.clone()
+}
+
+/// Setter body for `bind:value`: `($$value) => $.set(name, $$value)` if the
+/// rewritten expression is `$.get(name)`, otherwise fallback to direct
+/// assignment `(($$value) => expr = $$value)`.
+fn build_bind_setter(expr: &Value) -> Value {
+    if let Some(name) = extract_state_name(expr) {
+        let set_call = b::call(
+            b::member(b::id("$"), b::id("set"), false, false),
+            vec![b::id(&name), b::id("$$value")],
+        );
+        return b::arrow(vec![b::id("$$value")], set_call, false);
+    }
+    let assign = b::assignment("=", expr.clone(), b::id("$$value"));
+    b::arrow(vec![b::id("$$value")], assign, false)
+}
+
+/// If `expr` is `$.get(<Identifier>)`, return the identifier name.
+fn extract_state_name(expr: &Value) -> Option<String> {
+    if expr.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return None;
+    }
+    let callee = expr.get("callee")?;
+    if callee.get("type").and_then(|v| v.as_str()) != Some("MemberExpression") {
+        return None;
+    }
+    let obj = callee.get("object")?;
+    let prop = callee.get("property")?;
+    if obj.get("type").and_then(|v| v.as_str()) != Some("Identifier")
+        || obj.get("name").and_then(|v| v.as_str()) != Some("$")
+    {
+        return None;
+    }
+    if prop.get("type").and_then(|v| v.as_str()) != Some("Identifier")
+        || prop.get("name").and_then(|v| v.as_str()) != Some("get")
+    {
+        return None;
+    }
+    let args = expr.get("arguments")?.as_array()?;
+    if args.len() != 1 {
+        return None;
+    }
+    let arg = &args[0];
+    if arg.get("type").and_then(|v| v.as_str()) != Some("Identifier") {
+        return None;
+    }
+    arg.get("name").and_then(|v| v.as_str()).map(String::from)
 }
 
 /// Pure expressions whose evaluation is constant across renders. Approximated
@@ -871,6 +1124,190 @@ fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Optio
 /// invocation, return it. Used to emit a direct `Foo($$anchor, props)` call
 /// without a template literal.
 /// Walk a list of statements looking for any Identifier reference matching `name`.
+/// Walk a fragment collecting Identifier names that appear as the LHS of an
+/// AssignmentExpression or the argument of an UpdateExpression anywhere in
+/// the template's embedded expressions. Used to defeat the
+/// never-reassigned-state unwrap when reassignment lives outside the script.
+fn collect_template_reassignments(
+    fragment: &svelte_ast::Fragment,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    walk_fragment_expressions(fragment, &mut |expr| {
+        scan_reassignments(expr, &mut out);
+    });
+    out
+}
+
+fn scan_reassignments(node: &Value, out: &mut std::collections::HashSet<String>) {
+    match node {
+        Value::Array(arr) => {
+            for v in arr {
+                scan_reassignments(v, out);
+            }
+        }
+        Value::Object(obj) => {
+            let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match ty {
+                "AssignmentExpression" => {
+                    if let Some(left) = obj.get("left") {
+                        if left.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                            if let Some(name) = left.get("name").and_then(|v| v.as_str()) {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+                "UpdateExpression" => {
+                    if let Some(arg) = obj.get("argument") {
+                        if arg.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                            if let Some(name) = arg.get("name").and_then(|v| v.as_str()) {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            for (_, v) in obj.iter() {
+                scan_reassignments(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn walk_fragment_expressions(
+    f: &svelte_ast::Fragment,
+    visit: &mut dyn FnMut(&Value),
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    use svelte_ast::fragment::FragmentChild;
+    for node in &f.nodes {
+        match node {
+            FragmentChild::ExpressionTag(t) => visit(&t.expression),
+            FragmentChild::HtmlTag(t) => visit(&t.expression),
+            FragmentChild::RenderTag(t) => visit(&t.expression),
+            FragmentChild::ConstTag(t) => visit(&t.declaration),
+            FragmentChild::IfBlock(b) => {
+                visit(&b.test);
+                walk_fragment_expressions(&b.consequent, visit);
+                if let Some(alt) = b.alternate.as_ref() {
+                    walk_fragment_expressions(alt, visit);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                visit(&b.expression);
+                walk_fragment_expressions(&b.body, visit);
+                if let Some(fb) = b.fallback.as_ref() {
+                    walk_fragment_expressions(fb, visit);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                visit(&b.expression);
+                walk_fragment_expressions(&b.fragment, visit);
+            }
+            FragmentChild::AwaitBlock(b) => {
+                visit(&b.expression);
+                if let Some(f) = b.pending.as_ref() {
+                    walk_fragment_expressions(f, visit);
+                }
+                if let Some(f) = b.then.as_ref() {
+                    walk_fragment_expressions(f, visit);
+                }
+                if let Some(f) = b.catch_.as_ref() {
+                    walk_fragment_expressions(f, visit);
+                }
+            }
+            FragmentChild::SnippetBlock(b) => {
+                walk_fragment_expressions(&b.body, visit);
+            }
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    visit_attribute_exprs(a, visit);
+                }
+                walk_fragment_expressions(&el.fragment, visit);
+            }
+            FragmentChild::Component(c) => {
+                for a in &c.attributes {
+                    visit_attribute_exprs(a, visit);
+                }
+                walk_fragment_expressions(&c.fragment, visit);
+            }
+            FragmentChild::SvelteElement(el) => {
+                visit(&el.tag);
+                for a in &el.attributes {
+                    visit_attribute_exprs(a, visit);
+                }
+                walk_fragment_expressions(&el.fragment, visit);
+            }
+            FragmentChild::SvelteHead(el) => walk_fragment_expressions(&el.fragment, visit),
+            FragmentChild::SvelteFragment(el) => walk_fragment_expressions(&el.fragment, visit),
+            FragmentChild::TitleElement(el) => walk_fragment_expressions(&el.fragment, visit),
+            _ => {}
+        }
+    }
+}
+
+fn visit_attribute_exprs(
+    a: &svelte_ast::attributes::ElementAttribute,
+    visit: &mut dyn FnMut(&Value),
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    match a {
+        ElementAttribute::Attribute(attr) => match &attr.value {
+            AttributeValue::Single(t) => visit(&t.expression),
+            AttributeValue::Many(parts) => {
+                for p in parts {
+                    if let AttributeValuePart::ExpressionTag(t) = p {
+                        visit(&t.expression);
+                    }
+                }
+            }
+            AttributeValue::Empty(_) => {}
+        },
+        ElementAttribute::BindDirective(bd) => visit(&bd.expression),
+        ElementAttribute::SpreadAttribute(sa) => visit(&sa.expression),
+        ElementAttribute::OnDirective(od) => {
+            if let Some(e) = od.expression.as_ref() {
+                visit(e);
+            }
+        }
+        ElementAttribute::UseDirective(ud) => {
+            if let Some(e) = ud.expression.as_ref() {
+                visit(e);
+            }
+        }
+        ElementAttribute::TransitionDirective(td) => {
+            if let Some(e) = td.expression.as_ref() {
+                visit(e);
+            }
+        }
+        ElementAttribute::AnimateDirective(ad) => {
+            if let Some(e) = ad.expression.as_ref() {
+                visit(e);
+            }
+        }
+        ElementAttribute::ClassDirective(cd) => visit(&cd.expression),
+        ElementAttribute::StyleDirective(sd) => match &sd.value {
+            AttributeValue::Single(t) => visit(&t.expression),
+            AttributeValue::Many(parts) => {
+                for p in parts {
+                    if let AttributeValuePart::ExpressionTag(t) = p {
+                        visit(&t.expression);
+                    }
+                }
+            }
+            AttributeValue::Empty(_) => {}
+        },
+        ElementAttribute::LetDirective(ld) => {
+            if let Some(e) = ld.expression.as_ref() {
+                visit(e);
+            }
+        }
+        ElementAttribute::AttachTag(t) => visit(&t.expression),
+    }
+}
+
 fn body_uses_identifier(stmts: &[Value], name: &str) -> bool {
     fn walk(v: &Value, name: &str) -> bool {
         match v {
@@ -887,6 +1324,98 @@ fn body_uses_identifier(stmts: &[Value], name: &str) -> bool {
         }
     }
     stmts.iter().any(|s| walk(s, name))
+}
+
+/// Heuristic for "runes mode" applied to a fn_body. We check for any post-
+/// rewrite signal: `$.state`, `$.derived`, `$.props`, `$.prop`, `$.rest_props`,
+/// `$.user_effect`, `$.user_pre_effect`, `$.inspect`. Conservative — false
+/// positives in shared sub-expressions don't matter since we only use this to
+/// gate $.push/$.pop.
+fn body_has_runes(stmts: &[Value]) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("MemberExpression") {
+                    let obj_name = obj
+                        .get("object")
+                        .and_then(|o| o.get("name"))
+                        .and_then(|v| v.as_str());
+                    let prop_name = obj
+                        .get("property")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str());
+                    if obj_name == Some("$")
+                        && matches!(
+                            prop_name,
+                            Some("state")
+                                | Some("derived")
+                                | Some("props")
+                                | Some("prop")
+                                | Some("rest_props")
+                                | Some("user_effect")
+                                | Some("user_pre_effect")
+                                | Some("inspect")
+                                | Some("get")
+                                | Some("set")
+                        )
+                    {
+                        return true;
+                    }
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(walk)
+}
+
+/// Conservative port of upstream's `needs_context` analysis. Emit $.push/$.pop
+/// when the body has: a class declaration, a `new` expression, `this.X`
+/// member access, direct `$$props.X` member access, `$.user_effect` /
+/// `$.user_pre_effect` / `$.inspect`, or `$.run` (async).
+fn body_needs_context(stmts: &[Value]) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match ty {
+                    "ClassDeclaration" | "ClassExpression" | "NewExpression" => return true,
+                    "MemberExpression" => {
+                        let object = obj.get("object").cloned().unwrap_or(Value::Null);
+                        if object.get("type").and_then(|v| v.as_str()) == Some("ThisExpression") {
+                            return true;
+                        }
+                        let obj_name = object.get("name").and_then(|v| v.as_str());
+                        if obj_name == Some("$$props") {
+                            return true;
+                        }
+                        let prop_name = obj
+                            .get("property")
+                            .and_then(|p| p.get("name"))
+                            .and_then(|v| v.as_str());
+                        if obj_name == Some("$")
+                            && matches!(
+                                prop_name,
+                                Some("user_effect")
+                                    | Some("user_pre_effect")
+                                    | Some("inspect")
+                                    | Some("run")
+                            )
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(walk)
 }
 
 fn find_single_each_block(
@@ -1465,6 +1994,111 @@ fn constant_folded_literal(expr: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Find a single root RegularElement whose direct children are only
+/// ExpressionTag nodes (no Text, no nested blocks). Used to detect the
+/// `<p>{expr1}{expr2}...</p>` pattern lowered with $.child / $.reset /
+/// $.template_effect.
+fn find_single_dynamic_text_element(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Option<&svelte_ast::elements::RegularElement> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut found: Option<&svelte_ast::elements::RegularElement> = None;
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::RegularElement(e) => {
+                if found.is_some() {
+                    return None;
+                }
+                let mut has_expr = false;
+                let mut has_other = false;
+                for c in &e.fragment.nodes {
+                    match c {
+                        FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+                        FragmentChild::ExpressionTag(_) => {
+                            has_expr = true;
+                        }
+                        _ => {
+                            has_other = true;
+                        }
+                    }
+                }
+                if !has_expr || has_other {
+                    return None;
+                }
+                found = Some(e);
+            }
+            _ => return None,
+        }
+    }
+    found
+}
+
+/// Build a `$.template_effect(($0,...$N) => $.set_text(<text_var>, \`${$0 ?? ''}...\`), [() => expr0, ...])`
+/// call. When N == 1, emit the inline form `$.template_effect(() => $.set_text(text, expr ?? ''))`
+/// (no array, no params).
+fn build_template_effect_set_text(text_var: &str, exprs: &[Value]) -> Value {
+    if exprs.len() == 1 {
+        // Inline form: `$.template_effect(() => $.set_text(text, `${expr ?? ''}`))`
+        // BUT upstream uses `\`${expr ?? ''}\`` only when there's a text-around it.
+        // For pure single-expression case it just passes the expression.
+        // Hmm — to be safe, mirror the format used in nullish-coallescence-omittance:
+        // `() => $.set_text(text, \`Count is ${$.get(count) ?? ''}\`)`. For a pure single-expr
+        // we'll emit `() => $.set_text(text, \`${expr ?? ''}\`)`.
+        let expr = &exprs[0];
+        let coalesce = serde_json::json!({
+            "type": "LogicalExpression",
+            "operator": "??",
+            "left": expr,
+            "right": { "type": "Literal", "value": "", "raw": "''" }
+        });
+        let tpl = b::template_literal(vec!["", ""], vec![coalesce]);
+        return b::call(
+            b::member(b::id("$"), b::id("template_effect"), false, false),
+            vec![b::arrow(
+                vec![],
+                b::call(
+                    b::member(b::id("$"), b::id("set_text"), false, false),
+                    vec![b::id(text_var), tpl],
+                ),
+                false,
+            )],
+        );
+    }
+    // N-form: `$.template_effect(($0, $1, ...) => $.set_text(text, \`${$0 ?? ''}${$1 ?? ''}...\`), [() => expr0, ...])`
+    let params: Vec<Value> = (0..exprs.len()).map(|i| b::id(&format!("${i}"))).collect();
+    let parts: Vec<Value> = (0..exprs.len())
+        .map(|i| {
+            serde_json::json!({
+                "type": "LogicalExpression",
+                "operator": "??",
+                "left": { "type": "Identifier", "name": format!("${i}") },
+                "right": { "type": "Literal", "value": "", "raw": "''" }
+            })
+        })
+        .collect();
+    // template_literal expects Vec<&str> for the static parts; produce them.
+    let static_parts: Vec<&str> = (0..exprs.len() + 1).map(|_| "").collect();
+    let tpl = b::template_literal(static_parts, parts);
+    let arrow_fn = b::arrow(
+        params,
+        b::call(
+            b::member(b::id("$"), b::id("set_text"), false, false),
+            vec![b::id(text_var), tpl],
+        ),
+        false,
+    );
+    let thunks: Vec<Value> = exprs
+        .iter()
+        .map(|e| b::arrow(vec![], e.clone(), false))
+        .collect();
+    b::call(
+        b::member(b::id("$"), b::id("template_effect"), false, false),
+        vec![arrow_fn, b::array(thunks)],
+    )
 }
 
 fn find_single_svelte_element(

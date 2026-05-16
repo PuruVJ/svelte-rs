@@ -56,3 +56,36 @@ fn diff_svelte_element() {
 fn diff_function_prop_no_getter() {
     diff("function-prop-no-getter", "Function_prop_no_getter");
 }
+
+#[test]
+#[ignore]
+fn diff_text_nodes_deriveds() {
+    diff("text-nodes-deriveds", "Text_nodes_deriveds");
+}
+
+#[test]
+#[ignore]
+fn diff_state_proxy_literal() {
+    diff("state-proxy-literal", "State_proxy_literal");
+}
+
+#[test]
+#[ignore]
+fn diff_class_state() {
+    diff(
+        "class-state-field-constructor-assignment",
+        "Class_state_field_constructor_assignment",
+    );
+}
+
+#[test]
+#[ignore]
+fn diff_props_identifier() {
+    diff("props-identifier", "Props_identifier");
+}
+
+#[test]
+#[ignore]
+fn diff_nullish() {
+    diff("nullish-coallescence-omittance", "Nullish_coallescence_omittance");
+}

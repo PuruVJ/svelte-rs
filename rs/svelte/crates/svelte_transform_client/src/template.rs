@@ -15,11 +15,31 @@ use svelte_ast::fragment::{Fragment, FragmentChild};
 /// Build the static HTML skeleton for a fragment. Returns the raw HTML
 /// suitable for embedding inside a `$.from_html(\`...\`)` template literal.
 pub fn serialize_static_html(fragment: &Fragment) -> String {
+    let nodes = trim_whitespace_text(&fragment.nodes);
     let mut out = String::new();
-    for child in &fragment.nodes {
+    for child in nodes {
         serialize_child(child, &mut out);
     }
     out
+}
+
+/// Skip leading/trailing whitespace-only Text nodes at the top level.
+fn trim_whitespace_text(nodes: &[FragmentChild]) -> &[FragmentChild] {
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end {
+        match &nodes[start] {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => start += 1,
+            _ => break,
+        }
+    }
+    while end > start {
+        match &nodes[end - 1] {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => end -= 1,
+            _ => break,
+        }
+    }
+    &nodes[start..end]
 }
 
 fn serialize_child(child: &FragmentChild, out: &mut String) {
@@ -30,6 +50,22 @@ fn serialize_child(child: &FragmentChild, out: &mut String) {
         // template; for now we drop them (the simple-static cases only).
         _ => {}
     }
+}
+
+/// True if a node should be considered "content-bearing" for placeholder
+/// purposes (ExpressionTag / HtmlTag / RenderTag / blocks / components).
+fn is_dynamic_content(node: &FragmentChild) -> bool {
+    matches!(
+        node,
+        FragmentChild::ExpressionTag(_)
+            | FragmentChild::HtmlTag(_)
+            | FragmentChild::RenderTag(_)
+            | FragmentChild::IfBlock(_)
+            | FragmentChild::EachBlock(_)
+            | FragmentChild::AwaitBlock(_)
+            | FragmentChild::KeyBlock(_)
+            | FragmentChild::Component(_)
+    )
 }
 
 fn serialize_regular_element(el: &RegularElement, out: &mut String) {
@@ -45,8 +81,17 @@ fn serialize_regular_element(el: &RegularElement, out: &mut String) {
         return;
     }
     out.push('>');
-    for child in &el.fragment.nodes {
-        serialize_child(child, out);
+    // If the element has any dynamic content but no static text, emit a single
+    // space placeholder. Otherwise serialize children normally (Text nodes
+    // and nested static elements only).
+    let has_dynamic = el.fragment.nodes.iter().any(is_dynamic_content);
+    let has_static_text = el.fragment.nodes.iter().any(|n| matches!(n, FragmentChild::Text(t) if !t.data.trim().is_empty()));
+    if has_dynamic && !has_static_text {
+        out.push(' ');
+    } else {
+        for child in &el.fragment.nodes {
+            serialize_child(child, out);
+        }
     }
     out.push_str("</");
     out.push_str(&el.name);
