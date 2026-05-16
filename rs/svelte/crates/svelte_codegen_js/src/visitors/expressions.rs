@@ -210,14 +210,25 @@ fn emit_call_arguments(node: &Value, ctx: &mut Context) {
     let multiline = child_context.is_multiline();
 
     if multiline {
+        // Re-emit non-last args with newlines between them so each lives on
+        // its own indented line. The final arg goes on its own line too.
         ctx.indent();
         ctx.newline();
-    }
-    ctx.append(child_context);
-    ctx.append(final_context);
-    if multiline {
+        let last_idx = args.len() - 1;
+        for (i, arg) in args.iter().enumerate() {
+            if i == last_idx {
+                ctx.visit(arg);
+            } else {
+                ctx.visit(arg);
+                ctx.write(",", None);
+                ctx.newline();
+            }
+        }
         ctx.dedent();
         ctx.newline();
+    } else {
+        ctx.append(child_context);
+        ctx.append(final_context);
     }
     ctx.write(")", None);
 }

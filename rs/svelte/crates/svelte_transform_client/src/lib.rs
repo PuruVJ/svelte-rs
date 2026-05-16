@@ -28,6 +28,16 @@ pub struct ClientOptions {
     pub hmr: bool,
     pub dev: bool,
     pub filename: Option<String>,
+    /// When set to `Tree`, multi-root templates emit `\$.from_tree(...)` with
+    /// an array-of-arrays structure instead of `\$.from_html(\`...\`)`.
+    pub fragments: FragmentsMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FragmentsMode {
+    #[default]
+    Html,
+    Tree,
 }
 
 /// Transform a parsed `Root` into a client-side ESTree `Program`.
@@ -137,6 +147,40 @@ pub fn client_component_with_options(
         .iter()
         .filter(|s| snippet_declares_text(s))
         .count();
+
+    // Tree-mode templates: build `\$.from_tree(<array>, 1)` if the fragment
+    // is a pure-static multi-root tree and the compile option is enabled.
+    if options.fragments == FragmentsMode::Tree {
+        if let Some(tree) = try_tree_template(&root.fragment) {
+            let root_count = count_top_level_elements(&root.fragment);
+            program_body.push(b::declaration(
+                "var",
+                vec![b::declarator(
+                    b::id("root"),
+                    Some(b::call(
+                        b::member(b::id("$"), b::id("from_tree"), false, false),
+                        vec![tree, b::literal_num(1.0)],
+                    )),
+                )],
+            ));
+            fn_body.push(b::declaration(
+                "var",
+                vec![b::declarator(
+                    b::id("fragment"),
+                    Some(b::call(b::id("root"), vec![])),
+                )],
+            ));
+            fn_body.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("next"), false, false),
+                vec![b::literal_num(root_count as f64)],
+            )));
+            fn_body.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("append"), false, false),
+                vec![b::id("$$anchor"), b::id("fragment")],
+            )));
+            return finalize_program(program_body, fn_body, component_name, options);
+        }
+    }
 
     // Try the multi-root static template pattern (e.g. `<p>...</p> <Component .../>`).
     if let Some((tpl_html, fn_stmts)) = try_multi_root_static(&root.fragment, &constants, text_var_start) {
@@ -2483,6 +2527,146 @@ fn find_single_dynamic_text_element(
         }
     }
     found
+}
+
+/// Build the tree representation for `\$.from_tree(...)`. Returns the JSON
+/// ArrayExpression (or None if the fragment has dynamic content).
+fn try_tree_template(fragment: &svelte_ast::Fragment) -> Option<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    let nodes = fragment_trim_ws(&fragment.nodes);
+    let mut elements: Vec<Value> = Vec::new();
+    let mut first = true;
+    for n in nodes {
+        if let FragmentChild::Text(t) = n {
+            if t.data.trim().is_empty() {
+                continue;
+            }
+        }
+        if !first {
+            elements.push(b::literal_str(" "));
+        }
+        first = false;
+        let tree_node = tree_node_from_fragment_child(n)?;
+        elements.push(tree_node);
+    }
+    Some(b::array(elements))
+}
+
+/// Recursively build a tree node for a fragment child. Returns None for
+/// dynamic content (ExpressionTag, blocks, components, ...).
+fn tree_node_from_fragment_child(n: &svelte_ast::fragment::FragmentChild) -> Option<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    match n {
+        FragmentChild::Text(t) => Some(b::literal_str(&collapse_ws(&t.data))),
+        FragmentChild::RegularElement(el) => {
+            let mut arr: Vec<Value> = Vec::new();
+            arr.push(b::literal_str(&el.name));
+            // Attributes object or null.
+            let attrs = build_tree_attrs(el)?;
+            arr.push(attrs);
+            // Children.
+            let mut first = true;
+            let kids = fragment_trim_ws(&el.fragment.nodes);
+            for c in kids {
+                if let FragmentChild::Text(t) = c {
+                    if t.data.trim().is_empty() {
+                        continue;
+                    }
+                }
+                if !first {
+                    // Insert separator only between consecutive element children.
+                    if matches!(c, FragmentChild::RegularElement(_)) {
+                        arr.push(b::literal_str(" "));
+                    }
+                }
+                first = false;
+                arr.push(tree_node_from_fragment_child(c)?);
+            }
+            Some(b::array(arr))
+        }
+        _ => None,
+    }
+}
+
+fn fragment_trim_ws(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> &[svelte_ast::fragment::FragmentChild] {
+    use svelte_ast::fragment::FragmentChild;
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end {
+        if let FragmentChild::Text(t) = &nodes[start] {
+            if t.data.trim().is_empty() {
+                start += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    while end > start {
+        if let FragmentChild::Text(t) = &nodes[end - 1] {
+            if t.data.trim().is_empty() {
+                end -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    &nodes[start..end]
+}
+
+fn build_tree_attrs(el: &svelte_ast::elements::RegularElement) -> Option<Value> {
+    use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut props: Vec<Value> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(Attribute { name, value, .. }) => {
+                let v = match value {
+                    AttributeValue::Empty(true) => b::literal_str(""),
+                    AttributeValue::Empty(false) => b::literal_str(""),
+                    AttributeValue::Single(tag) => tag.expression.clone(),
+                    AttributeValue::Many(parts) => {
+                        let mut text = String::new();
+                        let mut all_text = true;
+                        for p in parts {
+                            match p {
+                                AttributeValuePart::Text(t) => text.push_str(&t.data),
+                                _ => {
+                                    all_text = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !all_text {
+                            return None;
+                        }
+                        b::literal_str(&text)
+                    }
+                };
+                props.push(b::init(name, v));
+            }
+            _ => return None,
+        }
+    }
+    if props.is_empty() {
+        Some(b::literal_null())
+    } else {
+        Some(b::object(props))
+    }
+}
+
+fn count_top_level_elements(fragment: &svelte_ast::Fragment) -> usize {
+    use svelte_ast::fragment::FragmentChild;
+    let mut count = 0;
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::RegularElement(_) | FragmentChild::Component(_) => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// Build `$.await(local, () => promise, pending?, ($$anchor, X) => { ... })`.

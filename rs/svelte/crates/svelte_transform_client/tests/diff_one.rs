@@ -4,7 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 use svelte_codegen_js::{default_visitors, print, PrintOptions};
 use svelte_parse::parse;
-use svelte_transform_client::{client_component_with_options, ClientOptions};
+use svelte_transform_client::{client_component_with_options, ClientOptions, FragmentsMode};
 
 fn diff(name: &str, component: &str) {
     let base = PathBuf::from(format!(
@@ -17,6 +17,9 @@ fn diff(name: &str, component: &str) {
     let mut options = ClientOptions::default();
     if config.contains("hmr: true") {
         options.hmr = true;
+    }
+    if config.contains("fragments: 'tree'") || config.contains("fragments:'tree'") {
+        options.fragments = FragmentsMode::Tree;
     }
     let root = parse(&src, false).unwrap();
     let prog = client_component_with_options(&root, component, &options);
@@ -100,4 +103,10 @@ fn diff_bind_component_snippet() {
 #[ignore]
 fn diff_await_block_scope() {
     diff("await-block-scope", "Await_block_scope");
+}
+
+#[test]
+#[ignore]
+fn diff_functional_templating() {
+    diff("functional-templating", "Functional_templating");
 }

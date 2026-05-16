@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use svelte_codegen_js::{default_visitors, print, PrintOptions};
 use svelte_parse::parse;
-use svelte_transform_client::{client_component_with_options, ClientOptions};
+use svelte_transform_client::{client_component_with_options, ClientOptions, FragmentsMode};
 
 fn snake_to_pascal(name: &str) -> String {
     let mut chars = name.chars();
@@ -28,6 +28,9 @@ fn parse_config(config: &str) -> ClientOptions {
     }
     if config.contains("dev: true") || config.contains("dev:true") {
         opts.dev = true;
+    }
+    if config.contains("fragments: 'tree'") || config.contains("fragments:'tree'") {
+        opts.fragments = FragmentsMode::Tree;
     }
     opts
 }
