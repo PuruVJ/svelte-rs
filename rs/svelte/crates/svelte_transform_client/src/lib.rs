@@ -134,7 +134,7 @@ pub fn client_component_with_options(
                 stmt.get("type").and_then(|v| v.as_str()) != Some("ImportDeclaration")
             })
             .collect();
-        if options.experimental_async {
+        if options.experimental_async && body_has_top_level_await(&non_imports) {
             let (transformed, last_idx) = transform_async_script(non_imports);
             async_var_last_idx = last_idx;
             for stmt in transformed {
@@ -341,17 +341,29 @@ pub fn client_component_with_options(
                 vec![b::id("$$anchor"), b::id("fragment")],
             )));
         } else if let Some(blk) = find_single_each_block(&root.fragment.nodes) {
-            // Single `{#each}` block at root.
-            let (prog_extras, fn_stmts) = build_each_block_client(blk);
-            for s in prog_extras {
-                program_body.push(s);
-            }
-            for stmt in fn_stmts {
-                fn_body.push(stmt);
+            if options.experimental_async && expression_uses_await(&blk.expression) {
+                for stmt in build_async_each_block_client(blk) {
+                    fn_body.push(stmt);
+                }
+            } else {
+                // Single `{#each}` block at root.
+                let (prog_extras, fn_stmts) = build_each_block_client(blk);
+                for s in prog_extras {
+                    program_body.push(s);
+                }
+                for stmt in fn_stmts {
+                    fn_body.push(stmt);
+                }
             }
         } else if let Some(blk) = find_single_if_block(&root.fragment.nodes) {
-            for stmt in build_if_block_client(blk) {
-                fn_body.push(stmt);
+            if options.experimental_async && expression_uses_await(&blk.test) {
+                for stmt in build_async_if_block_client(blk) {
+                    fn_body.push(stmt);
+                }
+            } else {
+                for stmt in build_if_block_client(blk) {
+                    fn_body.push(stmt);
+                }
             }
         }
     }
@@ -1418,6 +1430,532 @@ fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Optio
 /// invocation, return it. Used to emit a direct `Foo($$anchor, props)` call
 /// without a template literal.
 /// Walk a list of statements looking for any Identifier reference matching `name`.
+/// Walk `node` and wrap every `Identifier { name: target_name }` (in
+/// non-member-property, non-declaration position) into `$.get(target_name)`.
+fn wrap_identifier_with_get(node: &mut Value, target_name: &str) {
+    fn walk(node: &mut Value, target_name: &str, is_member_property: bool) {
+        if let Some(obj) = node.as_object_mut() {
+            let ty = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Skip declarations and function params; we only rewrite reads.
+            if matches!(
+                ty.as_str(),
+                "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+            ) {
+                return;
+            }
+            if ty == "Identifier" && !is_member_property {
+                let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if name == target_name {
+                    *node = serde_json::json!({
+                        "type": "CallExpression",
+                        "callee": {
+                            "type": "MemberExpression",
+                            "object": { "type": "Identifier", "name": "$" },
+                            "property": { "type": "Identifier", "name": "get" },
+                            "computed": false,
+                            "optional": false
+                        },
+                        "arguments": [{ "type": "Identifier", "name": target_name }],
+                        "optional": false
+                    });
+                    return;
+                }
+            }
+            if ty == "MemberExpression" {
+                if let Some(o) = obj.get_mut("object") {
+                    walk(o, target_name, false);
+                }
+                let computed = obj
+                    .get("computed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if let Some(p) = obj.get_mut("property") {
+                    walk(p, target_name, !computed);
+                }
+                return;
+            }
+            for (_, v) in obj.iter_mut() {
+                walk(v, target_name, false);
+            }
+        } else if let Some(arr) = node.as_array_mut() {
+            for v in arr {
+                walk(v, target_name, false);
+            }
+        }
+    }
+    walk(node, target_name, false);
+}
+
+/// True if any top-level statement in `body` is a `let/var/const X = await Y`
+/// declaration. Used to gate the async script transform.
+fn body_has_top_level_await(body: &[Value]) -> bool {
+    for stmt in body {
+        if stmt.get("type").and_then(|v| v.as_str()) != Some("VariableDeclaration") {
+            continue;
+        }
+        let decls = match stmt.get("declarations").and_then(|v| v.as_array()) {
+            Some(d) => d,
+            None => continue,
+        };
+        for d in decls {
+            if let Some(init) = d.get("init") {
+                if init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True if `expr` contains a top-level AwaitExpression (anywhere in its tree).
+fn expression_uses_await(expr: &Value) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
+                    return true;
+                }
+                // Don't recurse into function bodies — await inside a nested fn
+                // doesn't count as "this expression awaits".
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(
+                    ty,
+                    "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+                ) {
+                    return false;
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(expr)
+}
+
+/// Lower a single root `{#each await EXPR as item}...{/each}` block to the
+/// async each pattern using \$.async + \$.each.
+fn build_async_each_block_client(blk: &svelte_ast::blocks::EachBlock) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("fragment"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("comment"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("node"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("first_child"), false, false),
+                vec![b::id("fragment")],
+            )),
+        )],
+    ));
+
+    // Unwrap top-level await.
+    let collection_expr = match blk.expression.get("type").and_then(|v| v.as_str()) {
+        Some("AwaitExpression") => blk
+            .expression
+            .get("argument")
+            .cloned()
+            .unwrap_or_else(|| blk.expression.clone()),
+        _ => blk.expression.clone(),
+    };
+    let promise_thunk = b::arrow(vec![], collection_expr, false);
+
+    // Item parameter (e.g. `item` from `{#each ... as item}`).
+    let item_param = blk
+        .context
+        .clone()
+        .unwrap_or_else(|| b::id("$$item"));
+    let item_name = item_param
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("$$item")
+        .to_string();
+
+    // Inner each-iteration body: $.next(); var text = $.text(); $.template_effect(...);
+    // $.append($$anchor, text);
+    let mut counter: usize = 0;
+    let iter_body_stmts = build_async_each_iter_body(&blk.body, &item_name, &mut counter);
+    let iter_arrow = b::arrow(
+        vec![b::id("$$anchor"), item_param],
+        b::block(iter_body_stmts),
+        false,
+    );
+
+    // Optional fallback (the `{:else}` clause).
+    let fallback_arrow = blk.fallback.as_ref().map(|fb| {
+        let body = build_async_each_iter_body(fb, "", &mut counter);
+        b::arrow(vec![b::id("$$anchor")], b::block(body), false)
+    });
+
+    // $.each(node, FLAGS, () => $.get($$collection), $.index, iter_arrow [, fallback_arrow])
+    // Flag 17 (= 16 | 1) for no-fallback; 16 for has-fallback.
+    let flag_val = if fallback_arrow.is_some() { 16.0 } else { 17.0 };
+    let mut each_args: Vec<Value> = vec![
+        b::id("node"),
+        b::literal_num(flag_val),
+        b::arrow(
+            vec![],
+            b::call(
+                b::member(b::id("$"), b::id("get"), false, false),
+                vec![b::id("$$collection")],
+            ),
+            false,
+        ),
+        b::member(b::id("$"), b::id("index"), false, false),
+        iter_arrow,
+    ];
+    if let Some(fb) = fallback_arrow {
+        each_args.push(fb);
+    }
+    let each_call = b::call(
+        b::member(b::id("$"), b::id("each"), false, false),
+        each_args,
+    );
+
+    // Outer $.async wrapper.
+    let async_callback = b::arrow(
+        vec![b::id("node"), b::id("$$collection")],
+        b::block(vec![b::stmt(each_call)]),
+        false,
+    );
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("async"), false, false),
+        vec![
+            b::id("node"),
+            b::array(vec![]),
+            b::array(vec![promise_thunk]),
+            async_callback,
+        ],
+    )));
+
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("fragment")],
+    )));
+
+    out
+}
+
+/// Build the body of one each-iteration in async mode. Supports a single
+/// ExpressionTag (awaited or sync) and emits the $.text + template_effect
+/// pattern, with $.next() before the text declaration.
+fn build_async_each_iter_body(
+    fragment: &svelte_ast::Fragment,
+    item_name: &str,
+    counter: &mut usize,
+) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut expr: Option<Value> = None;
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::ExpressionTag(t) => {
+                if expr.is_some() {
+                    return Vec::new();
+                }
+                let raw = match t.expression.get("type").and_then(|v| v.as_str()) {
+                    Some("AwaitExpression") => t
+                        .expression
+                        .get("argument")
+                        .cloned()
+                        .unwrap_or_else(|| t.expression.clone()),
+                    _ => t.expression.clone(),
+                };
+                expr = Some(raw);
+            }
+            _ => return Vec::new(),
+        }
+    }
+    let Some(mut e) = expr else {
+        return Vec::new();
+    };
+    // Wrap references to the iteration item in $.get(...) since it's a
+    // reactive binding in async-each mode.
+    wrap_identifier_with_get(&mut e, item_name);
+    let var_name = if *counter == 0 {
+        "text".to_string()
+    } else {
+        format!("text_{}", *counter)
+    };
+    *counter += 1;
+    let mut stmts: Vec<Value> = Vec::new();
+    stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("next"), false, false),
+        vec![],
+    )));
+    stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id(&var_name),
+            Some(b::call(
+                b::member(b::id("$"), b::id("text"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    let void0 = serde_json::json!({
+        "type": "UnaryExpression",
+        "operator": "void",
+        "prefix": true,
+        "argument": { "type": "Literal", "value": 0, "raw": "0" }
+    });
+    let inner_arrow = b::arrow(
+        vec![b::id("$0")],
+        b::call(
+            b::member(b::id("$"), b::id("set_text"), false, false),
+            vec![b::id(&var_name), b::id("$0")],
+        ),
+        false,
+    );
+    let deps_array = b::array(vec![b::arrow(vec![], e, false)]);
+    stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("template_effect"), false, false),
+        vec![inner_arrow, void0, deps_array],
+    )));
+    stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id(&var_name)],
+    )));
+    stmts
+}
+
+/// Lower a single root `{#if await EXPR}{:else}{/if}` block to the async if
+/// pattern: \$.async(...) wrapping with consequent/alternate arrows.
+fn build_async_if_block_client(blk: &svelte_ast::blocks::IfBlock) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("fragment"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("comment"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("node"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("first_child"), false, false),
+                vec![b::id("fragment")],
+            )),
+        )],
+    ));
+
+    // Unwrap top-level await: `await X` → X.
+    let test_expr = match blk.test.get("type").and_then(|v| v.as_str()) {
+        Some("AwaitExpression") => blk
+            .test
+            .get("argument")
+            .cloned()
+            .unwrap_or_else(|| blk.test.clone()),
+        _ => blk.test.clone(),
+    };
+    let promise_thunk = b::arrow(vec![], test_expr, false);
+
+    // Build consequent / alternate as standalone arrow functions whose bodies
+    // are lowered fragments. Each body's text node gets a unique name from a
+    // shared counter so they don't collide.
+    let mut counter: usize = 0;
+    let consequent_body = build_async_branch_body(&blk.consequent, &mut counter);
+    let consequent_arrow = b::arrow(
+        vec![b::id("$$anchor")],
+        b::block(consequent_body),
+        false,
+    );
+
+    let has_alternate = blk.alternate.is_some();
+    let alternate_arrow = blk.alternate.as_ref().map(|alt| {
+        let alt_body = build_async_branch_body(alt, &mut counter);
+        b::arrow(vec![b::id("$$anchor")], b::block(alt_body), false)
+    });
+
+    let mut inner_stmts: Vec<Value> = Vec::new();
+    inner_stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(b::id("consequent"), Some(consequent_arrow))],
+    ));
+    if let Some(alt) = alternate_arrow {
+        inner_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(b::id("alternate"), Some(alt))],
+        ));
+    }
+
+    // $.if(node, ($$render) => { if ($.get($$condition)) $$render(consequent); else $$render(alternate, -1); })
+    let if_stmt_body = if has_alternate {
+        serde_json::json!({
+            "type": "IfStatement",
+            "test": {
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$" },
+                    "property": { "type": "Identifier", "name": "get" },
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{ "type": "Identifier", "name": "$$condition" }],
+                "optional": false
+            },
+            "consequent": b::stmt(b::call(
+                b::id("$$render"),
+                vec![b::id("consequent")]
+            )),
+            "alternate": b::stmt(b::call(
+                b::id("$$render"),
+                vec![b::id("alternate"), b::literal_num(-1.0)]
+            ))
+        })
+    } else {
+        serde_json::json!({
+            "type": "IfStatement",
+            "test": {
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$" },
+                    "property": { "type": "Identifier", "name": "get" },
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{ "type": "Identifier", "name": "$$condition" }],
+                "optional": false
+            },
+            "consequent": b::stmt(b::call(
+                b::id("$$render"),
+                vec![b::id("consequent")]
+            )),
+            "alternate": Value::Null
+        })
+    };
+    inner_stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("if"), false, false),
+        vec![
+            b::id("node"),
+            b::arrow(vec![b::id("$$render")], b::block(vec![if_stmt_body]), false),
+        ],
+    )));
+
+    let outer_arrow = b::arrow(
+        vec![b::id("node"), b::id("$$condition")],
+        b::block(inner_stmts),
+        false,
+    );
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("async"), false, false),
+        vec![
+            b::id("node"),
+            b::array(vec![]),
+            b::array(vec![promise_thunk]),
+            outer_arrow,
+        ],
+    )));
+
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("fragment")],
+    )));
+
+    out
+}
+
+/// Build the body of an async if-branch (consequent or alternate). For now
+/// only supports a fragment whose trimmed body is exactly one ExpressionTag
+/// (with an awaited expression). Other shapes return an empty body.
+fn build_async_branch_body(
+    fragment: &svelte_ast::Fragment,
+    counter: &mut usize,
+) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    // Find the single non-whitespace ExpressionTag in the fragment.
+    let mut expr: Option<Value> = None;
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::ExpressionTag(t) => {
+                if expr.is_some() {
+                    return Vec::new();
+                }
+                let raw = match t.expression.get("type").and_then(|v| v.as_str()) {
+                    Some("AwaitExpression") => t
+                        .expression
+                        .get("argument")
+                        .cloned()
+                        .unwrap_or_else(|| t.expression.clone()),
+                    _ => t.expression.clone(),
+                };
+                expr = Some(raw);
+            }
+            _ => return Vec::new(),
+        }
+    }
+    let Some(e) = expr else {
+        return Vec::new();
+    };
+    let var_name = if *counter == 0 {
+        "text".to_string()
+    } else {
+        format!("text_{}", *counter)
+    };
+    *counter += 1;
+
+    let mut stmts: Vec<Value> = Vec::new();
+    stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id(&var_name),
+            Some(b::call(
+                b::member(b::id("$"), b::id("text"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    // $.template_effect(($0) => $.set_text(text, $0), void 0, [() => expr])
+    let void0 = serde_json::json!({
+        "type": "UnaryExpression",
+        "operator": "void",
+        "prefix": true,
+        "argument": { "type": "Literal", "value": 0, "raw": "0" }
+    });
+    let inner_arrow = b::arrow(
+        vec![b::id("$0")],
+        b::call(
+            b::member(b::id("$"), b::id("set_text"), false, false),
+            vec![b::id(&var_name), b::id("$0")],
+        ),
+        false,
+    );
+    let deps_array = b::array(vec![b::arrow(vec![], e, false)]);
+    stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("template_effect"), false, false),
+        vec![inner_arrow, void0, deps_array],
+    )));
+    stmts.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id(&var_name)],
+    )));
+    stmts
+}
+
 /// Transform the script body for `experimental.async` mode. Pulls top-level
 /// `let X = await Y;` and `\$.inspect(...)` statements into a `\$.run([...])`
 /// invocation. Returns `(transformed_body, var_last_idx)` where

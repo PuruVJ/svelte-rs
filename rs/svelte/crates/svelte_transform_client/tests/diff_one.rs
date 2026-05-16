@@ -131,3 +131,15 @@ fn diff_async_top_level_group_sync_run() {
         "Async_top_level_group_sync_run",
     );
 }
+
+#[test]
+#[ignore]
+fn diff_async_if_hoisting() {
+    diff("async-if-hoisting", "Async_if_hoisting");
+}
+
+#[test]
+#[ignore]
+fn diff_async_each_hoisting() {
+    diff("async-each-hoisting", "Async_each_hoisting");
+}
