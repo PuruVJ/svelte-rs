@@ -844,6 +844,26 @@ fn lower_key_block(blk: &KeyBlock, acc: &mut Accumulator) {
     acc.push_str("<!--]-->");
 }
 
+/// Walk a body of statements and check if any references `$$renderer`. Used
+/// to decide whether the wrapping arrow needs the `$$renderer` parameter.
+fn body_uses_renderer(stmts: &[Value]) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("Identifier")
+                    && obj.get("name").and_then(|v| v.as_str()) == Some("$$renderer")
+                {
+                    return true;
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(walk)
+}
+
 fn lower_await_block(blk: &AwaitBlock, acc: &mut Accumulator) {
     // Server `{#await promise then v}then-body{:catch e}catch-body{/await}`
     // lowers (non-async mode) to:
@@ -856,11 +876,13 @@ fn lower_await_block(blk: &AwaitBlock, acc: &mut Accumulator) {
         .as_ref()
         .map(|f| ops_to_statements(lower_fragment_with_marker(f)))
         .unwrap_or_default();
-    let pending_cb = b::arrow(
-        vec![b::id("$$renderer")],
-        b::block(pending_body),
-        false,
-    );
+    let pending_uses_renderer = body_uses_renderer(&pending_body);
+    let pending_params = if pending_uses_renderer {
+        vec![b::id("$$renderer")]
+    } else {
+        vec![]
+    };
+    let pending_cb = b::arrow(pending_params, b::block(pending_body), false);
 
     let then_value = blk
         .value
@@ -871,11 +893,13 @@ fn lower_await_block(blk: &AwaitBlock, acc: &mut Accumulator) {
         .as_ref()
         .map(|f| ops_to_statements(lower_fragment_with_marker(f)))
         .unwrap_or_default();
-    let then_cb = b::arrow(
-        vec![b::id("$$renderer"), then_value],
-        b::block(then_body),
-        false,
-    );
+    let then_uses_renderer = body_uses_renderer(&then_body);
+    let then_params = if then_uses_renderer {
+        vec![b::id("$$renderer"), then_value]
+    } else {
+        vec![then_value]
+    };
+    let then_cb = b::arrow(then_params, b::block(then_body), false);
 
     let mut args: Vec<Value> = vec![
         b::id("$$renderer"),
@@ -893,11 +917,13 @@ fn lower_await_block(blk: &AwaitBlock, acc: &mut Accumulator) {
             .as_ref()
             .map(|f| ops_to_statements(lower_fragment_with_marker(f)))
             .unwrap_or_default();
-        args.push(b::arrow(
-            vec![b::id("$$renderer"), catch_param],
-            b::block(catch_body),
-            false,
-        ));
+        let catch_uses_renderer = body_uses_renderer(&catch_body);
+        let catch_params = if catch_uses_renderer {
+            vec![b::id("$$renderer"), catch_param]
+        } else {
+            vec![catch_param]
+        };
+        args.push(b::arrow(catch_params, b::block(catch_body), false));
     }
 
     acc.stmt(b::stmt(b::call(
