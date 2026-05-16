@@ -267,12 +267,15 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         diags.push(warnings::a11y_misplaced_role(span, "html"));
     }
 
-    // 14. a11y_aria_attributes — these elements can't have aria-*.
+    // 14. a11y_aria_attributes / a11y_misplaced_role — these elements can't
+    // have role or aria-*. role gets its own diagnostic; aria-* gets the
+    // aria_attributes warning.
     if matches!(el.name.as_str(), "meta" | "html" | "script" | "style") {
         for (n, _) in &attrs {
-            if n.starts_with("aria-") || *n == "role" {
+            if *n == "role" {
+                diags.push(warnings::a11y_misplaced_role(span, &el.name));
+            } else if n.starts_with("aria-") {
                 diags.push(warnings::a11y_aria_attributes(span, &el.name));
-                break;
             }
         }
     }
@@ -288,8 +291,9 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         }
     }
 
-    // 17. a11y_accesskey — `accesskey` attribute (avoid).
-    if has_attr("accesskey") {
+    // 17. a11y_accesskey — `accesskey` attribute (avoid). Case-insensitive
+    // since HTML attributes are case-insensitive.
+    if attrs.iter().any(|(n, _)| n.eq_ignore_ascii_case("accesskey")) {
         diags.push(warnings::a11y_accesskey(span));
     }
 
