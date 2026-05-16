@@ -168,3 +168,15 @@ fn diff_async_const() {
 fn diff_async_in_derived() {
     diff("async-in-derived", "Async_in_derived");
 }
+
+#[test]
+#[ignore]
+fn diff_skip_static_subtree() {
+    diff("skip-static-subtree", "Skip_static_subtree");
+}
+
+#[test]
+#[ignore]
+fn diff_select_with_rich_content() {
+    diff("select-with-rich-content", "Select_with_rich_content");
+}
