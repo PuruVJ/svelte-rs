@@ -85,7 +85,8 @@ pub fn client_component_with_options(
         }
     }
 
-    if !html.is_empty() {
+    let has_meaningful_html = !html.trim().is_empty();
+    if has_meaningful_html {
         program_body.push(b::declaration(
             "var",
             vec![b::declarator(
@@ -120,19 +121,55 @@ pub fn client_component_with_options(
 
     // If the only template content is a single Component invocation, emit
     // `Foo($$anchor, props)` directly inside the body.
-    if html.is_empty() {
+    if !has_meaningful_html {
         if let Some(single_comp) = find_single_component(&root.fragment.nodes) {
-            let call_with_directives =
-                build_component_call(single_comp, runes_mode);
+            let call_with_directives = build_component_call(single_comp, runes_mode);
             for stmt in call_with_directives {
                 fn_body.push(stmt);
             }
+        } else if let Some(svelte_el) = find_single_svelte_element(&root.fragment.nodes) {
+            // `<svelte:element this={tag}>...</svelte:element>` client lowering.
+            fn_body.push(b::declaration(
+                "var",
+                vec![b::declarator(
+                    b::id("fragment"),
+                    Some(b::call(
+                        b::member(b::id("$"), b::id("comment"), false, false),
+                        vec![],
+                    )),
+                )],
+            ));
+            fn_body.push(b::declaration(
+                "var",
+                vec![b::declarator(
+                    b::id("node"),
+                    Some(b::call(
+                        b::member(b::id("$"), b::id("first_child"), false, false),
+                        vec![b::id("fragment")],
+                    )),
+                )],
+            ));
+            fn_body.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("element"), false, false),
+                vec![b::id("node"), svelte_el.tag.clone(), b::literal_bool(false)],
+            )));
+            fn_body.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("append"), false, false),
+                vec![b::id("$$anchor"), b::id("fragment")],
+            )));
         }
     }
 
+    // Detect $$props usage in body (via fn_body's identifiers) so we know
+    // whether to include the parameter.
+    let uses_props = body_uses_identifier(&fn_body, "$$props");
+    let mut params = vec![b::id("$$anchor")];
+    if uses_props {
+        params.push(b::id("$$props"));
+    }
     let component_fn = b::function_declaration(
         b::id(component_name),
-        vec![b::id("$$anchor")],
+        params,
         b::block(fn_body),
         false,
     );
@@ -269,6 +306,46 @@ fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Optio
 /// When the only non-whitespace content of a fragment is a single Component
 /// invocation, return it. Used to emit a direct `Foo($$anchor, props)` call
 /// without a template literal.
+/// Walk a list of statements looking for any Identifier reference matching `name`.
+fn body_uses_identifier(stmts: &[Value], name: &str) -> bool {
+    fn walk(v: &Value, name: &str) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(|x| walk(x, name)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("Identifier")
+                    && obj.get("name").and_then(|v| v.as_str()) == Some(name)
+                {
+                    return true;
+                }
+                obj.values().any(|v| walk(v, name))
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(|s| walk(s, name))
+}
+
+fn find_single_svelte_element(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Option<&svelte_ast::elements::SvelteElement> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut el: Option<&svelte_ast::elements::SvelteElement> = None;
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::SvelteElement(e) => {
+                if el.is_some() {
+                    return None;
+                }
+                el = Some(e);
+            }
+            _ => return None,
+        }
+    }
+    el
+}
+
 fn find_single_component(
     nodes: &[svelte_ast::fragment::FragmentChild],
 ) -> Option<&svelte_ast::elements::Component> {
