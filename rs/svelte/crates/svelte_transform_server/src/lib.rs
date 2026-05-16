@@ -32,13 +32,14 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
         rewritten_instance = Some(rewritten);
     }
 
-    // Lower the template, then rewrite derived references in every embedded
-    // expression so `{counter.count}` becomes `${$.escape(counter().count)}`
-    // when `counter` is a derived binding.
+    // Hoist top-level `{#snippet}` blocks out of the fragment — upstream emits
+    // them as sibling `function NAME($$renderer, ...) { ... }` declarations
+    // before `export default function Component(...)`.
     let mut root_with_rewritten_template: Root = root.clone();
     if !derived_names.is_empty() {
         rewrite_fragment_derived_refs(&mut root_with_rewritten_template.fragment, &derived_names);
     }
+    let hoisted_snippets = extract_top_level_snippets(&mut root_with_rewritten_template.fragment);
     let template_ops = template::lower_fragment_trimmed(&root_with_rewritten_template.fragment);
     let mut function_body: Vec<Value> = Vec::new();
 
@@ -110,8 +111,47 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
         program_body.extend(hoisted);
     }
 
+    // Hoisted snippet function declarations go between the imports and the
+    // export-default component function.
+    for snippet in hoisted_snippets {
+        program_body.push(snippet);
+    }
+
     program_body.push(b::export_default(component_fn));
     b::program(program_body)
+}
+
+/// Remove top-level `{#snippet name(...)}{/snippet}` blocks from the fragment
+/// and lower each to a `function name($$renderer, ...params) { ... }`
+/// declaration. Mirrors upstream's snippet hoisting in
+/// `transform-server.js` (handles the `uses_component_bindings` path's
+/// snippet collection).
+fn extract_top_level_snippets(f: &mut svelte_ast::Fragment) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut hoisted: Vec<Value> = Vec::new();
+    let nodes = std::mem::take(&mut f.nodes);
+    for node in nodes {
+        if let FragmentChild::SnippetBlock(blk) = &node {
+            // Snippet bodies always get a leading `<!---->` marker (regardless
+            // of whether the body has dynamic content), so upstream's runtime
+            // can locate the snippet's start in the parent template.
+            let ops = template::lower_fragment_trimmed(&blk.body);
+            let body = template::prepend_marker_and_to_statements(ops);
+            let name = blk
+                .expression
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("$$snippet")
+                .to_string();
+            let params: Vec<Value> = std::iter::once(b::id("$$renderer"))
+                .chain(blk.parameters.iter().cloned())
+                .collect();
+            hoisted.push(b::function_declaration(b::id(&name), params, b::block(body), false));
+        } else {
+            f.nodes.push(node);
+        }
+    }
+    hoisted
 }
 
 /// Whether the component needs a `$$props` parameter. Returns true if the

@@ -635,12 +635,17 @@ fn fragment_has_top_level_await(f: &Fragment) -> bool {
     false
 }
 
-/// Trim leading/trailing whitespace-only Text nodes from a fragment, and
-/// strip leading whitespace from the first remaining text + trailing
-/// whitespace from the last remaining text. Mirrors `clean_nodes` from
-/// upstream `utils.js`.
+/// Trim leading/trailing whitespace-only Text nodes from a fragment, drop
+/// HTML comments (server-side stripped), and strip whitespace adjacent to
+/// dropped comments and edge whitespace from the first/last remaining text.
+/// Mirrors `clean_nodes` from upstream `utils.js`.
 fn trim_fragment_edges(fragment: &Fragment) -> Vec<FragmentChild> {
-    let mut nodes: Vec<FragmentChild> = fragment.nodes.clone();
+    let mut nodes: Vec<FragmentChild> = fragment
+        .nodes
+        .iter()
+        .filter(|n| !matches!(n, FragmentChild::Comment(_)))
+        .cloned()
+        .collect();
     while nodes
         .first()
         .map(|n| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
@@ -655,9 +660,6 @@ fn trim_fragment_edges(fragment: &Fragment) -> Vec<FragmentChild> {
     {
         nodes.pop();
     }
-    // Strip leading whitespace from the first text node (if any), trailing
-    // whitespace from the last text node (if any). This handles e.g.
-    // `\n\tclicks: {count}\n` → `clicks: {count}`.
     if let Some(FragmentChild::Text(t)) = nodes.first_mut() {
         t.data = t.data.trim_start().to_string();
     }
@@ -952,6 +954,30 @@ fn lower_snippet_block(blk: &SnippetBlock, acc: &mut Accumulator) {
         b::block(body),
         false,
     ));
+}
+
+/// Prepend a `<!---->` marker to the first `Push` op (or insert one if none),
+/// then convert to statements. Used for snippet bodies which always require
+/// the marker even when content is purely static.
+pub fn prepend_marker_and_to_statements(mut ops: Vec<TemplateOp>) -> Vec<Value> {
+    let mut prepended = false;
+    for op in ops.iter_mut() {
+        if let TemplateOp::Push(c) = op {
+            if let Some(first) = c.quasis.first_mut() {
+                let mut new_s = String::from("<!---->");
+                new_s.push_str(first);
+                *first = new_s;
+            }
+            prepended = true;
+            break;
+        }
+    }
+    if !prepended {
+        let mut marker = TemplateChunks::new();
+        marker.push_str("<!---->");
+        ops.insert(0, TemplateOp::Push(marker));
+    }
+    ops_to_statements(ops)
 }
 
 /// Convert a `Vec<TemplateOp>` (from `lower_fragment`) into a flat list of
