@@ -191,6 +191,8 @@ pub fn client_component_with_options(
         }
     }
 
+    let delegated_events = collect_delegated_event_names(&fn_body);
+
     // Detect $$props usage in body (via fn_body's identifiers) so we know
     // whether to include the parameter.
     let uses_props = body_uses_identifier(&fn_body, "$$props");
@@ -205,6 +207,7 @@ pub fn client_component_with_options(
         false,
     );
 
+    let _ = delegated_events.clone();
     if options.hmr {
         // HMR wrapper: declare component as `function`, wrap with $.hmr,
         // accept module updates, export at the end.
@@ -271,7 +274,65 @@ pub fn client_component_with_options(
         program_body.push(b::export_default(component_fn));
     }
 
+    if !delegated_events.is_empty() {
+        let mut event_names: Vec<String> = delegated_events.into_iter().collect();
+        event_names.sort();
+        program_body.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("delegate"), false, false),
+            vec![b::array(
+                event_names.iter().map(|s| b::literal_str(s)).collect(),
+            )],
+        )));
+    }
+
     b::program(program_body)
+}
+
+fn collect_delegated_event_names(stmts: &[Value]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
+        match v {
+            Value::Array(arr) => arr.iter().for_each(|x| walk(x, out)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("CallExpression") {
+                    if let Some(callee) = obj.get("callee") {
+                        let is_dot_delegated = callee
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            == Some("MemberExpression")
+                            && callee
+                                .get("object")
+                                .and_then(|o| o.get("name"))
+                                .and_then(|v| v.as_str())
+                                == Some("$")
+                            && callee
+                                .get("property")
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str())
+                                == Some("delegated");
+                        if is_dot_delegated {
+                            if let Some(args) = obj.get("arguments").and_then(|v| v.as_array()) {
+                                if let Some(first) = args.first() {
+                                    if first.get("type").and_then(|v| v.as_str()) == Some("Literal")
+                                    {
+                                        if let Some(name) =
+                                            first.get("value").and_then(|v| v.as_str())
+                                        {
+                                            out.insert(name.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                obj.values().for_each(|x| walk(x, out));
+            }
+            _ => {}
+        }
+    }
+    stmts.iter().for_each(|s| walk(s, &mut out));
+    out
 }
 
 /// Assemble the final Program from program-level statements + function body,
@@ -968,10 +1029,9 @@ fn find_single_text_only_element<'a>(
                         return None;
                     }
                 }
-                // No attributes (for now)
-                if !e.attributes.is_empty() {
-                    return None;
-                }
+                // Attributes are allowed; they get serialized inline or as
+                // runtime $.set_attribute calls. Event handlers become
+                // $.delegated calls.
                 el = Some(e);
             }
             _ => return None,
@@ -987,11 +1047,100 @@ fn build_each_with_element_body(
     el: &svelte_ast::elements::RegularElement,
     params: Vec<Value>,
 ) -> (Vec<Value>, Vec<Value>) {
+    use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
     use svelte_ast::fragment::FragmentChild;
     let mut program_extras: Vec<Value> = Vec::new();
 
+    // Separate attributes: static text-only → embed in HTML; dynamic → assign
+    // at runtime via $.set_attribute; events → $.delegated.
+    let mut static_attrs: Vec<(String, String)> = Vec::new();
+    let mut dyn_attrs: Vec<(String, Value)> = Vec::new();
+    let mut events: Vec<(String, Value)> = Vec::new();
+    for attr in &el.attributes {
+        match attr {
+            ElementAttribute::Attribute(Attribute { name, value, .. }) => {
+                if is_event_attribute(name) {
+                    if let AttributeValue::Single(tag) = value {
+                        events.push((name.clone(), tag.expression.clone()));
+                    }
+                    continue;
+                }
+                match value {
+                    AttributeValue::Empty(true) => {
+                        static_attrs.push((name.clone(), String::new()));
+                    }
+                    AttributeValue::Single(tag) => {
+                        dyn_attrs.push((name.clone(), tag.expression.clone()));
+                    }
+                    AttributeValue::Many(parts) => {
+                        let mut text = String::new();
+                        let mut all_text = true;
+                        for p in parts {
+                            match p {
+                                AttributeValuePart::Text(t) => text.push_str(&t.data),
+                                _ => {
+                                    all_text = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if all_text {
+                            static_attrs.push((name.clone(), text));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Inner element HTML for the template var.
-    let inner_html = format!("<{name}></{name}>", name = el.name);
+    let mut inner_html = format!("<{}", el.name);
+    for (n, v) in &static_attrs {
+        if v.is_empty() {
+            inner_html.push(' ');
+            inner_html.push_str(n);
+        } else {
+            inner_html.push_str(&format!(" {n}=\"{}\"", html_escape_attr(v)));
+        }
+    }
+    inner_html.push('>');
+    // Inner text content (static-only — if there's dynamic content, leave empty).
+    let inner_nodes: Vec<&FragmentChild> = el.fragment.nodes.iter().collect();
+    let last_idx = inner_nodes.len().saturating_sub(1);
+    let mut body_has_expression = false;
+    let mut body_quasis: Vec<String> = vec![String::new()];
+    let mut body_exprs: Vec<Value> = Vec::new();
+    for (i, n) in inner_nodes.iter().enumerate() {
+        match n {
+            FragmentChild::Text(t) => {
+                let mut data = collapse_ws(&t.data);
+                if i == 0 {
+                    data = data.trim_start().to_string();
+                }
+                if i == last_idx {
+                    data = data.trim_end().to_string();
+                }
+                body_quasis.last_mut().unwrap().push_str(&data);
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                body_has_expression = true;
+                if let Some(s) = constant_folded_literal(&tag.expression) {
+                    body_quasis.last_mut().unwrap().push_str(&s);
+                } else {
+                    body_exprs.push(tag.expression.clone());
+                    body_quasis.push(String::new());
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    if !body_has_expression {
+        // Static text — embed directly.
+        inner_html.push_str(&body_quasis[0]);
+    }
+    inner_html.push_str(&format!("</{}>", el.name));
     program_extras.push(b::declaration(
         "var",
         vec![b::declarator(
@@ -1003,8 +1152,7 @@ fn build_each_with_element_body(
         )],
     ));
 
-    // Build body content: var p = root_1(); p.textContent = `template literal`;
-    // $.append($$anchor, p);
+    // Build body content.
     let local_name = el.name.clone();
     let mut body_stmts: Vec<Value> = Vec::new();
     body_stmts.push(b::declaration(
@@ -1015,48 +1163,38 @@ fn build_each_with_element_body(
         )],
     ));
 
-    // Build template literal from inner text/expressions.
-    let mut quasis: Vec<String> = vec![String::new()];
-    let mut expressions: Vec<Value> = Vec::new();
-    let mut is_purely_static = true;
-    let inner_nodes: Vec<&FragmentChild> = el.fragment.nodes.iter().collect();
-    let last = inner_nodes.len().saturating_sub(1);
-    for (i, n) in inner_nodes.iter().enumerate() {
-        match n {
-            FragmentChild::Text(t) => {
-                let mut data = collapse_ws(&t.data);
-                if i == 0 {
-                    data = data.trim_start().to_string();
-                }
-                if i == last {
-                    data = data.trim_end().to_string();
-                }
-                quasis.last_mut().unwrap().push_str(&data);
-            }
-            FragmentChild::ExpressionTag(tag) => {
-                if let Some(s) = constant_folded_literal(&tag.expression) {
-                    quasis.last_mut().unwrap().push_str(&s);
-                } else {
-                    expressions.push(tag.expression.clone());
-                    quasis.push(String::new());
-                    is_purely_static = false;
-                }
-            }
-            _ => unreachable!(),
-        }
+    // Dynamic attributes
+    for (name, expr) in &dyn_attrs {
+        body_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("set_attribute"), false, false),
+            vec![b::id(&local_name), b::literal_str(name), expr.clone()],
+        )));
     }
-    let quasi_refs: Vec<&str> = quasis.iter().map(|s| s.as_str()).collect();
-    let tpl = b::template_literal(quasi_refs, expressions);
-    body_stmts.push(b::stmt(b::assignment(
-        "=",
-        b::member(b::id(&local_name), b::id("textContent"), false, false),
-        tpl,
-    )));
+
+    // Event handlers (delegated)
+    for (name, expr) in &events {
+        let event_name = name.strip_prefix("on").unwrap_or(name);
+        body_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("delegated"), false, false),
+            vec![b::literal_str(event_name), b::id(&local_name), expr.clone()],
+        )));
+    }
+
+    // Dynamic textContent (only when text content had expressions)
+    if body_has_expression {
+        let quasi_refs: Vec<&str> = body_quasis.iter().map(|s| s.as_str()).collect();
+        let tpl = b::template_literal(quasi_refs, body_exprs);
+        body_stmts.push(b::stmt(b::assignment(
+            "=",
+            b::member(b::id(&local_name), b::id("textContent"), false, false),
+            tpl,
+        )));
+    }
+
     body_stmts.push(b::stmt(b::call(
         b::member(b::id("$"), b::id("append"), false, false),
         vec![b::id("$$anchor"), b::id(&local_name)],
     )));
-    let _ = is_purely_static;
 
     // The outer fn-body for the each-block scaffolding.
     let mut out: Vec<Value> = Vec::new();
@@ -1103,6 +1241,26 @@ fn build_if_block_client(blk: &svelte_ast::blocks::IfBlock) -> Vec<Value> {
     // Stub — full if-block client lowering needs `$.if(node, condition,
     // consequent, alternate)` with proper anchor management. Not yet ported.
     Vec::new()
+}
+
+fn is_event_attribute(name: &str) -> bool {
+    if !name.starts_with("on") || name.len() < 3 {
+        return false;
+    }
+    let next = name.as_bytes()[2];
+    !next.is_ascii_uppercase() && next != b'-'
+}
+
+fn html_escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("&quot;"),
+            '&' => out.push_str("&amp;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn collapse_ws(s: &str) -> String {
