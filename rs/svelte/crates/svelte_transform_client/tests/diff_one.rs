@@ -50,3 +50,9 @@ fn diff_purity() {
 fn diff_svelte_element() {
     diff("svelte-element", "Svelte_element");
 }
+
+#[test]
+#[ignore]
+fn diff_function_prop_no_getter() {
+    diff("function-prop-no-getter", "Function_prop_no_getter");
+}

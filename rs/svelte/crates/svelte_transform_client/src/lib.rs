@@ -51,8 +51,23 @@ pub fn client_component_with_options(
     }
     program_body.push(b::import_all("$", "svelte/internal/client"));
 
-    // Hoisted instance imports
-    let rewritten_instance = root.instance.as_ref().map(|i| rewrite::rewrite_program(i.content.clone()));
+    // Hoisted instance imports + state-name collection (for template-side
+    // expression rewriting).
+    let (rewritten_instance, state_names): (Option<Value>, std::collections::HashSet<String>) =
+        match root.instance.as_ref() {
+            Some(i) => {
+                let (prog, names) = rewrite::rewrite_program_with_state(i.content.clone());
+                (Some(prog), names)
+            }
+            None => (None, Default::default()),
+        };
+
+    // Rewrite template-embedded expressions to use $.get/$.set for state.
+    let mut root_owned: Root = root.clone();
+    if !state_names.is_empty() {
+        rewrite_fragment_state_refs(&mut root_owned.fragment, &state_names);
+    }
+    let root = &root_owned;
 
     if let Some(rewritten) = &rewritten_instance {
         let body = rewritten
@@ -680,6 +695,115 @@ fn is_pure_expression(expr: &Value) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Walk a Fragment and apply state-access rewriting to every embedded
+/// expression (ExpressionTag, attribute values, BindDirective expressions,
+/// block tests/iterators, etc.). Mirrors what upstream's walker does as it
+/// transitions from script-scope to template-scope.
+fn rewrite_fragment_state_refs(
+    f: &mut svelte_ast::Fragment,
+    state_names: &std::collections::HashSet<String>,
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    use svelte_ast::fragment::FragmentChild;
+    for node in f.nodes.iter_mut() {
+        match node {
+            FragmentChild::ExpressionTag(t) => {
+                rewrite::rewrite_expression(&mut t.expression, state_names);
+            }
+            FragmentChild::HtmlTag(t) => {
+                rewrite::rewrite_expression(&mut t.expression, state_names);
+            }
+            FragmentChild::ConstTag(t) => {
+                rewrite::rewrite_expression(&mut t.declaration, state_names);
+            }
+            FragmentChild::RenderTag(t) => {
+                rewrite::rewrite_expression(&mut t.expression, state_names);
+            }
+            FragmentChild::IfBlock(b) => {
+                rewrite::rewrite_expression(&mut b.test, state_names);
+                rewrite_fragment_state_refs(&mut b.consequent, state_names);
+                if let Some(alt) = b.alternate.as_mut() {
+                    rewrite_fragment_state_refs(alt, state_names);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                rewrite::rewrite_expression(&mut b.expression, state_names);
+                rewrite_fragment_state_refs(&mut b.body, state_names);
+                if let Some(fb) = b.fallback.as_mut() {
+                    rewrite_fragment_state_refs(fb, state_names);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                rewrite::rewrite_expression(&mut b.expression, state_names);
+                rewrite_fragment_state_refs(&mut b.fragment, state_names);
+            }
+            FragmentChild::AwaitBlock(b) => {
+                rewrite::rewrite_expression(&mut b.expression, state_names);
+                if let Some(f) = b.pending.as_mut() {
+                    rewrite_fragment_state_refs(f, state_names);
+                }
+                if let Some(f) = b.then.as_mut() {
+                    rewrite_fragment_state_refs(f, state_names);
+                }
+                if let Some(f) = b.catch_.as_mut() {
+                    rewrite_fragment_state_refs(f, state_names);
+                }
+            }
+            FragmentChild::SnippetBlock(b) => {
+                rewrite_fragment_state_refs(&mut b.body, state_names);
+            }
+            FragmentChild::RegularElement(el) => {
+                rewrite_attrs_state_refs(&mut el.attributes, state_names);
+                rewrite_fragment_state_refs(&mut el.fragment, state_names);
+            }
+            FragmentChild::Component(c) => {
+                rewrite_attrs_state_refs(&mut c.attributes, state_names);
+                rewrite_fragment_state_refs(&mut c.fragment, state_names);
+            }
+            FragmentChild::SvelteElement(el) => {
+                rewrite::rewrite_expression(&mut el.tag, state_names);
+                rewrite_attrs_state_refs(&mut el.attributes, state_names);
+                rewrite_fragment_state_refs(&mut el.fragment, state_names);
+            }
+            FragmentChild::SvelteHead(el) => rewrite_fragment_state_refs(&mut el.fragment, state_names),
+            FragmentChild::SvelteFragment(el) => rewrite_fragment_state_refs(&mut el.fragment, state_names),
+            FragmentChild::TitleElement(el) => rewrite_fragment_state_refs(&mut el.fragment, state_names),
+            _ => {}
+        }
+    }
+}
+
+fn rewrite_attrs_state_refs(
+    attrs: &mut Vec<svelte_ast::ElementAttribute>,
+    state_names: &std::collections::HashSet<String>,
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for a in attrs.iter_mut() {
+        match a {
+            ElementAttribute::Attribute(attr) => match &mut attr.value {
+                AttributeValue::Single(tag) => {
+                    rewrite::rewrite_expression(&mut tag.expression, state_names);
+                }
+                AttributeValue::Many(parts) => {
+                    for p in parts.iter_mut() {
+                        if let AttributeValuePart::ExpressionTag(t) = p {
+                            rewrite::rewrite_expression(&mut t.expression, state_names);
+                        }
+                    }
+                }
+                AttributeValue::Empty(_) => {}
+            },
+            ElementAttribute::BindDirective(bd) => {
+                rewrite::rewrite_expression(&mut bd.expression, state_names);
+            }
+            ElementAttribute::SpreadAttribute(sa) => {
+                rewrite::rewrite_expression(&mut sa.expression, state_names);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1393,6 +1517,8 @@ fn build_component_call(
     runes_mode: bool,
 ) -> Vec<Value> {
     use svelte_ast::attributes::{Attribute, AttributeValue, ElementAttribute};
+    use svelte_ast::fragment::FragmentChild;
+
     let mut props: Vec<Value> = Vec::new();
     let mut bind_this: Option<&Value> = None;
     for a in &c.attributes {
@@ -1416,10 +1542,30 @@ fn build_component_call(
         props.push(b::init("$$legacy", b::literal_bool(true)));
     }
 
+    // Build children callback when the fragment has non-whitespace content.
+    let body_trimmed = trim_body_edges(&c.fragment.nodes);
+    let has_children = !body_trimmed.is_empty();
+    if has_children {
+        // Build children body. Currently supports text/expression-only.
+        if let Some(children_body) = build_children_body(&body_trimmed) {
+            props.push(b::init(
+                "children",
+                b::arrow(
+                    vec![b::id("$$anchor"), b::id("$$slotProps")],
+                    b::block(children_body),
+                    false,
+                ),
+            ));
+            props.push(b::init(
+                "$$slots",
+                b::object(vec![b::init("default", b::literal_bool(true))]),
+            ));
+        }
+    }
+
     let component_call = b::call(b::id(&c.name), vec![b::id("$$anchor"), b::object(props)]);
 
     if let Some(expr) = bind_this {
-        // $.bind_this(call, ($$value) => target = $$value, () => target)
         let setter = b::arrow(
             vec![b::id("$$value")],
             b::assignment("=", expr.clone(), b::id("$$value")),
@@ -1432,5 +1578,97 @@ fn build_component_call(
         ))];
     }
 
+    let _ = (has_children, FragmentChild::Text);
     vec![b::stmt(component_call)]
+}
+
+/// Build the body of a children-callback for a Component's slot fragment.
+/// Currently supports text/expression-only bodies (the most common case for
+/// simple slot patterns). Returns None for shapes we don't yet handle.
+fn build_children_body(
+    nodes: &[&svelte_ast::fragment::FragmentChild],
+) -> Option<Vec<Value>> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("next"), false, false),
+        vec![],
+    )));
+
+    // Build quasis + expressions for set_text.
+    let mut quasis: Vec<String> = vec![String::new()];
+    let mut expressions: Vec<Value> = Vec::new();
+    let mut has_expr = false;
+    let last = nodes.len().saturating_sub(1);
+    for (i, n) in nodes.iter().enumerate() {
+        match n {
+            FragmentChild::Text(t) => {
+                let mut data = collapse_ws(&t.data);
+                if i == 0 {
+                    data = data.trim_start().to_string();
+                }
+                if i == last {
+                    data = data.trim_end().to_string();
+                }
+                quasis.last_mut().unwrap().push_str(&data);
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                if let Some(s) = constant_folded_literal(&tag.expression) {
+                    quasis.last_mut().unwrap().push_str(&s);
+                } else {
+                    expressions.push(tag.expression.clone());
+                    quasis.push(String::new());
+                    has_expr = true;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("text"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("text"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+
+    if has_expr {
+        // Build `\`${e0 ?? ''}${e1 ?? ''}...\`` template.
+        let mut tpl_quasis: Vec<String> = vec![quasis[0].clone()];
+        let mut tpl_exprs: Vec<Value> = Vec::new();
+        for (i, expr) in expressions.iter().enumerate() {
+            tpl_exprs.push(b::logical("??", expr.clone(), b::literal_str("")));
+            tpl_quasis.push(quasis[i + 1].clone());
+        }
+        let qrefs: Vec<&str> = tpl_quasis.iter().map(|s| s.as_str()).collect();
+        let tpl = b::template_literal(qrefs, tpl_exprs);
+        out.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("template_effect"), false, false),
+            vec![b::arrow(
+                vec![],
+                b::call(
+                    b::member(b::id("$"), b::id("set_text"), false, false),
+                    vec![b::id("text"), tpl],
+                ),
+                false,
+            )],
+        )));
+    } else {
+        let joined: String = quasis.join("");
+        out.push(b::stmt(b::assignment(
+            "=",
+            b::member(b::id("text"), b::id("nodeValue"), false, false),
+            b::literal_str(&joined),
+        )));
+    }
+
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("text")],
+    )));
+    Some(out)
 }

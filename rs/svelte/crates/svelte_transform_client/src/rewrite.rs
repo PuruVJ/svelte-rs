@@ -25,6 +25,28 @@ pub fn rewrite_program(mut program: Value) -> Value {
     program
 }
 
+/// Variant that returns the collected state names alongside the rewritten
+/// program, so callers can apply the same state-access rewrite to template
+/// expressions.
+pub fn rewrite_program_with_state(mut program: Value) -> (Value, std::collections::HashSet<String>) {
+    walk(&mut program);
+    rewrite_props_destructuring(&mut program);
+    let state_names = collect_state_names(&program);
+    if !state_names.is_empty() {
+        rewrite_state_accesses(&mut program, &state_names);
+    }
+    (program, state_names)
+}
+
+/// Apply state-access rewriting to an arbitrary JSON expression value
+/// (e.g. an ExpressionTag's `.expression`). Skips when state names is empty.
+pub fn rewrite_expression(expr: &mut Value, state_names: &std::collections::HashSet<String>) {
+    if state_names.is_empty() {
+        return;
+    }
+    rewrite_state_accesses(expr, state_names);
+}
+
 /// Collect names of variables bound to `$.state(...)` or `$.derived(...)` /
 /// `$.derived(() => ...)`. These need read/write rewriting:
 /// - Read `x` → `$.get(x)`
@@ -119,15 +141,14 @@ fn rewrite_walk(node: &mut Value, names: &std::collections::HashSet<String>, is_
                 .map(|s| s.to_string());
             if let Some(name) = left_name {
                 if names.contains(&name) {
-                    // Recurse into RHS first.
                     if let Some(right) = node.get_mut("right") {
                         rewrite_walk(right, names, false);
                     }
                     let right_val = node.get("right").cloned().unwrap_or(Value::Null);
+                    let needs_proxy_flag = op == "=" && rhs_needs_proxy(&right_val);
                     let new_value = if op == "=" {
                         right_val
                     } else {
-                        // x += v → $.get(x) + v, etc.
                         let bin_op = op.trim_end_matches('=');
                         serde_json::json!({
                             "type": "BinaryExpression",
@@ -136,6 +157,15 @@ fn rewrite_walk(node: &mut Value, names: &std::collections::HashSet<String>, is_
                             "right": right_val
                         })
                     };
+                    let mut args = vec![
+                        serde_json::json!({ "type": "Identifier", "name": name }),
+                        new_value,
+                    ];
+                    if needs_proxy_flag {
+                        args.push(serde_json::json!({
+                            "type": "Literal", "value": true, "raw": "true"
+                        }));
+                    }
                     *node = serde_json::json!({
                         "type": "CallExpression",
                         "callee": {
@@ -145,10 +175,7 @@ fn rewrite_walk(node: &mut Value, names: &std::collections::HashSet<String>, is_
                             "computed": false,
                             "optional": false
                         },
-                        "arguments": [
-                            { "type": "Identifier", "name": name },
-                            new_value
-                        ],
+                        "arguments": args,
                         "optional": false
                     });
                     return;
@@ -257,6 +284,44 @@ fn rewrite_walk(node: &mut Value, names: &std::collections::HashSet<String>, is_
         for v in arr.iter_mut() {
             rewrite_walk(v, names, false);
         }
+    }
+}
+
+/// Decide whether a direct-assignment value needs the `true` 3rd arg to
+/// `$.set` — indicating "treat as a possibly-proxied object". Mirrors
+/// upstream's heuristic: function call result, member access on non-state
+/// identifier, or anything else that isn't a known primitive.
+fn rhs_needs_proxy(v: &Value) -> bool {
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match ty {
+        "Literal" => false,
+        "Identifier" => false,
+        // $.get(x) call — primitive read; no flag.
+        "CallExpression" => {
+            let callee = v.get("callee");
+            let is_dot_get = callee
+                .and_then(|c| c.get("type"))
+                .and_then(|x| x.as_str())
+                == Some("MemberExpression")
+                && callee
+                    .and_then(|c| c.get("object"))
+                    .and_then(|o| o.get("name"))
+                    .and_then(|x| x.as_str())
+                    == Some("$")
+                && callee
+                    .and_then(|c| c.get("property"))
+                    .and_then(|p| p.get("name"))
+                    .and_then(|x| x.as_str())
+                    == Some("get");
+            if is_dot_get {
+                false
+            } else {
+                // Generic call — could return anything; flag.
+                true
+            }
+        }
+        "ArrayExpression" | "ObjectExpression" => true,
+        _ => false,
     }
 }
 
