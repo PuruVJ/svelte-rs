@@ -609,11 +609,15 @@ fn fragment_has_form_control(f: &Fragment) -> bool {
                     return true;
                 }
             }
-            FragmentChild::Component(c) => {
-                if fragment_has_form_control(&c.fragment) {
-                    return true;
-                }
-            }
+            // Components / slots / svelte:* might render a form control —
+            // assume they do (matches upstream's permissive check).
+            FragmentChild::Component(_)
+            | FragmentChild::SvelteComponent(_)
+            | FragmentChild::SvelteSelf(_)
+            | FragmentChild::SvelteElement(_)
+            | FragmentChild::SvelteFragment(_)
+            | FragmentChild::SlotElement(_)
+            | FragmentChild::RenderTag(_) => return true,
             _ => {}
         }
     }
