@@ -159,9 +159,55 @@ fn visit_js_value(v: &serde_json::Value, is_instance: bool, state: &mut Validate
     }
 }
 
+/// Parse `<!-- svelte-ignore W1 W2 ... -->` into a list of warning codes.
+/// Returns empty when the comment isn't an ignore directive. Supports
+/// dash-syntax (`<!-- svelte-ignore-W -->`) for backwards-compat and
+/// stacked ignores in a single comment.
+fn parse_svelte_ignore(comment: &str) -> Vec<String> {
+    let trimmed = comment.trim();
+    let after = if let Some(s) = trimmed.strip_prefix("svelte-ignore") {
+        s
+    } else {
+        return Vec::new();
+    };
+    after
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
+    // Track svelte-ignore codes from sibling Comment nodes — they apply to the
+    // next non-comment, non-whitespace-text node. Text nodes between the
+    // comment and the target element don't clear pending ignores.
+    let mut pending_ignores: Vec<String> = Vec::new();
     for node in &fragment.nodes {
-        visit_node(node, state);
+        match node {
+            FragmentChild::Comment(c) => {
+                pending_ignores.extend(parse_svelte_ignore(&c.data));
+            }
+            FragmentChild::Text(_) => {
+                // Whitespace/text between comment and target — neither emits
+                // warnings nor clears the pending list.
+                visit_node(node, state);
+            }
+            _ => {
+                let prev_warnings_len = state.warnings.len();
+                visit_node(node, state);
+                if !pending_ignores.is_empty() {
+                    let ignored: std::collections::HashSet<&str> =
+                        pending_ignores.iter().map(|s| s.as_str()).collect();
+                    let mut new_warnings: Vec<_> = state.warnings[..prev_warnings_len].to_vec();
+                    for d in &state.warnings[prev_warnings_len..] {
+                        if !ignored.contains(d.code) {
+                            new_warnings.push(d.clone());
+                        }
+                    }
+                    state.warnings = new_warnings;
+                }
+                pending_ignores.clear();
+            }
+        }
     }
 }
 
