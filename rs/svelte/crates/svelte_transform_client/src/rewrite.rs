@@ -18,7 +18,261 @@ use serde_json::Value;
 pub fn rewrite_program(mut program: Value) -> Value {
     walk(&mut program);
     rewrite_props_destructuring(&mut program);
+    let state_names = collect_state_names(&program);
+    if !state_names.is_empty() {
+        rewrite_state_accesses(&mut program, &state_names);
+    }
     program
+}
+
+/// Collect names of variables bound to `$.state(...)` or `$.derived(...)` /
+/// `$.derived(() => ...)`. These need read/write rewriting:
+/// - Read `x` → `$.get(x)`
+/// - Write `x = v` → `$.set(x, v)`
+/// - Compound `x += v` → `$.set(x, $.get(x) + v)`
+fn collect_state_names(program: &Value) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(node: &Value, out: &mut std::collections::HashSet<String>) {
+        match node {
+            Value::Array(arr) => arr.iter().for_each(|v| walk(v, out)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    if let Some(init) = obj.get("init") {
+                        if is_state_or_derived_call(init) {
+                            if let Some(name) = obj
+                                .get("id")
+                                .and_then(|i| i.get("name"))
+                                .and_then(|v| v.as_str())
+                            {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(program, &mut out);
+    out
+}
+
+fn is_state_or_derived_call(v: &Value) -> bool {
+    if v.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let Some(callee) = v.get("callee") else {
+        return false;
+    };
+    if callee.get("type").and_then(|v| v.as_str()) != Some("MemberExpression") {
+        return false;
+    }
+    let obj = callee
+        .get("object")
+        .and_then(|o| o.get("name"))
+        .and_then(|v| v.as_str());
+    let prop = callee
+        .get("property")
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str());
+    obj == Some("$") && matches!(prop, Some("state") | Some("derived"))
+}
+
+/// Walk the program rewriting Identifier reads and assignments to state.
+/// Skips the binding's own declaration site (the `let x = $.state(...)` row).
+fn rewrite_state_accesses(node: &mut Value, names: &std::collections::HashSet<String>) {
+    rewrite_walk(node, names, false);
+}
+
+fn rewrite_walk(node: &mut Value, names: &std::collections::HashSet<String>, is_member_property: bool) {
+    let ty = node
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    match ty.as_str() {
+        "VariableDeclarator" => {
+            // Skip the `id` (it's the declaration itself) but recurse into `init`.
+            if let Some(init) = node.get_mut("init") {
+                rewrite_walk(init, names, false);
+            }
+            return;
+        }
+        "AssignmentExpression" => {
+            let op = node
+                .get("operator")
+                .and_then(|v| v.as_str())
+                .unwrap_or("=")
+                .to_string();
+            let left_name = node
+                .get("left")
+                .and_then(|l| {
+                    if l.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                        l.get("name").and_then(|v| v.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .map(|s| s.to_string());
+            if let Some(name) = left_name {
+                if names.contains(&name) {
+                    // Recurse into RHS first.
+                    if let Some(right) = node.get_mut("right") {
+                        rewrite_walk(right, names, false);
+                    }
+                    let right_val = node.get("right").cloned().unwrap_or(Value::Null);
+                    let new_value = if op == "=" {
+                        right_val
+                    } else {
+                        // x += v → $.get(x) + v, etc.
+                        let bin_op = op.trim_end_matches('=');
+                        serde_json::json!({
+                            "type": "BinaryExpression",
+                            "operator": bin_op,
+                            "left": make_get_call(&name),
+                            "right": right_val
+                        })
+                    };
+                    *node = serde_json::json!({
+                        "type": "CallExpression",
+                        "callee": {
+                            "type": "MemberExpression",
+                            "object": { "type": "Identifier", "name": "$" },
+                            "property": { "type": "Identifier", "name": "set" },
+                            "computed": false,
+                            "optional": false
+                        },
+                        "arguments": [
+                            { "type": "Identifier", "name": name },
+                            new_value
+                        ],
+                        "optional": false
+                    });
+                    return;
+                }
+            }
+            // Other assignments — recurse into children.
+        }
+        "UpdateExpression" => {
+            // x++, ++x, x--, --x. Only for Identifier args.
+            if let Some(arg) = node.get("argument") {
+                if arg.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                    let name = arg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if names.contains(&name) {
+                        let op = node
+                            .get("operator")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("++");
+                        let bin_op = if op == "++" { "+" } else { "-" };
+                        *node = serde_json::json!({
+                            "type": "CallExpression",
+                            "callee": {
+                                "type": "MemberExpression",
+                                "object": { "type": "Identifier", "name": "$" },
+                                "property": { "type": "Identifier", "name": "update" },
+                                "computed": false,
+                                "optional": false
+                            },
+                            "arguments": if bin_op == "-" {
+                                serde_json::json!([
+                                    { "type": "Identifier", "name": name },
+                                    { "type": "Literal", "value": -1, "raw": "-1" }
+                                ])
+                            } else {
+                                serde_json::json!([
+                                    { "type": "Identifier", "name": name }
+                                ])
+                            },
+                            "optional": false
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+        "Identifier" => {
+            if !is_member_property {
+                let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                if names.contains(name) {
+                    *node = make_get_call(name);
+                    return;
+                }
+            }
+            return;
+        }
+        "MemberExpression" => {
+            let computed = node
+                .get("computed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if let Some(obj) = node.get_mut("object") {
+                rewrite_walk(obj, names, false);
+            }
+            if let Some(prop) = node.get_mut("property") {
+                rewrite_walk(prop, names, !computed);
+            }
+            return;
+        }
+        "Property" => {
+            // For shorthand `{ onmouseup }` where onmouseup is just an Identifier,
+            // we should NOT rewrite to `{ onmouseup: $.get(onmouseup) }`.
+            // Only rewrite when the value field is not a shorthand mirror.
+            let shorthand = node
+                .get("shorthand")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if shorthand {
+                // Skip — don't recurse into key or value.
+                return;
+            }
+            let computed = node
+                .get("computed")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if computed {
+                if let Some(k) = node.get_mut("key") {
+                    rewrite_walk(k, names, false);
+                }
+            }
+            if let Some(v) = node.get_mut("value") {
+                rewrite_walk(v, names, false);
+            }
+            return;
+        }
+        _ => {}
+    }
+    // Generic recurse.
+    if let Some(obj) = node.as_object_mut() {
+        for (_, v) in obj.iter_mut() {
+            rewrite_walk(v, names, false);
+        }
+    } else if let Some(arr) = node.as_array_mut() {
+        for v in arr.iter_mut() {
+            rewrite_walk(v, names, false);
+        }
+    }
+}
+
+fn make_get_call(name: &str) -> Value {
+    serde_json::json!({
+        "type": "CallExpression",
+        "callee": {
+            "type": "MemberExpression",
+            "object": { "type": "Identifier", "name": "$" },
+            "property": { "type": "Identifier", "name": "get" },
+            "computed": false,
+            "optional": false
+        },
+        "arguments": [{ "type": "Identifier", "name": name }],
+        "optional": false
+    })
 }
 
 /// `let { a, b = 1, c: alias, ...rest } = $.props()` →
