@@ -143,10 +143,10 @@ impl Accumulator {
     fn maybe_emit_marker(&mut self, next_str_starts_with: Option<&str>) {
         if self.needs_anchor_marker {
             // Suppress the anchor marker when the next content is itself
-            // a block marker (e.g. `<!--]-->`). The block-end marker
-            // already serves as a position anchor.
+            // a block marker (`<!--…-->`) or a closing tag (`</X>`) — those
+            // already serve as position anchors / structural boundaries.
             let suppress = next_str_starts_with
-                .map(|s| s.starts_with("<!--"))
+                .map(|s| s.starts_with("<!--") || s.starts_with("</"))
                 .unwrap_or(false);
             if !suppress {
                 self.current.push_str("<!---->");
@@ -267,6 +267,23 @@ fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
 }
 
 fn lower_regular_element(el: &RegularElement, acc: &mut Accumulator) {
+    // Special server-side lowering for `<option value="X">content</option>`
+    // (inside or outside `<select>`): upstream emits
+    //   $$renderer.option({ value: 'X' }, ($$renderer) => { ...content... });
+    // Mirrors phases/3-transform/server/visitors/RegularElement.js's option path.
+    if el.name == "option" {
+        if let Some(value_attr) = el.attributes.iter().find_map(|a| {
+            if let ElementAttribute::Attribute(Attribute { name, value, .. }) = a {
+                if name == "value" {
+                    return Some(value.clone());
+                }
+            }
+            None
+        }) {
+            lower_option_with_value(el, &value_attr, acc);
+            return;
+        }
+    }
     acc.push_char('<');
     acc.push_str(&el.name);
     for attr in &el.attributes {
@@ -288,6 +305,62 @@ fn lower_regular_element(el: &RegularElement, acc: &mut Accumulator) {
     acc.push_str("</");
     acc.push_str(&el.name);
     acc.push_char('>');
+}
+
+/// Server-side lowering for `<option value="X">content</option>`:
+/// `\$\$renderer.option({ value: 'X' [, OTHER_ATTRS] }, (\$\$renderer) => { ...content... });`
+fn lower_option_with_value(el: &RegularElement, value_attr: &AttributeValue, acc: &mut Accumulator) {
+    // Build the props object. value is required; pass any other static attrs too.
+    let mut props: Vec<Value> = Vec::new();
+    // Convert value_attr to an expression for `value: ...`.
+    let value_expr: Value = match value_attr {
+        AttributeValue::Empty(_) => b::literal_str(""),
+        AttributeValue::Single(t) => t.expression.clone(),
+        AttributeValue::Many(parts) => {
+            // All-text → literal string; else template-literal.
+            let mut text = String::new();
+            let mut all_text = true;
+            for p in parts {
+                match p {
+                    AttributeValuePart::Text(t) => text.push_str(&t.data),
+                    AttributeValuePart::ExpressionTag(_) => {
+                        all_text = false;
+                        break;
+                    }
+                }
+            }
+            if all_text {
+                b::literal_str(&text)
+            } else {
+                let mut quasis: Vec<String> = vec![String::new()];
+                let mut exprs: Vec<Value> = Vec::new();
+                for p in parts {
+                    match p {
+                        AttributeValuePart::Text(t) => quasis.last_mut().unwrap().push_str(&t.data),
+                        AttributeValuePart::ExpressionTag(t) => {
+                            exprs.push(t.expression.clone());
+                            quasis.push(String::new());
+                        }
+                    }
+                }
+                let qrefs: Vec<&str> = quasis.iter().map(|s| s.as_str()).collect();
+                b::template_literal(qrefs, exprs)
+            }
+        }
+    };
+    props.push(b::init("value", value_expr));
+    // Build the inner body callback. Lower the children into ops + statements.
+    let trimmed = trim_fragment_edges(&el.fragment);
+    let body_synthetic_fragment = svelte_ast::Fragment {
+        nodes: trimmed.clone(),
+        ..el.fragment.clone()
+    };
+    let body_stmts = ops_to_statements(lower_fragment(&body_synthetic_fragment));
+    let body_arrow = b::arrow(vec![b::id("$$renderer")], b::block(body_stmts), false);
+    acc.stmt(b::stmt(b::call(
+        b::member(b::id("$$renderer"), b::id("option"), false, false),
+        vec![b::object(props), body_arrow],
+    )));
 }
 
 fn lower_attribute(attr: &ElementAttribute, acc: &mut Accumulator) {

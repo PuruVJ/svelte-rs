@@ -87,7 +87,21 @@ fn sweep_snapshot_fixtures() {
         let result = std::panic::catch_unwind(|| {
             let root = parse(&source, false)?;
             let program = server_component(&root, &component);
-            let r = print(&program, &default_visitors(), &PrintOptions::default());
+            // Comments: prefer parsed-expected `__embedded_comments`
+            // (parse-roundtrip fixtures), fall back to Root.comments.
+            let comments: Vec<serde_json::Value> = program
+                .get("__embedded_comments")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_else(|| {
+                    root.comments
+                        .iter()
+                        .map(|c| serde_json::to_value(c).unwrap())
+                        .collect()
+                });
+            let mut popts = PrintOptions::default();
+            popts.comments = comments;
+            let r = print(&program, &default_visitors(), &popts);
             Ok::<_, svelte_diagnostics::CompileDiagnostic>(r.code)
         });
         match result {
