@@ -75,6 +75,9 @@ pub fn client_component_with_options(
     if !state_names.is_empty() {
         rewrite_fragment_state_refs(&mut root_owned.fragment, &state_names);
     }
+    // Hoist top-level {#snippet name(...)}{/snippet} blocks. Each becomes
+    // `const name = ($$anchor, ...params) => { ... };` in program scope.
+    let hoisted_snippets = extract_top_level_snippets_client(&mut root_owned.fragment);
     let root = &root_owned;
 
     if let Some(rewritten) = &rewritten_instance {
@@ -88,6 +91,12 @@ pub fn client_component_with_options(
                 program_body.push(stmt);
             }
         }
+    }
+
+    // Insert hoisted snippet declarations between imports and the `var root` /
+    // component function.
+    for snip in &hoisted_snippets {
+        program_body.push(snip.clone());
     }
 
     let mut fn_body: Vec<Value> = Vec::new();
@@ -108,8 +117,29 @@ pub fn client_component_with_options(
         }
     }
 
+    // Collect compile-time constant bindings (let X = literal, never-reassigned)
+    // for downstream folding inside templates.
+    let constants: std::collections::HashMap<String, String> = {
+        let body = rewritten_instance
+            .as_ref()
+            .and_then(|p| p.get("body"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut all_reassigned = template_reassignments.clone();
+        all_reassigned.extend(state_names.iter().cloned());
+        collect_constant_bindings(&body, &all_reassigned)
+    };
+
+    // Each hoisted snippet that creates a `var text = ...` bumps the counter
+    // for subsequent text var allocations.
+    let text_var_start: usize = hoisted_snippets
+        .iter()
+        .filter(|s| snippet_declares_text(s))
+        .count();
+
     // Try the multi-root static template pattern (e.g. `<p>...</p> <Component .../>`).
-    if let Some((tpl_html, fn_stmts)) = try_multi_root_static(&root.fragment) {
+    if let Some((tpl_html, fn_stmts)) = try_multi_root_static(&root.fragment, &constants, text_var_start) {
         program_body.push(b::declaration(
             "var",
             vec![b::declarator(
@@ -521,22 +551,59 @@ fn finalize_program(
 /// Returns the template HTML + function body statements.
 fn try_multi_root_static(
     fragment: &svelte_ast::Fragment,
+    constants: &std::collections::HashMap<String, String>,
+    text_var_start: usize,
 ) -> Option<(String, Vec<Value>)> {
     use svelte_ast::fragment::FragmentChild;
     use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 
-    // Collect top-level nodes, filtering out whitespace-only text and HTML
-    // comments.
+    // Collect top-level Element/Component nodes, plus an optional trailing
+    // run of Text + ExpressionTag that forms a "trailing dynamic text" slot.
     let mut roots: Vec<&FragmentChild> = Vec::new();
+    let mut trailing_text_parts: Vec<DynamicPart> = Vec::new();
+    let mut seen_element_or_component = false;
     for n in &fragment.nodes {
         match n {
             FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
             FragmentChild::Comment(_) => continue,
-            FragmentChild::RegularElement(_) | FragmentChild::Component(_) => roots.push(n),
+            FragmentChild::RegularElement(_) | FragmentChild::Component(_) => {
+                if !trailing_text_parts.is_empty() {
+                    // Text/Expression appeared before this element — not the
+                    // simple "trailing text after elements" shape.
+                    return None;
+                }
+                roots.push(n);
+                seen_element_or_component = true;
+            }
+            FragmentChild::Text(t) => {
+                if !seen_element_or_component {
+                    return None;
+                }
+                let collapsed = collapse_ws(&t.data);
+                if !collapsed.is_empty() {
+                    trailing_text_parts.push(DynamicPart::Static(collapsed));
+                }
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                if !seen_element_or_component {
+                    return None;
+                }
+                if let Some(s) = constant_folded_literal_with(&tag.expression, constants) {
+                    trailing_text_parts.push(DynamicPart::Static(s));
+                } else {
+                    trailing_text_parts.push(DynamicPart::Expr(tag.expression.clone()));
+                }
+            }
             _ => return None,
         }
     }
-    if roots.len() < 2 {
+    let has_trailing_text = trailing_text_parts
+        .iter()
+        .any(|p| matches!(p, DynamicPart::Expr(_)));
+    if roots.len() < 2 && !has_trailing_text {
+        return None;
+    }
+    if roots.is_empty() {
         return None;
     }
 
@@ -598,10 +665,13 @@ fn try_multi_root_static(
                     }
                 }
 
-                let mut text = String::new();
-                let mut has_expression = false;
-                let mut runtime_expr: Option<Value> = None;
+                // Two passes: first try to fold to a static string. If any
+                // expression isn't foldable+pure, fall back to Dynamic.
                 let inner = trim_body_edges(&el.fragment.nodes);
+                let mut static_text = String::new();
+                let mut runtime_expr: Option<Value> = None;
+                let mut needs_dynamic = false;
+                let mut has_any_expression = false;
                 for (i, n) in inner.iter().enumerate() {
                     let last = i == inner.len() - 1;
                     match n {
@@ -613,22 +683,65 @@ fn try_multi_root_static(
                             if last {
                                 data = data.trim_end().to_string();
                             }
-                            text.push_str(&data);
+                            static_text.push_str(&data);
                         }
                         FragmentChild::ExpressionTag(tag) => {
-                            has_expression = true;
-                            if let Some(s) = constant_folded_literal(&tag.expression) {
-                                text.push_str(&s);
-                            } else if is_pure_expression(&tag.expression) {
+                            has_any_expression = true;
+                            if let Some(s) =
+                                constant_folded_literal_with(&tag.expression, constants)
+                            {
+                                static_text.push_str(&s);
+                            } else if is_pure_expression(&tag.expression)
+                                && runtime_expr.is_none()
+                                && static_text.is_empty()
+                                && i == inner.len() - 1
+                            {
                                 runtime_expr = Some(tag.expression.clone());
                                 break;
                             } else {
-                                return None;
+                                needs_dynamic = true;
+                                break;
                             }
                         }
                         _ => return None,
                     }
                 }
+
+                // Build the dynamic parts if needed.
+                let dynamic_parts: Option<Vec<DynamicPart>> = if needs_dynamic {
+                    let mut parts: Vec<DynamicPart> = Vec::new();
+                    for (i, n) in inner.iter().enumerate() {
+                        let last = i == inner.len() - 1;
+                        match n {
+                            FragmentChild::Text(t) => {
+                                let mut data = collapse_ws(&t.data);
+                                if i == 0 {
+                                    data = data.trim_start().to_string();
+                                }
+                                if last {
+                                    data = data.trim_end().to_string();
+                                }
+                                if !data.is_empty() {
+                                    parts.push(DynamicPart::Static(data));
+                                }
+                            }
+                            FragmentChild::ExpressionTag(tag) => {
+                                if let Some(s) =
+                                    constant_folded_literal_with(&tag.expression, constants)
+                                {
+                                    parts.push(DynamicPart::Static(s));
+                                } else {
+                                    parts.push(DynamicPart::Expr(tag.expression.clone()));
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    Some(parts)
+                } else {
+                    None
+                };
+
                 html.push('<');
                 html.push_str(&el.name);
                 for (n, v) in &static_attrs {
@@ -648,22 +761,30 @@ fn try_multi_root_static(
                     html.push_str("/>");
                 } else {
                     html.push('>');
-                    if !has_expression {
-                        html.push_str(&text);
+                    if needs_dynamic {
+                        // Element has dynamic content — use a single-space
+                        // placeholder so the runtime $.child() finds a Text
+                        // node it can update.
+                        html.push(' ');
+                    } else if !has_any_expression {
+                        // Pure static text content.
+                        html.push_str(&static_text);
                     }
                     html.push_str(&format!("</{}>", el.name));
                 }
-                let content = if let Some(expr) = runtime_expr {
+                let content = if let Some(parts) = dynamic_parts {
+                    MultiRootContent::Dynamic(parts)
+                } else if let Some(expr) = runtime_expr {
                     MultiRootContent::PureNonReactive(expr)
-                } else if has_expression {
-                    MultiRootContent::ConstFolded(text.clone())
+                } else if has_any_expression {
+                    MultiRootContent::ConstFolded(static_text.clone())
                 } else {
                     MultiRootContent::Static
                 };
                 slots.push(MultiRootSlot::Element {
                     name: el.name.clone(),
                     content,
-                    static_text: text,
+                    static_text,
                     is_input: el.name == "input",
                     dyn_attrs,
                     events,
@@ -676,6 +797,11 @@ fn try_multi_root_static(
             }
             _ => return None,
         }
+    }
+    // Trailing dynamic text — emit single-space placeholder. The template_effect
+    // call is appended after the main per-slot loop.
+    if has_trailing_text {
+        html.push(' ');
     }
 
     // Build function body. var fragment = root(); then traversal + content.
@@ -690,6 +816,9 @@ fn try_multi_root_static(
 
     let mut local_names: Vec<String> = Vec::with_capacity(slots.len());
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Track text_N variable for each Dynamic slot (or None for non-Dynamic).
+    let mut text_vars: Vec<Option<String>> = Vec::with_capacity(slots.len());
+    let mut text_counter: usize = text_var_start;
     for (idx, slot) in slots.iter().enumerate() {
         let base = match slot {
             MultiRootSlot::Element { name, .. } => name.clone(),
@@ -730,6 +859,7 @@ fn try_multi_root_static(
         }
 
         // Apply content for elements with non-static content.
+        let mut this_text_var: Option<String> = None;
         if let MultiRootSlot::Element {
             content, is_input, ..
         } = slot
@@ -749,6 +879,29 @@ fn try_multi_root_static(
                         b::literal_str(text),
                     )));
                 }
+                MultiRootContent::Dynamic(_) => {
+                    let var_name = if text_counter == 0 {
+                        "text".to_string()
+                    } else {
+                        format!("text_{}", text_counter)
+                    };
+                    text_counter += 1;
+                    this_text_var = Some(var_name.clone());
+                    out.push(b::declaration(
+                        "var",
+                        vec![b::declarator(
+                            b::id(&var_name),
+                            Some(b::call(
+                                b::member(b::id("$"), b::id("child"), false, false),
+                                vec![b::id(&local)],
+                            )),
+                        )],
+                    ));
+                    out.push(b::stmt(b::call(
+                        b::member(b::id("$"), b::id("reset"), false, false),
+                        vec![b::id(&local)],
+                    )));
+                }
                 MultiRootContent::Static => {}
             }
             if *is_input {
@@ -758,9 +911,55 @@ fn try_multi_root_static(
                 )));
             }
         }
+        // Component invocations go inline right after their var decl —
+        // matching upstream's ordering.
+        if let MultiRootSlot::Component(c) = slot {
+            out.push(b::stmt(build_multiroot_component_call(c, &local)?));
+        }
+        text_vars.push(this_text_var);
     }
 
-    // After all declarations, emit dynamic attributes, bind_value, delegated.
+    // Trailing dynamic text slot: emit `var text_N = $.sibling(<last_local>);`
+    // and queue its template_effect for post-decl phase.
+    let trailing_text_var: Option<String> = if has_trailing_text {
+        let prev = local_names.last().cloned().unwrap();
+        let var_name = if text_counter == 0 {
+            "text".to_string()
+        } else {
+            format!("text_{}", text_counter)
+        };
+        out.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&var_name),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("sibling"), false, false),
+                    vec![b::id(&prev)],
+                )),
+            )],
+        ));
+        Some(var_name)
+    } else {
+        None
+    };
+
+    // After all declarations, emit template_effect for Dynamic slots,
+    // followed by dynamic attributes, bind_value, delegated.
+    for (idx, slot) in slots.iter().enumerate() {
+        if let MultiRootSlot::Element { content, .. } = slot {
+            if let MultiRootContent::Dynamic(parts) = content {
+                if let Some(text_var) = &text_vars[idx] {
+                    out.push(b::stmt(build_template_effect_dynamic(text_var, parts)));
+                }
+            }
+        }
+    }
+    if let Some(text_var) = &trailing_text_var {
+        out.push(b::stmt(build_template_effect_dynamic(
+            text_var,
+            &trailing_text_parts,
+        )));
+    }
     for (idx, slot) in slots.iter().enumerate() {
         if let MultiRootSlot::Element {
             dyn_attrs,
@@ -797,47 +996,7 @@ fn try_multi_root_static(
         }
     }
 
-    // Now emit Component invocations.
-    for (idx, slot) in slots.iter().enumerate() {
-        if let MultiRootSlot::Component(c) = slot {
-            let local = &local_names[idx];
-            let mut props: Vec<Value> = Vec::new();
-            for a in &c.attributes {
-                match a {
-                    ElementAttribute::Attribute(Attribute { name, value, .. }) => {
-                        let value_expr = match value {
-                            AttributeValue::Empty(_) => b::literal_bool(true),
-                            AttributeValue::Single(tag) => tag.expression.clone(),
-                            AttributeValue::Many(parts) => {
-                                let mut s = String::new();
-                                let mut all_text = true;
-                                for p in parts {
-                                    match p {
-                                        AttributeValuePart::Text(t) => s.push_str(&t.data),
-                                        _ => {
-                                            all_text = false;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if !all_text {
-                                    return None;
-                                }
-                                b::literal_str(&s)
-                            }
-                        };
-                        props.push(b::init(name, value_expr));
-                    }
-                    _ => {}
-                }
-            }
-            out.push(b::stmt(b::call(
-                b::id(&c.name),
-                vec![b::id(local), b::object(props)],
-            )));
-        }
-    }
-
+    // (Component invocations are emitted inline in the per-slot loop above.)
     out.push(b::stmt(b::call(
         b::member(b::id("$"), b::id("append"), false, false),
         vec![b::id("$$anchor"), b::id("fragment")],
@@ -865,6 +1024,18 @@ enum MultiRootContent {
     Static,
     PureNonReactive(Value),
     ConstFolded(String),
+    /// Dynamic content — the element's children mix Text and ExpressionTags
+    /// (or one expression that isn't const-foldable). Emit:
+    ///   `var text_N = $.child(node); $.reset(node);` after the node decl,
+    ///   then `$.template_effect(() => $.set_text(text_N, \`...\`))` after
+    ///   all declarations.
+    Dynamic(Vec<DynamicPart>),
+}
+
+#[derive(Debug)]
+enum DynamicPart {
+    Static(String),
+    Expr(Value),
 }
 
 /// Getter body for `bind:value` — the expression is already state-rewritten
@@ -1124,6 +1295,100 @@ fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Optio
 /// invocation, return it. Used to emit a direct `Foo($$anchor, props)` call
 /// without a template literal.
 /// Walk a list of statements looking for any Identifier reference matching `name`.
+/// True if a hoisted snippet declaration contains a `var text = ...`
+/// declaration (used to bump the trailing-text counter in the main component).
+fn snippet_declares_text(stmt: &Value) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    let id_name = obj
+                        .get("id")
+                        .and_then(|i| i.get("name"))
+                        .and_then(|v| v.as_str());
+                    if id_name == Some("text") {
+                        return true;
+                    }
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(stmt)
+}
+
+/// Extract top-level `{#snippet name(...)}...{/snippet}` blocks from the
+/// fragment in-place. Each becomes
+/// `const name = ($$anchor, ...params) => { ... };` at program scope.
+fn extract_top_level_snippets_client(f: &mut svelte_ast::Fragment) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut hoisted: Vec<Value> = Vec::new();
+    let nodes = std::mem::take(&mut f.nodes);
+    for node in nodes {
+        if let FragmentChild::SnippetBlock(blk) = &node {
+            let name = blk
+                .expression
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("$$snippet")
+                .to_string();
+            let params: Vec<Value> = std::iter::once(b::id("$$anchor"))
+                .chain(blk.parameters.iter().cloned())
+                .collect();
+            let body = build_snippet_body_client(&blk.body);
+            let arrow = b::arrow(params, b::block(body), false);
+            hoisted.push(b::declaration(
+                "const",
+                vec![b::declarator(b::id(&name), Some(arrow))],
+            ));
+        } else {
+            f.nodes.push(node);
+        }
+    }
+    hoisted
+}
+
+/// Build the body of a snippet's arrow function. For a simple static-text-only
+/// snippet the body is:
+///   $.next();
+///   var text = $.text('TEXT');
+///   $.append($$anchor, text);
+fn build_snippet_body_client(body_frag: &svelte_ast::Fragment) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    // Concatenate static text-only children. For now only support the simple
+    // text-only snippet case; everything else is a TODO.
+    let mut text = String::new();
+    for n in &body_frag.nodes {
+        match n {
+            FragmentChild::Text(t) => text.push_str(&t.data),
+            _ => return Vec::new(),
+        }
+    }
+    let text = text.trim().to_string();
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("next"), false, false),
+        vec![],
+    )));
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("text"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("text"), false, false),
+                vec![b::literal_str(&text)],
+            )),
+        )],
+    ));
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("text")],
+    )));
+    out
+}
+
 /// Walk a fragment collecting Identifier names that appear as the LHS of an
 /// AssignmentExpression or the argument of an UpdateExpression anywhere in
 /// the template's embedded expressions. Used to defeat the
@@ -1265,7 +1530,18 @@ fn visit_attribute_exprs(
             }
             AttributeValue::Empty(_) => {}
         },
-        ElementAttribute::BindDirective(bd) => visit(&bd.expression),
+        ElementAttribute::BindDirective(bd) => {
+            // bind:X={target} causes the target to be reassigned from the
+            // outside — synthesize a fake AssignmentExpression for the visitor
+            // so the reassignment-collection picks it up.
+            let synthetic = serde_json::json!({
+                "type": "AssignmentExpression",
+                "operator": "=",
+                "left": bd.expression.clone(),
+                "right": { "type": "Identifier", "name": "$$bind_synthetic" }
+            });
+            visit(&synthetic);
+        }
         ElementAttribute::SpreadAttribute(sa) => visit(&sa.expression),
         ElementAttribute::OnDirective(od) => {
             if let Some(e) = od.expression.as_ref() {
@@ -1933,6 +2209,107 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
+/// Collect identifier → string-literal-value resolutions from a script body.
+/// Only includes `let X = 'literal'` / `let X = number-literal` style bindings
+/// AND post-rewrite never-reassigned-state unwraps where init became a literal.
+/// Names that are reassigned anywhere are excluded.
+fn collect_constant_bindings(
+    body: &[Value],
+    reassigned: &std::collections::HashSet<String>,
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    fn walk(
+        node: &Value,
+        out: &mut std::collections::HashMap<String, String>,
+        reassigned: &std::collections::HashSet<String>,
+    ) {
+        match node {
+            Value::Array(arr) => arr.iter().for_each(|v| walk(v, out, reassigned)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    let name_opt = obj
+                        .get("id")
+                        .and_then(|i| i.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    if let Some(name) = name_opt {
+                        if !reassigned.contains(&name) {
+                            if let Some(init) = obj.get("init") {
+                                if let Some(s) = constant_folded_literal(init) {
+                                    out.insert(name, s);
+                                }
+                            }
+                        }
+                    }
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out, reassigned);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in body {
+        walk(s, &mut out, reassigned);
+    }
+    out
+}
+
+/// Like `constant_folded_literal` but also resolves Identifier references via
+/// a `constants` map.
+fn constant_folded_literal_with(
+    expr: &Value,
+    constants: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let ty = expr.get("type").and_then(|v| v.as_str())?;
+    match ty {
+        "Identifier" => {
+            let name = expr.get("name").and_then(|v| v.as_str())?;
+            constants.get(name).cloned()
+        }
+        "Literal" => constant_folded_literal(expr),
+        "LogicalExpression" => {
+            let op = expr.get("operator").and_then(|v| v.as_str())?;
+            if op != "??" {
+                return None;
+            }
+            let left = expr.get("left")?;
+            let right = expr.get("right")?;
+            let left_ty = left.get("type").and_then(|v| v.as_str())?;
+            if left_ty == "Literal" {
+                let val = left.get("value")?;
+                if val.is_null() {
+                    return constant_folded_literal_with(right, constants);
+                }
+            }
+            if let Some(s) = constant_folded_literal_with(left, constants) {
+                return Some(s);
+            }
+            constant_folded_literal_with(right, constants)
+        }
+        "TemplateLiteral" => {
+            // `tag` or `${expr}` strings.
+            let quasis = expr.get("quasis").and_then(|v| v.as_array())?;
+            let exprs = expr.get("expressions").and_then(|v| v.as_array())?;
+            let mut out = String::new();
+            for (i, q) in quasis.iter().enumerate() {
+                let cooked = q
+                    .get("value")
+                    .and_then(|v| v.get("cooked"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                out.push_str(cooked);
+                if i < exprs.len() {
+                    let part = constant_folded_literal_with(&exprs[i], constants)?;
+                    out.push_str(&part);
+                }
+            }
+            Some(out)
+        }
+        _ => constant_folded_literal(expr),
+    }
+}
+
 fn constant_folded_literal(expr: &Value) -> Option<String> {
     let ty = expr.get("type").and_then(|v| v.as_str())?;
     match ty {
@@ -1945,6 +2322,31 @@ fn constant_folded_literal(expr: &Value) -> Option<String> {
                 Value::Bool(b) => Some(b.to_string()),
                 _ => None,
             }
+        }
+        "LogicalExpression" => {
+            // Nullish coalescing constant folding.
+            //   `null ?? r` → r
+            //   `<non-null literal> ?? r` → lhs
+            //   `lhs ?? rhs` recursively folded.
+            let op = expr.get("operator").and_then(|v| v.as_str())?;
+            if op != "??" {
+                return None;
+            }
+            let left = expr.get("left")?;
+            let right = expr.get("right")?;
+            // Check if left is a null literal.
+            let left_ty = left.get("type").and_then(|v| v.as_str())?;
+            if left_ty == "Literal" {
+                let val = left.get("value")?;
+                if val.is_null() {
+                    return constant_folded_literal(right);
+                }
+            }
+            // Try folding left; if it succeeds (and isn't "null"), use it.
+            if let Some(s) = constant_folded_literal(left) {
+                return Some(s);
+            }
+            constant_folded_literal(right)
         }
         "CallExpression" => {
             // Math.max / Math.min / Math.abs / Math.floor / Math.ceil / Math.round
@@ -2035,6 +2437,139 @@ fn find_single_dynamic_text_element(
         }
     }
     found
+}
+
+/// Build a multi-root Component invocation: `Name(local, { props..., get/set })`.
+fn build_multiroot_component_call(
+    c: &svelte_ast::elements::Component,
+    local: &str,
+) -> Option<Value> {
+    use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut props: Vec<Value> = Vec::new();
+    for a in &c.attributes {
+        match a {
+            ElementAttribute::Attribute(Attribute { name, value, .. }) => {
+                let value_expr = match value {
+                    AttributeValue::Empty(_) => b::literal_bool(true),
+                    AttributeValue::Single(tag) => tag.expression.clone(),
+                    AttributeValue::Many(parts) => {
+                        let mut s = String::new();
+                        let mut all_text = true;
+                        for p in parts {
+                            match p {
+                                AttributeValuePart::Text(t) => s.push_str(&t.data),
+                                _ => {
+                                    all_text = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if !all_text {
+                            return None;
+                        }
+                        b::literal_str(&s)
+                    }
+                };
+                props.push(b::init(name, value_expr));
+            }
+            ElementAttribute::BindDirective(bd) if bd.name != "this" => {
+                let getter = serde_json::json!({
+                    "type": "Property",
+                    "kind": "get",
+                    "key": { "type": "Identifier", "name": bd.name.clone() },
+                    "value": {
+                        "type": "FunctionExpression",
+                        "async": false,
+                        "generator": false,
+                        "id": null,
+                        "params": [],
+                        "body": {
+                            "type": "BlockStatement",
+                            "body": [{
+                                "type": "ReturnStatement",
+                                "argument": bd.expression.clone()
+                            }]
+                        }
+                    },
+                    "computed": false,
+                    "method": false,
+                    "shorthand": false
+                });
+                let setter_call = if let Some(name) = extract_state_name(&bd.expression) {
+                    b::call(
+                        b::member(b::id("$"), b::id("set"), false, false),
+                        vec![b::id(&name), b::id("$$value"), b::literal_bool(true)],
+                    )
+                } else {
+                    b::assignment("=", bd.expression.clone(), b::id("$$value"))
+                };
+                let setter = serde_json::json!({
+                    "type": "Property",
+                    "kind": "set",
+                    "key": { "type": "Identifier", "name": bd.name.clone() },
+                    "value": {
+                        "type": "FunctionExpression",
+                        "async": false,
+                        "generator": false,
+                        "id": null,
+                        "params": [{ "type": "Identifier", "name": "$$value" }],
+                        "body": {
+                            "type": "BlockStatement",
+                            "body": [{
+                                "type": "ExpressionStatement",
+                                "expression": setter_call
+                            }]
+                        }
+                    },
+                    "computed": false,
+                    "method": false,
+                    "shorthand": false
+                });
+                props.push(getter);
+                props.push(setter);
+            }
+            _ => {}
+        }
+    }
+    Some(b::call(b::id(&c.name), vec![b::id(local), b::object(props)]))
+}
+
+/// Build a `$.template_effect(() => $.set_text(text_var, `..${expr ?? ''}..`))` call
+/// from a sequence of `DynamicPart`s (mixing static text and expressions).
+fn build_template_effect_dynamic(text_var: &str, parts: &[DynamicPart]) -> Value {
+    // Merge consecutive static parts and produce the alternating
+    // quasi/expression form for a template literal.
+    let mut quasis: Vec<String> = Vec::new();
+    let mut exprs: Vec<Value> = Vec::new();
+    let mut buf = String::new();
+    for p in parts {
+        match p {
+            DynamicPart::Static(s) => buf.push_str(s),
+            DynamicPart::Expr(e) => {
+                quasis.push(std::mem::take(&mut buf));
+                exprs.push(serde_json::json!({
+                    "type": "LogicalExpression",
+                    "operator": "??",
+                    "left": e.clone(),
+                    "right": { "type": "Literal", "value": "", "raw": "''" }
+                }));
+            }
+        }
+    }
+    quasis.push(buf);
+    let static_parts: Vec<&str> = quasis.iter().map(|s| s.as_str()).collect();
+    let tpl = b::template_literal(static_parts, exprs);
+    b::call(
+        b::member(b::id("$"), b::id("template_effect"), false, false),
+        vec![b::arrow(
+            vec![],
+            b::call(
+                b::member(b::id("$"), b::id("set_text"), false, false),
+                vec![b::id(text_var), tpl],
+            ),
+            false,
+        )],
+    )
 }
 
 /// Build a `$.template_effect(($0,...$N) => $.set_text(<text_var>, \`${$0 ?? ''}...\`), [() => expr0, ...])`

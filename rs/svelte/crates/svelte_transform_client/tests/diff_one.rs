@@ -89,3 +89,15 @@ fn diff_props_identifier() {
 fn diff_nullish() {
     diff("nullish-coallescence-omittance", "Nullish_coallescence_omittance");
 }
+
+#[test]
+#[ignore]
+fn diff_bind_component_snippet() {
+    diff("bind-component-snippet", "Bind_component_snippet");
+}
+
+#[test]
+#[ignore]
+fn diff_await_block_scope() {
+    diff("await-block-scope", "Await_block_scope");
+}
