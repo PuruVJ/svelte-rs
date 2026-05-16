@@ -138,6 +138,9 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
         FragmentChild::DebugTag(t) => visit_debug_tag(t, state),
         FragmentChild::ConstTag(t) => visit_const_tag(t, state),
         FragmentChild::RegularElement(el) => {
+            state
+                .errors
+                .extend(crate::a11y::check_duplicate_attributes(&el.attributes));
             state.warnings.extend(crate::a11y::check_regular_element(el));
             visit_attributes(node, &el.attributes, state);
             visit_fragment(&el.fragment, state);

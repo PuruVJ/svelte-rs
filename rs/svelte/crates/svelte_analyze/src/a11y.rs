@@ -22,6 +22,38 @@ use svelte_ast::elements::RegularElement;
 use svelte_ast::fragment::{Fragment, FragmentChild};
 use svelte_diagnostics::{warnings, CompileDiagnostic};
 
+/// Check for `attribute_duplicate` — two attributes/directives with the same
+/// effective name on the same element. Returns hard errors (not warnings).
+pub fn check_duplicate_attributes(
+    attrs: &[ElementAttribute],
+) -> Vec<CompileDiagnostic> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for a in attrs {
+        let (name, start, end) = match a {
+            ElementAttribute::Attribute(svelte_ast::Attribute {
+                name, start, end, ..
+            }) => (name.clone(), *start, *end),
+            ElementAttribute::ClassDirective(d) => (format!("class:{}", d.name), d.start, d.end),
+            ElementAttribute::StyleDirective(d) => (format!("style:{}", d.name), d.start, d.end),
+            ElementAttribute::BindDirective(d) => (format!("bind:{}", d.name), d.start, d.end),
+            ElementAttribute::OnDirective(d) => (format!("on:{}", d.name), d.start, d.end),
+            ElementAttribute::UseDirective(d) => (format!("use:{}", d.name), d.start, d.end),
+            ElementAttribute::TransitionDirective(d) => {
+                (format!("transition:{}", d.name), d.start, d.end)
+            }
+            _ => continue,
+        };
+        if !seen.insert(name.clone()) {
+            out.push(svelte_diagnostics::errors::attribute_duplicate(Some((
+                start, end,
+            ))));
+        }
+    }
+    out
+}
+
 pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
     let mut diags = Vec::new();
     let attrs: Vec<(&str, &AttributeValue)> = el
