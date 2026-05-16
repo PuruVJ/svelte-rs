@@ -203,7 +203,12 @@ pub fn client_component_with_options(
     }
 
     // Try the multi-root static template pattern (e.g. `<p>...</p> <Component .../>`).
-    if let Some((tpl_html, fn_stmts)) = try_multi_root_static(&root.fragment, &constants, text_var_start) {
+    if let Some((tpl_html, fn_stmts)) = try_multi_root_static(
+        &root.fragment,
+        &constants,
+        text_var_start,
+        &async_var_last_idx,
+    ) {
         program_body.push(b::declaration(
             "var",
             vec![b::declarator(
@@ -678,6 +683,7 @@ fn try_multi_root_static(
     fragment: &svelte_ast::Fragment,
     constants: &std::collections::HashMap<String, String>,
     text_var_start: usize,
+    async_var_last_idx: &std::collections::HashMap<String, usize>,
 ) -> Option<(String, Vec<Value>)> {
     use svelte_ast::fragment::FragmentChild;
     use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
@@ -695,7 +701,8 @@ fn try_multi_root_static(
             FragmentChild::Comment(_) => continue,
             FragmentChild::RegularElement(_)
             | FragmentChild::Component(_)
-            | FragmentChild::AwaitBlock(_) => {
+            | FragmentChild::AwaitBlock(_)
+            | FragmentChild::IfBlock(_) => {
                 if has_real_trailing {
                     // Real trailing content already started — can't go back to
                     // adding a root.
@@ -943,6 +950,10 @@ fn try_multi_root_static(
                 html.push_str("<!>");
                 slots.push(MultiRootSlot::AwaitBlock(b));
             }
+            FragmentChild::IfBlock(b) => {
+                html.push_str("<!>");
+                slots.push(MultiRootSlot::IfBlock(b));
+            }
             _ => return None,
         }
     }
@@ -970,7 +981,9 @@ fn try_multi_root_static(
     for (idx, slot) in slots.iter().enumerate() {
         let base = match slot {
             MultiRootSlot::Element { name, .. } => name.clone(),
-            MultiRootSlot::Component(_) | MultiRootSlot::AwaitBlock(_) => "node".to_string(),
+            MultiRootSlot::Component(_)
+            | MultiRootSlot::AwaitBlock(_)
+            | MultiRootSlot::IfBlock(_) => "node".to_string(),
         };
         let count = counts.entry(base.clone()).or_insert(0);
         let local = if *count == 0 {
@@ -1068,6 +1081,12 @@ fn try_multi_root_static(
         // null, ($$anchor, X) => { ... })` invocation.
         if let MultiRootSlot::AwaitBlock(b) = slot {
             out.push(b::stmt(build_multiroot_await_call(b, &local)));
+        }
+        // {#if ...} blocks: emit `{ var consequent_N = (...) => {...};
+        // $.if(node_N, ($$render) => { if (test) $$render(consequent_N); }); }`.
+        if let MultiRootSlot::IfBlock(b) = slot {
+            let body = build_multiroot_if_block(b, &local, idx, async_var_last_idx);
+            out.push(b::block(body));
         }
         text_vars.push(this_text_var);
     }
@@ -1188,6 +1207,7 @@ enum MultiRootSlot<'a> {
     },
     Component(&'a svelte_ast::elements::Component),
     AwaitBlock(&'a svelte_ast::blocks::AwaitBlock),
+    IfBlock(&'a svelte_ast::blocks::IfBlock),
 }
 
 #[derive(Debug)]
@@ -1552,11 +1572,49 @@ fn body_has_top_level_await(body: &[Value]) -> bool {
     false
 }
 
-/// If `expr` is `\$.derived(() => <body containing top-level await>)` (the
-/// rewritten form of the user's `\$derived(await Y)`), return the *inner
-/// argument* with the outer `await` stripped (e.g. for `await Y` returns
-/// `Y`). Otherwise None.
+/// If `expr` is `\$.derived(() => <body that has any await>)`, return
+/// `(inner_body, body_is_outer_await)` where inner_body is what should go
+/// inside `\$.async_derived(...)`:
+/// - If body is AwaitExpression directly, returns (body.argument, true) so
+///   the outer await is stripped (yes1 case in async-in-derived).
+/// - If body just contains await elsewhere, returns (body, false) so the
+///   inner arrow stays async with body intact (yes2 case in async-in-derived).
 fn derived_with_await_body(expr: &Value) -> Option<Value> {
+    let (inner, _) = derived_with_await_body_info(expr)?;
+    Some(inner)
+}
+
+/// True if `\$.derived(EXPR)` where EXPR is an async ArrowFunctionExpression or
+/// async FunctionExpression — i.e. the user wrote `\$derived.by(async () => ...)`.
+fn init_is_derived_of_async_fn(expr: &Value) -> bool {
+    if expr.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let callee = match expr.get("callee") {
+        Some(c) => c,
+        None => return false,
+    };
+    if callee.get("type").and_then(|v| v.as_str()) != Some("MemberExpression") {
+        return false;
+    }
+    let obj = callee.get("object").and_then(|o| o.get("name")).and_then(|v| v.as_str());
+    let prop = callee.get("property").and_then(|p| p.get("name")).and_then(|v| v.as_str());
+    if obj != Some("$") || prop != Some("derived") {
+        return false;
+    }
+    let args = match expr.get("arguments").and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return false,
+    };
+    let arg = &args[0];
+    let ty = arg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(ty, "ArrowFunctionExpression" | "FunctionExpression") {
+        return false;
+    }
+    arg.get("async").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn derived_with_await_body_info(expr: &Value) -> Option<(Value, bool)> {
     if expr.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
         return None;
     }
@@ -1583,11 +1641,14 @@ fn derived_with_await_body(expr: &Value) -> Option<Value> {
     if arrow.get("type").and_then(|v| v.as_str()) != Some("ArrowFunctionExpression") {
         return None;
     }
-    let body = arrow.get("body")?;
-    if body.get("type").and_then(|v| v.as_str()) != Some("AwaitExpression") {
-        return None;
+    let body = arrow.get("body")?.clone();
+    if body.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
+        return Some((body.get("argument").cloned().unwrap_or(Value::Null), true));
     }
-    body.get("argument").cloned()
+    if expression_uses_await(&body) {
+        return Some((body, false));
+    }
+    None
 }
 
 /// If the fragment's only non-whitespace top-level node is a single
@@ -2397,8 +2458,11 @@ fn transform_async_script(
     enum Kind {
         AsyncDecl(String, Value, Value), // X = await Y (name, init, original id)
         SyncDecl(String, Value, Value),  // X = sync expr (name, init, original id)
-        // X = $.derived(() => await Y) → \`async () => X = await \$.async_derived(() => Y)\`
-        AsyncDerivedDecl(String, Value, Value),
+        // X = $.derived(() => <body with await>) → async wrapping.
+        // bool `inner_async` = true when inner $.async_derived arrow should be
+        // async (body retains internal awaits, e.g. yes2).  false when inner
+        // arrow can be sync because we stripped the outer await (yes1).
+        AsyncDerivedDecl(String, Value, bool, Value),
         Inspect(Vec<String>),            // names read by $.inspect
         Other,
     }
@@ -2426,8 +2490,23 @@ fn transform_async_script(
                             init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression");
                         if is_await {
                             items.push((Kind::AsyncDecl(name, init, id_node), stmt));
-                        } else if let Some(inner) = derived_with_await_body(&init) {
-                            items.push((Kind::AsyncDerivedDecl(name, inner, id_node), stmt));
+                        } else if let Some((inner, body_is_outer_await)) =
+                            derived_with_await_body_info(&init)
+                        {
+                            // body_is_outer_await=true → strip await, inner arrow is sync.
+                            // body_is_outer_await=false → keep body, inner arrow is async.
+                            let inner_async = !body_is_outer_await;
+                            // BUT — if the binding init is `\$.derived(asyncFn)` where the
+                            // arg is already an async arrow / function (from `\$derived.by`),
+                            // there is no `() => body` wrapper; treat as sync.
+                            if init_is_derived_of_async_fn(&init) {
+                                items.push((Kind::SyncDecl(name, init, id_node), stmt));
+                            } else {
+                                items.push((
+                                    Kind::AsyncDerivedDecl(name, inner, inner_async, id_node),
+                                    stmt,
+                                ));
+                            }
                         } else {
                             items.push((Kind::SyncDecl(name, init, id_node), stmt));
                         }
@@ -2462,6 +2541,10 @@ fn transform_async_script(
     let first_async_idx = items.iter().position(|(k, _)| {
         matches!(k, Kind::AsyncDecl(..) | Kind::AsyncDerivedDecl(..))
     });
+    let _ = first_async_idx;
+    let first_async_idx = items.iter().position(|(k, _)| {
+        matches!(k, Kind::AsyncDecl(..) | Kind::AsyncDerivedDecl(..))
+    });
     let boundary = first_async_idx.unwrap_or(items.len());
     let mut post_items: Vec<(Kind, Value)> = Vec::new();
     for (idx, (kind, stmt)) in items.into_iter().enumerate() {
@@ -2484,14 +2567,17 @@ fn transform_async_script(
                 var_last_idx.insert(name.clone(), idx);
                 i += 1;
             }
-            Kind::AsyncDerivedDecl(name, inner_body, id_node) => {
-                // `let X = $.derived(() => await Y)`
-                //   →  `var X;`
-                //       `async () => X = await $.async_derived(() => Y)`
+            Kind::AsyncDerivedDecl(name, inner_body, inner_async, id_node) => {
+                // `let X = $.derived(() => <body>)` where body uses await.
+                //   If body is `await Y` (outer await): inner arrow is sync,
+                //     `async () => X = await \$.async_derived(() => Y)`.
+                //   If body contains await deeper: inner arrow stays async,
+                //     `async () => X = await \$.async_derived(async () => body)`.
                 var_decls.push(b::declarator(id_node.clone(), None));
+                let inner_arrow = b::arrow(vec![], inner_body.clone(), *inner_async);
                 let async_derived_call = b::call(
                     b::member(b::id("$"), b::id("async_derived"), false, false),
-                    vec![b::arrow(vec![], inner_body.clone(), false)],
+                    vec![inner_arrow],
                 );
                 let await_expr = serde_json::json!({
                     "type": "AwaitExpression",
@@ -3017,7 +3103,12 @@ fn body_needs_context(stmts: &[Value]) -> bool {
                             .and_then(|p| p.get("name"))
                             .and_then(|v| v.as_str());
                         if obj_name == Some("$")
-                            && matches!(prop_name, Some("user_effect") | Some("user_pre_effect"))
+                            && matches!(
+                                prop_name,
+                                Some("user_effect")
+                                    | Some("user_pre_effect")
+                                    | Some("async_derived")
+                            )
                         {
                             return true;
                         }
@@ -3915,6 +4006,258 @@ fn count_top_level_elements(fragment: &svelte_ast::Fragment) -> usize {
         }
     }
     count
+}
+
+/// Lower a multi-root `{#if SYNC}` block (no async test) whose body contains
+/// `{@const}` declarations into the nested-block pattern used by async-mode
+/// snapshots (async-in-derived):
+///   { var consequent_N = (\$\$anchor) => { ... }; \$.if(local, (\$\$render) => { if (TEST) \$\$render(consequent_N); }); }
+fn build_multiroot_if_block(
+    blk: &svelte_ast::blocks::IfBlock,
+    local: &str,
+    slot_idx: usize,
+    script_async_vars: &std::collections::HashMap<String, usize>,
+) -> Vec<Value> {
+    let consequent_name = if slot_idx == 0 {
+        "consequent".to_string()
+    } else {
+        format!("consequent_{}", slot_idx)
+    };
+    let promises_name = if slot_idx == 0 {
+        "promises".to_string()
+    } else {
+        format!("promises_{}", slot_idx)
+    };
+
+    let consequent_body =
+        build_async_const_consequent_body(blk, &promises_name, script_async_vars);
+    let consequent_arrow = b::arrow(
+        vec![b::id("$$anchor")],
+        b::block(consequent_body),
+        false,
+    );
+
+    let mut out: Vec<Value> = Vec::new();
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(b::id(&consequent_name), Some(consequent_arrow))],
+    ));
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("if"), false, false),
+        vec![
+            b::id(local),
+            b::arrow(
+                vec![b::id("$$render")],
+                b::block(vec![serde_json::json!({
+                    "type": "IfStatement",
+                    "test": blk.test.clone(),
+                    "consequent": b::stmt(b::call(
+                        b::id("$$render"),
+                        vec![b::id(&consequent_name)]
+                    )),
+                    "alternate": Value::Null
+                })]),
+                false,
+            ),
+        ],
+    )));
+    out
+}
+
+/// Build the consequent body for a `{#if}` block in async mode (async-const,
+/// async-in-derived). Handles `{@const}` decls with @const-only bodies. The
+/// `promises_name` is the local promises var (e.g. "promises", "promises_1").
+fn build_async_const_consequent_body(
+    blk: &svelte_ast::blocks::IfBlock,
+    promises_name: &str,
+    script_async_vars: &std::collections::HashMap<String, usize>,
+) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut const_async_decls: Vec<(String, Value)> = Vec::new();
+    let mut const_sync_decls: Vec<(String, Value)> = Vec::new();
+    let mut async_var_names: std::collections::HashSet<String> = Default::default();
+    let mut script_dep_indices: std::collections::BTreeSet<usize> = Default::default();
+
+    for n in &blk.consequent.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::ConstTag(t) => {
+                if let Some(decls) = t
+                    .declaration
+                    .get("declarations")
+                    .and_then(|v| v.as_array())
+                {
+                    for d in decls {
+                        let name = d
+                            .get("id")
+                            .and_then(|i| i.get("name"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        let init = d.get("init").cloned().unwrap_or(Value::Null);
+                        if let Some(name) = name {
+                            // Detect script-async-var refs in init.
+                            for ref_name in collect_identifier_names(&init) {
+                                if let Some(&idx) = script_async_vars.get(&ref_name) {
+                                    script_dep_indices.insert(idx);
+                                }
+                            }
+                            if expression_uses_await(&init) {
+                                async_var_names.insert(name.clone());
+                                const_async_decls.push((name, init));
+                            } else {
+                                const_sync_decls.push((name, init));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let mut stmts: Vec<Value> = Vec::new();
+    for (name, _) in const_async_decls.iter().chain(const_sync_decls.iter()) {
+        stmts.push(b::declaration(
+            "let",
+            vec![b::declarator(b::id(name), None)],
+        ));
+    }
+
+    let mut run_callbacks: Vec<Value> = Vec::new();
+
+    // Prepend script-promise deps: `() => $$promises[N].promise` for each
+    // unique N from script_dep_indices.
+    for idx in &script_dep_indices {
+        let member = serde_json::json!({
+            "type": "MemberExpression",
+            "object": {
+                "type": "MemberExpression",
+                "object": { "type": "Identifier", "name": "$$promises" },
+                "property": { "type": "Literal", "value": *idx, "raw": idx.to_string() },
+                "computed": true,
+                "optional": false
+            },
+            "property": { "type": "Identifier", "name": "promise" },
+            "computed": false,
+            "optional": false
+        });
+        run_callbacks.push(b::arrow(vec![], member, false));
+    }
+
+    for (name, init) in &const_async_decls {
+        let wrapped = wrap_const_await_init_recursive(init);
+        let assign = b::assignment("=", b::id(name), wrapped);
+        run_callbacks.push(b::arrow(vec![], assign, true));
+    }
+    for (name, init) in &const_sync_decls {
+        let mut rhs = init.clone();
+        for an in &async_var_names {
+            wrap_identifier_with_get(&mut rhs, an);
+        }
+        // Script async-var references are already $.get(name) thanks to the
+        // template state-rewrite pass — don't double-wrap.
+        let derived_call = b::call(
+            b::member(b::id("$"), b::id("derived"), false, false),
+            vec![b::arrow(vec![], rhs, false)],
+        );
+        let assign = b::assignment("=", b::id(name), derived_call);
+        run_callbacks.push(b::arrow(vec![], assign, false));
+    }
+
+    stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id(promises_name),
+            Some(b::call(
+                b::member(b::id("$"), b::id("run"), false, false),
+                vec![b::array(run_callbacks)],
+            )),
+        )],
+    ));
+
+    stmts
+}
+
+/// Wrap an @const init that contains at least one await with the
+/// \$.save/\$.async_derived chain. Two shapes:
+/// - Top-level `await X`: strip outer await, wrap inner as `(await \$.save(X_TRANSFORMED))()`
+///   where X_TRANSFORMED has nested awaits rewritten to `(await \$.save(...))()`.
+/// - Non-await body containing await (e.g. `foo(await 1)`): keep the body
+///   but rewrite nested awaits, then wrap as
+///   `(await \$.save(\$.async_derived(async () => foo((await \$.save(1))()))))()`.
+fn wrap_const_await_init_recursive(expr: &Value) -> Value {
+    let is_top_await = expr.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression");
+    let body_expr = if is_top_await {
+        // Strip the outer await; inner_call becomes `(await $.save(X_TRANSFORMED))()`.
+        let inner_arg = expr.get("argument").cloned().unwrap_or(Value::Null);
+        let inner_arg_t = transform_inner_awaits(&inner_arg);
+        let save = b::call(
+            b::member(b::id("$"), b::id("save"), false, false),
+            vec![inner_arg_t],
+        );
+        let aw = serde_json::json!({
+            "type": "AwaitExpression",
+            "argument": save
+        });
+        b::call(aw, vec![])
+    } else {
+        // Body keeps its shape but inner awaits get rewritten.
+        transform_inner_awaits(expr)
+    };
+    // Inner arrow is async iff body retains any await.
+    let inner_async = expression_uses_await(&body_expr);
+    let async_arrow = b::arrow(vec![], body_expr, inner_async);
+    let async_derived = b::call(
+        b::member(b::id("$"), b::id("async_derived"), false, false),
+        vec![async_arrow],
+    );
+    let outer_save = b::call(
+        b::member(b::id("$"), b::id("save"), false, false),
+        vec![async_derived],
+    );
+    let outer_await = serde_json::json!({
+        "type": "AwaitExpression",
+        "argument": outer_save
+    });
+    b::call(outer_await, vec![])
+}
+
+/// Walk an expression and replace every AwaitExpression with `(await
+/// \$.save(X))()`. Recursive.
+fn transform_inner_awaits(expr: &Value) -> Value {
+    let ty = expr.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if ty == "AwaitExpression" {
+        let inner = expr.get("argument").cloned().unwrap_or(Value::Null);
+        let inner_t = transform_inner_awaits(&inner);
+        let save = b::call(
+            b::member(b::id("$"), b::id("save"), false, false),
+            vec![inner_t],
+        );
+        let aw = serde_json::json!({
+            "type": "AwaitExpression",
+            "argument": save
+        });
+        return b::call(aw, vec![]);
+    }
+    if matches!(
+        ty,
+        "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+    ) {
+        return expr.clone();
+    }
+    if let Some(obj) = expr.as_object() {
+        let mut new_obj = serde_json::Map::new();
+        for (k, v) in obj {
+            new_obj.insert(k.clone(), match v {
+                Value::Array(arr) => Value::Array(arr.iter().map(transform_inner_awaits).collect()),
+                Value::Object(_) => transform_inner_awaits(v),
+                _ => v.clone(),
+            });
+        }
+        return Value::Object(new_obj);
+    }
+    expr.clone()
 }
 
 /// Build `$.await(local, () => promise, pending?, ($$anchor, X) => { ... })`.

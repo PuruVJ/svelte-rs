@@ -162,3 +162,9 @@ fn diff_async_if_chain() {
 fn diff_async_const() {
     diff("async-const", "Async_const");
 }
+
+#[test]
+#[ignore]
+fn diff_async_in_derived() {
+    diff("async-in-derived", "Async_in_derived");
+}
