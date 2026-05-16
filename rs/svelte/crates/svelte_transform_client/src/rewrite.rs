@@ -49,21 +49,34 @@ pub fn rewrite_program_with_state_and_hints(
             reassigned.insert(n.clone());
         }
     }
+    // For each never-reassigned $.state binding, choose between two
+    // optimizations:
+    //   - Primitive literal init → unwrap to bare value (no $.state wrap).
+    //   - Object/Array literal init → wrap as `$.proxy(init)` (deep reactivity
+    //     via proxy, no $.get/$.set on the binding identifier).
+    // Both cases skip $.get/$.set rewriting for the name.
     let mut nonreactive_state: std::collections::HashSet<String> = Default::default();
+    let mut proxy_state: std::collections::HashSet<String> = Default::default();
     for n in &state_names {
         if !reassigned.contains(n) {
-            // Only $.state bindings can be unwrapped (derived must stay).
             if is_state_call_binding(&program, n) {
-                nonreactive_state.insert(n.clone());
+                if state_init_is_object_or_array_literal(&program, n) {
+                    proxy_state.insert(n.clone());
+                } else {
+                    nonreactive_state.insert(n.clone());
+                }
             }
         }
     }
     if !nonreactive_state.is_empty() {
         unwrap_state_initializers(&mut program, &nonreactive_state);
     }
+    if !proxy_state.is_empty() {
+        rewrap_state_as_proxy(&mut program, &proxy_state);
+    }
     let active_state: std::collections::HashSet<String> = state_names
         .iter()
-        .filter(|n| !nonreactive_state.contains(*n))
+        .filter(|n| !nonreactive_state.contains(*n) && !proxy_state.contains(*n))
         .cloned()
         .collect();
     if !active_state.is_empty() {
@@ -176,6 +189,96 @@ fn is_dollar_state_call(v: &Value) -> bool {
         .and_then(|p| p.get("name"))
         .and_then(|v| v.as_str());
     obj == Some("$") && prop == Some("state")
+}
+
+/// True if `name`'s `$.state(init)` init is an ObjectExpression or
+/// ArrayExpression — these need `$.proxy(init)` instead of bare unwrap.
+fn state_init_is_object_or_array_literal(program: &Value, name: &str) -> bool {
+    fn walk(node: &Value, name: &str) -> bool {
+        match node {
+            Value::Array(arr) => arr.iter().any(|v| walk(v, name)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    let bound_name = obj
+                        .get("id")
+                        .and_then(|i| i.get("name"))
+                        .and_then(|v| v.as_str());
+                    if bound_name == Some(name) {
+                        if let Some(init) = obj.get("init") {
+                            if is_dollar_state_call(init) {
+                                let inner = init
+                                    .get("arguments")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|a| a.first());
+                                let ty = inner
+                                    .and_then(|v| v.get("type"))
+                                    .and_then(|v| v.as_str());
+                                return matches!(
+                                    ty,
+                                    Some("ObjectExpression") | Some("ArrayExpression")
+                                );
+                            }
+                        }
+                    }
+                }
+                obj.values().any(|v| walk(v, name))
+            }
+            _ => false,
+        }
+    }
+    walk(program, name)
+}
+
+/// For each `let X = $.state(init)` where X is in `names`, replace `init`
+/// with `$.proxy(init)`. The binding is never reassigned but the inner value
+/// is mutable, so we use $.proxy for transparent deep reactivity.
+fn rewrap_state_as_proxy(program: &mut Value, names: &std::collections::HashSet<String>) {
+    fn walk(node: &mut Value, names: &std::collections::HashSet<String>) {
+        if let Some(obj) = node.as_object_mut() {
+            if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                let bound = obj
+                    .get("id")
+                    .and_then(|i| i.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                if let Some(name) = bound {
+                    if names.contains(&name) {
+                        if let Some(init) = obj.get_mut("init") {
+                            if is_dollar_state_call(init) {
+                                let inner = init
+                                    .get("arguments")
+                                    .and_then(|v| v.as_array())
+                                    .and_then(|a| a.first().cloned())
+                                    .unwrap_or_else(|| {
+                                        serde_json::json!({ "type": "Identifier", "name": "undefined" })
+                                    });
+                                *init = serde_json::json!({
+                                    "type": "CallExpression",
+                                    "callee": {
+                                        "type": "MemberExpression",
+                                        "object": { "type": "Identifier", "name": "$" },
+                                        "property": { "type": "Identifier", "name": "proxy" },
+                                        "computed": false,
+                                        "optional": false
+                                    },
+                                    "arguments": [inner],
+                                    "optional": false
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            for (_, v) in obj.iter_mut() {
+                walk(v, names);
+            }
+        } else if let Some(arr) = node.as_array_mut() {
+            for v in arr {
+                walk(v, names);
+            }
+        }
+    }
+    walk(program, names);
 }
 
 /// For each `let X = $.state(initial)` where X is in `names`, replace `init`

@@ -557,42 +557,61 @@ fn try_multi_root_static(
     use svelte_ast::fragment::FragmentChild;
     use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 
-    // Collect top-level Element/Component nodes, plus an optional trailing
-    // run of Text + ExpressionTag that forms a "trailing dynamic text" slot.
+    // Collect top-level Element/Component nodes, plus optional non-whitespace
+    // Text + ExpressionTag nodes AFTER the last element (the "trailing dynamic
+    // text" slot). Comments and whitespace text BETWEEN roots are separators.
     let mut roots: Vec<&FragmentChild> = Vec::new();
     let mut trailing_text_parts: Vec<DynamicPart> = Vec::new();
+    let mut pending_ws: Vec<DynamicPart> = Vec::new();
     let mut seen_element_or_component = false;
+    let mut has_real_trailing = false;
     for n in &fragment.nodes {
         match n {
-            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
             FragmentChild::Comment(_) => continue,
-            FragmentChild::RegularElement(_) | FragmentChild::Component(_) => {
-                if !trailing_text_parts.is_empty() {
-                    // Text/Expression appeared before this element — not the
-                    // simple "trailing text after elements" shape.
+            FragmentChild::RegularElement(_)
+            | FragmentChild::Component(_)
+            | FragmentChild::AwaitBlock(_) => {
+                if has_real_trailing {
+                    // Real trailing content already started — can't go back to
+                    // adding a root.
                     return None;
                 }
+                pending_ws.clear();
                 roots.push(n);
                 seen_element_or_component = true;
             }
             FragmentChild::Text(t) => {
                 if !seen_element_or_component {
+                    if t.data.trim().is_empty() {
+                        continue;
+                    }
                     return None;
                 }
                 let collapsed = collapse_ws(&t.data);
-                if !collapsed.is_empty() {
+                if collapsed.is_empty() {
+                    continue;
+                }
+                if has_real_trailing {
                     trailing_text_parts.push(DynamicPart::Static(collapsed));
+                } else if collapsed.trim().is_empty() {
+                    pending_ws.push(DynamicPart::Static(collapsed));
+                } else {
+                    trailing_text_parts.extend(pending_ws.drain(..));
+                    trailing_text_parts.push(DynamicPart::Static(collapsed));
+                    has_real_trailing = true;
                 }
             }
             FragmentChild::ExpressionTag(tag) => {
                 if !seen_element_or_component {
                     return None;
                 }
+                trailing_text_parts.extend(pending_ws.drain(..));
                 if let Some(s) = constant_folded_literal_with(&tag.expression, constants) {
                     trailing_text_parts.push(DynamicPart::Static(s));
                 } else {
                     trailing_text_parts.push(DynamicPart::Expr(tag.expression.clone()));
                 }
+                has_real_trailing = true;
             }
             _ => return None,
         }
@@ -795,6 +814,10 @@ fn try_multi_root_static(
                 html.push_str("<!>");
                 slots.push(MultiRootSlot::Component(c));
             }
+            FragmentChild::AwaitBlock(b) => {
+                html.push_str("<!>");
+                slots.push(MultiRootSlot::AwaitBlock(b));
+            }
             _ => return None,
         }
     }
@@ -822,7 +845,7 @@ fn try_multi_root_static(
     for (idx, slot) in slots.iter().enumerate() {
         let base = match slot {
             MultiRootSlot::Element { name, .. } => name.clone(),
-            MultiRootSlot::Component(_) => "node".to_string(),
+            MultiRootSlot::Component(_) | MultiRootSlot::AwaitBlock(_) => "node".to_string(),
         };
         let count = counts.entry(base.clone()).or_insert(0);
         let local = if *count == 0 {
@@ -916,6 +939,11 @@ fn try_multi_root_static(
         if let MultiRootSlot::Component(c) = slot {
             out.push(b::stmt(build_multiroot_component_call(c, &local)?));
         }
+        // {#await ...} blocks: inline `$.await(node, () => $.get(promise),
+        // null, ($$anchor, X) => { ... })` invocation.
+        if let MultiRootSlot::AwaitBlock(b) = slot {
+            out.push(b::stmt(build_multiroot_await_call(b, &local)));
+        }
         text_vars.push(this_text_var);
     }
 
@@ -943,22 +971,39 @@ fn try_multi_root_static(
         None
     };
 
-    // After all declarations, emit template_effect for Dynamic slots,
-    // followed by dynamic attributes, bind_value, delegated.
+    // After all declarations, emit template_effect for Dynamic slots.
+    // When there are multiple text-slot effects, bundle them into one
+    // template_effect with a block body so they share the same reactive scope.
+    let mut all_text_effects: Vec<(String, Vec<DynamicPart>)> = Vec::new();
     for (idx, slot) in slots.iter().enumerate() {
         if let MultiRootSlot::Element { content, .. } = slot {
             if let MultiRootContent::Dynamic(parts) = content {
                 if let Some(text_var) = &text_vars[idx] {
-                    out.push(b::stmt(build_template_effect_dynamic(text_var, parts)));
+                    all_text_effects.push((text_var.clone(), parts.clone()));
                 }
             }
         }
     }
     if let Some(text_var) = &trailing_text_var {
-        out.push(b::stmt(build_template_effect_dynamic(
-            text_var,
-            &trailing_text_parts,
-        )));
+        all_text_effects.push((text_var.clone(), trailing_text_parts.clone()));
+    }
+    match all_text_effects.len() {
+        0 => {}
+        1 => {
+            let (tv, parts) = &all_text_effects[0];
+            out.push(b::stmt(build_template_effect_dynamic(tv, parts)));
+        }
+        _ => {
+            // Bundle multiple set_text calls into one effect block.
+            let mut stmts: Vec<Value> = Vec::new();
+            for (tv, parts) in &all_text_effects {
+                stmts.push(b::stmt(build_set_text_template(tv, parts)));
+            }
+            out.push(b::stmt(b::call(
+                b::member(b::id("$"), b::id("template_effect"), false, false),
+                vec![b::arrow(vec![], b::block(stmts), false)],
+            )));
+        }
     }
     for (idx, slot) in slots.iter().enumerate() {
         if let MultiRootSlot::Element {
@@ -1017,6 +1062,7 @@ enum MultiRootSlot<'a> {
         bind_value: Option<Value>,
     },
     Component(&'a svelte_ast::elements::Component),
+    AwaitBlock(&'a svelte_ast::blocks::AwaitBlock),
 }
 
 #[derive(Debug)]
@@ -1032,7 +1078,7 @@ enum MultiRootContent {
     Dynamic(Vec<DynamicPart>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum DynamicPart {
     Static(String),
     Expr(Value),
@@ -2439,6 +2485,38 @@ fn find_single_dynamic_text_element(
     found
 }
 
+/// Build `$.await(local, () => promise, pending?, ($$anchor, X) => { ... })`.
+/// For now only the simplest form is supported: empty body fragments.
+fn build_multiroot_await_call(b: &svelte_ast::blocks::AwaitBlock, local: &str) -> Value {
+    let promise_thunk = b::arrow(vec![], b.expression.clone(), false);
+    let pending = if let Some(_pending) = b.pending.as_ref() {
+        // TODO: lower pending fragment as a callback.
+        b::literal_null()
+    } else {
+        b::literal_null()
+    };
+    let then_param = b
+        .value
+        .as_ref()
+        .map(|v| {
+            if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                vec![b::id("$$anchor"), b::id(name)]
+            } else {
+                vec![b::id("$$anchor"), v.clone()]
+            }
+        })
+        .unwrap_or_else(|| vec![b::id("$$anchor")]);
+    let then_callback = if b.then.is_some() {
+        b::arrow(then_param, b::block(vec![]), false)
+    } else {
+        b::literal_null()
+    };
+    b::call(
+        b::member(b::id("$"), b::id("await"), false, false),
+        vec![b::id(local), promise_thunk, pending, then_callback],
+    )
+}
+
 /// Build a multi-root Component invocation: `Name(local, { props..., get/set })`.
 fn build_multiroot_component_call(
     c: &svelte_ast::elements::Component,
@@ -2532,6 +2610,35 @@ fn build_multiroot_component_call(
         }
     }
     Some(b::call(b::id(&c.name), vec![b::id(local), b::object(props)]))
+}
+
+/// Build just the `$.set_text(text_var, \`...\`)` call (no template_effect
+/// wrap). Used when bundling multiple set_text calls into one effect.
+fn build_set_text_template(text_var: &str, parts: &[DynamicPart]) -> Value {
+    let mut quasis: Vec<String> = Vec::new();
+    let mut exprs: Vec<Value> = Vec::new();
+    let mut buf = String::new();
+    for p in parts {
+        match p {
+            DynamicPart::Static(s) => buf.push_str(s),
+            DynamicPart::Expr(e) => {
+                quasis.push(std::mem::take(&mut buf));
+                exprs.push(serde_json::json!({
+                    "type": "LogicalExpression",
+                    "operator": "??",
+                    "left": e.clone(),
+                    "right": { "type": "Literal", "value": "", "raw": "''" }
+                }));
+            }
+        }
+    }
+    quasis.push(buf);
+    let static_parts: Vec<&str> = quasis.iter().map(|s| s.as_str()).collect();
+    let tpl = b::template_literal(static_parts, exprs);
+    b::call(
+        b::member(b::id("$"), b::id("set_text"), false, false),
+        vec![b::id(text_var), tpl],
+    )
 }
 
 /// Build a `$.template_effect(() => $.set_text(text_var, `..${expr ?? ''}..`))` call
