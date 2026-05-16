@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::context::Context;
 
 pub fn variable_declaration(node: &Value, ctx: &mut Context) {
+    use crate::comments::flush_comments_until;
     let kind = node.get("kind").and_then(|v| v.as_str()).unwrap_or("var");
     ctx.write(kind, Some(node));
     ctx.write(" ", None);
@@ -13,14 +14,86 @@ pub fn variable_declaration(node: &Value, ctx: &mut Context) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    // Don't use sequence's length-based multi-line wrap — VariableDeclaration
-    // upstream just comma-separates declarators on a single line regardless
-    // of total length. (sequence() would force-break a single long declarator.)
-    for (i, d) in declarations.iter().enumerate() {
-        if i > 0 {
-            ctx.write(", ", None);
+
+    // Detect any comment whose position falls between two declarators (i.e.
+    // before declarator[N].loc.start but after declarator[N-1].loc.end). When
+    // present, switch to a multi-line layout with comments emitted on their
+    // own indented lines.
+    fn loc_start(d: &Value) -> Option<(u32, u32)> {
+        // Prefer declarator's own loc; fall back to its id's loc when missing.
+        let p = d
+            .get("loc")
+            .and_then(|l| l.get("start"))
+            .or_else(|| d.get("id")?.get("loc")?.get("start"))?;
+        Some((
+            p.get("line")?.as_u64()? as u32,
+            p.get("column")?.as_u64()? as u32,
+        ))
+    }
+    fn loc_end(d: &Value) -> Option<(u32, u32)> {
+        let p = d
+            .get("loc")
+            .and_then(|l| l.get("end"))
+            .or_else(|| d.get("id")?.get("loc")?.get("end"))?;
+        Some((
+            p.get("line")?.as_u64()? as u32,
+            p.get("column")?.as_u64()? as u32,
+        ))
+    }
+
+    let has_inter_comment = declarations.len() > 1 && {
+        let state = ctx.comment_state();
+        let s = state.borrow();
+        let comments = &s.comments;
+        let mut found = false;
+        for i in 1..declarations.len() {
+            let after = loc_end(&declarations[i - 1]);
+            let before = loc_start(&declarations[i]);
+            if let (Some(after), Some(before)) = (after, before) {
+                for c in comments {
+                    let cs = c.get("loc").and_then(|l| l.get("start")).and_then(|p| {
+                        Some((
+                            p.get("line")?.as_u64()? as u32,
+                            p.get("column")?.as_u64()? as u32,
+                        ))
+                    });
+                    if let Some(cs) = cs {
+                        if crate::comments::before(after, cs)
+                            && crate::comments::before(cs, before)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
         }
-        ctx.visit(d);
+        found
+    };
+
+    if has_inter_comment {
+        ctx.indent();
+        for (i, d) in declarations.iter().enumerate() {
+            if i > 0 {
+                ctx.write(",", None);
+                ctx.newline();
+            }
+            if let Some(start) = loc_start(d) {
+                flush_comments_until(ctx, None, Some(start), false);
+            }
+            ctx.visit(d);
+        }
+        ctx.dedent();
+    } else {
+        for (i, d) in declarations.iter().enumerate() {
+            if i > 0 {
+                ctx.write(", ", None);
+            }
+            ctx.visit(d);
+        }
     }
     ctx.write(";", None);
 }

@@ -67,8 +67,10 @@ pub fn reset_comment_index(node: &Value, ctx: &Context) {
     let state = ctx.comment_state();
     let mut state = state.borrow_mut();
 
+    // Nodes without `loc` are synthetic (built by transforms, no source
+    // location). Don't advance the cursor for them — leaving the comment
+    // index in place lets subsequent loc-bearing nodes pick up the comments.
     let Some(node_start) = loc(node, "start") else {
-        state.index = state.comments.len();
         return;
     };
 

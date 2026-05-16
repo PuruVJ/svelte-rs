@@ -77,7 +77,14 @@ fn sweep_snapshot_fixtures_client() {
         let result = std::panic::catch_unwind(|| {
             let root = parse(&source, false)?;
             let program = client_component_with_options(&root, &component, &options);
-            let r = print(&program, &default_visitors(), &PrintOptions::default());
+            let comments: Vec<serde_json::Value> = root
+                .comments
+                .iter()
+                .map(|c| serde_json::to_value(c).unwrap())
+                .collect();
+            let mut popts = PrintOptions::default();
+            popts.comments = comments;
+            let r = print(&program, &default_visitors(), &popts);
             Ok::<_, svelte_diagnostics::CompileDiagnostic>(r.code)
         });
         match result {

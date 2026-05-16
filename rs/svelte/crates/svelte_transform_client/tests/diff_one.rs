@@ -26,7 +26,14 @@ fn diff(name: &str, component: &str) {
     }
     let root = parse(&src, false).unwrap();
     let prog = client_component_with_options(&root, component, &options);
-    let r = print(&prog, &default_visitors(), &PrintOptions::default());
+    let comments: Vec<serde_json::Value> = root
+        .comments
+        .iter()
+        .map(|c| serde_json::to_value(c).unwrap())
+        .collect();
+    let mut popts = PrintOptions::default();
+    popts.comments = comments;
+    let r = print(&prog, &default_visitors(), &popts);
     println!("=== EXPECTED ===\n{expected}\n=== GOT ===\n{}", r.code);
     if r.code != expected {
         panic!("diff for {name}");

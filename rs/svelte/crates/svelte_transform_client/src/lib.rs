@@ -2020,9 +2020,9 @@ fn transform_async_script(
     // Consecutive SyncDecl + Inspect statements group into ONE \$.run callback
     // (to preserve sync-tick observable ordering — upstream's rule).
     enum Kind {
-        AsyncDecl(String, Value), // X = await Y
-        SyncDecl(String, Value),  // X = sync expr
-        Inspect(Vec<String>),     // names read by $.inspect
+        AsyncDecl(String, Value, Value), // X = await Y (name, init, original id)
+        SyncDecl(String, Value, Value),  // X = sync expr (name, init, original id)
+        Inspect(Vec<String>),            // names read by $.inspect
         Other,
     }
     let mut items: Vec<(Kind, Value)> = Vec::new();
@@ -2037,19 +2037,20 @@ fn transform_async_script(
                     .unwrap_or_default();
                 if decls.len() == 1 {
                     let d = &decls[0];
-                    let name = d
-                        .get("id")
+                    let id_node = d.get("id").cloned();
+                    let name = id_node
+                        .as_ref()
                         .and_then(|i| i.get("name"))
                         .and_then(|v| v.as_str())
                         .map(String::from);
                     let init = d.get("init").cloned();
-                    if let (Some(name), Some(init)) = (name, init) {
+                    if let (Some(name), Some(init), Some(id_node)) = (name, init, id_node) {
                         let is_await =
                             init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression");
                         if is_await {
-                            items.push((Kind::AsyncDecl(name, init), stmt));
+                            items.push((Kind::AsyncDecl(name, init, id_node), stmt));
                         } else {
-                            items.push((Kind::SyncDecl(name, init), stmt));
+                            items.push((Kind::SyncDecl(name, init, id_node), stmt));
                         }
                         continue;
                     }
@@ -2070,15 +2071,15 @@ fn transform_async_script(
         }
     }
 
-    let mut var_names: Vec<String> = Vec::new();
+    let mut var_decls: Vec<Value> = Vec::new();
     let mut run_callbacks: Vec<Value> = Vec::new();
     let mut other_stmts: Vec<Value> = Vec::new();
     let mut var_last_idx: std::collections::HashMap<String, usize> = Default::default();
     let mut i = 0;
     while i < items.len() {
         match &items[i].0 {
-            Kind::AsyncDecl(name, init) => {
-                var_names.push(name.clone());
+            Kind::AsyncDecl(name, init, id_node) => {
+                var_decls.push(b::declarator(id_node.clone(), None));
                 let assign = b::assignment("=", b::id(name), init.clone());
                 let arrow = b::arrow(vec![], assign, true);
                 let idx = run_callbacks.len();
@@ -2086,14 +2087,14 @@ fn transform_async_script(
                 var_last_idx.insert(name.clone(), idx);
                 i += 1;
             }
-            Kind::SyncDecl(_, _) | Kind::Inspect(_) => {
+            Kind::SyncDecl(_, _, _) | Kind::Inspect(_) => {
                 // Group consecutive SyncDecl / Inspect items into one callback.
                 let mut group_stmts: Vec<Value> = Vec::new();
                 let mut group_names: Vec<String> = Vec::new();
                 while i < items.len() {
                     match &items[i].0 {
-                        Kind::SyncDecl(name, init) => {
-                            var_names.push(name.clone());
+                        Kind::SyncDecl(name, init, id_node) => {
+                            var_decls.push(b::declarator(id_node.clone(), None));
                             group_stmts.push(b::stmt(b::assignment(
                                 "=",
                                 b::id(name),
@@ -2139,12 +2140,8 @@ fn transform_async_script(
     }
 
     let mut combined: Vec<Value> = Vec::new();
-    if !var_names.is_empty() {
-        let declarators: Vec<Value> = var_names
-            .iter()
-            .map(|n| b::declarator(b::id(n), None))
-            .collect();
-        combined.push(b::declaration("var", declarators));
+    if !var_decls.is_empty() {
+        combined.push(b::declaration("var", var_decls));
     }
     if !run_callbacks.is_empty() {
         combined.push(b::declaration(
