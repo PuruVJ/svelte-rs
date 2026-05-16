@@ -331,33 +331,27 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
     diags
 }
 
-/// WAI-ARIA 1.2 role list (subset — the most common roles). Mirrors
-/// upstream's `aria-query`-backed check.
+/// WAI-ARIA 1.2 role list. Sourced from
+/// https://www.w3.org/TR/wai-aria-1.2/#role_definitions (concrete + composite).
 fn is_known_role(role: &str) -> bool {
     matches!(
         role,
-        // Document structure
-        "article" | "banner" | "complementary" | "contentinfo" | "definition"
-        | "directory" | "document" | "feed" | "figure" | "form" | "group"
-        | "heading" | "img" | "list" | "listitem" | "main" | "math" | "navigation"
-        | "none" | "note" | "presentation" | "region" | "row" | "rowgroup"
-        | "rowheader" | "search" | "separator" | "table" | "term" | "toolbar"
-        | "tooltip"
-        // Widget roles
-        | "button" | "checkbox" | "combobox" | "gridcell" | "link" | "menuitem"
-        | "menuitemcheckbox" | "menuitemradio" | "option" | "progressbar"
-        | "radio" | "scrollbar" | "searchbox" | "slider" | "spinbutton"
-        | "switch" | "tab" | "tabpanel" | "textbox" | "treeitem"
-        // Composite widgets
-        | "grid" | "listbox" | "menu" | "menubar" | "radiogroup"
-        | "tablist" | "tree" | "treegrid"
-        // Landmark
-        | "application" | "alert" | "alertdialog" | "dialog" | "log" | "marquee"
-        | "status" | "timer" | "columnheader"
-        // Live regions
-        | "code" | "deletion" | "emphasis" | "insertion" | "paragraph"
-        | "strong" | "subscript" | "superscript" | "time" | "blockquote"
-        | "caption" | "cell" | "generic" | "meter"
+        "alert" | "alertdialog" | "application" | "article" | "banner"
+        | "blockquote" | "button" | "caption" | "cell" | "checkbox"
+        | "code" | "columnheader" | "combobox" | "complementary" | "contentinfo"
+        | "definition" | "deletion" | "dialog" | "directory" | "document"
+        | "emphasis" | "feed" | "figure" | "form" | "generic" | "grid"
+        | "gridcell" | "group" | "heading" | "img" | "insertion" | "link"
+        | "list" | "listbox" | "listitem" | "log" | "main" | "marquee"
+        | "math" | "menu" | "menubar" | "menuitem" | "menuitemcheckbox"
+        | "menuitemradio" | "meter" | "navigation" | "none" | "note"
+        | "option" | "paragraph" | "presentation" | "progressbar" | "radio"
+        | "radiogroup" | "region" | "row" | "rowgroup" | "rowheader"
+        | "scrollbar" | "search" | "searchbox" | "separator" | "slider"
+        | "spinbutton" | "status" | "strong" | "subscript" | "superscript"
+        | "switch" | "tab" | "table" | "tablist" | "tabpanel" | "term"
+        | "textbox" | "time" | "timer" | "toolbar" | "tooltip" | "tree"
+        | "treegrid" | "treeitem"
     )
 }
 
