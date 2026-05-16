@@ -164,15 +164,28 @@ fn lower_child(child: &FragmentChild, acc: &mut Accumulator) {
         FragmentChild::Text(t) => acc.push_str(&collapse_whitespace(&t.data)),
         FragmentChild::RegularElement(el) => lower_regular_element(el, acc),
         FragmentChild::ExpressionTag(tag) => {
-            // Constant folding: literal expressions get inlined as text.
-            //  `{'literal'}`  → text "literal"
-            //  `{null}`       → text "" (renders as empty server-side)
-            //  `{undefined}`  → text ""
-            //  `{42}`         → text "42"
-            //  `{true}`       → text "true"
-            // Mirrors upstream's `ExpressionTag.js` constant-folding path.
             if let Some(s) = as_inlineable_literal(&tag.expression) {
                 acc.push_str(&s);
+            } else if expression_has_await(&tag.expression) {
+                // Async expression tag: emit as
+                // `$$renderer.push(async () => $.escape(await EXPR));`
+                // — matches upstream's async ExpressionTag handling.
+                let escape_call = b::call(
+                    b::member(b::id("$"), b::id("escape"), false, false),
+                    vec![tag.expression.clone()],
+                );
+                let async_arrow = serde_json::json!({
+                    "type": "ArrowFunctionExpression",
+                    "async": true,
+                    "generator": false,
+                    "params": [],
+                    "body": escape_call,
+                    "expression": true
+                });
+                acc.stmt(b::stmt(b::call(
+                    b::member(b::id("$$renderer"), b::id("push"), false, false),
+                    vec![async_arrow],
+                )));
             } else {
                 let escaped = b::call(
                     b::member(b::id("$"), b::id("escape"), false, false),
@@ -475,18 +488,62 @@ fn lower_component(c: &Component, acc: &mut Accumulator) {
 }
 
 fn lower_if_block(blk: &IfBlock, acc: &mut Accumulator) {
-    // Server-side `{#if}` lowering (matches `IfBlock.js`):
-    //   $$renderer.push(`<!--[-->`)
-    //   if (test) { <consequent> } else { <alternate> }
-    //   $$renderer.push(`<!--]-->`)
-    // Each branch is its own nested set of $$renderer.push(...) calls.
+    let test_has_await = expression_has_await(&blk.test);
+    let body_has_await = fragment_has_top_level_await(&blk.consequent)
+        || blk
+            .alternate
+            .as_ref()
+            .map(fragment_has_top_level_await)
+            .unwrap_or(false);
+    let async_mode = test_has_await || body_has_await;
+
+    if async_mode {
+        // Async-mode if-block:
+        //   $$renderer.child_block(async ($$renderer) => {
+        //     if ((await $.save(test))()) {
+        //       $$renderer.push('<!--[0-->');
+        //       ...consequent...
+        //     } else {
+        //       $$renderer.push('<!--[-1-->');
+        //       ...alternate...
+        //     }
+        //   });
+        //   $$renderer.push(`<!--]-->`);
+        let mut test = blk.test.clone();
+        transform_await_to_save_call(&mut test);
+
+        let mut consequent_body = vec![marker_push("<!--[0-->")];
+        consequent_body.extend(ops_to_statements(lower_fragment_trimmed(&blk.consequent)));
+
+        let mut alternate_body = vec![marker_push("<!--[-1-->")];
+        if let Some(alt) = &blk.alternate {
+            alternate_body.extend(ops_to_statements(lower_fragment_trimmed(alt)));
+        }
+
+        let if_stmt = b::if_stmt(test, b::block(consequent_body), Some(b::block(alternate_body)));
+        let child_block = b::call(
+            b::member(b::id("$$renderer"), b::id("child_block"), false, false),
+            vec![serde_json::json!({
+                "type": "ArrowFunctionExpression",
+                "async": true,
+                "generator": false,
+                "params": [b::id("$$renderer")],
+                "body": b::block(vec![if_stmt]),
+                "expression": false
+            })],
+        );
+        acc.stmt(b::stmt(child_block));
+        acc.push_str("<!--]-->");
+        return;
+    }
+
+    // Non-async (synchronous) if-block:
     acc.push_str("<!--[-->");
     let consequent_body = ops_to_statements(lower_fragment_with_marker(&blk.consequent));
     let alternate_body = blk
         .alternate
         .as_ref()
         .map(|f| ops_to_statements(lower_fragment_with_marker(f)));
-
     let if_stmt = b::if_stmt(
         blk.test.clone(),
         b::block(consequent_body),
@@ -494,6 +551,65 @@ fn lower_if_block(blk: &IfBlock, acc: &mut Accumulator) {
     );
     acc.stmt(if_stmt);
     acc.push_str("<!--]-->");
+}
+
+/// Builds a `$$renderer.push('<!--MARKER-->')` statement for use inside async
+/// block bodies. Mirrors upstream's literal-string push at branch entry.
+fn marker_push(s: &str) -> Value {
+    b::stmt(b::call(
+        b::member(b::id("$$renderer"), b::id("push"), false, false),
+        vec![b::literal_str(s)],
+    ))
+}
+
+/// Top-level await detection in a fragment — looks at direct ExpressionTag /
+/// HtmlTag / RenderTag / IfBlock test / EachBlock expression / AwaitBlock
+/// expression. Does NOT recurse into nested function bodies. Used to decide
+/// whether the parent block needs async lowering.
+fn fragment_has_top_level_await(f: &Fragment) -> bool {
+    for n in &f.nodes {
+        match n {
+            FragmentChild::ExpressionTag(t) if expression_has_await(&t.expression) => return true,
+            FragmentChild::HtmlTag(t) if expression_has_await(&t.expression) => return true,
+            FragmentChild::ConstTag(t) if expression_has_await(&t.declaration) => return true,
+            FragmentChild::RenderTag(t) if expression_has_await(&t.expression) => return true,
+            FragmentChild::IfBlock(b) => {
+                if expression_has_await(&b.test)
+                    || fragment_has_top_level_await(&b.consequent)
+                    || b.alternate
+                        .as_ref()
+                        .map(fragment_has_top_level_await)
+                        .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                if expression_has_await(&b.expression)
+                    || fragment_has_top_level_await(&b.body)
+                    || b.fallback
+                        .as_ref()
+                        .map(fragment_has_top_level_await)
+                        .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            FragmentChild::AwaitBlock(_) => return true,
+            FragmentChild::KeyBlock(b) => {
+                if expression_has_await(&b.expression) || fragment_has_top_level_await(&b.fragment) {
+                    return true;
+                }
+            }
+            FragmentChild::RegularElement(el) => {
+                if fragment_has_top_level_await(&el.fragment) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Trim leading/trailing whitespace-only Text nodes from a fragment, and
@@ -529,21 +645,25 @@ fn trim_fragment_edges(fragment: &Fragment) -> Vec<FragmentChild> {
 }
 
 fn lower_each_block(blk: &EachBlock, acc: &mut Accumulator) {
-    // Server `{#each}` lowering (simplified — see `EachBlock.js` for full).
-    //   $$renderer.push(`<!--[-->`)
-    //   const each_array = $.ensure_array_like(expression);
-    //   for (let $$index = 0, $$length = each_array.length; $$index < $$length; $$index++) {
-    //     let CONTEXT = each_array[$$index];
-    //     <body>
-    //   }
-    //   $$renderer.push(`<!--]-->`)
+    // Sync vs async lowering: when the each-expression or body contains
+    // top-level await, the for-loop body goes inside
+    // `$$renderer.child_block(async ($$renderer) => { ... })`.
+    let expr_has_await = expression_has_await(&blk.expression);
+    let body_has_await = fragment_has_top_level_await(&blk.body);
+    let async_mode = expr_has_await || body_has_await;
+
     acc.push_str("<!--[-->");
 
+    let mut expr = blk.expression.clone();
+    if expr_has_await {
+        transform_await_to_save_call(&mut expr);
+        // The save-call form is `(await $.save(EXPR))()` — wrap accordingly.
+    }
     let array_decl = b::const_decl(
         "each_array",
         b::call(
             b::member(b::id("$"), b::id("ensure_array_like"), false, false),
-            vec![blk.expression.clone()],
+            vec![expr],
         ),
     );
 
@@ -597,8 +717,25 @@ fn lower_each_block(blk: &EachBlock, acc: &mut Accumulator) {
         "body": b::block(body_stmts)
     });
 
-    acc.stmt(array_decl);
-    acc.stmt(for_stmt);
+    if async_mode {
+        // Wrap in $$renderer.child_block(async ($$renderer) => { array_decl; for_stmt })
+        let inner = b::block(vec![array_decl, for_stmt]);
+        let child_block = b::call(
+            b::member(b::id("$$renderer"), b::id("child_block"), false, false),
+            vec![serde_json::json!({
+                "type": "ArrowFunctionExpression",
+                "async": true,
+                "generator": false,
+                "params": [b::id("$$renderer")],
+                "body": inner,
+                "expression": false
+            })],
+        );
+        acc.stmt(b::stmt(child_block));
+    } else {
+        acc.stmt(array_decl);
+        acc.stmt(for_stmt);
+    }
     acc.push_str("<!--]-->");
 }
 
@@ -813,6 +950,88 @@ fn as_inlineable_literal(expr: &Value) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Returns true if `expr` contains any AwaitExpression node (recursive search).
+pub fn expression_has_await(expr: &Value) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
+                    return true;
+                }
+                // Don't recurse into arrow/function bodies — internal awaits there
+                // are part of inner async fns and don't make this expr async.
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(
+                    ty,
+                    "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+                ) {
+                    return false;
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(expr)
+}
+
+/// Transform every top-level `await X` in an expression into `(await $.save(X))()`.
+/// Used in async-mode `if test` / `each expr` lowering — the save+call pattern
+/// caches the awaited value so it can be re-read on subsequent renders.
+/// Mirrors upstream's `phases/3-transform/server/visitors/shared/utils.js`
+/// transform pass.
+pub fn transform_await_to_save_call(expr: &mut Value) {
+    fn walk(v: &mut Value) {
+        let ty = v
+            .get("type")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if matches!(
+            ty.as_str(),
+            "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+        ) {
+            return;
+        }
+        if ty == "AwaitExpression" {
+            let arg = v.get("argument").cloned().unwrap_or(Value::Null);
+            // Rewrite: (await $.save(arg))()
+            *v = serde_json::json!({
+                "type": "CallExpression",
+                "callee": {
+                    "type": "AwaitExpression",
+                    "argument": {
+                        "type": "CallExpression",
+                        "callee": {
+                            "type": "MemberExpression",
+                            "object": { "type": "Identifier", "name": "$" },
+                            "property": { "type": "Identifier", "name": "save" },
+                            "computed": false,
+                            "optional": false
+                        },
+                        "arguments": [arg],
+                        "optional": false
+                    }
+                },
+                "arguments": [],
+                "optional": false
+            });
+            return;
+        }
+        if let Some(arr) = v.as_array_mut() {
+            for x in arr {
+                walk(x);
+            }
+        } else if let Some(obj) = v.as_object_mut() {
+            for (_, x) in obj.iter_mut() {
+                walk(x);
+            }
+        }
+    }
+    walk(expr);
 }
 
 /// `{@render snippet(args)}` — prepend `$$renderer` to the call's argument

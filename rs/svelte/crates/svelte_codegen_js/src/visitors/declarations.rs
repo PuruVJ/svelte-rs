@@ -13,7 +13,15 @@ pub fn variable_declaration(node: &Value, ctx: &mut Context) {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    crate::visitors::programs::sequence(ctx, &declarations, false);
+    // Don't use sequence's length-based multi-line wrap — VariableDeclaration
+    // upstream just comma-separates declarators on a single line regardless
+    // of total length. (sequence() would force-break a single long declarator.)
+    for (i, d) in declarations.iter().enumerate() {
+        if i > 0 {
+            ctx.write(", ", None);
+        }
+        ctx.visit(d);
+    }
     ctx.write(";", None);
 }
 
