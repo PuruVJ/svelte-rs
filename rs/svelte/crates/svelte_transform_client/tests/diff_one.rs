@@ -21,6 +21,9 @@ fn diff(name: &str, component: &str) {
     if config.contains("fragments: 'tree'") || config.contains("fragments:'tree'") {
         options.fragments = FragmentsMode::Tree;
     }
+    if config.contains("async: true") || config.contains("async:true") {
+        options.experimental_async = true;
+    }
     let root = parse(&src, false).unwrap();
     let prog = client_component_with_options(&root, component, &options);
     let r = print(&prog, &default_visitors(), &PrintOptions::default());
@@ -109,4 +112,13 @@ fn diff_await_block_scope() {
 #[ignore]
 fn diff_functional_templating() {
     diff("functional-templating", "Functional_templating");
+}
+
+#[test]
+#[ignore]
+fn diff_async_top_level_inspect_server() {
+    diff(
+        "async-top-level-inspect-server",
+        "Async_top_level_inspect_server",
+    );
 }

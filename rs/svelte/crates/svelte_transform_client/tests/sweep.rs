@@ -32,6 +32,9 @@ fn parse_config(config: &str) -> ClientOptions {
     if config.contains("fragments: 'tree'") || config.contains("fragments:'tree'") {
         opts.fragments = FragmentsMode::Tree;
     }
+    if config.contains("async: true") || config.contains("async:true") {
+        opts.experimental_async = true;
+    }
     opts
 }
 

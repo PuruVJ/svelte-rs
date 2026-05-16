@@ -31,6 +31,10 @@ pub struct ClientOptions {
     /// When set to `Tree`, multi-root templates emit `\$.from_tree(...)` with
     /// an array-of-arrays structure instead of `\$.from_html(\`...\`)`.
     pub fragments: FragmentsMode,
+    /// `experimental.async` — enables the async pipeline (`\$.run`,
+    /// `\$.async`, `\$.async_derived`, `\$.save`, deps-aware
+    /// `\$.template_effect`). Imports `svelte/internal/flags/async`.
+    pub experimental_async: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,7 +60,9 @@ pub fn client_component_with_options(
 
     let mut program_body: Vec<Value> = Vec::new();
     program_body.push(import_side_effect("svelte/internal/disclose-version"));
-    if !runes_mode {
+    if options.experimental_async {
+        program_body.push(import_side_effect("svelte/internal/flags/async"));
+    } else if !runes_mode {
         program_body.push(import_side_effect("svelte/internal/flags/legacy"));
     }
     program_body.push(b::import_all("$", "svelte/internal/client"));
@@ -111,6 +117,10 @@ pub fn client_component_with_options(
 
     let mut fn_body: Vec<Value> = Vec::new();
 
+    // Async transform produces a mapping of var-name → last $$promises index
+    // that touched it (for template_effect deps).
+    let mut async_var_last_idx: std::collections::HashMap<String, usize> = Default::default();
+
     // Instance-script non-import statements appear inside the component fn.
     if let Some(rewritten) = &rewritten_instance {
         let body = rewritten
@@ -118,12 +128,22 @@ pub fn client_component_with_options(
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        for stmt in body {
-            let ty = stmt.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            if matches!(ty, "ImportDeclaration") {
-                continue;
+        let non_imports: Vec<Value> = body
+            .into_iter()
+            .filter(|stmt| {
+                stmt.get("type").and_then(|v| v.as_str()) != Some("ImportDeclaration")
+            })
+            .collect();
+        if options.experimental_async {
+            let (transformed, last_idx) = transform_async_script(non_imports);
+            async_var_last_idx = last_idx;
+            for stmt in transformed {
+                fn_body.push(stmt);
             }
-            fn_body.push(stmt);
+        } else {
+            for stmt in non_imports {
+                fn_body.push(stmt);
+            }
         }
     }
 
@@ -238,13 +258,18 @@ pub fn client_component_with_options(
                     })
                     .collect();
                 if !exprs.is_empty() {
+                    let child_args = if options.experimental_async {
+                        vec![b::id(&top_name), b::literal_bool(true)]
+                    } else {
+                        vec![b::id(&top_name)]
+                    };
                     fn_body.push(b::declaration(
                         "var",
                         vec![b::declarator(
                             b::id("text"),
                             Some(b::call(
                                 b::member(b::id("$"), b::id("child"), false, false),
-                                vec![b::id(&top_name)],
+                                child_args,
                             )),
                         )],
                     ));
@@ -252,9 +277,17 @@ pub fn client_component_with_options(
                         b::member(b::id("$"), b::id("reset"), false, false),
                         vec![b::id(&top_name)],
                     )));
-                    fn_body.push(b::stmt(build_template_effect_set_text(
-                        "text", &exprs,
-                    )));
+                    if options.experimental_async {
+                        fn_body.push(b::stmt(build_template_effect_set_text_async(
+                            "text",
+                            &exprs,
+                            &async_var_last_idx,
+                        )));
+                    } else {
+                        fn_body.push(b::stmt(build_template_effect_set_text(
+                            "text", &exprs,
+                        )));
+                    }
                 }
             }
             fn_body.push(b::stmt(b::call(
@@ -1385,6 +1418,158 @@ fn guess_single_root_var(nodes: &[svelte_ast::fragment::FragmentChild]) -> Optio
 /// invocation, return it. Used to emit a direct `Foo($$anchor, props)` call
 /// without a template literal.
 /// Walk a list of statements looking for any Identifier reference matching `name`.
+/// Transform the script body for `experimental.async` mode. Pulls top-level
+/// `let X = await Y;` and `\$.inspect(...)` statements into a `\$.run([...])`
+/// invocation. Returns `(transformed_body, var_last_idx)` where
+/// `var_last_idx[name]` is the last index in $$promises that touched `name`.
+fn transform_async_script(
+    body: Vec<Value>,
+) -> (Vec<Value>, std::collections::HashMap<String, usize>) {
+    let mut var_decls: Vec<Value> = Vec::new();
+    let mut run_callbacks: Vec<Value> = Vec::new();
+    let mut other_stmts: Vec<Value> = Vec::new();
+    let mut var_last_idx: std::collections::HashMap<String, usize> = Default::default();
+
+    for stmt in body {
+        let ty = stmt.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if ty == "VariableDeclaration" {
+            let decls = stmt
+                .get("declarations")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if decls.len() == 1 {
+                let d = &decls[0];
+                let name_opt = d
+                    .get("id")
+                    .and_then(|i| i.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                if let (Some(name), Some(init)) = (name_opt, d.get("init")) {
+                    if init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
+                        // `var X;`
+                        var_decls.push(b::declaration(
+                            "var",
+                            vec![b::declarator(b::id(&name), None)],
+                        ));
+                        let assign = b::assignment("=", b::id(&name), init.clone());
+                        let arrow = b::arrow(vec![], assign, true);
+                        let idx = run_callbacks.len();
+                        run_callbacks.push(arrow);
+                        var_last_idx.insert(name, idx);
+                        continue;
+                    }
+                }
+            }
+            other_stmts.push(stmt);
+        } else if ty == "ExpressionStatement" {
+            if let Some(e) = stmt.get("expression") {
+                if is_dollar_inspect_call(e) {
+                    // $.inspect(X) → `() => void 0` (production no-op). Update
+                    // var_last_idx for each identifier read by the call args,
+                    // so template_effect deps point at this callback (since
+                    // the template render must wait for the inspect to run).
+                    let arg_names = collect_identifier_names(e);
+                    let void_expr = serde_json::json!({
+                        "type": "UnaryExpression",
+                        "operator": "void",
+                        "prefix": true,
+                        "argument": { "type": "Literal", "value": 0, "raw": "0" }
+                    });
+                    let idx = run_callbacks.len();
+                    run_callbacks.push(b::arrow(vec![], void_expr, false));
+                    for n in arg_names {
+                        var_last_idx.insert(n, idx);
+                    }
+                    continue;
+                }
+            }
+            other_stmts.push(stmt);
+        } else {
+            other_stmts.push(stmt);
+        }
+    }
+
+    let mut combined: Vec<Value> = Vec::new();
+    combined.extend(var_decls);
+    if !run_callbacks.is_empty() {
+        combined.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id("$$promises"),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("run"), false, false),
+                    vec![b::array(run_callbacks)],
+                )),
+            )],
+        ));
+    }
+    combined.extend(other_stmts);
+    (combined, var_last_idx)
+}
+
+/// True if `v` is a `\$.inspect(...)` call.
+fn is_dollar_inspect_call(v: &Value) -> bool {
+    if v.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let Some(callee) = v.get("callee") else {
+        return false;
+    };
+    if callee.get("type").and_then(|v| v.as_str()) != Some("MemberExpression") {
+        return false;
+    }
+    let obj = callee
+        .get("object")
+        .and_then(|o| o.get("name"))
+        .and_then(|v| v.as_str());
+    let prop = callee
+        .get("property")
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str());
+    obj == Some("$") && prop == Some("inspect")
+}
+
+/// Walk a node collecting top-level Identifier names referenced (excludes
+/// member-expression properties).
+fn collect_identifier_names(node: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    fn walk(v: &Value, out: &mut Vec<String>, is_member_property: bool) {
+        match v {
+            Value::Array(arr) => arr.iter().for_each(|x| walk(x, out, false)),
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                if ty == "Identifier" && !is_member_property {
+                    if let Some(n) = obj.get("name").and_then(|x| x.as_str()) {
+                        if !out.contains(&n.to_string()) {
+                            out.push(n.to_string());
+                        }
+                    }
+                }
+                if ty == "MemberExpression" {
+                    if let Some(o) = obj.get("object") {
+                        walk(o, out, false);
+                    }
+                    let computed = obj
+                        .get("computed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if let Some(p) = obj.get("property") {
+                        walk(p, out, !computed);
+                    }
+                    return;
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out, false);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(node, &mut out, false);
+    out
+}
+
 /// True if a hoisted snippet declaration contains a `var text = ...`
 /// declaration (used to bump the trailing-text counter in the main component).
 fn snippet_declares_text(stmt: &Value) -> bool {
@@ -1763,13 +1948,7 @@ fn body_needs_context(stmts: &[Value]) -> bool {
                             .and_then(|p| p.get("name"))
                             .and_then(|v| v.as_str());
                         if obj_name == Some("$")
-                            && matches!(
-                                prop_name,
-                                Some("user_effect")
-                                    | Some("user_pre_effect")
-                                    | Some("inspect")
-                                    | Some("run")
-                            )
+                            && matches!(prop_name, Some("user_effect") | Some("user_pre_effect"))
                         {
                             return true;
                         }
@@ -2794,6 +2973,62 @@ fn build_multiroot_component_call(
         }
     }
     Some(b::call(b::id(&c.name), vec![b::id(local), b::object(props)]))
+}
+
+/// Async-mode variant of `build_template_effect_set_text`. Produces:
+///   \$.template_effect(\$0 => \$.set_text(text_var, \$0), void 0, void 0, [\$\$promises[N]])
+/// for a single non-foldable expression, where N is the last \$\$promises
+/// index that touched any var referenced by the expression.
+fn build_template_effect_set_text_async(
+    text_var: &str,
+    exprs: &[Value],
+    var_last_idx: &std::collections::HashMap<String, usize>,
+) -> Value {
+    // Pick out the LAST $$promises index referenced by any of the expressions.
+    let mut max_idx: Option<usize> = None;
+    for e in exprs {
+        for n in collect_identifier_names(e) {
+            if let Some(&i) = var_last_idx.get(&n) {
+                max_idx = Some(max_idx.map_or(i, |m| m.max(i)));
+            }
+        }
+    }
+
+    // For a single-expression, emit `$.set_text(text, expr)` — no template
+    // literal wrap, no nullish coalesce.
+    if exprs.len() == 1 {
+        let arrow = b::arrow(
+            vec![],
+            b::call(
+                b::member(b::id("$"), b::id("set_text"), false, false),
+                vec![b::id(text_var), exprs[0].clone()],
+            ),
+            false,
+        );
+        let void0 = serde_json::json!({
+            "type": "UnaryExpression",
+            "operator": "void",
+            "prefix": true,
+            "argument": { "type": "Literal", "value": 0, "raw": "0" }
+        });
+        let deps = if let Some(idx) = max_idx {
+            b::array(vec![serde_json::json!({
+                "type": "MemberExpression",
+                "object": { "type": "Identifier", "name": "$$promises" },
+                "property": { "type": "Literal", "value": idx, "raw": idx.to_string() },
+                "computed": true,
+                "optional": false
+            })])
+        } else {
+            b::array(vec![])
+        };
+        return b::call(
+            b::member(b::id("$"), b::id("template_effect"), false, false),
+            vec![arrow, void0.clone(), void0, deps],
+        );
+    }
+    // Multi-expression async — fall back to the sync builder (rare case).
+    build_template_effect_set_text(text_var, exprs)
 }
 
 /// Build just the `$.set_text(text_var, \`...\`)` call (no template_effect
