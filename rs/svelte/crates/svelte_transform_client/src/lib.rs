@@ -360,6 +360,14 @@ pub fn client_component_with_options(
                 for stmt in build_async_if_block_client(blk) {
                     fn_body.push(stmt);
                 }
+            } else if options.experimental_async && if_body_has_const_with_await(blk) {
+                let (extras, stmts) = build_async_const_if_block_client(blk);
+                for s in extras {
+                    program_body.push(s);
+                }
+                for stmt in stmts {
+                    fn_body.push(stmt);
+                }
             } else {
                 for stmt in build_if_block_client(blk) {
                     fn_body.push(stmt);
@@ -1826,6 +1834,331 @@ fn build_async_each_iter_body(
         vec![b::id("$$anchor"), b::id(&var_name)],
     )));
     stmts
+}
+
+/// True if any top-level @const declaration in the if-block's body has an
+/// AwaitExpression initializer (recursively across the consequent fragment).
+fn if_body_has_const_with_await(blk: &svelte_ast::blocks::IfBlock) -> bool {
+    use svelte_ast::fragment::FragmentChild;
+    for n in &blk.consequent.nodes {
+        if let FragmentChild::ConstTag(t) = n {
+            let decls = t
+                .declaration
+                .get("declarations")
+                .and_then(|v| v.as_array());
+            if let Some(decls) = decls {
+                for d in decls {
+                    if let Some(init) = d.get("init") {
+                        if expression_uses_await(init) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Lower a single root `{#if SYNC}` block whose body contains `{@const}`
+/// declarations (at least one with `await`) plus a single element with a
+/// dynamic ExpressionTag child. Returns `(program_extras, fn_stmts)`.
+fn build_async_const_if_block_client(
+    blk: &svelte_ast::blocks::IfBlock,
+) -> (Vec<Value>, Vec<Value>) {
+    use svelte_ast::fragment::FragmentChild;
+    let mut program_extras: Vec<Value> = Vec::new();
+    let mut out: Vec<Value> = Vec::new();
+
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("fragment"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("comment"), false, false),
+                vec![],
+            )),
+        )],
+    ));
+    out.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("node"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("first_child"), false, false),
+                vec![b::id("fragment")],
+            )),
+        )],
+    ));
+
+    // Walk the consequent body, splitting @const from the element body.
+    let mut const_async_decls: Vec<(String, Value)> = Vec::new();
+    let mut const_sync_decls: Vec<(String, Value)> = Vec::new();
+    let mut body_element: Option<&svelte_ast::elements::RegularElement> = None;
+    let mut consequent_text_expr: Option<Value> = None;
+    let mut async_var_names: std::collections::HashSet<String> = Default::default();
+
+    for n in &blk.consequent.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::ConstTag(t) => {
+                if let Some(decls) = t
+                    .declaration
+                    .get("declarations")
+                    .and_then(|v| v.as_array())
+                {
+                    for d in decls {
+                        let name = d
+                            .get("id")
+                            .and_then(|i| i.get("name"))
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        let init = d.get("init").cloned().unwrap_or(Value::Null);
+                        if let Some(name) = name {
+                            if expression_uses_await(&init) {
+                                async_var_names.insert(name.clone());
+                                const_async_decls.push((name, init));
+                            } else {
+                                const_sync_decls.push((name, init));
+                            }
+                        }
+                    }
+                }
+            }
+            FragmentChild::RegularElement(el) => {
+                if body_element.is_some() {
+                    // Multiple elements — fall back to empty body.
+                    return (program_extras, out);
+                }
+                // Extract the inner single ExpressionTag.
+                for c in &el.fragment.nodes {
+                    match c {
+                        FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+                        FragmentChild::ExpressionTag(et) => {
+                            if consequent_text_expr.is_some() {
+                                return (program_extras, out);
+                            }
+                            consequent_text_expr = Some(et.expression.clone());
+                        }
+                        _ => return (program_extras, out),
+                    }
+                }
+                body_element = Some(el);
+            }
+            _ => return (program_extras, out),
+        }
+    }
+
+    // Build the consequent arrow body.
+    let mut consequent_stmts: Vec<Value> = Vec::new();
+
+    // Hoist `let X;` declarations for every const name (async first, then sync).
+    for (name, _) in const_async_decls.iter().chain(const_sync_decls.iter()) {
+        consequent_stmts.push(b::declaration(
+            "let",
+            vec![b::declarator(b::id(name), None)],
+        ));
+    }
+
+    // Build $.run callbacks. Order: async first, then sync (matching upstream).
+    let mut run_callbacks: Vec<Value> = Vec::new();
+    let mut sync_dep_idx: Option<usize> = None;
+    for (name, init) in &const_async_decls {
+        // (await $.save($.async_derived(async () => (await $.save(LITERAL))())))()
+        let wrapped = wrap_const_await_init(init);
+        let assign = b::assignment("=", b::id(name), wrapped);
+        run_callbacks.push(b::arrow(vec![], assign, true));
+    }
+    for (name, init) in &const_sync_decls {
+        // X = $.derived(() => RHS with `$.get(asyncVar)` for any async ref)
+        let mut rhs = init.clone();
+        for an in &async_var_names {
+            wrap_identifier_with_get(&mut rhs, an);
+        }
+        let derived_call = b::call(
+            b::member(b::id("$"), b::id("derived"), false, false),
+            vec![b::arrow(vec![], rhs, false)],
+        );
+        let assign = b::assignment("=", b::id(name), derived_call);
+        let idx = run_callbacks.len();
+        run_callbacks.push(b::arrow(vec![], assign, false));
+        sync_dep_idx = Some(idx);
+        let _ = name;
+    }
+
+    consequent_stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("promises"),
+            Some(b::call(
+                b::member(b::id("$"), b::id("run"), false, false),
+                vec![b::array(run_callbacks)],
+            )),
+        )],
+    ));
+
+    // Element body: var p = root_1(); var text = $.child(p, true); $.reset(p);
+    // $.template_effect(() => $.set_text(text, $.get(name)), void 0, void 0, [promises[K]]);
+    // $.append($$anchor, p);
+    if let (Some(el), Some(mut text_expr)) = (body_element, consequent_text_expr) {
+        // Emit `var root_1 = $.from_html(\`<p> </p>\`);` at program level.
+        let html = format!("<{}> </{}>", el.name, el.name);
+        program_extras.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id("root_1"),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("from_html"), false, false),
+                    vec![b::template_literal(vec![&html], vec![])],
+                )),
+            )],
+        ));
+
+        let local = el.name.clone();
+        consequent_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&local),
+                Some(b::call(b::id("root_1"), vec![])),
+            )],
+        ));
+        consequent_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id("text"),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("child"), false, false),
+                    vec![b::id(&local), b::literal_bool(true)],
+                )),
+            )],
+        ));
+        consequent_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("reset"), false, false),
+            vec![b::id(&local)],
+        )));
+
+        // Wrap async var AND sync-derived var references in $.get(...) —
+        // both are reactive values in async-const lowering.
+        for an in &async_var_names {
+            wrap_identifier_with_get(&mut text_expr, an);
+        }
+        for (name, _) in &const_sync_decls {
+            wrap_identifier_with_get(&mut text_expr, name);
+        }
+        let void0 = serde_json::json!({
+            "type": "UnaryExpression",
+            "operator": "void",
+            "prefix": true,
+            "argument": { "type": "Literal", "value": 0, "raw": "0" }
+        });
+        let deps_array = if let Some(idx) = sync_dep_idx {
+            b::array(vec![serde_json::json!({
+                "type": "MemberExpression",
+                "object": { "type": "Identifier", "name": "promises" },
+                "property": { "type": "Literal", "value": idx, "raw": idx.to_string() },
+                "computed": true,
+                "optional": false
+            })])
+        } else {
+            b::array(vec![])
+        };
+        let inner_arrow = b::arrow(
+            vec![],
+            b::call(
+                b::member(b::id("$"), b::id("set_text"), false, false),
+                vec![b::id("text"), text_expr],
+            ),
+            false,
+        );
+        consequent_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("template_effect"), false, false),
+            vec![inner_arrow, void0.clone(), void0, deps_array],
+        )));
+        consequent_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("append"), false, false),
+            vec![b::id("$$anchor"), b::id(&local)],
+        )));
+    }
+
+    let consequent_arrow = b::arrow(
+        vec![b::id("$$anchor")],
+        b::block(consequent_stmts),
+        false,
+    );
+
+    // { var consequent = (...) => {...}; $.if(node, ($$render) => { if (TEST) $$render(consequent); }); }
+    let block_body = vec![
+        b::declaration(
+            "var",
+            vec![b::declarator(b::id("consequent"), Some(consequent_arrow))],
+        ),
+        b::stmt(b::call(
+            b::member(b::id("$"), b::id("if"), false, false),
+            vec![
+                b::id("node"),
+                b::arrow(
+                    vec![b::id("$$render")],
+                    b::block(vec![serde_json::json!({
+                        "type": "IfStatement",
+                        "test": blk.test.clone(),
+                        "consequent": b::stmt(b::call(
+                            b::id("$$render"),
+                            vec![b::id("consequent")]
+                        )),
+                        "alternate": Value::Null
+                    })]),
+                    false,
+                ),
+            ],
+        )),
+    ];
+    out.push(b::block(block_body));
+
+    out.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("fragment")],
+    )));
+
+    (program_extras, out)
+}
+
+/// Wrap an `await X` expression in the async-const $.save/$.async_derived
+/// chain: `(await $.save($.async_derived(async () => (await $.save(X_INNER))())))()`.
+/// X_INNER is X with any nested awaits recursively wrapped the same way.
+fn wrap_const_await_init(expr: &Value) -> Value {
+    if expr.get("type").and_then(|v| v.as_str()) != Some("AwaitExpression") {
+        return expr.clone();
+    }
+    let inner_arg = expr.get("argument").cloned().unwrap_or(Value::Null);
+    // Inner: (await $.save(X_INNER))()
+    let inner_save = b::call(
+        b::member(b::id("$"), b::id("save"), false, false),
+        vec![inner_arg],
+    );
+    let inner_await = serde_json::json!({
+        "type": "AwaitExpression",
+        "argument": inner_save
+    });
+    let inner_call = b::call(inner_await, vec![]);
+    // async () => INNER
+    let async_arrow = b::arrow(vec![], inner_call, true);
+    // $.async_derived(async () => INNER)
+    let async_derived = b::call(
+        b::member(b::id("$"), b::id("async_derived"), false, false),
+        vec![async_arrow],
+    );
+    // await $.save($.async_derived(...))
+    let outer_save = b::call(
+        b::member(b::id("$"), b::id("save"), false, false),
+        vec![async_derived],
+    );
+    let outer_await = serde_json::json!({
+        "type": "AwaitExpression",
+        "argument": outer_save
+    });
+    // (...) ()
+    b::call(outer_await, vec![])
 }
 
 /// Lower a single root `{#if await EXPR}{:else}{/if}` block to the async if

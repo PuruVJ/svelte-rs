@@ -156,3 +156,9 @@ fn diff_async_each_hoisting() {
 fn diff_async_if_chain() {
     diff("async-if-chain", "Async_if_chain");
 }
+
+#[test]
+#[ignore]
+fn diff_async_const() {
+    diff("async-const", "Async_const");
+}
