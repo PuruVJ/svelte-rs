@@ -365,6 +365,34 @@ pub fn client_component_with_options(
                     fn_body.push(stmt);
                 }
             }
+        } else if options.experimental_async {
+            if let Some(expr) = find_single_root_expression_tag(&root.fragment.nodes) {
+                // Sole-text template body in async mode: $.next() + $.text() +
+                // template_effect with deps.
+                fn_body.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("next"), false, false),
+                    vec![],
+                )));
+                fn_body.push(b::declaration(
+                    "var",
+                    vec![b::declarator(
+                        b::id("text"),
+                        Some(b::call(
+                            b::member(b::id("$"), b::id("text"), false, false),
+                            vec![],
+                        )),
+                    )],
+                ));
+                fn_body.push(b::stmt(build_template_effect_set_text_async(
+                    "text",
+                    &[expr],
+                    &async_var_last_idx,
+                )));
+                fn_body.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("append"), false, false),
+                    vec![b::id("$$anchor"), b::id("text")],
+                )));
+            }
         }
     }
 
@@ -1510,6 +1538,30 @@ fn body_has_top_level_await(body: &[Value]) -> bool {
         }
     }
     false
+}
+
+/// If the fragment's only non-whitespace top-level node is a single
+/// ExpressionTag, return that expression. Used for the async sole-text
+/// template lowering.
+fn find_single_root_expression_tag(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Option<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut expr: Option<Value> = None;
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::ExpressionTag(t) => {
+                if expr.is_some() {
+                    return None;
+                }
+                expr = Some(t.expression.clone());
+            }
+            _ => return None,
+        }
+    }
+    expr
 }
 
 /// True if `expr` contains a top-level AwaitExpression (anywhere in its tree).
