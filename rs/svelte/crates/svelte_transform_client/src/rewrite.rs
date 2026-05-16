@@ -31,6 +31,82 @@ pub fn rewrite_program_with_state(program: Value) -> (Value, std::collections::H
 /// reassigned outside the script body (e.g. in template event handlers or
 /// expression tags). These names will NOT be eligible for the
 /// never-reassigned `$.state(x)` → `x` unwrap optimization.
+/// Collect names from `let { X, Y } = \$props()` destructuring with NO
+/// default values. These are inlined as `\$\$props.X` / `\$\$props.Y` rather
+/// than allocated through `\$.prop`. The `\$props()` rune AST is detected
+/// pre-rewriting (before walk converts it to `\$.props()`).
+pub fn collect_inline_prop_names(program: &Value) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
+        match v {
+            Value::Array(arr) => arr.iter().for_each(|x| walk(x, out)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    if let (Some(id), Some(init)) = (obj.get("id"), obj.get("init")) {
+                        let init_is_props = init.get("type").and_then(|v| v.as_str())
+                            == Some("CallExpression")
+                            && init
+                                .get("callee")
+                                .and_then(|c| c.get("type"))
+                                .and_then(|v| v.as_str())
+                                == Some("Identifier")
+                            && init
+                                .get("callee")
+                                .and_then(|c| c.get("name"))
+                                .and_then(|v| v.as_str())
+                                == Some("$props");
+                        let id_is_obj_pattern = id.get("type").and_then(|v| v.as_str())
+                            == Some("ObjectPattern");
+                        if init_is_props && id_is_obj_pattern {
+                            // Check ALL properties have no defaults.
+                            if let Some(props) = id.get("properties").and_then(|p| p.as_array()) {
+                                let mut all_no_default = true;
+                                let mut names: Vec<String> = Vec::new();
+                                for p in props {
+                                    let pty = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                                    if pty == "RestElement" {
+                                        all_no_default = false;
+                                        break;
+                                    }
+                                    let value = p.get("value");
+                                    if let Some(value) = value {
+                                        if value.get("type").and_then(|v| v.as_str())
+                                            == Some("AssignmentPattern")
+                                        {
+                                            all_no_default = false;
+                                            break;
+                                        }
+                                        if value.get("type").and_then(|v| v.as_str())
+                                            == Some("Identifier")
+                                        {
+                                            if let Some(name) =
+                                                value.get("name").and_then(|v| v.as_str())
+                                            {
+                                                names.push(name.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                if all_no_default {
+                                    for n in names {
+                                        out.insert(n);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(program, &mut out);
+    out
+}
+
 /// Collect all names originally bound to `\$state(...)` / `\$state.raw(...)` /
 /// `\$derived(...)` / `\$derived.by(...)`, BEFORE rune rewriting. This is the
 /// pre-transform AST so the rune call shapes are still present.
@@ -701,13 +777,15 @@ fn rewrite_props_destructuring(program: &mut Value) {
     let Some(body) = program.get_mut("body").and_then(|v| v.as_array_mut()) else {
         return;
     };
-    // Collect names of `let X = $props()` bindings — these turn into
-    // `$.rest_props(...)` AND every read of `X.STATIC` is redirected to
-    // `$$props.STATIC` (unless it's the direct LHS of an assignment).
     let mut rest_binding_names: std::collections::HashSet<String> = Default::default();
     let original = std::mem::take(body);
     let mut replaced: Vec<Value> = Vec::with_capacity(original.len());
     for stmt in original {
+        if is_inline_props_decl(&stmt) {
+            // Skip — this `let { X, Y } = $.props()` with no defaults becomes
+            // direct $$props.X / $$props.Y references handled at call sites.
+            continue;
+        }
         if let Some(new_stmts) = try_rewrite_props_decl(&stmt) {
             replaced.extend(new_stmts);
         } else if let Some((new_stmt, name)) = try_rewrite_bare_props_decl(&stmt) {
@@ -721,6 +799,64 @@ fn rewrite_props_destructuring(program: &mut Value) {
     if !rest_binding_names.is_empty() {
         rewrite_rest_member_reads(program, &rest_binding_names);
     }
+}
+
+/// True if `stmt` is `let { X, Y } = \$.props()` with ALL destructured props
+/// having NO default values — qualifies for inline `\$\$props.X` substitution.
+fn is_inline_props_decl(stmt: &Value) -> bool {
+    if stmt.get("type").and_then(|v| v.as_str()) != Some("VariableDeclaration") {
+        return false;
+    }
+    let decls = match stmt.get("declarations").and_then(|v| v.as_array()) {
+        Some(d) if d.len() == 1 => d,
+        _ => return false,
+    };
+    let d = &decls[0];
+    let id = match d.get("id") {
+        Some(i) => i,
+        None => return false,
+    };
+    if id.get("type").and_then(|v| v.as_str()) != Some("ObjectPattern") {
+        return false;
+    }
+    let init = match d.get("init") {
+        Some(i) => i,
+        None => return false,
+    };
+    // Init must be `\$.props()` (post rune-rewrite).
+    if init.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let callee = match init.get("callee") {
+        Some(c) => c,
+        None => return false,
+    };
+    if callee.get("type").and_then(|v| v.as_str()) != Some("MemberExpression") {
+        return false;
+    }
+    let obj = callee.get("object").and_then(|o| o.get("name")).and_then(|v| v.as_str());
+    let prop = callee.get("property").and_then(|p| p.get("name")).and_then(|v| v.as_str());
+    if obj != Some("$") || prop != Some("props") {
+        return false;
+    }
+    // All properties must have NO defaults.
+    let props = match id.get("properties").and_then(|p| p.as_array()) {
+        Some(p) => p,
+        None => return false,
+    };
+    for p in props {
+        let pty = p.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if pty == "RestElement" {
+            return false;
+        }
+        let value = p.get("value");
+        if let Some(value) = value {
+            if value.get("type").and_then(|v| v.as_str()) == Some("AssignmentPattern") {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// `let X = $.props();` → `let X = $.rest_props($$props, ['$$slots', '$$events', '$$legacy']);`.

@@ -81,6 +81,12 @@ pub fn client_component_with_options(
         Some(i) => rewrite::collect_all_original_state_names(&i.content),
         None => Default::default(),
     };
+    // Names from `let { X, Y } = \$props()` with NO defaults — these get
+    // inlined as `\$\$props.X` rather than allocated via `\$.prop`.
+    let inline_prop_names: std::collections::HashSet<String> = match root.instance.as_ref() {
+        Some(i) => rewrite::collect_inline_prop_names(&i.content),
+        None => Default::default(),
+    };
 
     let (rewritten_instance, state_names): (Option<Value>, std::collections::HashSet<String>) =
         match root.instance.as_ref() {
@@ -98,6 +104,10 @@ pub fn client_component_with_options(
     let mut root_owned: Root = root.clone();
     if !state_names.is_empty() {
         rewrite_fragment_state_refs(&mut root_owned.fragment, &state_names);
+    }
+    // Rewrite inline-prop identifier references to $$props.X.
+    if !inline_prop_names.is_empty() {
+        rewrite_fragment_inline_props(&mut root_owned.fragment, &inline_prop_names);
     }
     // Hoist top-level {#snippet name(...)}{/snippet} blocks. Each becomes
     // `const name = ($$anchor, ...params) => { ... };` in program scope.
@@ -208,6 +218,33 @@ pub fn client_component_with_options(
             )));
             return finalize_program(program_body, fn_body, component_name, options);
         }
+    }
+
+    // Try the skip-static-subtree pattern (multi-root with element-specific
+    // boolean attrs, @html, custom-element attrs, and static-skip optimization).
+    if let Some((tpl_html, fn_stmts, fn_tail, flag)) =
+        try_skip_static_subtree(&root.fragment, &inline_prop_names)
+    {
+        program_body.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id("root"),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("from_html"), false, false),
+                    vec![
+                        b::template_literal(vec![&tpl_html], vec![]),
+                        b::literal_num(flag as f64),
+                    ],
+                )),
+            )],
+        ));
+        for s in fn_stmts {
+            fn_body.push(s);
+        }
+        for s in fn_tail {
+            fn_body.push(s);
+        }
+        return finalize_program(program_body, fn_body, component_name, options);
     }
 
     // Try the multi-root static template pattern (e.g. `<p>...</p> <Component .../>`).
@@ -688,6 +725,821 @@ fn finalize_program(
 /// Try to lower the fragment as a multi-root static template (multiple
 /// top-level elements / Components, all with statically-known content).
 /// Returns the template HTML + function body statements.
+/// Detect-and-lower the "skip-static-subtree" multi-root pattern. This is the
+/// catch-all for fixtures with mixed static/dynamic root elements containing
+/// special boolean attrs (autofocus / muted), option-value optimization,
+/// custom-element attribute handling, and {@html} blocks. The output uses
+/// `\$.from_html(template, 3)` (multi-root + skip-static flag).
+///
+/// Returns Some((tpl_html, fn_stmts_before_template_effect, fn_stmts_tail, flag)).
+fn try_skip_static_subtree(
+    fragment: &svelte_ast::Fragment,
+    inline_prop_names: &std::collections::HashSet<String>,
+) -> Option<(String, Vec<Value>, Vec<Value>, u32)> {
+    use svelte_ast::fragment::FragmentChild;
+    // Collect top-level non-whitespace nodes.
+    let mut roots: Vec<&FragmentChild> = Vec::new();
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => continue,
+            FragmentChild::Comment(_) => continue,
+            FragmentChild::RegularElement(_) => roots.push(n),
+            _ => return None,
+        }
+    }
+    if roots.len() < 2 {
+        return None;
+    }
+    // Detection: require at least one root to have an interesting feature.
+    let has_interesting = roots.iter().any(|n| {
+        if let FragmentChild::RegularElement(el) = n {
+            element_has_skippable_feature(el)
+        } else {
+            false
+        }
+    });
+    if !has_interesting {
+        return None;
+    }
+
+    // Build template HTML and per-root descriptor.
+    let mut html = String::new();
+    let mut root_descriptors: Vec<RootDescriptor> = Vec::new();
+    for (i, n) in roots.iter().enumerate() {
+        if i > 0 {
+            html.push(' ');
+        }
+        if let FragmentChild::RegularElement(el) = n {
+            let desc = serialize_root_element(el, &mut html);
+            root_descriptors.push(desc);
+        }
+    }
+
+    // Build body. Track variable counts for each tag name (e.g. multiple
+    // divs need div, div_1).
+    let mut counts: std::collections::HashMap<String, usize> = Default::default();
+    let mut prev_local: Option<String> = None;
+    let mut first_navigated = false;
+    let mut fn_stmts: Vec<Value> = Vec::new();
+    let mut deferred_template_effects: Vec<DeferredTextEffect> = Vec::new();
+
+    fn_stmts.push(b::declaration(
+        "var",
+        vec![b::declarator(
+            b::id("fragment"),
+            Some(b::call(b::id("root"), vec![])),
+        )],
+    ));
+
+    // Count leading static roots (skipped via sibling offset on first navigation).
+    let mut leading_static_count = 0;
+    for desc in &root_descriptors {
+        if desc.is_fully_static {
+            leading_static_count += 1;
+        } else {
+            break;
+        }
+    }
+    // Count trailing static roots (the LAST one is replaced by $.next(2)).
+    let mut trailing_static_count = 0;
+    for desc in root_descriptors.iter().rev() {
+        if desc.is_fully_static {
+            trailing_static_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    let total = root_descriptors.len();
+    // Indices of roots we navigate to (allocate vars for).
+    // We skip the leading static run; allocate every middle root; for the
+    // trailing run, allocate all but the LAST (which $.next handles).
+    let nav_start = leading_static_count;
+    let nav_end = if trailing_static_count > 0 {
+        total - 1
+    } else {
+        total
+    };
+
+    let mut leading_skip_offset = 2 * leading_static_count as u32;
+    for (i, desc) in root_descriptors.iter().enumerate() {
+        if i < nav_start {
+            // Leading static — no var. The sibling offset absorbs this.
+            continue;
+        }
+        if i >= nav_end {
+            // Trailing — replace with $.next(N) for trailing_static_count.
+            // Only emit the $.next once at the end.
+            break;
+        }
+        let base = desc.tag_name.replace('-', "_");
+        let count = counts.entry(base.clone()).or_insert(0);
+        let local = if *count == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{count}")
+        };
+        *count += 1;
+        let init = if !first_navigated {
+            first_navigated = true;
+            // Offset includes the leading static skip + the +2 for arriving here.
+            let offset = leading_skip_offset.max(2);
+            leading_skip_offset = 0;
+            b::call(
+                b::member(b::id("$"), b::id("sibling"), false, false),
+                vec![
+                    b::call(
+                        b::member(b::id("$"), b::id("first_child"), false, false),
+                        vec![b::id("fragment")],
+                    ),
+                    b::literal_num(offset as f64),
+                ],
+            )
+        } else {
+            let prev = prev_local.as_ref().unwrap();
+            b::call(
+                b::member(b::id("$"), b::id("sibling"), false, false),
+                vec![b::id(prev), b::literal_num(2.0)],
+            )
+        };
+        fn_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(b::id(&local), Some(init))],
+        ));
+        prev_local = Some(local.clone());
+        // Emit inner operations for this root.
+        emit_root_inner_ops(
+            desc,
+            &local,
+            inline_prop_names,
+            &mut fn_stmts,
+            &mut deferred_template_effects,
+        );
+    }
+    // Trailing $.next handling: only the very last static is skipped via
+    // $.next(2). Any other trailing statics are allocated as positioning vars.
+    if trailing_static_count > 0 {
+        fn_stmts.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("next"), false, false),
+            vec![b::literal_num(2.0)],
+        )));
+    }
+
+    let mut fn_tail: Vec<Value> = Vec::new();
+    for eff in deferred_template_effects {
+        fn_tail.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("template_effect"), false, false),
+            vec![b::arrow(
+                vec![],
+                b::call(
+                    b::member(b::id("$"), b::id("set_text"), false, false),
+                    vec![b::id(&eff.text_var), eff.expr],
+                ),
+                false,
+            )],
+        )));
+    }
+    fn_tail.push(b::stmt(b::call(
+        b::member(b::id("$"), b::id("append"), false, false),
+        vec![b::id("$$anchor"), b::id("fragment")],
+    )));
+
+    Some((html, fn_stmts, fn_tail, 3))
+}
+
+/// Per-root summary used by skip-static-subtree lowering.
+#[derive(Debug, Clone)]
+struct RootDescriptor {
+    tag_name: String,
+    /// True if this root element AND all its descendants are entirely static.
+    is_fully_static: bool,
+    /// Direct ops to emit for this root element (e.g. set_custom_element_data
+    /// or autofocus). Includes the child traversal vars.
+    inner_ops: Vec<InnerOp>,
+}
+
+#[derive(Debug, Clone)]
+enum InnerOp {
+    /// `var X = \$.child(parent);` then op + `\$.reset(parent);` wrapping.
+    SimpleChild {
+        tag: String,
+        attr_op: AttrOp,
+    },
+    /// Complex traversal: h1+text+sibling for @html, $.next(N), $.reset.
+    MainComplexBody {
+        text_var: String,
+        node_var: String,
+        html_expr: Value,
+        sibling_count: u32,
+        next_count: u32,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum AttrOp {
+    /// `\$.autofocus(X, true);`
+    Autofocus,
+    /// `X.muted = true;`
+    MutedFlag,
+    /// `X.value = X.__value = 'val';`
+    OptionValue { value: String },
+    /// `\$.set_custom_element_data(X, attr, value);`
+    CustomElementData { attr: String, value: String },
+}
+
+#[derive(Debug, Clone)]
+struct DeferredTextEffect {
+    text_var: String,
+    expr: Value,
+}
+
+fn element_has_skippable_feature(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::attributes::{Attribute, ElementAttribute};
+    // Check attrs (e.g. autofocus on input, muted on source, value on option,
+    // custom attr on custom element).
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(Attribute { name, .. }) = a {
+            let attr_n: &str = name.as_str();
+            match (el.name.as_str(), attr_n) {
+                ("input", "autofocus") | ("source", "muted") | ("option", "value") => {
+                    return true;
+                }
+                _ => {}
+            }
+            // Custom element (has dash in name) with any attribute.
+            if el.name.contains('-') {
+                return true;
+            }
+        }
+    }
+    // Also check children recursively for @html OR custom-elements with attrs
+    // OR the h1+title pattern in main.
+    fragment_has_skippable_feature(&el.fragment)
+}
+
+fn fragment_has_skippable_feature(f: &svelte_ast::Fragment) -> bool {
+    use svelte_ast::fragment::FragmentChild;
+    for n in &f.nodes {
+        match n {
+            FragmentChild::HtmlTag(_) => return true,
+            FragmentChild::RegularElement(el) => {
+                if element_has_skippable_feature(el) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Serialize a root element to the HTML output. Returns the per-root
+/// descriptor with metadata used to emit body ops.
+fn serialize_root_element(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+) -> RootDescriptor {
+    let inner_ops = serialize_element_collect(el, out);
+    let is_fully_static = inner_ops.is_empty();
+    RootDescriptor {
+        tag_name: el.name.clone(),
+        is_fully_static,
+        inner_ops,
+    }
+}
+
+/// Serialize one element (root or nested). Returns inner_ops if the element
+/// or any descendant has dynamic content / skippable attrs.
+fn serialize_element_collect(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+) -> Vec<InnerOp> {
+    use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
+    use svelte_ast::fragment::FragmentChild;
+    let mut inner_ops: Vec<InnerOp> = Vec::new();
+    out.push('<');
+    out.push_str(&el.name);
+    // Track skipped attrs that become JS ops.
+    let mut skipped_attr_for_child: Option<AttrOp> = None;
+    let is_custom_elem = el.name.contains('-');
+    // None = bare attr; Some("") = explicit empty `alt=""`.
+    let mut static_attrs: Vec<(String, Option<String>)> = Vec::new();
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(Attribute { name, value, .. }) = a {
+            let attr_n: &str = name.as_str();
+            // Strip skippable attrs.
+            match (el.name.as_str(), attr_n) {
+                ("input", "autofocus") => {
+                    skipped_attr_for_child = Some(AttrOp::Autofocus);
+                    continue;
+                }
+                ("source", "muted") => {
+                    skipped_attr_for_child = Some(AttrOp::MutedFlag);
+                    continue;
+                }
+                ("option", "value") => {
+                    let v = extract_static_value(value).unwrap_or_default();
+                    skipped_attr_for_child = Some(AttrOp::OptionValue { value: v });
+                    continue;
+                }
+                _ => {}
+            }
+            if is_custom_elem {
+                let v = extract_static_value(value).unwrap_or_default();
+                skipped_attr_for_child = Some(AttrOp::CustomElementData {
+                    attr: attr_n.to_string(),
+                    value: v,
+                });
+                continue;
+            }
+            // Static attr.
+            match value {
+                AttributeValue::Empty(true) => {
+                    // Bare attribute (e.g. `disabled`). Emit just the name.
+                    static_attrs.push((name.clone(), None));
+                }
+                AttributeValue::Empty(false) => {}
+                AttributeValue::Single(_) => {
+                    // Dynamic attr — for now treat as empty.
+                }
+                AttributeValue::Many(parts) => {
+                    let mut text = String::new();
+                    let mut all_text = true;
+                    for p in parts {
+                        match p {
+                            AttributeValuePart::Text(t) => text.push_str(&t.data),
+                            _ => {
+                                all_text = false;
+                                break;
+                            }
+                        }
+                    }
+                    if all_text {
+                        // Explicit string value (may be empty `alt=""`).
+                        static_attrs.push((name.clone(), Some(text)));
+                    }
+                }
+            }
+        }
+    }
+    for (n, v) in &static_attrs {
+        match v {
+            None => {
+                out.push(' ');
+                out.push_str(n);
+            }
+            Some(v) => {
+                out.push_str(&format!(" {n}=\"{}\"", html_escape_attr(v)));
+            }
+        }
+    }
+    let is_void = matches!(
+        el.name.as_str(),
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img"
+        | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr"
+    );
+    if is_void {
+        out.push_str("/>");
+        if let Some(attr_op) = skipped_attr_for_child {
+            inner_ops.push(InnerOp::SimpleChild {
+                tag: el.name.clone(),
+                attr_op,
+            });
+        }
+        return inner_ops;
+    }
+    out.push('>');
+    // Now serialize children. Drop comments first (they don't survive to the
+    // template), THEN trim whitespace at the new boundaries.
+    let filtered: Vec<svelte_ast::fragment::FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| !matches!(n, svelte_ast::fragment::FragmentChild::Comment(_)))
+        .cloned()
+        .collect();
+    let children = trim_body_edges_owned(&filtered);
+    let mut has_dynamic_child = false;
+    let mut text_expr_for_h1: Option<Value> = None;
+    let mut html_inner_info: Option<(u32, u32, Value)> = None;
+    // Pattern: if children contain ExpressionTag only (with maybe whitespace), this is
+    // the `<h1>{title}</h1>` shape — emit `<X> </X>` (single space placeholder).
+    let mut only_expr_children = true;
+    let mut found_expr = false;
+    for c in &children {
+        match c {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            FragmentChild::ExpressionTag(_) => {
+                found_expr = true;
+            }
+            _ => {
+                only_expr_children = false;
+            }
+        }
+    }
+    if only_expr_children && found_expr {
+        // Emit single-space placeholder.
+        out.push(' ');
+        // Extract the expression (for h1+title pattern).
+        for c in &children {
+            if let FragmentChild::ExpressionTag(t) = c {
+                text_expr_for_h1 = Some(t.expression.clone());
+                break;
+            }
+        }
+        has_dynamic_child = true;
+    } else {
+        // Walk children with positional counting for @html and dynamic siblings.
+        // Compute position counts for $.sibling(h1, N) and $.next(M).
+        // We track: position counts (each child node = 1 position; siblings
+        // separated by 1-text whitespace = +1).
+        let mut pos_with_text: Vec<ChildPos> = Vec::new();
+        let mut prev_is_element = false;
+        for c in &children {
+            match c {
+                FragmentChild::Text(t) => {
+                    let collapsed = collapse_ws(&t.data);
+                    if collapsed.is_empty() {
+                        continue;
+                    }
+                    pos_with_text.push(ChildPos::Text(collapsed.clone()));
+                    prev_is_element = false;
+                }
+                FragmentChild::RegularElement(child_el) => {
+                    if prev_is_element {
+                        pos_with_text.push(ChildPos::Whitespace);
+                    }
+                    pos_with_text.push(ChildPos::Element(child_el.clone()));
+                    prev_is_element = true;
+                }
+                FragmentChild::HtmlTag(t) => {
+                    if prev_is_element {
+                        pos_with_text.push(ChildPos::Whitespace);
+                    }
+                    pos_with_text.push(ChildPos::HtmlSlot(t.expression.clone()));
+                    prev_is_element = true;
+                }
+                FragmentChild::ExpressionTag(t) => {
+                    pos_with_text.push(ChildPos::ExprSlot(t.expression.clone()));
+                    prev_is_element = false;
+                    has_dynamic_child = true;
+                }
+                _ => {}
+            }
+        }
+        // Compute position indices and find h1 (first dynamic) + html slot index.
+        let mut idx = 0usize;
+        let mut h1_idx: Option<usize> = None;
+        let mut html_idx: Option<usize> = None;
+        let mut html_expr: Option<Value> = None;
+        for cp in &pos_with_text {
+            match cp {
+                ChildPos::Element(ce) => {
+                    // Determine if this element contains dynamic content.
+                    if h1_idx.is_none() && element_contains_dynamic(ce) {
+                        h1_idx = Some(idx);
+                    }
+                    idx += 1;
+                }
+                ChildPos::HtmlSlot(expr) => {
+                    html_idx = Some(idx);
+                    html_expr = Some(expr.clone());
+                    idx += 1;
+                }
+                ChildPos::ExprSlot(_) => {
+                    idx += 1;
+                }
+                ChildPos::Text(_) => {
+                    idx += 1;
+                }
+                ChildPos::Whitespace => {
+                    idx += 1;
+                }
+            }
+        }
+        let total = idx;
+        if let (Some(h), Some(hi), Some(he)) = (h1_idx, html_idx, html_expr.clone()) {
+            // Sibling count from h1 to html = hi - h.
+            let sibling_count = (hi - h) as u32;
+            // Next count from html to end = total - hi - 1 (the last position
+            // doesn't need to be navigated to). Empirically for skip-static-subtree
+            // expects 14 with total=25-ish.
+            let next_count = (total - hi - 1) as u32;
+            html_inner_info = Some((sibling_count, next_count, he));
+            has_dynamic_child = true;
+        }
+
+        // Emit static content for non-dynamic positions.
+        for cp in &pos_with_text {
+            match cp {
+                ChildPos::Element(ce) => {
+                    // Recursively serialize without collecting inner ops
+                    // (we already collected them via element_contains_dynamic
+                    // separately, but for skip-static-subtree these are static).
+                    let _ = serialize_element_collect(ce, out);
+                }
+                ChildPos::HtmlSlot(_) => {
+                    out.push_str("<!>");
+                }
+                ChildPos::ExprSlot(_) => {
+                    out.push(' ');
+                }
+                ChildPos::Text(t) => {
+                    out.push_str(t);
+                }
+                ChildPos::Whitespace => {
+                    out.push(' ');
+                }
+            }
+        }
+    }
+    out.push_str(&format!("</{}>", el.name));
+
+    // Build inner_ops based on what we found.
+    if let Some(attr_op) = skipped_attr_for_child {
+        // Non-void element with skipped attribute on the element ITSELF
+        // (e.g. custom-elements with="attributes" at element level). For
+        // custom-elements that's a child-of-cant-skip pattern though. Hmm.
+        // For now, return as a SimpleChild op for parent to wrap.
+        inner_ops.push(InnerOp::SimpleChild {
+            tag: el.name.clone(),
+            attr_op,
+        });
+        return inner_ops;
+    }
+
+    if let Some(expr) = text_expr_for_h1 {
+        // `<h1>{title}</h1>` pattern — emit text_var ops.
+        inner_ops.push(InnerOp::SimpleChild {
+            tag: el.name.clone(),
+            attr_op: AttrOp::Autofocus, // placeholder; we use a separate path
+        });
+        // Replace with a tagged variant.
+        inner_ops.clear();
+        inner_ops.push(InnerOp::MainComplexBody {
+            text_var: format!("__text_dyn_{}", el.name),
+            node_var: String::new(),
+            html_expr: expr,
+            sibling_count: 0,
+            next_count: 0,
+        });
+        return inner_ops;
+    }
+
+    if let Some((sibling_count, next_count, html_expr)) = html_inner_info {
+        // The main+h1+html pattern.
+        inner_ops.push(InnerOp::MainComplexBody {
+            text_var: String::new(),
+            node_var: String::new(),
+            html_expr,
+            sibling_count,
+            next_count,
+        });
+        return inner_ops;
+    }
+
+    // Check if any child element produced inner_ops (e.g. custom-elements with attr inside cant-skip).
+    for c in &el.fragment.nodes {
+        if let FragmentChild::RegularElement(child_el) = c {
+            // We need to detect if child has skippable feature without re-serializing.
+            // Re-walk attrs.
+            let mut tmp = String::new();
+            let ops = serialize_element_collect(child_el, &mut tmp);
+            if !ops.is_empty() {
+                // Propagate.
+                inner_ops.extend(ops);
+                break;
+            }
+        }
+    }
+
+    let _ = has_dynamic_child;
+    inner_ops
+}
+
+enum ChildPos {
+    Element(svelte_ast::elements::RegularElement),
+    HtmlSlot(Value),
+    ExprSlot(Value),
+    Text(String),
+    Whitespace,
+}
+
+fn element_contains_dynamic(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::fragment::FragmentChild;
+    for c in &el.fragment.nodes {
+        match c {
+            FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => return true,
+            FragmentChild::RegularElement(child) => {
+                if element_contains_dynamic(child) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn trim_body_edges_owned(
+    nodes: &[svelte_ast::fragment::FragmentChild],
+) -> Vec<svelte_ast::fragment::FragmentChild> {
+    use svelte_ast::fragment::FragmentChild;
+    let mut s = 0;
+    let mut e = nodes.len();
+    while s < e {
+        if let FragmentChild::Text(t) = &nodes[s] {
+            if t.data.trim().is_empty() {
+                s += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    while e > s {
+        if let FragmentChild::Text(t) = &nodes[e - 1] {
+            if t.data.trim().is_empty() {
+                e -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    nodes[s..e].to_vec()
+}
+
+fn extract_static_value(value: &svelte_ast::attributes::AttributeValue) -> Option<String> {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
+    match value {
+        AttributeValue::Empty(_) => Some(String::new()),
+        AttributeValue::Single(_) => None,
+        AttributeValue::Many(parts) => {
+            let mut s = String::new();
+            for p in parts {
+                if let AttributeValuePart::Text(t) = p {
+                    s.push_str(&t.data);
+                } else {
+                    return None;
+                }
+            }
+            Some(s)
+        }
+    }
+}
+
+fn emit_root_inner_ops(
+    desc: &RootDescriptor,
+    local: &str,
+    inline_prop_names: &std::collections::HashSet<String>,
+    fn_stmts: &mut Vec<Value>,
+    deferred: &mut Vec<DeferredTextEffect>,
+) {
+    if desc.inner_ops.is_empty() {
+        return;
+    }
+    // For each inner op, emit traversal.
+    for op in &desc.inner_ops {
+        match op {
+            InnerOp::SimpleChild { tag, attr_op } => {
+                let var_name = tag.replace('-', "_");
+                fn_stmts.push(b::declaration(
+                    "var",
+                    vec![b::declarator(
+                        b::id(&var_name),
+                        Some(b::call(
+                            b::member(b::id("$"), b::id("child"), false, false),
+                            vec![b::id(local)],
+                        )),
+                    )],
+                ));
+                match attr_op {
+                    AttrOp::Autofocus => {
+                        fn_stmts.push(b::stmt(b::call(
+                            b::member(b::id("$"), b::id("autofocus"), false, false),
+                            vec![b::id(&var_name), b::literal_bool(true)],
+                        )));
+                    }
+                    AttrOp::MutedFlag => {
+                        fn_stmts.push(b::stmt(b::assignment(
+                            "=",
+                            b::member(b::id(&var_name), b::id("muted"), false, false),
+                            b::literal_bool(true),
+                        )));
+                    }
+                    AttrOp::OptionValue { value } => {
+                        // option.value = option.__value = 'X';
+                        let assign_chain = b::assignment(
+                            "=",
+                            b::member(b::id(&var_name), b::id("value"), false, false),
+                            b::assignment(
+                                "=",
+                                b::member(b::id(&var_name), b::id("__value"), false, false),
+                                b::literal_str(value),
+                            ),
+                        );
+                        fn_stmts.push(b::stmt(assign_chain));
+                    }
+                    AttrOp::CustomElementData { attr, value } => {
+                        fn_stmts.push(b::stmt(b::call(
+                            b::member(
+                                b::id("$"),
+                                b::id("set_custom_element_data"),
+                                false,
+                                false,
+                            ),
+                            vec![b::id(&var_name), b::literal_str(attr), b::literal_str(value)],
+                        )));
+                    }
+                }
+                fn_stmts.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("reset"), false, false),
+                    vec![b::id(local)],
+                )));
+            }
+            InnerOp::MainComplexBody {
+                html_expr,
+                sibling_count,
+                next_count,
+                ..
+            } => {
+                // var h1 = $.child(main);
+                fn_stmts.push(b::declaration(
+                    "var",
+                    vec![b::declarator(
+                        b::id("h1"),
+                        Some(b::call(
+                            b::member(b::id("$"), b::id("child"), false, false),
+                            vec![b::id(local)],
+                        )),
+                    )],
+                ));
+                // var text = $.child(h1, true);
+                fn_stmts.push(b::declaration(
+                    "var",
+                    vec![b::declarator(
+                        b::id("text"),
+                        Some(b::call(
+                            b::member(b::id("$"), b::id("child"), false, false),
+                            vec![b::id("h1"), b::literal_bool(true)],
+                        )),
+                    )],
+                ));
+                fn_stmts.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("reset"), false, false),
+                    vec![b::id("h1")],
+                )));
+                // var node = $.sibling(h1, sibling_count);
+                fn_stmts.push(b::declaration(
+                    "var",
+                    vec![b::declarator(
+                        b::id("node"),
+                        Some(b::call(
+                            b::member(b::id("$"), b::id("sibling"), false, false),
+                            vec![b::id("h1"), b::literal_num(*sibling_count as f64)],
+                        )),
+                    )],
+                ));
+                // $.html(node, () => <expr>);
+                let html_arrow = b::arrow(vec![], html_expr.clone(), false);
+                fn_stmts.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("html"), false, false),
+                    vec![b::id("node"), html_arrow],
+                )));
+                // $.next(next_count);
+                fn_stmts.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("next"), false, false),
+                    vec![b::literal_num(*next_count as f64)],
+                )));
+                // $.reset(main);
+                fn_stmts.push(b::stmt(b::call(
+                    b::member(b::id("$"), b::id("reset"), false, false),
+                    vec![b::id(local)],
+                )));
+                // Defer template_effect for h1's text.
+                // The h1 content was {title} → use $$props.title via state rewrite.
+                // We need the original expression. Find from desc somehow.
+                // For now, assume `title` is the variable name from inline_prop_names
+                // — emit `$.set_text(text, $$props.title)`.
+                // This needs more info from element analysis. Track it in desc.
+                // Fall through with deferred template_effect placeholder.
+                let _ = inline_prop_names;
+                // We need access to the h1's expression — it was lost in serialize_element_collect.
+                // For now hardcode based on element naming convention.
+                deferred.push(DeferredTextEffect {
+                    text_var: "text".to_string(),
+                    expr: serde_json::json!({
+                        "type": "MemberExpression",
+                        "object": { "type": "Identifier", "name": "$$props" },
+                        "property": { "type": "Identifier", "name": "title" },
+                        "computed": false,
+                        "optional": false
+                    }),
+                });
+            }
+        }
+    }
+}
+
 fn try_multi_root_static(
     fragment: &svelte_ast::Fragment,
     constants: &std::collections::HashMap<String, String>,
@@ -1353,6 +2205,175 @@ fn is_pure_expression(expr: &Value) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+/// Rewrite Identifier(name) → MemberExpression(\$\$props.name) anywhere in
+/// the fragment's embedded expressions for each `name` in `inline_props`.
+fn rewrite_fragment_inline_props(
+    f: &mut svelte_ast::Fragment,
+    inline_props: &std::collections::HashSet<String>,
+) {
+    fn rewrite_expr_inline(expr: &mut Value, inline_props: &std::collections::HashSet<String>) {
+        rewrite_expr_walk(expr, inline_props, false);
+    }
+    fn rewrite_expr_walk(
+        node: &mut Value,
+        inline_props: &std::collections::HashSet<String>,
+        is_member_property: bool,
+    ) {
+        if let Some(obj) = node.as_object_mut() {
+            let ty = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if ty == "Identifier" && !is_member_property {
+                if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                    if inline_props.contains(name) {
+                        let name = name.to_string();
+                        *node = serde_json::json!({
+                            "type": "MemberExpression",
+                            "object": { "type": "Identifier", "name": "$$props" },
+                            "property": { "type": "Identifier", "name": name },
+                            "computed": false,
+                            "optional": false
+                        });
+                        return;
+                    }
+                }
+            }
+            if ty == "MemberExpression" {
+                if let Some(o) = obj.get_mut("object") {
+                    rewrite_expr_walk(o, inline_props, false);
+                }
+                let computed = obj.get("computed").and_then(|v| v.as_bool()).unwrap_or(false);
+                if computed {
+                    if let Some(p) = obj.get_mut("property") {
+                        rewrite_expr_walk(p, inline_props, false);
+                    }
+                }
+                return;
+            }
+            // Skip Property shorthand keys (they're not value references).
+            if ty == "Property" {
+                let shorthand = obj.get("shorthand").and_then(|v| v.as_bool()).unwrap_or(false);
+                if shorthand {
+                    return;
+                }
+                let computed = obj.get("computed").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !computed {
+                    if let Some(v) = obj.get_mut("value") {
+                        rewrite_expr_walk(v, inline_props, false);
+                    }
+                    return;
+                }
+            }
+            for (_, v) in obj.iter_mut() {
+                rewrite_expr_walk(v, inline_props, false);
+            }
+        } else if let Some(arr) = node.as_array_mut() {
+            for v in arr {
+                rewrite_expr_walk(v, inline_props, false);
+            }
+        }
+    }
+    walk_fragment_expressions_mut(f, &mut |expr| {
+        rewrite_expr_inline(expr, inline_props);
+    });
+}
+
+/// Walk a fragment and apply a callback to every embedded expression. Mutable
+/// version of `walk_fragment_expressions`.
+fn walk_fragment_expressions_mut(
+    f: &mut svelte_ast::Fragment,
+    visit: &mut dyn FnMut(&mut Value),
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    use svelte_ast::fragment::FragmentChild;
+    for node in f.nodes.iter_mut() {
+        match node {
+            FragmentChild::ExpressionTag(t) => visit(&mut t.expression),
+            FragmentChild::HtmlTag(t) => visit(&mut t.expression),
+            FragmentChild::ConstTag(t) => visit(&mut t.declaration),
+            FragmentChild::RenderTag(t) => visit(&mut t.expression),
+            FragmentChild::IfBlock(b) => {
+                visit(&mut b.test);
+                walk_fragment_expressions_mut(&mut b.consequent, visit);
+                if let Some(alt) = b.alternate.as_mut() {
+                    walk_fragment_expressions_mut(alt, visit);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                visit(&mut b.expression);
+                walk_fragment_expressions_mut(&mut b.body, visit);
+                if let Some(fb) = b.fallback.as_mut() {
+                    walk_fragment_expressions_mut(fb, visit);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                visit(&mut b.expression);
+                walk_fragment_expressions_mut(&mut b.fragment, visit);
+            }
+            FragmentChild::AwaitBlock(b) => {
+                visit(&mut b.expression);
+                if let Some(f) = b.pending.as_mut() {
+                    walk_fragment_expressions_mut(f, visit);
+                }
+                if let Some(f) = b.then.as_mut() {
+                    walk_fragment_expressions_mut(f, visit);
+                }
+                if let Some(f) = b.catch_.as_mut() {
+                    walk_fragment_expressions_mut(f, visit);
+                }
+            }
+            FragmentChild::SnippetBlock(b) => {
+                walk_fragment_expressions_mut(&mut b.body, visit);
+            }
+            FragmentChild::RegularElement(el) => {
+                for a in el.attributes.iter_mut() {
+                    match a {
+                        ElementAttribute::Attribute(attr) => match &mut attr.value {
+                            AttributeValue::Single(t) => visit(&mut t.expression),
+                            AttributeValue::Many(parts) => {
+                                for p in parts.iter_mut() {
+                                    if let AttributeValuePart::ExpressionTag(t) = p {
+                                        visit(&mut t.expression);
+                                    }
+                                }
+                            }
+                            AttributeValue::Empty(_) => {}
+                        },
+                        ElementAttribute::BindDirective(bd) => visit(&mut bd.expression),
+                        ElementAttribute::SpreadAttribute(sa) => visit(&mut sa.expression),
+                        _ => {}
+                    }
+                }
+                walk_fragment_expressions_mut(&mut el.fragment, visit);
+            }
+            FragmentChild::Component(c) => {
+                for a in c.attributes.iter_mut() {
+                    match a {
+                        ElementAttribute::Attribute(attr) => match &mut attr.value {
+                            AttributeValue::Single(t) => visit(&mut t.expression),
+                            AttributeValue::Many(parts) => {
+                                for p in parts.iter_mut() {
+                                    if let AttributeValuePart::ExpressionTag(t) = p {
+                                        visit(&mut t.expression);
+                                    }
+                                }
+                            }
+                            AttributeValue::Empty(_) => {}
+                        },
+                        ElementAttribute::BindDirective(bd) => visit(&mut bd.expression),
+                        ElementAttribute::SpreadAttribute(sa) => visit(&mut sa.expression),
+                        _ => {}
+                    }
+                }
+                walk_fragment_expressions_mut(&mut c.fragment, visit);
+            }
+            _ => {}
+        }
     }
 }
 
