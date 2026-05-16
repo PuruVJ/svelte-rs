@@ -156,6 +156,33 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
                 ));
             }
         }
+        "a" => {
+            // <a> needs an href OR a name/id attribute. Without any of those
+            // it isn't a real anchor.
+            if !has_attr("href") && !has_attr("name") && !has_attr("id") {
+                diags.push(warnings::a11y_missing_attribute(
+                    span, "a", "an", "href",
+                ));
+            }
+            // Empty href / href="#" / href="javascript:..." → invalid.
+            if let Some(href) = attr_static_string(attr_get("href")) {
+                if href.is_empty() || href == "#" {
+                    diags.push(warnings::a11y_invalid_attribute(span, "href", &href));
+                }
+            }
+            // Empty name=''
+            if let Some(name_val) = attr_static_string(attr_get("name")) {
+                if name_val.is_empty() {
+                    diags.push(warnings::a11y_invalid_attribute(span, "name", ""));
+                }
+            }
+            // Empty id=''
+            if let Some(id_val) = attr_static_string(attr_get("id")) {
+                if id_val.is_empty() {
+                    diags.push(warnings::a11y_invalid_attribute(span, "id", ""));
+                }
+            }
+        }
         _ => {}
     }
 
