@@ -242,10 +242,18 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
     }
 
     // 19. a11y_unknown_aria_attribute — `aria-foo=...` with foo not in spec.
-    for (n, _) in &attrs {
+    //     Also: a11y_incorrect_aria_attribute_type_* — value-type checks.
+    for (n, v) in &attrs {
         if let Some(stripped) = n.strip_prefix("aria-") {
             if !is_known_aria_attribute(stripped) {
                 diags.push(warnings::a11y_unknown_aria_attribute(span, n, None));
+                continue;
+            }
+            // Type-check the value if static.
+            if let Some(value) = attr_static_string(Some(*v)) {
+                if let Some(diag) = check_aria_value_type(span, n, stripped, &value) {
+                    diags.push(diag);
+                }
             }
         }
     }
@@ -292,6 +300,114 @@ fn is_known_role(role: &str) -> bool {
         | "strong" | "subscript" | "superscript" | "time" | "blockquote"
         | "caption" | "cell" | "generic" | "meter"
     )
+}
+
+/// Check the static value of an aria attribute against its expected type.
+/// Returns a diagnostic if the value type doesn't match.
+fn check_aria_value_type(
+    span: Option<(u32, u32)>,
+    full_name: &str,
+    stripped: &str,
+    value: &str,
+) -> Option<CompileDiagnostic> {
+    match aria_type(stripped) {
+        AriaType::Boolean => {
+            if !matches!(value, "true" | "false" | "") {
+                Some(warnings::a11y_incorrect_aria_attribute_type_boolean(
+                    span, full_name,
+                ))
+            } else {
+                None
+            }
+        }
+        AriaType::Tristate => {
+            if !matches!(value, "true" | "false" | "mixed" | "") {
+                Some(warnings::a11y_incorrect_aria_attribute_type_tristate(
+                    span, full_name,
+                ))
+            } else {
+                None
+            }
+        }
+        AriaType::Integer => {
+            if value.parse::<i64>().is_err() {
+                Some(warnings::a11y_incorrect_aria_attribute_type_integer(
+                    span, full_name,
+                ))
+            } else {
+                None
+            }
+        }
+        AriaType::Number => {
+            if value.parse::<f64>().is_err() {
+                Some(warnings::a11y_incorrect_aria_attribute_type(
+                    span, full_name, "number",
+                ))
+            } else {
+                None
+            }
+        }
+        AriaType::Token(allowed) => {
+            if !allowed.contains(&value) {
+                Some(warnings::a11y_incorrect_aria_attribute_type_token(
+                    span, full_name, value,
+                ))
+            } else {
+                None
+            }
+        }
+        AriaType::TokenList(allowed) => {
+            for token in value.split_ascii_whitespace() {
+                if !allowed.contains(&token) {
+                    return Some(warnings::a11y_incorrect_aria_attribute_type_tokenlist(
+                        span, full_name, token,
+                    ));
+                }
+            }
+            None
+        }
+        AriaType::String | AriaType::IdRef | AriaType::IdRefList | AriaType::Unknown => None,
+    }
+}
+
+#[derive(Debug)]
+enum AriaType {
+    Boolean,
+    Tristate,
+    Integer,
+    Number,
+    String,
+    IdRef,
+    IdRefList,
+    Token(&'static [&'static str]),
+    TokenList(&'static [&'static str]),
+    Unknown,
+}
+
+fn aria_type(name: &str) -> AriaType {
+    match name {
+        "atomic" | "busy" | "disabled" | "modal" | "multiline" | "multiselectable"
+        | "readonly" | "required" | "selected" | "hidden" | "haspopup" => AriaType::Boolean,
+        "checked" | "pressed" | "expanded" | "grabbed" => AriaType::Tristate,
+        "level" | "colcount" | "colindex" | "colspan" | "posinset" | "rowcount"
+        | "rowindex" | "rowspan" | "setsize" => AriaType::Integer,
+        "valuemax" | "valuemin" | "valuenow" => AriaType::Number,
+        "autocomplete" => AriaType::Token(&["inline", "list", "both", "none"]),
+        "current" => AriaType::Token(&["page", "step", "location", "date", "time", "true", "false"]),
+        "dropeffect" => AriaType::TokenList(&["copy", "move", "link", "execute", "popup", "none"]),
+        "live" => AriaType::Token(&["off", "polite", "assertive"]),
+        "orientation" => AriaType::Token(&["horizontal", "vertical", "undefined"]),
+        "relevant" => AriaType::TokenList(&["additions", "removals", "text", "all"]),
+        "sort" => AriaType::Token(&["ascending", "descending", "none", "other"]),
+        "invalid" => AriaType::Token(&["grammar", "spelling", "true", "false"]),
+        "activedescendant" | "errormessage" => AriaType::IdRef,
+        "controls" | "describedby" | "details" | "flowto" | "labelledby" | "owns" => {
+            AriaType::IdRefList
+        }
+        "keyshortcuts" | "label" | "placeholder" | "roledescription" | "valuetext"
+        | "braillelabel" | "brailleroledescription" => AriaType::String,
+        _ => AriaType::Unknown,
+    }
 }
 
 /// WAI-ARIA 1.2 `aria-*` attribute list (subset).
