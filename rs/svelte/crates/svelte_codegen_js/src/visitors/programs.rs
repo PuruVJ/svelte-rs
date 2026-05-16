@@ -255,6 +255,7 @@ pub fn default_visitors() -> VisitorTable {
     t.insert("YieldExpression", expressions::yield_expression);
     t.insert("ImportExpression", expressions::import_expression);
     t.insert("TaggedTemplateExpression", expressions::tagged_template_expression);
+    t.insert("MetaProperty", expressions::meta_property);
 
     // statements
     t.insert("ExpressionStatement", statements::expression_statement);

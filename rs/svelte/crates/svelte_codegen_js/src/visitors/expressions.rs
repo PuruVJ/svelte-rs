@@ -416,6 +416,13 @@ pub fn import_expression(node: &Value, ctx: &mut Context) {
     ctx.write(")", None);
 }
 
+pub fn meta_property(node: &Value, ctx: &mut Context) {
+    // `import.meta` or `new.target` — emit `meta.property` form. Mirrors esrap.
+    let meta = node.get("meta").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    let prop = node.get("property").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("");
+    ctx.write(&format!("{meta}.{prop}"), Some(node));
+}
+
 pub fn tagged_template_expression(node: &Value, ctx: &mut Context) {
     visit_wrapped(node, &node["tag"], "tag", ctx);
     ctx.visit(&node["quasi"]);

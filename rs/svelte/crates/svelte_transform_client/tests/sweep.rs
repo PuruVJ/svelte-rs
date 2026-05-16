@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use svelte_codegen_js::{default_visitors, print, PrintOptions};
 use svelte_parse::parse;
-use svelte_transform_client::client_component;
+use svelte_transform_client::{client_component_with_options, ClientOptions};
 
 fn snake_to_pascal(name: &str) -> String {
     let mut chars = name.chars();
@@ -17,6 +17,19 @@ fn snake_to_pascal(name: &str) -> String {
     };
     let tail: String = chars.map(|c| if c == '-' { '_' } else { c }).collect();
     format!("{head}{tail}")
+}
+
+/// Extract a few compile options from a fixture's `_config.js`. Cheaply
+/// regex-style — most fixtures use a consistent shape.
+fn parse_config(config: &str) -> ClientOptions {
+    let mut opts = ClientOptions::default();
+    if config.contains("hmr: true") || config.contains("hmr:true") {
+        opts.hmr = true;
+    }
+    if config.contains("dev: true") || config.contains("dev:true") {
+        opts.dev = true;
+    }
+    opts
 }
 
 #[test]
@@ -47,10 +60,17 @@ fn sweep_snapshot_fixtures_client() {
             Ok(s) => s,
             Err(_) => continue,
         };
+        let config_path = entry.path().join("_config.js");
+        let options = if config_path.exists() {
+            let cfg = fs::read_to_string(&config_path).unwrap_or_default();
+            parse_config(&cfg)
+        } else {
+            ClientOptions::default()
+        };
         let component = snake_to_pascal(&name);
         let result = std::panic::catch_unwind(|| {
             let root = parse(&source, false)?;
-            let program = client_component(&root, &component);
+            let program = client_component_with_options(&root, &component, &options);
             let r = print(&program, &default_visitors(), &PrintOptions::default());
             Ok::<_, svelte_diagnostics::CompileDiagnostic>(r.code)
         });
