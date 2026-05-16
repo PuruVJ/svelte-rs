@@ -30,6 +30,9 @@ pub struct ValidateState<'a> {
     pub is_runes: bool,
     pub component_name: String,
     pub filename: Option<String>,
+    /// Imported identifier names from the instance script — used to detect
+    /// `<lowercaseImportedName>` patterns for `component_name_lowercase`.
+    pub imported_names: std::collections::HashSet<String>,
 }
 
 impl<'a> ValidateState<'a> {
@@ -41,6 +44,7 @@ impl<'a> ValidateState<'a> {
             is_runes: analysis.runes,
             component_name: analysis.name.clone(),
             filename: analysis.filename.clone(),
+            imported_names: std::collections::HashSet::new(),
         }
     }
 }
@@ -51,6 +55,7 @@ impl<'a> ValidateState<'a> {
 /// LabeledStatement, etc.).
 pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Vec<CompileDiagnostic>) {
     let mut state = ValidateState::new(analysis);
+    state.imported_names = collect_imported_names(root);
     visit_fragment(&root.fragment, &mut state);
     if let Some(s) = root.instance.as_ref() {
         visit_program(&s.content, /*is_instance=*/ true, &mut state);
@@ -59,6 +64,40 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
         visit_program(&s.content, /*is_instance=*/ false, &mut state);
     }
     (state.warnings, state.errors)
+}
+
+/// Collect identifier names imported via `import X from ...` /
+/// `import { Y } from ...` / `import * as Z from ...` in instance + module
+/// scripts. Used by `component_name_lowercase` detection.
+fn collect_imported_names(root: &Root) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk_program(program: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+        let Some(body) = program.get("body").and_then(|v| v.as_array()) else {
+            return;
+        };
+        for stmt in body {
+            if stmt.get("type").and_then(|v| v.as_str()) != Some("ImportDeclaration") {
+                continue;
+            }
+            let Some(specs) = stmt.get("specifiers").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for s in specs {
+                if let Some(local) = s.get("local") {
+                    if let Some(name) = local.get("name").and_then(|v| v.as_str()) {
+                        out.insert(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(s) = &root.instance {
+        walk_program(&s.content, &mut out);
+    }
+    if let Some(s) = &root.module {
+        walk_program(&s.content, &mut out);
+    }
+    out
 }
 
 /// Walk a Program (the `content` of a `<script>` block) and run JS-side
@@ -142,6 +181,16 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                 .errors
                 .extend(crate::a11y::check_duplicate_attributes(&el.attributes));
             state.warnings.extend(crate::a11y::check_regular_element(el));
+            // component_name_lowercase: `<thisShouldWarnMe>` where the name
+            // matches a script-level import → warn.
+            if state.imported_names.contains(&el.name) {
+                state
+                    .warnings
+                    .push(warnings::component_name_lowercase(
+                        Some((el.start, el.end)),
+                        &el.name,
+                    ));
+            }
             visit_attributes(node, &el.attributes, state);
             visit_fragment(&el.fragment, state);
         }
