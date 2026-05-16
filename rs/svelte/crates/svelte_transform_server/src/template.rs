@@ -495,9 +495,14 @@ fn lower_if_block(blk: &IfBlock, acc: &mut Accumulator) {
             .as_ref()
             .map(fragment_has_top_level_await)
             .unwrap_or(false);
+    // child_block wrap is only required when the IF TEST itself is async.
+    // Body awaits are handled per-element (ExpressionTag etc.). Indexed
+    // markers `<!--[0-->` are still used when body has awaits, since the
+    // runtime needs them for hydration tracking.
+    let wrap_in_child_block = test_has_await;
     let async_mode = test_has_await || body_has_await;
 
-    if async_mode {
+    if async_mode && wrap_in_child_block {
         // Async-mode if-block:
         //   $$renderer.child_block(async ($$renderer) => {
         //     if ((await $.save(test))()) {
@@ -537,7 +542,25 @@ fn lower_if_block(blk: &IfBlock, acc: &mut Accumulator) {
         return;
     }
 
-    // Non-async (synchronous) if-block:
+    // Non-(child-block-wrapped) if. Use indexed markers when async_mode (body
+    // has awaits), otherwise the simple `<!--[-->`/`<!--]-->` pair.
+    if async_mode {
+        let mut consequent_body = vec![marker_push("<!--[0-->")];
+        consequent_body.extend(ops_to_statements(lower_fragment_trimmed(&blk.consequent)));
+        let mut alternate_body = vec![marker_push("<!--[-1-->")];
+        if let Some(alt) = &blk.alternate {
+            alternate_body.extend(ops_to_statements(lower_fragment_trimmed(alt)));
+        }
+        let if_stmt = b::if_stmt(
+            blk.test.clone(),
+            b::block(consequent_body),
+            Some(b::block(alternate_body)),
+        );
+        acc.stmt(if_stmt);
+        acc.push_str("<!--]-->");
+        return;
+    }
+
     acc.push_str("<!--[-->");
     let consequent_body = ops_to_statements(lower_fragment_with_marker(&blk.consequent));
     let alternate_body = blk
@@ -717,9 +740,43 @@ fn lower_each_block(blk: &EachBlock, acc: &mut Accumulator) {
         "body": b::block(body_stmts)
     });
 
+    let has_fallback = blk.fallback.is_some();
+
     if async_mode {
-        // Wrap in $$renderer.child_block(async ($$renderer) => { array_decl; for_stmt })
-        let inner = b::block(vec![array_decl, for_stmt]);
+        // Async-mode each-block with optional fallback:
+        //   $$renderer.child_block(async ($$renderer) => {
+        //     const each_array = ...;
+        //     if (each_array.length !== 0) {
+        //       $$renderer.push('<!--[-->');
+        //       for (...) { ... }
+        //     } else {
+        //       $$renderer.push('<!--[!-->');
+        //       <fallback>
+        //     }
+        //   });
+        let mut inner_stmts: Vec<Value> = vec![array_decl];
+        if has_fallback {
+            let then_body = vec![
+                marker_push("<!--[-->"),
+                for_stmt,
+            ];
+            let mut else_body = vec![marker_push("<!--[!-->")];
+            else_body.extend(ops_to_statements(lower_fragment_with_marker(
+                blk.fallback.as_ref().unwrap(),
+            )));
+            inner_stmts.push(b::if_stmt(
+                b::binary(
+                    "!==",
+                    b::member(b::id("each_array"), b::id("length"), false, false),
+                    b::literal_num(0.0),
+                ),
+                b::block(then_body),
+                Some(b::block(else_body)),
+            ));
+        } else {
+            inner_stmts.push(for_stmt);
+        }
+        let inner = b::block(inner_stmts);
         let child_block = b::call(
             b::member(b::id("$$renderer"), b::id("child_block"), false, false),
             vec![serde_json::json!({
@@ -731,10 +788,48 @@ fn lower_each_block(blk: &EachBlock, acc: &mut Accumulator) {
                 "expression": false
             })],
         );
+        // For async-fallback, the `<!--[-->` opener moves inside (above) — strip
+        // it from the parent push. The closer remains.
+        if has_fallback {
+            // Remove the `<!--[-->` we already pushed at the top
+            // by replacing the last push op (which was `<!--[-->`).
+            // Hack: pop last chunk from current and replace with empty marker.
+            if let Some(last) = acc.current.quasis.last_mut() {
+                if last.ends_with("<!--[-->") {
+                    let new_len = last.len() - "<!--[-->".len();
+                    last.truncate(new_len);
+                }
+            }
+        }
         acc.stmt(b::stmt(child_block));
     } else {
         acc.stmt(array_decl);
-        acc.stmt(for_stmt);
+        if has_fallback {
+            // Sync fallback: emit `if (length !== 0) { <!--[--> for-loop } else { <!--[!--> fallback }`
+            // Need to undo our top-level `<!--[-->` first.
+            if let Some(last) = acc.current.quasis.last_mut() {
+                if last.ends_with("<!--[-->") {
+                    let new_len = last.len() - "<!--[-->".len();
+                    last.truncate(new_len);
+                }
+            }
+            let then_body = vec![marker_push("<!--[-->"), for_stmt];
+            let mut else_body = vec![marker_push("<!--[!-->")];
+            else_body.extend(ops_to_statements(lower_fragment_trimmed(
+                blk.fallback.as_ref().unwrap(),
+            )));
+            acc.stmt(b::if_stmt(
+                b::binary(
+                    "!==",
+                    b::member(b::id("each_array"), b::id("length"), false, false),
+                    b::literal_num(0.0),
+                ),
+                b::block(then_body),
+                Some(b::block(else_body)),
+            ));
+        } else {
+            acc.stmt(for_stmt);
+        }
     }
     acc.push_str("<!--]-->");
 }
