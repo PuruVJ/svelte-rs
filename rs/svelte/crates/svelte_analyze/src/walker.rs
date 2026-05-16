@@ -705,6 +705,12 @@ fn rune_to_binding_kind(rune: &str) -> BindingKind {
 /// `$effect`, `$props`, `$bindable`, `$inspect`, `$host`, plus `.raw` /
 /// `.by` / etc. variants).
 pub fn detect_runes(root: &Root) -> bool {
+    // <svelte:options runes /> or <svelte:options runes={true} /> → explicit opt-in.
+    if let Some(options) = &root.options {
+        if options.runes == Some(true) {
+            return true;
+        }
+    }
     fn walk(node: &Value) -> bool {
         match node {
             Value::Object(map) => {
