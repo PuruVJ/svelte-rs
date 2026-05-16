@@ -74,6 +74,14 @@ pub fn client_component_with_options(
 
     // Hoisted instance imports + state-name collection (for template-side
     // expression rewriting).
+    // All names originally bound as $state/$derived (regardless of unwrap/proxy
+    // optimization). Used to detect if-block tests that reference state for
+    // \$.async wrapping in async-mode chains.
+    let original_state_names: std::collections::HashSet<String> = match root.instance.as_ref() {
+        Some(i) => rewrite::collect_all_original_state_names(&i.content),
+        None => Default::default(),
+    };
+
     let (rewritten_instance, state_names): (Option<Value>, std::collections::HashSet<String>) =
         match root.instance.as_ref() {
             Some(i) => {
@@ -208,6 +216,7 @@ pub fn client_component_with_options(
         &constants,
         text_var_start,
         &async_var_last_idx,
+        &original_state_names,
     ) {
         program_body.push(b::declaration(
             "var",
@@ -684,6 +693,7 @@ fn try_multi_root_static(
     constants: &std::collections::HashMap<String, String>,
     text_var_start: usize,
     async_var_last_idx: &std::collections::HashMap<String, usize>,
+    original_state_names: &std::collections::HashSet<String>,
 ) -> Option<(String, Vec<Value>)> {
     use svelte_ast::fragment::FragmentChild;
     use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
@@ -974,24 +984,34 @@ fn try_multi_root_static(
     ));
 
     let mut local_names: Vec<String> = Vec::with_capacity(slots.len());
+    // Shared counters for if-block-chain naming (consequent_N, alternate_N,
+    // text_N, fragment_N, node_N). Mutates across slots.
+    let mut if_chain_ctx = IfChainGlobalCtx::default();
+    // The root fragment owns "fragment" (counter=0). Bump ctx.fragment so
+    // subsequent ctx.next_fragment() returns "fragment_1", "fragment_2", ...
+    let _ = if_chain_ctx.next_fragment();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     // Track text_N variable for each Dynamic slot (or None for non-Dynamic).
     let mut text_vars: Vec<Option<String>> = Vec::with_capacity(slots.len());
     let mut text_counter: usize = text_var_start;
     for (idx, slot) in slots.iter().enumerate() {
-        let base = match slot {
-            MultiRootSlot::Element { name, .. } => name.clone(),
-            MultiRootSlot::Component(_)
-            | MultiRootSlot::AwaitBlock(_)
-            | MultiRootSlot::IfBlock(_) => "node".to_string(),
+        let local = match slot {
+            MultiRootSlot::IfBlock(_) => if_chain_ctx.next_node(),
+            other => {
+                let base = match other {
+                    MultiRootSlot::Element { name, .. } => name.clone(),
+                    _ => "node".to_string(),
+                };
+                let count = counts.entry(base.clone()).or_insert(0);
+                let l = if *count == 0 {
+                    base.clone()
+                } else {
+                    format!("{base}_{}", count)
+                };
+                *count += 1;
+                l
+            }
         };
-        let count = counts.entry(base.clone()).or_insert(0);
-        let local = if *count == 0 {
-            base.clone()
-        } else {
-            format!("{base}_{}", count)
-        };
-        *count += 1;
         local_names.push(local.clone());
 
         if idx == 0 {
@@ -1085,8 +1105,31 @@ fn try_multi_root_static(
         // {#if ...} blocks: emit `{ var consequent_N = (...) => {...};
         // $.if(node_N, ($$render) => { if (test) $$render(consequent_N); }); }`.
         if let MultiRootSlot::IfBlock(b) = slot {
-            let body = build_multiroot_if_block(b, &local, idx, async_var_last_idx);
-            out.push(b::block(body));
+            let body = build_multiroot_if_block(
+                b,
+                &local,
+                idx,
+                async_var_last_idx,
+                original_state_names,
+                &mut if_chain_ctx,
+            );
+            // For chain pattern (which emits $.async or block directly),
+            // body already contains the wrapping. Don't wrap in another
+            // block — emit statements directly.
+            // The const-body path keeps its own block wrap via b::block.
+            if if_body_is_const_only(b) {
+                out.push(b::block(body));
+            } else {
+                let needs_outer_block =
+                    !chain_needs_async_wrap(b, async_var_last_idx, original_state_names);
+                if needs_outer_block {
+                    out.push(b::block(body));
+                } else {
+                    for s in body {
+                        out.push(s);
+                    }
+                }
+            }
         }
         text_vars.push(this_text_var);
     }
@@ -3077,11 +3120,220 @@ fn body_has_runes(stmts: &[Value]) -> bool {
     stmts.iter().any(walk)
 }
 
+/// Collect function/variable names declared at the top level of fn_body.
+/// Used to determine which identifiers are "safe" (declared in scope) for the
+/// unsafe-call heuristic. Includes function declarations, var/let/const decls
+/// with Identifier patterns, and function parameter names.
+fn collect_local_declared_names(stmts: &[Value]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
+        match v {
+            Value::Array(arr) => {
+                for x in arr {
+                    walk(x, out);
+                }
+            }
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match ty {
+                    "FunctionDeclaration" => {
+                        if let Some(n) = obj
+                            .get("id")
+                            .and_then(|i| i.get("name"))
+                            .and_then(|v| v.as_str())
+                        {
+                            out.insert(n.to_string());
+                        }
+                    }
+                    "VariableDeclarator" => {
+                        if let Some(n) = obj
+                            .get("id")
+                            .and_then(|i| i.get("name"))
+                            .and_then(|v| v.as_str())
+                        {
+                            out.insert(n.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for s in stmts {
+        walk(s, &mut out);
+    }
+    out
+}
+
+/// Narrow trigger for $.push/$.pop in async-in-derived shape: check if any
+/// `$.async_derived(...)` callback body contains an unsafe call to an
+/// identifier (e.g. `foo(await 1)` triggers; `() => foo` does not).
+fn has_unsafe_call_in_async_derived(stmts: &[Value]) -> bool {
+    let declared = collect_local_declared_names(stmts);
+    let allowed: std::collections::HashSet<&str> = [
+        "$$render",
+        "$$anchor",
+        "$$value",
+        "$$props",
+        "root",
+        "root_1",
+        "root_2",
+        "root_3",
+        "root_4",
+        "root_5",
+    ]
+    .iter()
+    .cloned()
+    .collect();
+
+    fn scan_calls_for_unsafe(
+        v: &Value,
+        declared: &std::collections::HashSet<String>,
+        allowed: &std::collections::HashSet<&str>,
+    ) -> bool {
+        if let Some(obj) = v.as_object() {
+            let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if ty == "CallExpression" {
+                if let Some(callee) = obj.get("callee") {
+                    if callee.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                        let name = callee.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        if !name.is_empty()
+                            && !name.starts_with('$')
+                            && !declared.contains(name)
+                            && !allowed.contains(name)
+                            && name.chars().next().map_or(false, |c| c.is_lowercase())
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            for v in obj.values() {
+                if scan_calls_for_unsafe(v, declared, allowed) {
+                    return true;
+                }
+            }
+        } else if let Some(arr) = v.as_array() {
+            for v in arr {
+                if scan_calls_for_unsafe(v, declared, allowed) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn walk(
+        v: &Value,
+        declared: &std::collections::HashSet<String>,
+        allowed: &std::collections::HashSet<&str>,
+    ) -> bool {
+        if let Some(obj) = v.as_object() {
+            if obj.get("type").and_then(|x| x.as_str()) == Some("CallExpression") {
+                let callee = obj.get("callee").cloned().unwrap_or(Value::Null);
+                let is_async_derived = callee
+                    .get("type")
+                    .and_then(|x| x.as_str())
+                    == Some("MemberExpression")
+                    && callee
+                        .get("object")
+                        .and_then(|o| o.get("name"))
+                        .and_then(|x| x.as_str())
+                        == Some("$")
+                    && callee
+                        .get("property")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|x| x.as_str())
+                        == Some("async_derived");
+                if is_async_derived {
+                    if let Some(args) = obj.get("arguments") {
+                        if scan_calls_for_unsafe(args, declared, allowed) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            for v in obj.values() {
+                if walk(v, declared, allowed) {
+                    return true;
+                }
+            }
+        } else if let Some(arr) = v.as_array() {
+            for v in arr {
+                if walk(v, declared, allowed) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    stmts.iter().any(|s| walk(s, &declared, &allowed))
+}
+
+/// True if `stmts` contains an "unsafe call" — a CallExpression whose callee
+/// is an Identifier with a lowercase name that isn't declared locally and
+/// isn't one of the known runtime/parameter names. Skip the bodies of nested
+/// arrow / function expressions when scanning (those have their own scope).
+fn body_has_unsafe_call(stmts: &[Value]) -> bool {
+    let declared = collect_local_declared_names(stmts);
+    let allowed: std::collections::HashSet<&str> = [
+        "$$render",
+        "$$anchor",
+        "$$value",
+        "$$props",
+        "$$bind_synthetic",
+    ]
+    .iter()
+    .cloned()
+    .collect();
+    fn walk(
+        v: &Value,
+        declared: &std::collections::HashSet<String>,
+        allowed: &std::collections::HashSet<&str>,
+    ) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(|x| walk(x, declared, allowed)),
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty == "CallExpression" {
+                    if let Some(callee) = obj.get("callee") {
+                        if callee.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                            let name = callee
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if !name.is_empty()
+                                && !name.starts_with('$')
+                                && !declared.contains(name)
+                                && !allowed.contains(name)
+                                && name.chars().next().map_or(false, |c| c.is_lowercase())
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                obj.values().any(|v| walk(v, declared, allowed))
+            }
+            _ => false,
+        }
+    }
+    stmts.iter().any(|s| walk(s, &declared, &allowed))
+}
+
 /// Conservative port of upstream's `needs_context` analysis. Emit $.push/$.pop
 /// when the body has: a class declaration, a `new` expression, `this.X`
 /// member access, direct `$$props.X` member access, `$.user_effect` /
-/// `$.user_pre_effect` / `$.inspect`, or `$.run` (async).
+/// `$.user_pre_effect` / `$.inspect`, or an unsafe call to an undeclared
+/// identifier from a nested $.async_derived callback (async-in-derived signal).
 fn body_needs_context(stmts: &[Value]) -> bool {
+    if has_unsafe_call_in_async_derived(stmts) {
+        return true;
+    }
     fn walk(v: &Value) -> bool {
         match v {
             Value::Array(arr) => arr.iter().any(walk),
@@ -3105,9 +3357,7 @@ fn body_needs_context(stmts: &[Value]) -> bool {
                         if obj_name == Some("$")
                             && matches!(
                                 prop_name,
-                                Some("user_effect")
-                                    | Some("user_pre_effect")
-                                    | Some("async_derived")
+                                Some("user_effect") | Some("user_pre_effect")
                             )
                         {
                             return true;
@@ -4020,13 +4270,59 @@ fn build_multiroot_if_block(
     local: &str,
     slot_idx: usize,
     script_async_vars: &std::collections::HashMap<String, usize>,
+    original_state_names: &std::collections::HashSet<String>,
+    ctx: &mut IfChainGlobalCtx,
 ) -> Vec<Value> {
     // @const-only body → original async-const path.
     if if_body_is_const_only(blk) {
         return build_multiroot_if_const_body(blk, local, slot_idx, script_async_vars);
     }
     // Chain-rendering path for async-if-chain shape.
-    build_multiroot_if_chain(blk, local, slot_idx, script_async_vars)
+    build_multiroot_if_chain(blk, local, script_async_vars, original_state_names, ctx)
+}
+
+/// True if this if-block (or chain) needs $.async wrapping (because any test
+/// has await or references a script async var OR a script-declared state).
+fn chain_needs_async_wrap(
+    blk: &svelte_ast::blocks::IfBlock,
+    script_async_vars: &std::collections::HashMap<String, usize>,
+    original_state_names: &std::collections::HashSet<String>,
+) -> bool {
+    let mut cur = blk.clone();
+    loop {
+        if expression_uses_await(&cur.test) {
+            return true;
+        }
+        for n in collect_identifier_names(&cur.test) {
+            if script_async_vars.contains_key(&n) || original_state_names.contains(&n) {
+                return true;
+            }
+        }
+        match cur.alternate.as_ref() {
+            None => return false,
+            Some(alt) => {
+                let mut next: Option<svelte_ast::blocks::IfBlock> = None;
+                for n in &alt.nodes {
+                    use svelte_ast::fragment::FragmentChild;
+                    match n {
+                        FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+                        FragmentChild::Comment(_) => {}
+                        FragmentChild::IfBlock(b) => {
+                            if next.is_some() {
+                                return false;
+                            }
+                            next = Some(b.clone());
+                        }
+                        _ => return false,
+                    }
+                }
+                match next {
+                    Some(b) => cur = b,
+                    None => return false,
+                }
+            }
+        }
+    }
 }
 
 fn if_body_is_const_only(blk: &svelte_ast::blocks::IfBlock) -> bool {
@@ -4110,13 +4406,16 @@ fn build_multiroot_if_const_body(
 fn build_multiroot_if_chain(
     blk: &svelte_ast::blocks::IfBlock,
     local: &str,
-    slot_idx: usize,
     script_async_vars: &std::collections::HashMap<String, usize>,
+    original_state_names: &std::collections::HashSet<String>,
+    ctx: &mut IfChainGlobalCtx,
 ) -> Vec<Value> {
     use svelte_ast::fragment::FragmentChild;
 
     // Walk the chain. Each `{:else if}` is a nested IfBlock at the only
-    // (non-whitespace) position in the alternate fragment.
+    // (non-whitespace) position in the alternate fragment. Stops at a
+    // mid-chain `{:else if AWAIT_TEST}` — that branch and everything after it
+    // becomes the synthetic nested-async alternate.
     struct Branch {
         test: Value,
         body: svelte_ast::Fragment,
@@ -4124,6 +4423,7 @@ fn build_multiroot_if_chain(
     let mut branches: Vec<Branch> = Vec::new();
     let mut current = blk.clone();
     let mut final_alternate: Option<svelte_ast::Fragment> = None;
+    let mut nested_if_break: Option<svelte_ast::blocks::IfBlock> = None;
     loop {
         branches.push(Branch {
             test: current.test.clone(),
@@ -4132,7 +4432,6 @@ fn build_multiroot_if_chain(
         match current.alternate.as_ref() {
             None => break,
             Some(alt) => {
-                // Detect single nested IfBlock at the only non-ws position.
                 let mut only_ifblock: Option<svelte_ast::blocks::IfBlock> = None;
                 let mut has_other = false;
                 for n in &alt.nodes {
@@ -4153,7 +4452,13 @@ fn build_multiroot_if_chain(
                     }
                 }
                 if !has_other && only_ifblock.is_some() {
-                    current = only_ifblock.unwrap();
+                    let nested = only_ifblock.unwrap();
+                    // Mid-chain await test breaks the chain.
+                    if !branches.is_empty() && expression_uses_await(&nested.test) {
+                        nested_if_break = Some(nested);
+                        break;
+                    }
+                    current = nested;
                 } else {
                     final_alternate = Some(alt.clone());
                     break;
@@ -4162,49 +4467,43 @@ fn build_multiroot_if_chain(
         }
     }
 
-    // Determine async wrapping. Pre-deps come from script-async-var refs in
-    // tests. Await thunks come from the FIRST test if it has `await` directly.
+    // Determine async wrapping. Wrap if any test:
+    //   - has top-level await, OR
+    //   - references a script async var (via $$promises), OR
+    //   - references a script-declared state binding (originally $state/$derived,
+    //     even if unwrapped via the never-reassigned opt).
     let mut pre_deps: std::collections::BTreeSet<usize> = Default::default();
+    let mut references_state = false;
     for br in &branches {
         for n in collect_identifier_names(&br.test) {
             if let Some(&i) = script_async_vars.get(&n) {
                 pre_deps.insert(i);
             }
+            if original_state_names.contains(&n) {
+                references_state = true;
+            }
         }
     }
     let first_test_has_await = expression_uses_await(&branches[0].test);
-    let needs_async_wrap = !pre_deps.is_empty() || first_test_has_await;
+    let needs_async_wrap =
+        !pre_deps.is_empty() || first_test_has_await || references_state;
+    // Include ALL script $$promises indices as pre-deps when wrapping.
+    if needs_async_wrap {
+        for &idx in script_async_vars.values() {
+            pre_deps.insert(idx);
+        }
+    }
 
-    // Allocate consequent/alternate names. Use a shared global counter via
-    // slot_idx — we'll use slot_idx-based offsets for now since each slot's
-    // names are independent.
-    let mut counter = consequent_counter_start(slot_idx);
+    // Allocate consequent names from the shared global counter.
     let mut consequent_names: Vec<String> = Vec::with_capacity(branches.len());
     for _ in 0..branches.len() {
-        let name = if counter == 0 {
-            "consequent".to_string()
-        } else {
-            format!("consequent_{}", counter)
-        };
-        counter += 1;
-        consequent_names.push(name);
+        consequent_names.push(ctx.next_consequent());
     }
-    let alternate_name = if final_alternate.is_some() {
-        let n = if counter == 0 {
-            "alternate".to_string()
-        } else {
-            format!("alternate_{}", counter)
-        };
-        Some(n)
-    } else {
-        None
-    };
 
     // Build consequent_N arrows.
     let mut inner_stmts: Vec<Value> = Vec::new();
-    let mut text_counter = if_text_counter_start(slot_idx);
     for (i, br) in branches.iter().enumerate() {
-        let body_stmts = build_if_branch_body(&br.body, &mut text_counter);
+        let body_stmts = build_if_branch_body_ctx(&br.body, ctx);
         inner_stmts.push(b::declaration(
             "var",
             vec![b::declarator(
@@ -4213,15 +4512,97 @@ fn build_multiroot_if_chain(
             )],
         ));
     }
-    if let (Some(alt_frag), Some(alt_name)) = (&final_alternate, &alternate_name) {
-        let body_stmts = build_if_branch_body(alt_frag, &mut text_counter);
+    // Hoist "complex" sync tests (those containing a CallExpression to a
+    // non-$ identifier) to `var d_N = \$.derived(() => test)`. Used only when
+    // the chain is NOT being $.async-wrapped (the hoisted derived is for
+    // sync chain perf). Track the hoist names so we can rewrite the render.
+    let mut hoist_var_names: std::collections::HashMap<usize, String> = Default::default();
+    if !needs_async_wrap {
+        for (i, br) in branches.iter().enumerate() {
+            if expression_contains_user_call(&br.test) {
+                let name = if ctx.derived_counter == 0 {
+                    "d".to_string()
+                } else {
+                    format!("d_{}", ctx.derived_counter)
+                };
+                ctx.derived_counter += 1;
+                inner_stmts.push(b::declaration(
+                    "var",
+                    vec![b::declarator(
+                        b::id(&name),
+                        Some(b::call(
+                            b::member(b::id("$"), b::id("derived"), false, false),
+                            vec![b::arrow(vec![], br.test.clone(), false)],
+                        )),
+                    )],
+                ));
+                hoist_var_names.insert(i, name);
+            }
+        }
+    }
+    // Build the final alternate or synthetic nested-alternate body FIRST so
+    // any inner counter allocations happen before the outer alternate name
+    // is reserved.
+    let alternate_name: Option<String>;
+    if let Some(alt_frag) = &final_alternate {
+        let body_stmts = build_if_branch_body_ctx(alt_frag, ctx);
+        let alt_name = ctx.next_alternate();
         inner_stmts.push(b::declaration(
             "var",
             vec![b::declarator(
-                b::id(alt_name),
+                b::id(&alt_name),
                 Some(b::arrow(vec![b::id("$$anchor")], b::block(body_stmts), false)),
             )],
         ));
+        alternate_name = Some(alt_name);
+    } else if let Some(nested) = &nested_if_break {
+        let frag_name = ctx.next_fragment();
+        let node_name = ctx.next_node();
+        let mut nested_body: Vec<Value> = Vec::new();
+        nested_body.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&frag_name),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("comment"), false, false),
+                    vec![],
+                )),
+            )],
+        ));
+        nested_body.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&node_name),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("first_child"), false, false),
+                    vec![b::id(&frag_name)],
+                )),
+            )],
+        ));
+        let nested_stmts =
+            build_multiroot_if_chain_nested(
+                nested,
+                &node_name,
+                script_async_vars,
+                original_state_names,
+                ctx,
+            );
+        nested_body.extend(nested_stmts);
+        nested_body.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("append"), false, false),
+            vec![b::id("$$anchor"), b::id(&frag_name)],
+        )));
+        let alt_name = ctx.next_alternate();
+        inner_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&alt_name),
+                Some(b::arrow(vec![b::id("$$anchor")], b::block(nested_body), false)),
+            )],
+        ));
+        alternate_name = Some(alt_name);
+    } else {
+        alternate_name = None;
     }
 
     // Build the $.if() render call. Chain: if (T1) render(c1); else if (T2)
@@ -4248,6 +4629,21 @@ fn build_multiroot_if_chain(
                     "optional": false
                 },
                 "arguments": [{ "type": "Identifier", "name": "$$condition" }],
+                "optional": false
+            });
+        }
+        // If test was hoisted to $.derived, substitute $.get(d_N).
+        if let Some(hoisted) = hoist_var_names.get(&i) {
+            test = serde_json::json!({
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$" },
+                    "property": { "type": "Identifier", "name": "get" },
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{ "type": "Identifier", "name": hoisted }],
                 "optional": false
             });
         }
@@ -4303,16 +4699,9 @@ fn build_multiroot_if_chain(
             "argument": { "type": "Literal", "value": 0, "raw": "0" }
         });
         let (awaits_arg, callback_params): (Value, Vec<Value>) = if first_test_has_await {
-            let test_arg = match branches[0].test.get("type").and_then(|v| v.as_str()) {
-                Some("AwaitExpression") => branches[0]
-                    .test
-                    .get("argument")
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                _ => branches[0].test.clone(),
-            };
+            let test_thunk = build_await_test_thunk(&branches[0].test);
             (
-                b::array(vec![b::arrow(vec![], test_arg, false)]),
+                b::array(vec![test_thunk]),
                 vec![b::id(local), b::id("$$condition")],
             )
         } else {
@@ -4332,12 +4721,10 @@ fn build_multiroot_if_chain(
     out
 }
 
-/// Build the body of one if-branch (consequent or alternate) — typically a
-/// single text or single-expression. For now supports text-only and
-/// single-expression patterns.
-fn build_if_branch_body(
+/// Build the body of one if-branch using the shared chain counter ctx.
+fn build_if_branch_body_ctx(
     fragment: &svelte_ast::Fragment,
-    text_counter: &mut usize,
+    ctx: &mut IfChainGlobalCtx,
 ) -> Vec<Value> {
     use svelte_ast::fragment::FragmentChild;
     let mut text_parts: Vec<DynamicPart> = Vec::new();
@@ -4368,12 +4755,7 @@ fn build_if_branch_body(
     if text_parts.is_empty() {
         return Vec::new();
     }
-    let var_name = if *text_counter == 0 {
-        "text".to_string()
-    } else {
-        format!("text_{}", text_counter)
-    };
-    *text_counter += 1;
+    let var_name = ctx.next_text();
     let mut stmts: Vec<Value> = Vec::new();
     // If single static, emit `var text_N = $.text('content');`.
     // If contains exprs, emit `var text_N = $.text();` + template_effect.
@@ -4459,15 +4841,357 @@ fn build_if_branch_body(
 }
 
 fn consequent_counter_start(slot_idx: usize) -> usize {
-    // For multi-root if-blocks, each block typically starts its consequents
-    // at slot_idx*K for some K based on how many branches in earlier blocks.
-    // Tracking globally is hard without a pre-walk; for now, multiply by 3
-    // assuming roughly 3 branches per block (good enough for fixtures we test).
     slot_idx * 3
+}
+
+/// True if `expr` contains a CallExpression whose callee is an Identifier
+/// (i.e. a user-level function call like `complex1()`), excluding `$.*` calls.
+fn expression_contains_user_call(expr: &Value) -> bool {
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Array(arr) => arr.iter().any(walk),
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty == "CallExpression" {
+                    if let Some(callee) = obj.get("callee") {
+                        if callee.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                            let name = callee.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            if !name.starts_with('$') {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                if matches!(
+                    ty,
+                    "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+                ) {
+                    return false;
+                }
+                obj.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    walk(expr)
+}
+
+/// Build the `await` thunk arg for a $.async call given an if-block test
+/// expression. If the test is `await X` directly: `() => X`. If the test has
+/// nested awaits (like `await X > 10`): `async () => transform_inner_awaits(test)`.
+fn build_await_test_thunk(test: &Value) -> Value {
+    if test.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
+        let inner = test.get("argument").cloned().unwrap_or(Value::Null);
+        return b::arrow(vec![], inner, false);
+    }
+    // Inner await rewriting + async arrow.
+    let transformed = transform_inner_awaits(test);
+    b::arrow(vec![], transformed, true)
+}
+
+/// Like build_multiroot_if_chain but emits a NESTED $.async with an extra
+/// `true` arg on $.if (the nested-in-chain marker).
+fn build_multiroot_if_chain_nested(
+    blk: &svelte_ast::blocks::IfBlock,
+    local: &str,
+    script_async_vars: &std::collections::HashMap<String, usize>,
+    original_state_names: &std::collections::HashSet<String>,
+    ctx: &mut IfChainGlobalCtx,
+) -> Vec<Value> {
+    use svelte_ast::fragment::FragmentChild;
+    struct Branch {
+        test: Value,
+        body: svelte_ast::Fragment,
+    }
+    let mut branches: Vec<Branch> = Vec::new();
+    let mut current = blk.clone();
+    let mut final_alternate: Option<svelte_ast::Fragment> = None;
+    let mut nested_if_break: Option<svelte_ast::blocks::IfBlock> = None;
+    loop {
+        branches.push(Branch {
+            test: current.test.clone(),
+            body: current.consequent.clone(),
+        });
+        match current.alternate.as_ref() {
+            None => break,
+            Some(alt) => {
+                let mut only_ifblock: Option<svelte_ast::blocks::IfBlock> = None;
+                let mut has_other = false;
+                for n in &alt.nodes {
+                    match n {
+                        FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+                        FragmentChild::Comment(_) => {}
+                        FragmentChild::IfBlock(b) => {
+                            if only_ifblock.is_some() {
+                                has_other = true;
+                                break;
+                            }
+                            only_ifblock = Some(b.clone());
+                        }
+                        _ => {
+                            has_other = true;
+                            break;
+                        }
+                    }
+                }
+                if !has_other && only_ifblock.is_some() {
+                    let nested = only_ifblock.unwrap();
+                    if !branches.is_empty() && expression_uses_await(&nested.test) {
+                        nested_if_break = Some(nested);
+                        break;
+                    }
+                    current = nested;
+                } else {
+                    final_alternate = Some(alt.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    // Nested chain: include script $$promises only if the test references
+    // a script state binding (same rule as the outer chain).
+    let mut pre_deps: std::collections::BTreeSet<usize> = Default::default();
+    let mut references_state = false;
+    for br in &branches {
+        for n in collect_identifier_names(&br.test) {
+            if let Some(&i) = script_async_vars.get(&n) {
+                pre_deps.insert(i);
+            }
+            if original_state_names.contains(&n) {
+                references_state = true;
+            }
+        }
+    }
+    if references_state {
+        for &idx in script_async_vars.values() {
+            pre_deps.insert(idx);
+        }
+    }
+    let first_test_has_await = expression_uses_await(&branches[0].test);
+
+    let mut consequent_names: Vec<String> = Vec::with_capacity(branches.len());
+    for _ in 0..branches.len() {
+        consequent_names.push(ctx.next_consequent());
+    }
+
+    let mut inner_stmts: Vec<Value> = Vec::new();
+    for (i, br) in branches.iter().enumerate() {
+        let body_stmts = build_if_branch_body_ctx(&br.body, ctx);
+        inner_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&consequent_names[i]),
+                Some(b::arrow(vec![b::id("$$anchor")], b::block(body_stmts), false)),
+            )],
+        ));
+    }
+    let alternate_name: Option<String>;
+    if let Some(alt_frag) = &final_alternate {
+        let body_stmts = build_if_branch_body_ctx(alt_frag, ctx);
+        let alt_name = ctx.next_alternate();
+        inner_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&alt_name),
+                Some(b::arrow(vec![b::id("$$anchor")], b::block(body_stmts), false)),
+            )],
+        ));
+        alternate_name = Some(alt_name);
+    } else if let Some(nested) = &nested_if_break {
+        let frag_name = ctx.next_fragment();
+        let node_name = ctx.next_node();
+        let mut nested_body: Vec<Value> = Vec::new();
+        nested_body.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&frag_name),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("comment"), false, false),
+                    vec![],
+                )),
+            )],
+        ));
+        nested_body.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&node_name),
+                Some(b::call(
+                    b::member(b::id("$"), b::id("first_child"), false, false),
+                    vec![b::id(&frag_name)],
+                )),
+            )],
+        ));
+        let nested_stmts =
+            build_multiroot_if_chain_nested(
+                nested,
+                &node_name,
+                script_async_vars,
+                original_state_names,
+                ctx,
+            );
+        nested_body.extend(nested_stmts);
+        nested_body.push(b::stmt(b::call(
+            b::member(b::id("$"), b::id("append"), false, false),
+            vec![b::id("$$anchor"), b::id(&frag_name)],
+        )));
+        let alt_name = ctx.next_alternate();
+        inner_stmts.push(b::declaration(
+            "var",
+            vec![b::declarator(
+                b::id(&alt_name),
+                Some(b::arrow(vec![b::id("$$anchor")], b::block(nested_body), false)),
+            )],
+        ));
+        alternate_name = Some(alt_name);
+    } else {
+        alternate_name = None;
+    }
+
+    let mut chain_if: Value = Value::Null;
+    if let Some(alt_name) = &alternate_name {
+        chain_if = b::stmt(b::call(
+            b::id("$$render"),
+            vec![b::id(alt_name), b::literal_num(-1.0)],
+        ));
+    }
+    for (i, br) in branches.iter().enumerate().rev() {
+        let mut test = br.test.clone();
+        if i == 0 && first_test_has_await {
+            test = serde_json::json!({
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$" },
+                    "property": { "type": "Identifier", "name": "get" },
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{ "type": "Identifier", "name": "$$condition" }],
+                "optional": false
+            });
+        }
+        let render_args = if i == 0 {
+            vec![b::id(&consequent_names[i])]
+        } else {
+            vec![b::id(&consequent_names[i]), b::literal_num(i as f64)]
+        };
+        let cons_call = b::stmt(b::call(b::id("$$render"), render_args));
+        let new_if = serde_json::json!({
+            "type": "IfStatement",
+            "test": test,
+            "consequent": cons_call,
+            "alternate": chain_if
+        });
+        chain_if = new_if;
+    }
+    let render_arrow = b::arrow(
+        vec![b::id("$$render")],
+        b::block(vec![chain_if]),
+        false,
+    );
+    // Nested $.if takes a third arg `true`.
+    let if_call = b::call(
+        b::member(b::id("$"), b::id("if"), false, false),
+        vec![b::id(local), render_arrow, b::literal_bool(true)],
+    );
+    inner_stmts.push(b::stmt(if_call));
+
+    // Always wraps in $.async (since we got here via mid-chain await break).
+    let pre_deps_array = b::array(
+        pre_deps
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "type": "MemberExpression",
+                    "object": { "type": "Identifier", "name": "$$promises" },
+                    "property": { "type": "Literal", "value": *i, "raw": i.to_string() },
+                    "computed": true,
+                    "optional": false
+                })
+            })
+            .collect(),
+    );
+    let test_thunk = build_await_test_thunk(&branches[0].test);
+    let callback = b::arrow(
+        vec![b::id(local), b::id("$$condition")],
+        b::block(inner_stmts),
+        false,
+    );
+    vec![b::stmt(b::call(
+        b::member(b::id("$"), b::id("async"), false, false),
+        vec![
+            b::id(local),
+            pre_deps_array,
+            b::array(vec![test_thunk]),
+            callback,
+        ],
+    ))]
 }
 
 fn if_text_counter_start(slot_idx: usize) -> usize {
     slot_idx * 3
+}
+
+/// Counters that increment GLOBALLY across the program for the
+/// async-if-chain shape. Shared across multi-root if-block slots so
+/// consequent/alternate/text/fragment/node names match upstream's compiler.
+#[derive(Default)]
+struct IfChainGlobalCtx {
+    consequent: usize,
+    alternate: usize,
+    text: usize,
+    fragment: usize,
+    node: usize,
+    derived_counter: usize,
+}
+
+impl IfChainGlobalCtx {
+    fn next_consequent(&mut self) -> String {
+        let s = if self.consequent == 0 {
+            "consequent".to_string()
+        } else {
+            format!("consequent_{}", self.consequent)
+        };
+        self.consequent += 1;
+        s
+    }
+    fn next_alternate(&mut self) -> String {
+        let s = if self.alternate == 0 {
+            "alternate".to_string()
+        } else {
+            format!("alternate_{}", self.alternate)
+        };
+        self.alternate += 1;
+        s
+    }
+    fn next_text(&mut self) -> String {
+        let s = if self.text == 0 {
+            "text".to_string()
+        } else {
+            format!("text_{}", self.text)
+        };
+        self.text += 1;
+        s
+    }
+    fn next_fragment(&mut self) -> String {
+        let s = if self.fragment == 0 {
+            "fragment".to_string()
+        } else {
+            format!("fragment_{}", self.fragment)
+        };
+        self.fragment += 1;
+        s
+    }
+    fn next_node(&mut self) -> String {
+        let s = if self.node == 0 {
+            "node".to_string()
+        } else {
+            format!("node_{}", self.node)
+        };
+        self.node += 1;
+        s
+    }
 }
 
 /// Build the consequent body for a `{#if}` block in async mode (async-const,

@@ -31,6 +31,72 @@ pub fn rewrite_program_with_state(program: Value) -> (Value, std::collections::H
 /// reassigned outside the script body (e.g. in template event handlers or
 /// expression tags). These names will NOT be eligible for the
 /// never-reassigned `$.state(x)` → `x` unwrap optimization.
+/// Collect all names originally bound to `\$state(...)` / `\$state.raw(...)` /
+/// `\$derived(...)` / `\$derived.by(...)`, BEFORE rune rewriting. This is the
+/// pre-transform AST so the rune call shapes are still present.
+pub fn collect_all_original_state_names(
+    program: &Value,
+) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
+        match v {
+            Value::Array(arr) => arr.iter().for_each(|x| walk(x, out)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    if let Some(init) = obj.get("init") {
+                        if is_state_or_derived_rune_call(init) {
+                            if let Some(name) = obj
+                                .get("id")
+                                .and_then(|i| i.get("name"))
+                                .and_then(|v| v.as_str())
+                            {
+                                out.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(program, &mut out);
+    out
+}
+
+fn is_state_or_derived_rune_call(v: &Value) -> bool {
+    if v.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let Some(callee) = v.get("callee") else {
+        return false;
+    };
+    let ty = callee.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match ty {
+        "Identifier" => {
+            let name = callee.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(name, "$state" | "$derived")
+        }
+        "MemberExpression" => {
+            let obj_name = callee
+                .get("object")
+                .and_then(|o| o.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let prop_name = callee
+                .get("property")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            (obj_name == "$state" && prop_name == "raw")
+                || (obj_name == "$derived" && prop_name == "by")
+        }
+        _ => false,
+    }
+}
+
 pub fn rewrite_program_with_state_and_hints(
     mut program: Value,
     extra_reassigned: &std::collections::HashSet<String>,
