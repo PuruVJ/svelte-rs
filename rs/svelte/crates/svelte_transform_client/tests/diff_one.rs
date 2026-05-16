@@ -150,3 +150,9 @@ fn diff_async_if_hoisting() {
 fn diff_async_each_hoisting() {
     diff("async-each-hoisting", "Async_each_hoisting");
 }
+
+#[test]
+#[ignore]
+fn diff_async_if_chain() {
+    diff("async-if-chain", "Async_if_chain");
+}

@@ -1519,7 +1519,8 @@ fn wrap_identifier_with_get(node: &mut Value, target_name: &str) {
 }
 
 /// True if any top-level statement in `body` is a `let/var/const X = await Y`
-/// declaration. Used to gate the async script transform.
+/// declaration OR a `let X = $.derived(() => <body with await>)` declaration.
+/// Used to gate the async script transform.
 fn body_has_top_level_await(body: &[Value]) -> bool {
     for stmt in body {
         if stmt.get("type").and_then(|v| v.as_str()) != Some("VariableDeclaration") {
@@ -1534,10 +1535,51 @@ fn body_has_top_level_await(body: &[Value]) -> bool {
                 if init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression") {
                     return true;
                 }
+                if derived_with_await_body(init).is_some() {
+                    return true;
+                }
             }
         }
     }
     false
+}
+
+/// If `expr` is `\$.derived(() => <body containing top-level await>)` (the
+/// rewritten form of the user's `\$derived(await Y)`), return the *inner
+/// argument* with the outer `await` stripped (e.g. for `await Y` returns
+/// `Y`). Otherwise None.
+fn derived_with_await_body(expr: &Value) -> Option<Value> {
+    if expr.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return None;
+    }
+    let callee = expr.get("callee")?;
+    if callee.get("type").and_then(|v| v.as_str()) != Some("MemberExpression") {
+        return None;
+    }
+    let obj = callee
+        .get("object")
+        .and_then(|o| o.get("name"))
+        .and_then(|v| v.as_str());
+    let prop = callee
+        .get("property")
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str());
+    if obj != Some("$") || prop != Some("derived") {
+        return None;
+    }
+    let args = expr.get("arguments")?.as_array()?;
+    if args.is_empty() {
+        return None;
+    }
+    let arrow = &args[0];
+    if arrow.get("type").and_then(|v| v.as_str()) != Some("ArrowFunctionExpression") {
+        return None;
+    }
+    let body = arrow.get("body")?;
+    if body.get("type").and_then(|v| v.as_str()) != Some("AwaitExpression") {
+        return None;
+    }
+    body.get("argument").cloned()
 }
 
 /// If the fragment's only non-whitespace top-level node is a single
@@ -2022,6 +2064,8 @@ fn transform_async_script(
     enum Kind {
         AsyncDecl(String, Value, Value), // X = await Y (name, init, original id)
         SyncDecl(String, Value, Value),  // X = sync expr (name, init, original id)
+        // X = $.derived(() => await Y) → \`async () => X = await \$.async_derived(() => Y)\`
+        AsyncDerivedDecl(String, Value, Value),
         Inspect(Vec<String>),            // names read by $.inspect
         Other,
     }
@@ -2049,6 +2093,8 @@ fn transform_async_script(
                             init.get("type").and_then(|v| v.as_str()) == Some("AwaitExpression");
                         if is_await {
                             items.push((Kind::AsyncDecl(name, init, id_node), stmt));
+                        } else if let Some(inner) = derived_with_await_body(&init) {
+                            items.push((Kind::AsyncDerivedDecl(name, inner, id_node), stmt));
                         } else {
                             items.push((Kind::SyncDecl(name, init, id_node), stmt));
                         }
@@ -2073,8 +2119,26 @@ fn transform_async_script(
 
     let mut var_decls: Vec<Value> = Vec::new();
     let mut run_callbacks: Vec<Value> = Vec::new();
-    let mut other_stmts: Vec<Value> = Vec::new();
+    let mut pre_stmts: Vec<Value> = Vec::new();
+    let mut post_stmts: Vec<Value> = Vec::new();
     let mut var_last_idx: std::collections::HashMap<String, usize> = Default::default();
+    // SyncDecls / Inspect / Other statements that appear BEFORE the first
+    // async/async-derived decl stay in place as ordinary `let` declarations
+    // (matching upstream's behavior: they have no async ordering implications).
+    // Post-boundary Other statements go AFTER the \$.run block.
+    let first_async_idx = items.iter().position(|(k, _)| {
+        matches!(k, Kind::AsyncDecl(..) | Kind::AsyncDerivedDecl(..))
+    });
+    let boundary = first_async_idx.unwrap_or(items.len());
+    let mut post_items: Vec<(Kind, Value)> = Vec::new();
+    for (idx, (kind, stmt)) in items.into_iter().enumerate() {
+        if idx < boundary {
+            pre_stmts.push(stmt);
+        } else {
+            post_items.push((kind, stmt));
+        }
+    }
+    let mut items = post_items;
     let mut i = 0;
     while i < items.len() {
         match &items[i].0 {
@@ -2087,7 +2151,27 @@ fn transform_async_script(
                 var_last_idx.insert(name.clone(), idx);
                 i += 1;
             }
-            Kind::SyncDecl(_, _, _) | Kind::Inspect(_) => {
+            Kind::AsyncDerivedDecl(name, inner_body, id_node) => {
+                // `let X = $.derived(() => await Y)`
+                //   →  `var X;`
+                //       `async () => X = await $.async_derived(() => Y)`
+                var_decls.push(b::declarator(id_node.clone(), None));
+                let async_derived_call = b::call(
+                    b::member(b::id("$"), b::id("async_derived"), false, false),
+                    vec![b::arrow(vec![], inner_body.clone(), false)],
+                );
+                let await_expr = serde_json::json!({
+                    "type": "AwaitExpression",
+                    "argument": async_derived_call
+                });
+                let assign = b::assignment("=", b::id(name), await_expr);
+                let arrow = b::arrow(vec![], assign, true);
+                let idx = run_callbacks.len();
+                run_callbacks.push(arrow);
+                var_last_idx.insert(name.clone(), idx);
+                i += 1;
+            }
+            Kind::SyncDecl(..) | Kind::Inspect(_) => {
                 // Group consecutive SyncDecl / Inspect items into one callback.
                 let mut group_stmts: Vec<Value> = Vec::new();
                 let mut group_names: Vec<String> = Vec::new();
@@ -2133,13 +2217,14 @@ fn transform_async_script(
                 }
             }
             Kind::Other => {
-                other_stmts.push(items[i].1.clone());
+                post_stmts.push(items[i].1.clone());
                 i += 1;
             }
         }
     }
 
     let mut combined: Vec<Value> = Vec::new();
+    combined.extend(pre_stmts);
     if !var_decls.is_empty() {
         combined.push(b::declaration("var", var_decls));
     }
@@ -2155,7 +2240,7 @@ fn transform_async_script(
             )],
         ));
     }
-    combined.extend(other_stmts);
+    combined.extend(post_stmts);
     (combined, var_last_idx)
 }
 
