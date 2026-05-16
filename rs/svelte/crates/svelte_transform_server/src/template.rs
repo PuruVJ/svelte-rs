@@ -125,6 +125,11 @@ pub fn lower_fragment_with_marker(fragment: &Fragment) -> Vec<TemplateOp> {
 struct Accumulator {
     ops: Vec<TemplateOp>,
     current: TemplateChunks,
+    /// Set when last emitted op was a Stmt (Component invocation, block,
+    /// etc.). The next push of text/expression content prepends `<!---->`
+    /// as an anchor marker so the runtime can locate the end of the
+    /// preceding dynamic insertion.
+    needs_anchor_marker: bool,
 }
 
 impl Accumulator {
@@ -132,15 +137,36 @@ impl Accumulator {
         Self {
             ops: Vec::new(),
             current: TemplateChunks::new(),
+            needs_anchor_marker: false,
+        }
+    }
+    fn maybe_emit_marker(&mut self, next_str_starts_with: Option<&str>) {
+        if self.needs_anchor_marker {
+            // Suppress the anchor marker when the next content is itself
+            // a block marker (e.g. `<!--]-->`). The block-end marker
+            // already serves as a position anchor.
+            let suppress = next_str_starts_with
+                .map(|s| s.starts_with("<!--"))
+                .unwrap_or(false);
+            if !suppress {
+                self.current.push_str("<!---->");
+            }
+            self.needs_anchor_marker = false;
         }
     }
     fn push_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.maybe_emit_marker(Some(s));
         self.current.push_str(s);
     }
     fn push_char(&mut self, c: char) {
+        self.maybe_emit_marker(None);
         self.current.push_char(c);
     }
     fn push_expression(&mut self, e: Value) {
+        self.maybe_emit_marker(None);
         self.current.push_expression(e);
     }
     fn flush(&mut self) {
@@ -152,6 +178,7 @@ impl Accumulator {
     fn stmt(&mut self, s: Value) {
         self.flush();
         self.ops.push(TemplateOp::Stmt(s));
+        self.needs_anchor_marker = true;
     }
     fn into_ops(mut self) -> Vec<TemplateOp> {
         self.flush();
@@ -457,7 +484,63 @@ fn lower_component(c: &Component, acc: &mut Accumulator) {
             ElementAttribute::SpreadAttribute(s) => {
                 props.push(b::spread(s.expression.clone()));
             }
-            // Directives are stripped server-side.
+            // bind:X={target} (NOT bind:this) → getter/setter prop pair.
+            // The setter assigns the target and sets \$\$settled = false so
+            // the component-body do-while wrapper re-iterates.
+            ElementAttribute::BindDirective(bd) if bd.name != "this" => {
+                let bind_name = bd.name.clone();
+                let target = bd.expression.clone();
+                // get NAME() { return target; }
+                let getter = serde_json::json!({
+                    "type": "Property",
+                    "kind": "get",
+                    "key": { "type": "Identifier", "name": bind_name.clone() },
+                    "value": {
+                        "type": "FunctionExpression",
+                        "async": false,
+                        "generator": false,
+                        "id": null,
+                        "params": [],
+                        "body": {
+                            "type": "BlockStatement",
+                            "body": [{
+                                "type": "ReturnStatement",
+                                "argument": target.clone()
+                            }]
+                        }
+                    },
+                    "computed": false,
+                    "method": false,
+                    "shorthand": false
+                });
+                // set NAME($$value) { target = $$value; $$settled = false; }
+                let setter_body = vec![
+                    b::stmt(b::assignment("=", target, b::id("$$value"))),
+                    b::stmt(b::assignment("=", b::id("$$settled"), b::literal_bool(false))),
+                ];
+                let setter = serde_json::json!({
+                    "type": "Property",
+                    "kind": "set",
+                    "key": { "type": "Identifier", "name": bind_name },
+                    "value": {
+                        "type": "FunctionExpression",
+                        "async": false,
+                        "generator": false,
+                        "id": null,
+                        "params": [{ "type": "Identifier", "name": "$$value" }],
+                        "body": {
+                            "type": "BlockStatement",
+                            "body": setter_body
+                        }
+                    },
+                    "computed": false,
+                    "method": false,
+                    "shorthand": false
+                });
+                props.push(getter);
+                props.push(setter);
+            }
+            // Other directives (on:, use:, etc.) are stripped server-side.
             _ => {}
         }
     }

@@ -39,6 +39,25 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
     if !derived_names.is_empty() {
         rewrite_fragment_derived_refs(&mut root_with_rewritten_template.fragment, &derived_names);
     }
+    // Collect script-level constants (`let X = 'literal'`, never reassigned,
+    // never originally a $state/$derived binding) and substitute Identifier
+    // references in template expressions with the literal value. Enables
+    // nullish-coalescence-omittance fold-through.
+    if let Some(rewritten) = &rewritten_instance {
+        let original_state_names = root
+            .instance
+            .as_ref()
+            .map(|i| collect_original_state_names(&i.content))
+            .unwrap_or_default();
+        let mut constants = collect_script_constants(rewritten);
+        constants.retain(|n, _| !original_state_names.contains(n));
+        if !constants.is_empty() {
+            substitute_constants_in_fragment(
+                &mut root_with_rewritten_template.fragment,
+                &constants,
+            );
+        }
+    }
     let hoisted_snippets = extract_top_level_snippets(&mut root_with_rewritten_template.fragment);
     let template_ops = template::lower_fragment_trimmed(&root_with_rewritten_template.fragment);
     let mut function_body: Vec<Value> = Vec::new();
@@ -50,7 +69,57 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
         let _ = hoisted;
     }
 
-    function_body.extend(template::ops_to_statements(template_ops));
+    let has_bind_on_component = fragment_has_bind_on_component(&root_with_rewritten_template.fragment);
+    let template_stmts = template::ops_to_statements(template_ops);
+
+    if has_bind_on_component {
+        // Wrap the template body in the `do { ... } while (!$$settled)`
+        // pattern with copy/subsume so `bind:X={target}` round-trips on the
+        // server. Mirrors upstream's `Component.js` settled-binding path.
+        function_body.push(b::declaration(
+            "let",
+            vec![b::declarator(b::id("$$settled"), Some(b::literal_bool(true)))],
+        ));
+        function_body.push(b::declaration(
+            "let",
+            vec![b::declarator(b::id("$$inner_renderer"), None)],
+        ));
+        function_body.push(b::function_declaration(
+            b::id("$$render_inner"),
+            vec![b::id("$$renderer")],
+            b::block(template_stmts),
+            false,
+        ));
+        // do { $$settled = true; $$inner_renderer = $$renderer.copy(); $$render_inner($$inner_renderer); } while (!$$settled);
+        let do_body = b::block(vec![
+            b::stmt(b::assignment("=", b::id("$$settled"), b::literal_bool(true))),
+            b::stmt(b::assignment(
+                "=",
+                b::id("$$inner_renderer"),
+                b::call(
+                    b::member(b::id("$$renderer"), b::id("copy"), false, false),
+                    vec![],
+                ),
+            )),
+            b::stmt(b::call(b::id("$$render_inner"), vec![b::id("$$inner_renderer")])),
+        ]);
+        function_body.push(serde_json::json!({
+            "type": "DoWhileStatement",
+            "body": do_body,
+            "test": {
+                "type": "UnaryExpression",
+                "operator": "!",
+                "prefix": true,
+                "argument": { "type": "Identifier", "name": "$$settled" }
+            }
+        }));
+        function_body.push(b::stmt(b::call(
+            b::member(b::id("$$renderer"), b::id("subsume"), false, false),
+            vec![b::id("$$inner_renderer")],
+        )));
+    } else {
+        function_body.extend(template_stmts);
+    }
 
     let needs_context = component_needs_context(&root);
     let needs_props = uses_props(&root) || needs_context;
@@ -126,6 +195,370 @@ pub fn server_component(root: &Root, component_name: &str) -> Value {
 /// declaration. Mirrors upstream's snippet hoisting in
 /// `transform-server.js` (handles the `uses_component_bindings` path's
 /// snippet collection).
+/// True if any Component in the fragment has a `bind:X={target}` directive
+/// (not bind:this). Triggers the server-side do-while + copy/subsume wrapper.
+fn fragment_has_bind_on_component(f: &svelte_ast::Fragment) -> bool {
+    use svelte_ast::attributes::ElementAttribute;
+    use svelte_ast::fragment::FragmentChild;
+    fn walk(f: &svelte_ast::Fragment) -> bool {
+        for n in &f.nodes {
+            match n {
+                FragmentChild::Component(c) => {
+                    for a in &c.attributes {
+                        if let ElementAttribute::BindDirective(bd) = a {
+                            if bd.name != "this" {
+                                return true;
+                            }
+                        }
+                    }
+                    if walk(&c.fragment) {
+                        return true;
+                    }
+                }
+                FragmentChild::RegularElement(el) => {
+                    if walk(&el.fragment) {
+                        return true;
+                    }
+                }
+                FragmentChild::IfBlock(b) => {
+                    if walk(&b.consequent) {
+                        return true;
+                    }
+                    if let Some(alt) = b.alternate.as_ref() {
+                        if walk(alt) {
+                            return true;
+                        }
+                    }
+                }
+                FragmentChild::EachBlock(b) => {
+                    if walk(&b.body) {
+                        return true;
+                    }
+                    if let Some(fb) = b.fallback.as_ref() {
+                        if walk(fb) {
+                            return true;
+                        }
+                    }
+                }
+                FragmentChild::KeyBlock(b) => {
+                    if walk(&b.fragment) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+    walk(f)
+}
+
+/// Collect names originally bound to `\$state(...)` / `\$state.raw(...)` /
+/// `\$derived(...)` / `\$derived.by(...)`, BEFORE rune rewriting. The
+/// pre-rewrite Program is walked.
+fn collect_original_state_names(program: &Value) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = Default::default();
+    fn walk(v: &Value, out: &mut std::collections::HashSet<String>) {
+        match v {
+            Value::Array(arr) => arr.iter().for_each(|x| walk(x, out)),
+            Value::Object(obj) => {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("VariableDeclarator") {
+                    if let Some(init) = obj.get("init") {
+                        if is_rune_state_or_derived(init) {
+                            if let Some(n) = obj
+                                .get("id")
+                                .and_then(|i| i.get("name"))
+                                .and_then(|v| v.as_str())
+                            {
+                                out.insert(n.to_string());
+                            }
+                        }
+                    }
+                }
+                for (_, v) in obj.iter() {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(program, &mut out);
+    out
+}
+
+fn is_rune_state_or_derived(v: &Value) -> bool {
+    if v.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
+        return false;
+    }
+    let callee = match v.get("callee") {
+        Some(c) => c,
+        None => return false,
+    };
+    let ty = callee.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    match ty {
+        "Identifier" => {
+            let name = callee.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            matches!(name, "$state" | "$derived")
+        }
+        "MemberExpression" => {
+            let obj_n = callee
+                .get("object")
+                .and_then(|o| o.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let prop_n = callee
+                .get("property")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            (obj_n == "$state" && prop_n == "raw")
+                || (obj_n == "$derived" && prop_n == "by")
+        }
+        _ => false,
+    }
+}
+
+/// Collect script-level `let X = 'literal' | number | boolean` bindings that
+/// are never reassigned. The values are returned as JS Literal AST nodes
+/// (ready to substitute into template expressions).
+fn collect_script_constants(
+    program: &Value,
+) -> std::collections::HashMap<String, Value> {
+    let body = program.get("body").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    // First pass: candidates (name → init literal).
+    let mut candidates: std::collections::HashMap<String, Value> = Default::default();
+    for stmt in &body {
+        if stmt.get("type").and_then(|v| v.as_str()) != Some("VariableDeclaration") {
+            continue;
+        }
+        let decls = match stmt.get("declarations").and_then(|v| v.as_array()) {
+            Some(d) => d,
+            None => continue,
+        };
+        for d in decls {
+            let name = d
+                .get("id")
+                .and_then(|i| i.get("name"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let init = d.get("init").cloned();
+            if let (Some(name), Some(init)) = (name, init) {
+                if init.get("type").and_then(|v| v.as_str()) == Some("Literal") {
+                    candidates.insert(name, init);
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return candidates;
+    }
+    // Second pass: drop any candidate that's reassigned anywhere in the
+    // program (AssignmentExpression / UpdateExpression with that identifier
+    // as LHS).
+    fn collect_reassigned(node: &Value, out: &mut std::collections::HashSet<String>) {
+        match node {
+            Value::Array(arr) => arr.iter().for_each(|v| collect_reassigned(v, out)),
+            Value::Object(obj) => {
+                let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if ty == "AssignmentExpression" {
+                    if let Some(left) = obj.get("left") {
+                        if left.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                            if let Some(n) = left.get("name").and_then(|v| v.as_str()) {
+                                out.insert(n.to_string());
+                            }
+                        }
+                    }
+                } else if ty == "UpdateExpression" {
+                    if let Some(arg) = obj.get("argument") {
+                        if arg.get("type").and_then(|v| v.as_str()) == Some("Identifier") {
+                            if let Some(n) = arg.get("name").and_then(|v| v.as_str()) {
+                                out.insert(n.to_string());
+                            }
+                        }
+                    }
+                }
+                for (_, v) in obj.iter() {
+                    collect_reassigned(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut reassigned: std::collections::HashSet<String> = Default::default();
+    collect_reassigned(program, &mut reassigned);
+    candidates.retain(|n, _| !reassigned.contains(n));
+    candidates
+}
+
+/// Walk the fragment and replace bare Identifier references (in template
+/// expressions, attribute values, block tests, etc.) whose name is in
+/// `constants` with the constant Literal value.
+fn substitute_constants_in_fragment(
+    f: &mut svelte_ast::Fragment,
+    constants: &std::collections::HashMap<String, Value>,
+) {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    use svelte_ast::fragment::FragmentChild;
+    fn substitute_walk(
+        node: &mut Value,
+        constants: &std::collections::HashMap<String, Value>,
+        is_member_property: bool,
+    ) {
+        if let Some(obj) = node.as_object_mut() {
+            let ty = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Skip ArrowFunctionExpression / FunctionExpression bodies — they
+            // create their own scopes and may shadow these names.
+            if matches!(
+                ty.as_str(),
+                "ArrowFunctionExpression" | "FunctionExpression" | "FunctionDeclaration"
+            ) {
+                return;
+            }
+            if ty == "Identifier" && !is_member_property {
+                if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+                    if let Some(replacement) = constants.get(name) {
+                        *node = replacement.clone();
+                        return;
+                    }
+                }
+            }
+            if ty == "MemberExpression" {
+                if let Some(o) = obj.get_mut("object") {
+                    substitute_walk(o, constants, false);
+                }
+                let computed = obj
+                    .get("computed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if computed {
+                    if let Some(p) = obj.get_mut("property") {
+                        substitute_walk(p, constants, false);
+                    }
+                }
+                return;
+            }
+            if ty == "Property" {
+                let shorthand = obj.get("shorthand").and_then(|v| v.as_bool()).unwrap_or(false);
+                if shorthand {
+                    return;
+                }
+                let computed = obj.get("computed").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !computed {
+                    if let Some(v) = obj.get_mut("value") {
+                        substitute_walk(v, constants, false);
+                    }
+                    return;
+                }
+            }
+            for (_, v) in obj.iter_mut() {
+                substitute_walk(v, constants, false);
+            }
+        } else if let Some(arr) = node.as_array_mut() {
+            for v in arr {
+                substitute_walk(v, constants, false);
+            }
+        }
+    }
+    fn substitute_in_fragment(
+        f: &mut svelte_ast::Fragment,
+        constants: &std::collections::HashMap<String, Value>,
+    ) {
+        for node in f.nodes.iter_mut() {
+            match node {
+                FragmentChild::ExpressionTag(t) => substitute_walk(&mut t.expression, constants, false),
+                FragmentChild::HtmlTag(t) => substitute_walk(&mut t.expression, constants, false),
+                FragmentChild::ConstTag(t) => substitute_walk(&mut t.declaration, constants, false),
+                FragmentChild::RenderTag(t) => substitute_walk(&mut t.expression, constants, false),
+                FragmentChild::IfBlock(b) => {
+                    substitute_walk(&mut b.test, constants, false);
+                    substitute_in_fragment(&mut b.consequent, constants);
+                    if let Some(alt) = b.alternate.as_mut() {
+                        substitute_in_fragment(alt, constants);
+                    }
+                }
+                FragmentChild::EachBlock(b) => {
+                    substitute_walk(&mut b.expression, constants, false);
+                    substitute_in_fragment(&mut b.body, constants);
+                    if let Some(fb) = b.fallback.as_mut() {
+                        substitute_in_fragment(fb, constants);
+                    }
+                }
+                FragmentChild::KeyBlock(b) => {
+                    substitute_walk(&mut b.expression, constants, false);
+                    substitute_in_fragment(&mut b.fragment, constants);
+                }
+                FragmentChild::AwaitBlock(b) => {
+                    substitute_walk(&mut b.expression, constants, false);
+                    if let Some(fb) = b.pending.as_mut() {
+                        substitute_in_fragment(fb, constants);
+                    }
+                    if let Some(fb) = b.then.as_mut() {
+                        substitute_in_fragment(fb, constants);
+                    }
+                    if let Some(fb) = b.catch_.as_mut() {
+                        substitute_in_fragment(fb, constants);
+                    }
+                }
+                FragmentChild::SnippetBlock(b) => {
+                    substitute_in_fragment(&mut b.body, constants);
+                }
+                FragmentChild::RegularElement(el) => {
+                    for a in el.attributes.iter_mut() {
+                        match a {
+                            ElementAttribute::Attribute(attr) => match &mut attr.value {
+                                AttributeValue::Single(t) => substitute_walk(&mut t.expression, constants, false),
+                                AttributeValue::Many(parts) => {
+                                    for p in parts.iter_mut() {
+                                        if let AttributeValuePart::ExpressionTag(t) = p {
+                                            substitute_walk(&mut t.expression, constants, false);
+                                        }
+                                    }
+                                }
+                                AttributeValue::Empty(_) => {}
+                            },
+                            ElementAttribute::BindDirective(bd) => substitute_walk(&mut bd.expression, constants, false),
+                            ElementAttribute::SpreadAttribute(sa) => substitute_walk(&mut sa.expression, constants, false),
+                            _ => {}
+                        }
+                    }
+                    substitute_in_fragment(&mut el.fragment, constants);
+                }
+                FragmentChild::Component(c) => {
+                    for a in c.attributes.iter_mut() {
+                        match a {
+                            ElementAttribute::Attribute(attr) => match &mut attr.value {
+                                AttributeValue::Single(t) => substitute_walk(&mut t.expression, constants, false),
+                                AttributeValue::Many(parts) => {
+                                    for p in parts.iter_mut() {
+                                        if let AttributeValuePart::ExpressionTag(t) = p {
+                                            substitute_walk(&mut t.expression, constants, false);
+                                        }
+                                    }
+                                }
+                                AttributeValue::Empty(_) => {}
+                            },
+                            ElementAttribute::BindDirective(bd) => substitute_walk(&mut bd.expression, constants, false),
+                            ElementAttribute::SpreadAttribute(sa) => substitute_walk(&mut sa.expression, constants, false),
+                            _ => {}
+                        }
+                    }
+                    substitute_in_fragment(&mut c.fragment, constants);
+                }
+                FragmentChild::SvelteElement(el) => {
+                    substitute_walk(&mut el.tag, constants, false);
+                    substitute_in_fragment(&mut el.fragment, constants);
+                }
+                _ => {}
+            }
+        }
+    }
+    substitute_in_fragment(f, constants);
+}
+
 fn extract_top_level_snippets(f: &mut svelte_ast::Fragment) -> Vec<Value> {
     use svelte_ast::fragment::FragmentChild;
     let mut hoisted: Vec<Value> = Vec::new();
