@@ -12,7 +12,154 @@ use serde_json::Value;
 /// Walk a JSON AST in place and erase rune calls. Returns the rewritten value.
 pub fn rewrite_program(mut program: Value) -> Value {
     walk(&mut program);
+    transform_class_state_fields(&mut program);
     program
+}
+
+/// For each `class { name = $.derived(...); ... }` declaration, rename the
+/// field to `#name` and insert `get name()` + `set name($$value)` accessors.
+/// Mirrors upstream's class-state-field transform pattern.
+fn transform_class_state_fields(node: &mut Value) {
+    fn class_walk(v: &mut Value) {
+        if let Some(obj) = v.as_object_mut() {
+            let ty = obj
+                .get("type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if matches!(ty.as_str(), "ClassDeclaration" | "ClassExpression") {
+                if let Some(body) = obj.get_mut("body") {
+                    if let Some(inner) = body.get_mut("body").and_then(|v| v.as_array_mut()) {
+                        let original = std::mem::take(inner);
+                        let mut transformed: Vec<Value> = Vec::with_capacity(original.len());
+                        for member in original {
+                            transform_class_member(&member, &mut transformed);
+                        }
+                        *inner = transformed;
+                    }
+                }
+            }
+            for (_, v) in obj.iter_mut() {
+                class_walk(v);
+            }
+        } else if let Some(arr) = v.as_array_mut() {
+            for v in arr {
+                class_walk(v);
+            }
+        }
+    }
+    class_walk(node);
+}
+
+fn transform_class_member(member: &Value, out: &mut Vec<Value>) {
+    let ty = member.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if ty != "PropertyDefinition" {
+        out.push(member.clone());
+        return;
+    }
+    let value = match member.get("value") {
+        Some(v) if !v.is_null() => v,
+        _ => {
+            out.push(member.clone());
+            return;
+        }
+    };
+    if !is_derived_call(value) {
+        out.push(member.clone());
+        return;
+    }
+    let key = match member.get("key") {
+        Some(k) if k.get("type").and_then(|v| v.as_str()) == Some("Identifier") => k,
+        _ => {
+            out.push(member.clone());
+            return;
+        }
+    };
+    let name = key
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        out.push(member.clone());
+        return;
+    }
+    let private_key = serde_json::json!({ "type": "PrivateIdentifier", "name": name });
+
+    // Renamed field
+    let mut renamed = member.clone();
+    renamed["key"] = private_key.clone();
+    out.push(renamed);
+
+    // Getter
+    let getter_body = serde_json::json!({
+        "type": "BlockStatement",
+        "body": [{
+            "type": "ReturnStatement",
+            "argument": {
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "ThisExpression" },
+                    "property": private_key.clone(),
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [],
+                "optional": false
+            }
+        }]
+    });
+    out.push(serde_json::json!({
+        "type": "MethodDefinition",
+        "kind": "get",
+        "static": false,
+        "computed": false,
+        "key": { "type": "Identifier", "name": name },
+        "value": {
+            "type": "FunctionExpression",
+            "async": false,
+            "generator": false,
+            "id": null,
+            "params": [],
+            "body": getter_body
+        }
+    }));
+
+    // Setter
+    let setter_body = serde_json::json!({
+        "type": "BlockStatement",
+        "body": [{
+            "type": "ReturnStatement",
+            "argument": {
+                "type": "CallExpression",
+                "callee": {
+                    "type": "MemberExpression",
+                    "object": { "type": "ThisExpression" },
+                    "property": private_key,
+                    "computed": false,
+                    "optional": false
+                },
+                "arguments": [{ "type": "Identifier", "name": "$$value" }],
+                "optional": false
+            }
+        }]
+    });
+    out.push(serde_json::json!({
+        "type": "MethodDefinition",
+        "kind": "set",
+        "static": false,
+        "computed": false,
+        "key": { "type": "Identifier", "name": name },
+        "value": {
+            "type": "FunctionExpression",
+            "async": false,
+            "generator": false,
+            "id": null,
+            "params": [{ "type": "Identifier", "name": "$$value" }],
+            "body": setter_body
+        }
+    }));
 }
 
 /// Walk a JSON AST and return the set of names bound to `$derived(...)` /
