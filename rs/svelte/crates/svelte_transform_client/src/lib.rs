@@ -9,8 +9,11 @@
 #![forbid(unsafe_code)]
 
 mod typed_fast;
+mod walker;
 
 pub use typed_fast::try_typed_client;
+pub use walker::try_typed_client_walker;
+pub use walker::fold_in_fragment as walker_fold_in_fragment;
 
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 use svelte_ast::fragment::FragmentChild;

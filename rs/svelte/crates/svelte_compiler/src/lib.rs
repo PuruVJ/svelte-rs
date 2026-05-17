@@ -46,7 +46,7 @@ pub fn compile(
     component_name: &str,
     options: CompileOptions,
 ) -> Result<CompileResult, CompileDiagnostic> {
-    let root = svelte_parse::parse(source, false)?;
+    let mut root = svelte_parse::parse(source, false)?;
     let _analysis =
         svelte_analyze::analyze_component(root.clone(), options.module.filename.as_deref())?;
 
@@ -72,7 +72,14 @@ pub fn compile(
             }
         }
         Some(Generate::Client) | None => {
+            // Apply compile-time Math.X(literal-nums) fold to the fragment
+            // before pattern matching so the walker sees constants.
+            svelte_transform_client::walker_fold_in_fragment(&mut root.fragment);
             if let Some(p) = svelte_transform_client::try_typed_client(&root, component_name) {
+                p
+            } else if let Some(p) =
+                svelte_transform_client::try_typed_client_walker(&root, component_name)
+            {
                 p
             } else if let Some(p) =
                 svelte_transform_client::try_typed_client_component(&root, component_name)
