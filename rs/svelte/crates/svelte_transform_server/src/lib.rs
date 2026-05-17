@@ -40,11 +40,14 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     let mut needs_component_wrap = false;
     let mut consts: std::collections::HashMap<String, Expression> =
         std::collections::HashMap::new();
+    let mut derived_bindings: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
         uses_props = info.uses_props;
         needs_component_wrap = info.needs_component_wrap();
+        derived_bindings = info.derived_bindings;
         if let Some(name) = &info.single_id_props {
             script::rewrite_props_destructure(&mut content, name);
         }
@@ -56,10 +59,15 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
 
     // Build the function body: rune-rewritten script statements first, then template.
     let mut func_body: Vec<Statement> = script_rest;
-    // Substitute script constants into every template expression.
+    // Apply template-only transforms: substitute script constants AND
+    // call-wrap every Identifier that refers to a $derived binding.
     let mut fragment = root.fragment.clone();
     if !consts.is_empty() {
         substitute_consts_in_fragment(&mut fragment, &consts);
+    }
+    let derived = &derived_bindings;
+    if !derived.is_empty() {
+        call_derived_in_fragment(&mut fragment, derived);
     }
     let template_body = lower_fragment_server(&fragment)?;
     func_body.extend(template_body);
@@ -147,6 +155,8 @@ fn lower_fragment_with_marker(
                 }
                 FragmentChild::AwaitBlock(ab) => {
                     out.extend(lower_await_block_server(ab)?);
+                    // BLOCK_CLOSE `<!--]-->` fuses with the next text push.
+                    buf.push_str("<!--]-->");
                     last_was_component = false;
                 }
                 _ => return None,
@@ -1011,6 +1021,108 @@ fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment) -> bool {
         }
     }
     f.nodes.iter().all(is_static)
+}
+
+/// Walk every Expression in a fragment and call-wrap Identifier refs to
+/// derived bindings.
+fn call_derived_in_fragment(
+    f: &mut svelte_ast::fragment::Fragment,
+    derived: &std::collections::HashSet<String>,
+) {
+    for n in &mut f.nodes {
+        call_derived_in_node(n, derived);
+    }
+}
+
+fn call_derived_in_node(
+    n: &mut FragmentChild,
+    derived: &std::collections::HashSet<String>,
+) {
+    match n {
+        FragmentChild::ExpressionTag(t) => script::call_derived_refs(&mut t.expression, derived),
+        FragmentChild::HtmlTag(t) => script::call_derived_refs(&mut t.expression, derived),
+        FragmentChild::RegularElement(el) => {
+            for attr in &mut el.attributes {
+                call_derived_in_attr(attr, derived);
+            }
+            call_derived_in_fragment(&mut el.fragment, derived);
+        }
+        FragmentChild::Component(c) => {
+            for attr in &mut c.attributes {
+                call_derived_in_attr(attr, derived);
+            }
+            call_derived_in_fragment(&mut c.fragment, derived);
+        }
+        FragmentChild::SvelteElement(el) => {
+            script::call_derived_refs(&mut el.tag, derived);
+            for attr in &mut el.attributes {
+                call_derived_in_attr(attr, derived);
+            }
+            call_derived_in_fragment(&mut el.fragment, derived);
+        }
+        FragmentChild::EachBlock(eb) => {
+            script::call_derived_refs(&mut eb.expression, derived);
+            if let Some(k) = &mut eb.key {
+                script::call_derived_refs(k, derived);
+            }
+            call_derived_in_fragment(&mut eb.body, derived);
+            if let Some(f) = &mut eb.fallback {
+                call_derived_in_fragment(f, derived);
+            }
+        }
+        FragmentChild::IfBlock(ib) => {
+            script::call_derived_refs(&mut ib.test, derived);
+            call_derived_in_fragment(&mut ib.consequent, derived);
+            if let Some(a) = &mut ib.alternate {
+                call_derived_in_fragment(a, derived);
+            }
+        }
+        FragmentChild::AwaitBlock(ab) => {
+            script::call_derived_refs(&mut ab.expression, derived);
+            if let Some(p) = &mut ab.pending {
+                call_derived_in_fragment(p, derived);
+            }
+            if let Some(t) = &mut ab.then {
+                call_derived_in_fragment(t, derived);
+            }
+            if let Some(c) = &mut ab.catch_ {
+                call_derived_in_fragment(c, derived);
+            }
+        }
+        FragmentChild::KeyBlock(kb) => {
+            script::call_derived_refs(&mut kb.expression, derived);
+            call_derived_in_fragment(&mut kb.fragment, derived);
+        }
+        _ => {}
+    }
+}
+
+fn call_derived_in_attr(
+    attr: &mut ElementAttribute,
+    derived: &std::collections::HashSet<String>,
+) {
+    match attr {
+        ElementAttribute::Attribute(a) => match &mut a.value {
+            AttributeValue::Single(tag) => {
+                script::call_derived_refs(&mut tag.expression, derived);
+            }
+            AttributeValue::Many(parts) => {
+                for p in parts {
+                    if let AttributeValuePart::ExpressionTag(t) = p {
+                        script::call_derived_refs(&mut t.expression, derived);
+                    }
+                }
+            }
+            _ => {}
+        },
+        ElementAttribute::SpreadAttribute(s) => {
+            script::call_derived_refs(&mut s.expression, derived);
+        }
+        ElementAttribute::BindDirective(b) => {
+            script::call_derived_refs(&mut b.expression, derived);
+        }
+        _ => {}
+    }
 }
 
 /// Walk every Expression in a fragment and apply substitute_and_fold.

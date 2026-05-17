@@ -20,13 +20,14 @@ use svelte_js_ast::*;
 pub struct RewriteInfo {
     pub uses_props: bool,
     pub rune_bindings: HashSet<String>,
+    /// Names of bindings whose initializer was `$derived(...)` or
+    /// `$derived.by(...)`. Template references to these names need to be
+    /// CALLED (`promise` → `promise()`).
+    pub derived_bindings: HashSet<String>,
     /// `Some(name)` when the script has `let name = $props()` — a single
-    /// identifier destructure. Triggers the `$$renderer.component(...)`
-    /// wrap and `let { $$slots, $$events, ...name } = $$props` rewrite.
+    /// identifier destructure.
     pub single_id_props: Option<String>,
-    /// Set when the script contains a class with rune-initialized fields
-    /// (`a = $state(...)`, `foo = $derived(...)`, etc.) — triggers the
-    /// `$$renderer.component(...)` wrap.
+    /// Set when the script contains a class with rune-initialized fields.
     pub has_class_with_runes: bool,
 }
 
@@ -39,10 +40,12 @@ impl RewriteInfo {
 /// Rewrite a Program in-place to erase server-irrelevant rune calls.
 pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
     let mut rune_bindings: HashSet<String> = HashSet::new();
+    let mut derived_bindings: HashSet<String> = HashSet::new();
     let mut single_id_props: Option<String> = None;
     let mut has_class_with_runes = false;
     for s in &p.body {
         collect_rune_bindings_stmt(s, &mut rune_bindings);
+        collect_derived_bindings_stmt(s, &mut derived_bindings);
         check_single_id_props_stmt(s, &mut single_id_props);
         if stmt_has_class_with_runes(s) {
             has_class_with_runes = true;
@@ -53,13 +56,115 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
         rewrite_statement(s, &mut ctx);
     }
     if single_id_props.is_some() || has_class_with_runes {
-        ctx.uses_props = true; // emit $$props parameter
+        ctx.uses_props = true;
     }
     RewriteInfo {
         uses_props: ctx.uses_props,
         rune_bindings,
+        derived_bindings,
         single_id_props,
         has_class_with_runes,
+    }
+}
+
+fn collect_derived_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
+    match s {
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    if is_derived_call(init) {
+                        out.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+        Statement::Block(b) => {
+            for s in &b.body {
+                collect_derived_bindings_stmt(s, out);
+            }
+        }
+        Statement::ExportNamed(e) => {
+            if let Some(d) = &e.declaration {
+                collect_derived_bindings_stmt(d, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_derived_call(e: &Expression) -> bool {
+    let Expression::Call(c) = e else { return false };
+    let Some(kp) = global_keypath(&c.callee) else { return false };
+    matches!(kp.as_str(), "$derived" | "$derived.by")
+}
+
+/// Walk an Expression and wrap every Identifier reference that names a
+/// derived binding with `IDENT()` — making the template-position access
+/// actually call the derived getter.
+pub fn call_derived_refs(e: &mut Expression, derived: &HashSet<String>) {
+    if derived.is_empty() {
+        return;
+    }
+    call_derived_refs_inner(e, derived);
+}
+
+fn call_derived_refs_inner(e: &mut Expression, derived: &HashSet<String>) {
+    match e {
+        Expression::Identifier(i) => {
+            if derived.contains(&i.name) {
+                let id = std::mem::replace(
+                    i,
+                    Identifier { name: String::new(), span: Span::ZERO },
+                );
+                *e = Expression::Call(Box::new(CallExpression {
+                    callee: Expression::Identifier(id),
+                    arguments: Vec::new(),
+                    optional: false,
+                    span: Span::ZERO,
+                }));
+            }
+        }
+        Expression::Member(m) => {
+            call_derived_refs_inner(&mut m.object, derived);
+            if let MemberProperty::Expression(e) = &mut m.property {
+                call_derived_refs_inner(e, derived);
+            }
+        }
+        Expression::Call(c) => {
+            call_derived_refs_inner(&mut c.callee, derived);
+            for a in &mut c.arguments {
+                match a {
+                    Argument::Expression(e) => call_derived_refs_inner(e, derived),
+                    Argument::Spread(s) => call_derived_refs_inner(&mut s.argument, derived),
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            call_derived_refs_inner(&mut b.left, derived);
+            call_derived_refs_inner(&mut b.right, derived);
+        }
+        Expression::Logical(l) => {
+            call_derived_refs_inner(&mut l.left, derived);
+            call_derived_refs_inner(&mut l.right, derived);
+        }
+        Expression::Conditional(c) => {
+            call_derived_refs_inner(&mut c.test, derived);
+            call_derived_refs_inner(&mut c.consequent, derived);
+            call_derived_refs_inner(&mut c.alternate, derived);
+        }
+        Expression::Unary(u) => call_derived_refs_inner(&mut u.argument, derived),
+        Expression::Sequence(s) => {
+            for e in &mut s.expressions {
+                call_derived_refs_inner(e, derived);
+            }
+        }
+        Expression::Template(t) => {
+            for ex in &mut t.expressions {
+                call_derived_refs_inner(ex, derived);
+            }
+        }
+        Expression::Paren(p) => call_derived_refs_inner(&mut p.expression, derived),
+        _ => {}
     }
 }
 
