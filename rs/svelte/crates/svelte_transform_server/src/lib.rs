@@ -90,30 +90,52 @@ fn lower_fragment_with_marker(
     }
     let nodes = trim_boundary_whitespace(&f.nodes);
     let nodes = trim_boundary_text(nodes);
+    let mut emitted_static_push = false;
+    let mut last_was_component = false;
     for n in nodes.iter() {
         // RegularElement with <option> children: write open tag + interleave
         // option calls + close tag inline (keeps the existing buf flowing).
         if let FragmentChild::RegularElement(el) = n {
             if has_option_child(el) {
                 emit_select_inline(el, &mut buf, &mut out)?;
+                last_was_component = false;
                 continue;
             }
         }
         if append_node_to_template(n, &mut buf).is_none() {
             if let Some(stmt) = buf.flush() {
+                emitted_static_push = true;
                 out.push(stmt);
             }
             match n {
-                FragmentChild::Component(c) => out.push(lower_component_server(c)?),
-                FragmentChild::SvelteElement(el) => out.push(lower_svelte_element_server(el)?),
-                FragmentChild::EachBlock(eb) => out.extend(lower_each_block_server(eb)?),
-                FragmentChild::AwaitBlock(ab) => out.extend(lower_await_block_server(ab)?),
+                FragmentChild::Component(c) => {
+                    out.push(lower_component_server(c)?);
+                    last_was_component = true;
+                }
+                FragmentChild::SvelteElement(el) => {
+                    out.push(lower_svelte_element_server(el)?);
+                    last_was_component = false;
+                }
+                FragmentChild::EachBlock(eb) => {
+                    out.extend(lower_each_block_server(eb)?);
+                    last_was_component = false;
+                }
+                FragmentChild::AwaitBlock(ab) => {
+                    out.extend(lower_await_block_server(ab)?);
+                    last_was_component = false;
+                }
                 _ => return None,
             }
+        } else {
+            last_was_component = false;
         }
     }
     if let Some(stmt) = buf.flush() {
         out.push(stmt);
+    } else if last_was_component && emitted_static_push {
+        // Mid-fragment Component followed by no more static content needs
+        // a closing `<!---->` marker to anchor the end of the hydration scope.
+        out.push(push_template("<!---->"));
     }
     Some(out)
 }
