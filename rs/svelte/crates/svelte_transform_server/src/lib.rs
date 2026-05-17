@@ -81,6 +81,14 @@ fn lower_fragment_with_marker(
     }
     let nodes = trim_boundary_whitespace(&f.nodes);
     for n in nodes {
+        // RegularElement with <option> children: write open tag + interleave
+        // option calls + close tag inline (keeps the existing buf flowing).
+        if let FragmentChild::RegularElement(el) = n {
+            if has_option_child(el) {
+                emit_select_inline(el, &mut buf, &mut out)?;
+                continue;
+            }
+        }
         if append_node_to_template(n, &mut buf).is_none() {
             if let Some(stmt) = buf.flush() {
                 out.push(stmt);
@@ -98,6 +106,42 @@ fn lower_fragment_with_marker(
         out.push(stmt);
     }
     Some(out)
+}
+
+/// Inline emit `<select>` with `<option>` children — writes the open tag
+/// into `buf`, interleaves option calls into `out` (flushing buf each
+/// time), and finishes by writing the close tag into `buf`.
+fn emit_select_inline(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+) -> Option<()> {
+    buf.push_str("<");
+    buf.push_str(&el.name);
+    for attr in &el.attributes {
+        append_element_attribute_server(attr, buf)?;
+    }
+    buf.push_str(">");
+    let children = trim_boundary_whitespace(&el.fragment.nodes);
+    for c in children {
+        match c {
+            FragmentChild::RegularElement(child) if child.name == "option" => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.push(lower_option_server(child)?);
+            }
+            other => {
+                if append_node_to_template(other, buf).is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+    buf.push_str("</");
+    buf.push_str(&el.name);
+    buf.push_str(">");
+    Some(())
 }
 
 /// True when the first non-whitespace child is a tag/block/component
@@ -288,6 +332,92 @@ fn build_block_arrow(
     })))
 }
 
+/// True if the element has any `<option>` direct child. `<select>` /
+/// `<datalist>` etc. with rich-content options need special interleaved
+/// `$$renderer.option(...)` lowering.
+fn has_option_child(el: &svelte_ast::elements::RegularElement) -> bool {
+    el.fragment.nodes.iter().any(|n| {
+        matches!(n, FragmentChild::RegularElement(child) if child.name == "option")
+    })
+}
+
+/// `<select>` with `<option>` children: emit the open tag, each option as a
+/// `$$renderer.option(props, body_fn)` call, then the close tag.
+fn lower_select_element_server(
+    el: &svelte_ast::elements::RegularElement,
+) -> Option<Vec<Statement>> {
+    let mut out = Vec::new();
+    // Open tag — serialize into a small TemplateBuf, flush.
+    let mut buf = TemplateBuf::new();
+    buf.push_str("<");
+    buf.push_str(&el.name);
+    for attr in &el.attributes {
+        append_element_attribute_server(attr, &mut buf)?;
+    }
+    buf.push_str(">");
+    let children = trim_boundary_whitespace(&el.fragment.nodes);
+    for c in children {
+        match c {
+            FragmentChild::RegularElement(child) if child.name == "option" => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.push(lower_option_server(child)?);
+            }
+            other => {
+                if append_node_to_template(other, &mut buf).is_none() {
+                    return None;
+                }
+            }
+        }
+    }
+    buf.push_str("</");
+    buf.push_str(&el.name);
+    buf.push_str(">");
+    if let Some(stmt) = buf.flush() {
+        out.push(stmt);
+    }
+    Some(out)
+}
+
+/// `<option value="X">content</option>` → `$$renderer.option({ value: 'X' }, ($$renderer) => { ...body... });`.
+fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Statement> {
+    let mut props: Vec<ObjectMember> = Vec::new();
+    for attr in &el.attributes {
+        if let ElementAttribute::Attribute(a) = attr {
+            if is_event_handler_name(&a.name) {
+                continue;
+            }
+            props.push(attribute_to_object_member(a)?);
+        }
+    }
+    let body_stmts = lower_fragment_with_marker(
+        &el.fragment,
+        body_needs_marker(&el.fragment),
+    )?;
+    let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: body_stmts,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    Some(t::stmt(Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$$renderer"), "option"),
+        arguments: vec![
+            Argument::Expression(Expression::Object(Box::new(ObjectExpression {
+                properties: props,
+                span: Span::ZERO,
+            }))),
+            Argument::Expression(body_arrow),
+        ],
+        optional: false,
+        span: Span::ZERO,
+    }))))
+}
+
 /// `$$renderer.push(\`STR\`);`
 fn push_template(s: &str) -> Statement {
     t::stmt(Expression::Call(Box::new(CallExpression {
@@ -323,6 +453,22 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             }
             Some(())
         }
+        FragmentChild::HtmlTag(tag) => {
+            // `{@html EXPR}` → `${$.html(EXPR)}` (no escaping).
+            buf.push_expr(Expression::Call(Box::new(CallExpression {
+                callee: t::member_id(t::id("$"), "html"),
+                arguments: vec![Argument::Expression(tag.expression.clone())],
+                optional: false,
+                span: Span::ZERO,
+            })));
+            Some(())
+        }
+        FragmentChild::RegularElement(el) if has_option_child(el) => {
+            // `<select>` with `<option>` children uses interleaved
+            // `$$renderer.option(...)` calls — signal "not inline" so the
+            // caller can lower it as a separate statement.
+            None
+        }
         FragmentChild::RegularElement(el) => {
             buf.push_str("<");
             buf.push_str(&el.name);
@@ -351,24 +497,21 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
     }
 }
 
-/// Skip leading + trailing whitespace-only Text nodes from a slice of
-/// fragment children. Returns the inner slice.
+/// Skip leading + trailing whitespace-only Text nodes (and Comments,
+/// which are dropped server-side anyway) from a slice of fragment children.
 fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
+    let is_boundary_skip = |n: &FragmentChild| match n {
+        FragmentChild::Text(t) => t.data.trim().is_empty(),
+        FragmentChild::Comment(_) => true,
+        _ => false,
+    };
     let mut start = 0;
     let mut end = nodes.len();
-    while start < end {
-        if matches!(&nodes[start], FragmentChild::Text(t) if t.data.trim().is_empty()) {
-            start += 1;
-        } else {
-            break;
-        }
+    while start < end && is_boundary_skip(&nodes[start]) {
+        start += 1;
     }
-    while end > start {
-        if matches!(&nodes[end - 1], FragmentChild::Text(t) if t.data.trim().is_empty()) {
-            end -= 1;
-        } else {
-            break;
-        }
+    while end > start && is_boundary_skip(&nodes[end - 1]) {
+        end -= 1;
     }
     &nodes[start..end]
 }

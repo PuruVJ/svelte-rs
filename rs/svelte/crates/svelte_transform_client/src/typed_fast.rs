@@ -1,25 +1,26 @@
 //! Fully-typed `client_component` fast path for the simple-static
-//! template case. See `svelte_transform_server::typed_fast` for the
-//! sibling implementation — same intent, different output shape.
+//! template case.
 //!
-//! Recognized shape:
-//! - No `<script>` / `<script context="module">`.
-//! - No `<style>` (no CSS scoping hooks).
-//! - Single root element with static-only children (no `{expr}`, no
-//!   blocks, no components, no directives).
+//! Recognized shapes:
+//! - No `<script>` / `<script context="module">`, no `<style>`.
+//! - Static-only content (no `{expr}`, blocks, components, directives).
+//! - Single OR multiple top-level non-whitespace elements.
 //!
-//! Output shape (matches what `_expected/client/hello-world.svelte.js`
-//! encodes):
+//! Output (single-root):
 //! ```js
-//! import 'svelte/internal/disclose-version';
-//! import 'svelte/internal/flags/legacy';
-//! import * as $ from 'svelte/internal/client';
-//!
 //! var root = $.from_html(`HTML`);
-//!
 //! export default function Name($$anchor) {
-//!     var ROOT_VAR = root();
-//!     $.append($$anchor, ROOT_VAR);
+//!     var TAG = root();
+//!     $.append($$anchor, TAG);
+//! }
+//! ```
+//!
+//! Output (multi-root):
+//! ```js
+//! var root = $.from_html(`HTML`, 1);
+//! export default function Name($$anchor) {
+//!     var fragment = root();
+//!     $.append($$anchor, fragment);
 //! }
 //! ```
 
@@ -35,25 +36,26 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
     if root.css.is_some() {
         return None;
     }
-    let (root_el_tag, html) = static_single_root(&root.fragment)?;
+    let (root_var_name, html, is_multi_root) = static_root(&root.fragment)?;
 
     let import_disclose = t::import_side_effect("svelte/internal/disclose-version");
     let import_flags = t::import_side_effect("svelte/internal/flags/legacy");
     let import_internal = t::import_namespace("$", "svelte/internal/client");
 
-    // `var root = $.from_html(\`HTML\`);`
-    let from_html_call = t::call(
-        t::member_id(t::id("$"), "from_html"),
-        vec![t::template_raw(vec![html], vec![])],
+    // `var root = $.from_html(\`HTML\`[, 1]);`
+    let mut from_html_args = vec![t::template_raw(vec![html], vec![])];
+    if is_multi_root {
+        from_html_args.push(t::lit_number(1.0));
+    }
+    let root_var = t::var(
+        "root",
+        t::call(t::member_id(t::id("$"), "from_html"), from_html_args),
     );
-    let root_var = t::var("root", from_html_call);
 
-    // Inside the function: `var TAG = root(); $.append($$anchor, TAG);`
-    let tag_var = root_el_tag;
-    let inner_var = t::var(&tag_var, t::call(t::id("root"), vec![]));
+    let inner_var = t::var(&root_var_name, t::call(t::id("root"), vec![]));
     let append_call = t::call(
         t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        vec![t::id("$$anchor"), t::id(&root_var_name)],
     );
     let func_body = vec![inner_var, t::stmt(append_call)];
 
@@ -72,15 +74,10 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
     ]))
 }
 
-/// If the fragment is a single root regular element whose children are all
-/// static, return `(tag_name, html_for_from_html)`. Otherwise None.
-///
-/// `tag_name` is the variable name we'll bind the element to inside the
-/// component function — for `<h1>`, it's `"h1"`. For multi-element roots
-/// or anything dynamic we bail.
-fn static_single_root(fragment: &Fragment) -> Option<(String, String)> {
-    // Skip leading/trailing whitespace-only Text nodes the same way
-    // `lower_fragment_trimmed` does.
+/// Returns `(var_name, html, is_multi_root)` for a fully-static fragment.
+/// `var_name` is the tag name for single-root templates, `"fragment"` for
+/// multi-root.
+fn static_root(fragment: &Fragment) -> Option<(String, String, bool)> {
     let non_ws: Vec<&FragmentChild> = fragment
         .nodes
         .iter()
@@ -89,34 +86,172 @@ fn static_single_root(fragment: &Fragment) -> Option<(String, String)> {
             _ => true,
         })
         .collect();
-    if non_ws.len() != 1 {
+    if non_ws.is_empty() {
         return None;
     }
-    let FragmentChild::RegularElement(el) = non_ws[0] else {
+
+    // Single non-WS root: use the element's name as the variable.
+    if non_ws.len() == 1 {
+        if let FragmentChild::RegularElement(el) = non_ws[0] {
+            if !el.attributes.is_empty() {
+                // typed_component handles attributed elements.
+                return None;
+            }
+            let mut html = String::with_capacity(32);
+            html.push('<');
+            html.push_str(&el.name);
+            html.push('>');
+            for child in &el.fragment.nodes {
+                append_static(child, &mut html)?;
+            }
+            if !is_void(&el.name) {
+                html.push_str("</");
+                html.push_str(&el.name);
+                html.push('>');
+            }
+            return Some((el.name.clone(), html, false));
+        }
         return None;
-    };
-    if !el.attributes.is_empty() {
-        return None;
     }
-    let mut html = String::with_capacity(32);
-    html.push('<');
-    html.push_str(&el.name);
-    html.push('>');
-    for child in &el.fragment.nodes {
-        append_static(child, &mut html)?;
+
+    // Multiple roots: walk the whole fragment, including whitespace between
+    // top-level siblings (collapse runs to single spaces).
+    let mut html = String::with_capacity(64);
+    let trimmed = trim_boundary_whitespace(&fragment.nodes);
+    for n in trimmed {
+        match n {
+            FragmentChild::Text(t) => {
+                // Collapse whitespace runs to single space.
+                let collapsed = collapse_ws(&t.data);
+                for ch in collapsed.chars() {
+                    match ch {
+                        '`' => html.push_str("\\`"),
+                        '\\' => html.push_str("\\\\"),
+                        _ => html.push(ch),
+                    }
+                }
+            }
+            FragmentChild::RegularElement(el) => {
+                if !el.attributes.is_empty() {
+                    // Attributes — walk and only static-text-value ones supported.
+                    html.push('<');
+                    html.push_str(&el.name);
+                    for attr in &el.attributes {
+                        if let svelte_ast::attributes::ElementAttribute::Attribute(a) = attr {
+                            if let Some(()) = append_static_attr(a, &mut html) {
+                                continue;
+                            }
+                        }
+                        return None;
+                    }
+                    if is_void(&el.name) {
+                        html.push_str("/>");
+                        continue;
+                    }
+                    html.push('>');
+                } else {
+                    html.push('<');
+                    html.push_str(&el.name);
+                    html.push('>');
+                    if is_void(&el.name) {
+                        continue;
+                    }
+                }
+                let children = trim_boundary_whitespace(&el.fragment.nodes);
+                for c in children {
+                    append_static_to_string(c, &mut html)?;
+                }
+                html.push_str("</");
+                html.push_str(&el.name);
+                html.push('>');
+            }
+            _ => return None,
+        }
     }
-    if !is_void(&el.name) {
-        html.push_str("</");
-        html.push_str(&el.name);
-        html.push('>');
+    Some(("fragment".to_string(), html, true))
+}
+
+fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end {
+        if matches!(&nodes[start], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            start += 1;
+        } else {
+            break;
+        }
     }
-    Some((el.name.clone(), html))
+    while end > start {
+        if matches!(&nodes[end - 1], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &nodes[start..end]
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out
+}
+
+fn append_static_attr(a: &svelte_ast::attributes::Attribute, html: &mut String) -> Option<()> {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
+    match &a.value {
+        AttributeValue::Empty => {
+            html.push(' ');
+            html.push_str(&a.name);
+            Some(())
+        }
+        AttributeValue::Single(_) => None,
+        AttributeValue::Many(parts) => {
+            if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                return None;
+            }
+            html.push(' ');
+            html.push_str(&a.name);
+            html.push_str("=\"");
+            for p in parts {
+                if let AttributeValuePart::Text(t) = p {
+                    for c in t.data.chars() {
+                        match c {
+                            '"' => html.push_str("&quot;"),
+                            '&' => html.push_str("&amp;"),
+                            '`' => html.push_str("\\`"),
+                            '\\' => html.push_str("\\\\"),
+                            _ => html.push(c),
+                        }
+                    }
+                }
+            }
+            html.push('"');
+            Some(())
+        }
+    }
 }
 
 fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {
+    append_static_to_string(child, out)
+}
+
+fn append_static_to_string(child: &FragmentChild, out: &mut String) -> Option<()> {
     match child {
         FragmentChild::Text(t) => {
-            for ch in t.data.chars() {
+            let collapsed = collapse_ws(&t.data);
+            for ch in collapsed.chars() {
                 match ch {
                     '`' => out.push_str("\\`"),
                     '\\' => out.push_str("\\\\"),
@@ -127,20 +262,37 @@ fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {
         }
         FragmentChild::RegularElement(el) => {
             if !el.attributes.is_empty() {
-                return None;
-            }
-            out.push('<');
-            out.push_str(&el.name);
-            out.push('>');
-            if !is_void(&el.name) {
-                for child in &el.fragment.nodes {
-                    append_static(child, out)?;
-                }
                 out.push('<');
-                out.push('/');
+                out.push_str(&el.name);
+                for attr in &el.attributes {
+                    if let svelte_ast::attributes::ElementAttribute::Attribute(a) = attr {
+                        if let Some(()) = append_static_attr(a, out) {
+                            continue;
+                        }
+                    }
+                    return None;
+                }
+                if is_void(&el.name) {
+                    out.push_str("/>");
+                    return Some(());
+                }
+                out.push('>');
+            } else {
+                out.push('<');
                 out.push_str(&el.name);
                 out.push('>');
+                if is_void(&el.name) {
+                    return Some(());
+                }
             }
+            let children = trim_boundary_whitespace(&el.fragment.nodes);
+            for c in children {
+                append_static_to_string(c, out)?;
+            }
+            out.push('<');
+            out.push('/');
+            out.push_str(&el.name);
+            out.push('>');
             Some(())
         }
         _ => None,
