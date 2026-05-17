@@ -89,7 +89,8 @@ fn lower_fragment_with_marker(
         buf.push_str("<!---->");
     }
     let nodes = trim_boundary_whitespace(&f.nodes);
-    for n in nodes {
+    let nodes = trim_boundary_text(nodes);
+    for n in nodes.iter() {
         // RegularElement with <option> children: write open tag + interleave
         // option calls + close tag inline (keeps the existing buf flowing).
         if let FragmentChild::RegularElement(el) = n {
@@ -153,27 +154,21 @@ fn emit_select_inline(
     Some(())
 }
 
-/// True when the first non-whitespace child is a tag/block/component
-/// (something that needs a `<!---->` anchor marker in the output).
+/// Returns true unless the first non-trivial child of the fragment is a
+/// RegularElement (which provides its own anchor). Used to decide whether
+/// to prepend `<!---->` to a body push.
 fn body_needs_marker(f: &svelte_ast::fragment::Fragment) -> bool {
-    f.nodes
+    let first = f
+        .nodes
         .iter()
-        .find(|n| !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
-        .map(|n| {
-            matches!(
-                n,
-                FragmentChild::ExpressionTag(_)
-                    | FragmentChild::HtmlTag(_)
-                    | FragmentChild::EachBlock(_)
-                    | FragmentChild::IfBlock(_)
-                    | FragmentChild::AwaitBlock(_)
-                    | FragmentChild::KeyBlock(_)
-                    | FragmentChild::Component(_)
-                    | FragmentChild::SvelteElement(_)
-                    | FragmentChild::SvelteComponent(_)
-            )
-        })
-        .unwrap_or(false)
+        .find(|n| !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()));
+    match first {
+        None => false,
+        Some(FragmentChild::RegularElement(_)) => false,
+        // Comments are dropped — look past them when deciding.
+        Some(FragmentChild::Comment(_)) => true,
+        _ => true,
+    }
 }
 
 /// `{#each EXPR as PATTERN[, INDEX]}body{/each}` →
@@ -400,10 +395,8 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             props.push(attribute_to_object_member(a)?);
         }
     }
-    let body_stmts = lower_fragment_with_marker(
-        &el.fragment,
-        body_needs_marker(&el.fragment),
-    )?;
+    // <option> body doesn't need a hydration anchor — renderer.option handles positioning.
+    let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
     let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
         body: ArrowBody::Block(Box::new(BlockStatement {
@@ -490,9 +483,9 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                 Some(())
             } else {
                 buf.push_str(">");
-                // Strip whitespace-only Text at the element-body boundaries.
                 let children = trim_boundary_whitespace(&el.fragment.nodes);
-                for c in children {
+                let children = trim_boundary_text(children);
+                for c in children.iter() {
                     append_node_to_template(c, buf)?;
                 }
                 buf.push_str("</");
@@ -504,6 +497,28 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
         FragmentChild::Comment(_) => Some(()), // HTML comments dropped server-side
         _ => None,
     }
+}
+
+/// After `trim_boundary_whitespace`, trim leading whitespace inside the
+/// FIRST surviving Text node and trailing whitespace inside the LAST.
+/// Returns owned Vec since the first/last text may need to be cloned.
+fn trim_boundary_text(nodes: &[FragmentChild]) -> Vec<FragmentChild> {
+    let mut out: Vec<FragmentChild> = nodes.to_vec();
+    if let Some(FragmentChild::Text(t)) = out.first_mut() {
+        let trimmed = t.data.trim_start().to_string();
+        if trimmed != t.data {
+            t.data = trimmed.clone();
+            t.raw = trimmed;
+        }
+    }
+    if let Some(FragmentChild::Text(t)) = out.last_mut() {
+        let trimmed = t.data.trim_end().to_string();
+        if trimmed != t.data {
+            t.data = trimmed.clone();
+            t.raw = trimmed;
+        }
+    }
+    out
 }
 
 /// Skip leading + trailing whitespace-only Text nodes (and Comments,
@@ -781,7 +796,7 @@ fn lower_svelte_element_server(
     }))))
 }
 
-/// `<Foo a={x} b="y" {...rest} />` → `Foo($$renderer, { a: x, b: 'y', ...rest });`.
+/// `<Foo a={x} b="y" {...rest}>BODY</Foo>` → `Foo($$renderer, { a: x, b: 'y', ...rest, children: ..., $$slots: { default: true } });`.
 /// Directives (`bind:this`, `on:click`, etc.) are dropped server-side.
 fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Statement> {
     let mut props: Vec<ObjectMember> = Vec::new();
@@ -800,11 +815,71 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
                     span: Span::ZERO,
                 })));
             }
-            // All other directives (bind/use/transition/animate/let/class/style/on/attach)
-            // are SSR-irrelevant — drop them.
             _ => {}
         }
     }
+
+    // If the component has body content, lower it into a `children:
+    // ($$renderer) => { ... }` slot + add `$$slots: { default: true }`.
+    let has_body = !c.fragment.nodes.iter().all(|n| {
+        matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty())
+    });
+    if has_body {
+        let body_stmts =
+            lower_fragment_with_marker(&c.fragment, body_needs_marker(&c.fragment))?;
+        let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: body_stmts,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: "children".to_string(),
+                span: Span::ZERO,
+            }),
+            value: children_arrow,
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
+        // $$slots: { default: true }
+        props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: "$$slots".to_string(),
+                span: Span::ZERO,
+            }),
+            value: Expression::Object(Box::new(ObjectExpression {
+                properties: vec![ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: "default".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    value: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                        value: true,
+                        span: Span::ZERO,
+                    }))),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                }))],
+                span: Span::ZERO,
+            })),
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
+    }
+
     let args = vec![
         Argument::Expression(t::id("$$renderer")),
         Argument::Expression(Expression::Object(Box::new(ObjectExpression {
