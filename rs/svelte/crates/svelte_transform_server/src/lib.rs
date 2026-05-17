@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+mod script;
 mod typed_fast;
 
 pub use typed_fast::try_typed_server;
@@ -19,45 +20,51 @@ use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
 /// Second-tier typed entry point. Currently handles:
-/// - "instance script with imports only + empty template"
-/// - "no script + single static-template component" (e.g. `<Foo bind:this={x}/>`)
+/// - "instance script (imports + optionally rune-erasable statements) + simple template"
+/// - "single <Component bind:this={x}/>"
+/// - "<svelte:element this={tag}>"
 pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<Program> {
-    if root.css.is_some() {
-        return None;
-    }
-    if root.module.is_some() {
+    if root.css.is_some() || root.module.is_some() {
         return None;
     }
 
-    // Decide whether typed_fast already claims this shape.
-    if root.instance.is_none() && root.module.is_none() && !fragment_is_empty(&root.fragment) {
-        // Only handle the single-component case here; pure static HTML is
-        // typed_fast's territory.
+    // Decide whether typed_fast already claims this shape (no script, static HTML).
+    let fragment_empty = fragment_is_empty(&root.fragment);
+    if root.instance.is_none() && !fragment_empty {
+        // Only handle a small set of single-node fragments here.
         let only = single_non_ws_node(&root.fragment)?;
-        if !matches!(only, FragmentChild::Component(_)) {
+        if !matches!(only, FragmentChild::Component(_) | FragmentChild::SvelteElement(_)) {
             return None;
         }
     }
 
-    let (script_imports, script_body) = match root.instance.as_ref() {
-        Some(s) => partition_imports(&s.content.body)?,
-        None => (Vec::new(), Vec::new()),
-    };
-    if !script_body.is_empty() {
-        return None;
+    // Process the instance script: rewrite runes, split imports vs rest.
+    let mut script_imports: Vec<Statement> = Vec::new();
+    let mut script_rest: Vec<Statement> = Vec::new();
+    let mut uses_props = false;
+    if let Some(s) = root.instance.as_ref() {
+        let mut content = s.content.clone();
+        uses_props = script::rewrite_program_for_server(&mut content);
+        let (imports, rest) = partition_imports(&content.body)?;
+        script_imports = imports;
+        script_rest = rest;
     }
 
-    // Build the function body from the template.
-    let func_body = lower_fragment_server(&root.fragment)?;
+    // Build the function body: rune-rewritten script statements first, then template.
+    let mut func_body: Vec<Statement> = script_rest;
+    let template_body = lower_fragment_server(&root.fragment)?;
+    func_body.extend(template_body);
+
+    // Build the parameter list. Runes-mode uses_props adds $$props.
+    let mut params = vec![t::pat_id("$$renderer")];
+    if uses_props {
+        params.push(t::pat_id("$$props"));
+    }
 
     let mut top: Vec<Statement> = Vec::with_capacity(2 + script_imports.len());
     top.push(t::import_namespace("$", "svelte/internal/server"));
     top.extend(script_imports);
-    top.push(t::export_default_function(
-        component_name,
-        vec![t::pat_id("$$renderer")],
-        func_body,
-    ));
+    top.push(t::export_default_function(component_name, params, func_body));
     Some(t::program(top))
 }
 
@@ -72,10 +79,27 @@ fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<State
                 }
             }
             FragmentChild::Component(c) => out.push(lower_component_server(c)?),
+            FragmentChild::SvelteElement(el) => out.push(lower_svelte_element_server(el)?),
             _ => return None,
         }
     }
     Some(out)
+}
+
+/// `<svelte:element this={tag}>` → `$.element($$renderer, tag);` (server form,
+/// drops attribute content for now).
+fn lower_svelte_element_server(
+    el: &svelte_ast::elements::SvelteElement,
+) -> Option<Statement> {
+    Some(t::stmt(Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$"), "element"),
+        arguments: vec![
+            Argument::Expression(t::id("$$renderer")),
+            Argument::Expression(el.tag.clone()),
+        ],
+        optional: false,
+        span: Span::ZERO,
+    }))))
 }
 
 /// `<Foo a={x} b="y" {...rest} />` → `Foo($$renderer, { a: x, b: 'y', ...rest });`.
