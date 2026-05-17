@@ -96,7 +96,7 @@ fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<State
 fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<()> {
     match n {
         FragmentChild::Text(t) => {
-            buf.push_str(&escape_text(&t.data));
+            buf.push_str(&escape_text(&collapse_ws(&t.data)));
             Some(())
         }
         FragmentChild::ExpressionTag(tag) => {
@@ -109,12 +109,21 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             })));
             Some(())
         }
-        FragmentChild::RegularElement(el) if el.attributes.is_empty() => {
-            // Simple element with no attributes — serialize verbatim.
+        FragmentChild::RegularElement(el) => {
+            // Serialize the open tag — attributes must all be plain
+            // static text (no directives/spread/dynamic expressions).
             buf.push_str("<");
             buf.push_str(&el.name);
+            for attr in &el.attributes {
+                match attr {
+                    ElementAttribute::Attribute(a) => append_static_attribute(a, buf)?,
+                    _ => return None,
+                }
+            }
             buf.push_str(">");
-            for c in &el.fragment.nodes {
+            // Strip whitespace-only Text at the element-body boundaries.
+            let children = trim_boundary_whitespace(&el.fragment.nodes);
+            for c in children {
                 append_node_to_template(c, buf)?;
             }
             if !is_void(&el.name) {
@@ -127,6 +136,92 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
         FragmentChild::Comment(_) => Some(()), // HTML comments dropped server-side
         _ => None,
     }
+}
+
+/// Skip leading + trailing whitespace-only Text nodes from a slice of
+/// fragment children. Returns the inner slice.
+fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end {
+        if matches!(&nodes[start], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        if matches!(&nodes[end - 1], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &nodes[start..end]
+}
+
+/// Collapse all consecutive whitespace runs in `s` to a single space.
+/// Matches upstream's `regex_starts_with_whitespaces` / collapse-whitespace
+/// behavior at preserveWhitespace=false.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out
+}
+
+/// Serialize a static attribute (`name="value"` or `name`) into the template
+/// buffer. Returns None when the attribute is dynamic (single Expression /
+/// multi-part) — caller handles via `$.attr(...)` interpolations.
+fn append_static_attribute(a: &Attribute, buf: &mut TemplateBuf) -> Option<()> {
+    match &a.value {
+        AttributeValue::Empty => {
+            buf.push_str(" ");
+            buf.push_str(&a.name);
+            Some(())
+        }
+        AttributeValue::Single(_) => None,
+        AttributeValue::Many(parts) => {
+            // Only handle all-Text parts (no interpolation).
+            if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                return None;
+            }
+            buf.push_str(" ");
+            buf.push_str(&a.name);
+            buf.push_str("=\"");
+            for p in parts {
+                if let AttributeValuePart::Text(t) = p {
+                    buf.push_str(&escape_attribute_text(&t.data));
+                }
+            }
+            buf.push_str("\"");
+            Some(())
+        }
+    }
+}
+
+fn escape_attribute_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("&quot;"),
+            '&' => out.push_str("&amp;"),
+            '`' => out.push_str("\\`"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn escape_text(s: &str) -> String {
