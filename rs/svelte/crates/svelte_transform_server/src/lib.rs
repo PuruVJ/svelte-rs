@@ -159,6 +159,12 @@ fn lower_fragment_with_marker(
                     buf.push_str("<!--]-->");
                     last_was_component = false;
                 }
+                FragmentChild::IfBlock(ib) => {
+                    out.extend(lower_if_block_server(ib)?);
+                    // BLOCK_CLOSE `<!--]-->` fuses with the next text push.
+                    buf.push_str("<!--]-->");
+                    last_was_component = false;
+                }
                 _ => return None,
             }
         } else {
@@ -338,6 +344,50 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         })),
         push_template("<!--]-->"),
     ])
+}
+
+/// `{#if TEST}consequent{:else if X}...{:else}alternate{/if}` →
+///
+/// ```text
+/// if (TEST) {
+///     $$renderer.push('<!--[0-->');
+///     ...consequent body...
+/// } else {
+///     $$renderer.push('<!--[-1-->');
+///     ...alternate body...
+/// }
+/// ```
+///
+/// Caller appends a trailing `<!--]-->` marker that fuses with following content.
+/// Ports `packages/svelte/src/compiler/phases/3-transform/server/visitors/IfBlock.js`.
+fn lower_if_block_server(
+    ib: &svelte_ast::blocks::IfBlock,
+) -> Option<Vec<Statement>> {
+    let mut consequent_body: Vec<Statement> = Vec::new();
+    consequent_body.push(push_template("<!--[0-->"));
+    consequent_body.extend(lower_fragment_with_marker(
+        &ib.consequent,
+        body_needs_marker(&ib.consequent),
+    )?);
+
+    let mut alternate_body: Vec<Statement> = Vec::new();
+    alternate_body.push(push_template("<!--[-1-->"));
+    if let Some(alt) = &ib.alternate {
+        alternate_body.extend(lower_fragment_with_marker(alt, body_needs_marker(alt))?);
+    }
+
+    Some(vec![Statement::If(Box::new(IfStatement {
+        test: ib.test.clone(),
+        consequent: Statement::Block(Box::new(BlockStatement {
+            body: consequent_body,
+            span: Span::ZERO,
+        })),
+        alternate: Some(Statement::Block(Box::new(BlockStatement {
+            body: alternate_body,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }))])
 }
 
 /// `{#await EXPR [as PAT][:then PAT][:catch PAT]}...{/await}` →
