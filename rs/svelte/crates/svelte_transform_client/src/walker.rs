@@ -115,7 +115,13 @@ pub fn try_typed_client_walker_with(
                 } else {
                     prev_var.clone().expect("single-root nav established")
                 };
-                emit_element_content(content, &var, &mut body_stmts, &mut effects);
+                emit_element_content(
+                    content,
+                    &var,
+                    &mut body_stmts,
+                    &mut effects,
+                    &script.state_bindings,
+                );
             }
             NodeKind::Component(c) => {
                 html.push_str("<!>");
@@ -382,6 +388,10 @@ struct ScriptInfo {
     body: Vec<Statement>,
     /// Whether to emit `import 'svelte/internal/flags/legacy';`
     emit_legacy_flag: bool,
+    /// Bindings that became `$.state(...)` — references to them in reactive
+    /// contexts (template_effect deps, function bodies) need `$.get(X)` /
+    /// `$.set(X, V)` wrapping.
+    state_bindings: HashSet<String>,
 }
 
 fn analyze_script(instance: opt_ref::Ref<svelte_ast::root::Script>) -> Option<ScriptInfo> {
@@ -390,11 +400,26 @@ fn analyze_script(instance: opt_ref::Ref<svelte_ast::root::Script>) -> Option<Sc
             imports: Vec::new(),
             body: Vec::new(),
             emit_legacy_flag: true,
+            state_bindings: HashSet::new(),
         });
     };
 
     let body = &script.content.body;
     let assigned: HashSet<String> = collect_assigned_targets(body);
+
+    // First pass: discover which $state bindings need lowering to $.state.
+    let mut state_bindings: HashSet<String> = HashSet::new();
+    for s in body {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    if is_state_call(init) && assigned.contains(&id.name) {
+                        state_bindings.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+    }
 
     let mut imports: Vec<Statement> = Vec::new();
     let mut rest: Vec<Statement> = Vec::new();
@@ -410,7 +435,8 @@ fn analyze_script(instance: opt_ref::Ref<svelte_ast::root::Script>) -> Option<Sc
             }
             _ => {
                 saw_non_import = true;
-                let rewritten = rewrite_top_stmt(s, &assigned, &mut uses_runes)?;
+                let rewritten =
+                    rewrite_top_stmt(s, &assigned, &state_bindings, &mut uses_runes)?;
                 rest.push(rewritten);
             }
         }
@@ -420,18 +446,23 @@ fn analyze_script(instance: opt_ref::Ref<svelte_ast::root::Script>) -> Option<Sc
         imports,
         body: rest,
         emit_legacy_flag: !uses_runes,
+        state_bindings,
     })
 }
 
-/// Rewrite a top-level script statement for the client. Currently:
-/// - `let X = $state(LIT)` where X is never assigned anywhere → `let X = LIT;`
+/// Rewrite a top-level script statement for the client. Handles:
+/// - `let X = $state(LIT)` where X is never assigned → `let X = LIT;`
+///   (strips the rune call entirely)
+/// - `let X = $state(V)` where X IS assigned somewhere → `let X = $.state(V);`
 /// - `let X = LIT` (no rune) → unchanged
 /// - `const X = LIT` → unchanged
-/// - Functions → unchanged
-/// - Anything else → bail (returns None).
+/// - Functions → body recursively rewritten so reads of state bindings
+///   become `$.get(X)` and writes become `$.set(X, ...)` / `$.update(X)`.
+/// - Anything else (assignment expressions to plain bindings etc.) → bail.
 fn rewrite_top_stmt(
     s: &Statement,
     assigned: &HashSet<String>,
+    state_bindings: &HashSet<String>,
     uses_runes: &mut bool,
 ) -> Option<Statement> {
     match s {
@@ -439,10 +470,18 @@ fn rewrite_top_stmt(
             let mut out = (**v).clone();
             for d in &mut out.declarations {
                 if let Some(init) = &mut d.init {
+                    // First, try strip (binding never assigned).
                     let stripped = try_strip_state(init, &d.id, assigned, uses_runes);
                     if !stripped {
-                        // Identifier init or other simple non-rune init: OK.
-                        // Bail if init contains an unsupported rune call.
+                        // Try lower $state(V) → $.state(V) if this binding is
+                        // a state binding.
+                        if let Pattern::Identifier(id) = &d.id {
+                            if state_bindings.contains(&id.name) && is_state_call(init) {
+                                *uses_runes = true;
+                                lower_state_init(init);
+                                continue;
+                            }
+                        }
                         if expr_has_unsupported_rune(init) {
                             return None;
                         }
@@ -451,10 +490,266 @@ fn rewrite_top_stmt(
             }
             Some(Statement::Variable(Box::new(out)))
         }
-        Statement::Function(_) => Some(s.clone()),
+        Statement::Function(f) => {
+            let mut f2 = (**f).clone();
+            rewrite_block_for_state(&mut f2.body.body, state_bindings);
+            Some(Statement::Function(Box::new(f2)))
+        }
         Statement::Expression(_) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// `$state(V)` → `$.state(V)` (in-place).
+fn lower_state_init(init: &mut Expression) {
+    let Expression::Call(c) = init else { return };
+    c.callee = t::member_id(t::id("$"), "state");
+}
+
+/// Walk a function body and rewrite state-binding references.
+fn rewrite_block_for_state(body: &mut Vec<Statement>, state: &HashSet<String>) {
+    for s in body {
+        rewrite_stmt_for_state(s, state);
+    }
+}
+
+fn rewrite_stmt_for_state(s: &mut Statement, state: &HashSet<String>) {
+    use Statement as S;
+    match s {
+        S::Variable(v) => {
+            for d in &mut v.declarations {
+                if let Some(init) = &mut d.init {
+                    rewrite_expr_for_state(init, state);
+                }
+            }
+        }
+        S::Expression(e) => rewrite_expr_for_state(&mut e.expression, state),
+        S::Block(b) => {
+            for s in &mut b.body {
+                rewrite_stmt_for_state(s, state);
+            }
+        }
+        S::Return(r) => {
+            if let Some(a) = &mut r.argument {
+                rewrite_expr_for_state(a, state);
+            }
+        }
+        S::If(i) => {
+            rewrite_expr_for_state(&mut i.test, state);
+            rewrite_stmt_for_state(&mut i.consequent, state);
+            if let Some(a) = &mut i.alternate {
+                rewrite_stmt_for_state(a, state);
+            }
+        }
+        S::For(f) => {
+            if let Some(init) = &mut f.init {
+                if let ForInit::Expression(e) = init {
+                    rewrite_expr_for_state(e, state);
+                } else if let ForInit::Declaration(d) = init {
+                    for d in &mut d.declarations {
+                        if let Some(init) = &mut d.init {
+                            rewrite_expr_for_state(init, state);
+                        }
+                    }
+                }
+            }
+            if let Some(t) = &mut f.test {
+                rewrite_expr_for_state(t, state);
+            }
+            if let Some(u) = &mut f.update {
+                rewrite_expr_for_state(u, state);
+            }
+            rewrite_stmt_for_state(&mut f.body, state);
+        }
+        S::ForIn(f) => {
+            rewrite_expr_for_state(&mut f.right, state);
+            rewrite_stmt_for_state(&mut f.body, state);
+        }
+        S::ForOf(f) => {
+            rewrite_expr_for_state(&mut f.right, state);
+            rewrite_stmt_for_state(&mut f.body, state);
+        }
+        S::While(w) => {
+            rewrite_expr_for_state(&mut w.test, state);
+            rewrite_stmt_for_state(&mut w.body, state);
+        }
+        S::Function(f) => {
+            for s in &mut f.body.body {
+                rewrite_stmt_for_state(s, state);
+            }
+        }
+        S::Throw(t) => rewrite_expr_for_state(&mut t.argument, state),
+        _ => {}
+    }
+}
+
+pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>) {
+    use Expression as E;
+    match e {
+        E::Identifier(i) => {
+            if state.contains(&i.name) {
+                let name = i.name.clone();
+                *e = t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]);
+            }
+        }
+        E::Assignment(a) => {
+            // Try to detect `X = ...` or `X OP= ...` where X is a state binding.
+            if let AssignmentTarget::Expression(target) = &a.left {
+                if let E::Identifier(id) = target {
+                    if state.contains(&id.name) {
+                        let name = id.name.clone();
+                        // Recurse into RHS first (its own reads become $.get).
+                        rewrite_expr_for_state(&mut a.right, state);
+                        let rhs = std::mem::replace(
+                            &mut a.right,
+                            Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                        );
+                        let new_value = match a.operator {
+                            AssignmentOperator::Assign => rhs,
+                            AssignmentOperator::AddAssign => binop(
+                                BinaryOperator::Plus,
+                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                rhs,
+                            ),
+                            AssignmentOperator::SubAssign => binop(
+                                BinaryOperator::Minus,
+                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                rhs,
+                            ),
+                            AssignmentOperator::MulAssign => binop(
+                                BinaryOperator::Mul,
+                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                rhs,
+                            ),
+                            AssignmentOperator::DivAssign => binop(
+                                BinaryOperator::Div,
+                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                rhs,
+                            ),
+                            AssignmentOperator::ModAssign => binop(
+                                BinaryOperator::Mod,
+                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                rhs,
+                            ),
+                            _ => rhs,
+                        };
+                        *e = t::call(
+                            t::member_id(t::id("$"), "set"),
+                            vec![t::id(&name), new_value],
+                        );
+                        return;
+                    }
+                }
+            }
+            // Not a state assignment — recurse normally.
+            if let AssignmentTarget::Expression(target) = &mut a.left {
+                rewrite_expr_for_state(target, state);
+            }
+            rewrite_expr_for_state(&mut a.right, state);
+        }
+        E::Update(u) => {
+            if let E::Identifier(id) = &u.argument {
+                if state.contains(&id.name) {
+                    let name = id.name.clone();
+                    let increment_args = match u.operator {
+                        UpdateOperator::Increment => vec![t::id(&name)],
+                        UpdateOperator::Decrement => vec![t::id(&name), t::lit_number(-1.0)],
+                    };
+                    *e = t::call(t::member_id(t::id("$"), "update"), increment_args);
+                    return;
+                }
+            }
+            rewrite_expr_for_state(&mut u.argument, state);
+        }
+        E::Call(c) => {
+            rewrite_expr_for_state(&mut c.callee, state);
+            for a in &mut c.arguments {
+                match a {
+                    Argument::Expression(e) => rewrite_expr_for_state(e, state),
+                    Argument::Spread(s) => rewrite_expr_for_state(&mut s.argument, state),
+                }
+            }
+        }
+        E::Member(m) => {
+            rewrite_expr_for_state(&mut m.object, state);
+            if let MemberProperty::Expression(e) = &mut m.property {
+                rewrite_expr_for_state(e, state);
+            }
+        }
+        E::Binary(b) => {
+            rewrite_expr_for_state(&mut b.left, state);
+            rewrite_expr_for_state(&mut b.right, state);
+        }
+        E::Logical(l) => {
+            rewrite_expr_for_state(&mut l.left, state);
+            rewrite_expr_for_state(&mut l.right, state);
+        }
+        E::Conditional(c) => {
+            rewrite_expr_for_state(&mut c.test, state);
+            rewrite_expr_for_state(&mut c.consequent, state);
+            rewrite_expr_for_state(&mut c.alternate, state);
+        }
+        E::Unary(u) => rewrite_expr_for_state(&mut u.argument, state),
+        E::Sequence(s) => {
+            for e in &mut s.expressions {
+                rewrite_expr_for_state(e, state);
+            }
+        }
+        E::Paren(p) => rewrite_expr_for_state(&mut p.expression, state),
+        E::Template(t) => {
+            for ex in &mut t.expressions {
+                rewrite_expr_for_state(ex, state);
+            }
+        }
+        E::Spread(s) => rewrite_expr_for_state(&mut s.argument, state),
+        E::Arrow(a) => match &mut a.body {
+            ArrowBody::Block(b) => {
+                for s in &mut b.body {
+                    rewrite_stmt_for_state(s, state);
+                }
+            }
+            ArrowBody::Expression(e) => rewrite_expr_for_state(e, state),
+        },
+        E::Function(f) => {
+            for s in &mut f.body.body {
+                rewrite_stmt_for_state(s, state);
+            }
+        }
+        E::New(n) => {
+            rewrite_expr_for_state(&mut n.callee, state);
+            for a in &mut n.arguments {
+                match a {
+                    Argument::Expression(e) => rewrite_expr_for_state(e, state),
+                    Argument::Spread(s) => rewrite_expr_for_state(&mut s.argument, state),
+                }
+            }
+        }
+        E::Array(a) => {
+            for el in &mut a.elements {
+                if let ArrayElement::Expression(e) = el {
+                    rewrite_expr_for_state(e, state);
+                }
+            }
+        }
+        E::Object(o) => {
+            for m in &mut o.properties {
+                if let ObjectMember::Property(p) = m {
+                    rewrite_expr_for_state(&mut p.value, state);
+                }
+            }
+        }
+        E::Await(a) => rewrite_expr_for_state(&mut a.argument, state),
+        _ => {}
+    }
+}
+
+fn binop(op: BinaryOperator, left: Expression, right: Expression) -> Expression {
+    Expression::Binary(Box::new(BinaryExpression {
+        left,
+        operator: op,
+        right,
+        span: Span::ZERO,
+    }))
 }
 
 /// If `init` is `$state(LIT)` (or `$state.raw(LIT)`) and `id` is a never-
@@ -1067,6 +1362,7 @@ fn emit_element_content(
     parent_var: &str,
     body_stmts: &mut Vec<Statement>,
     effects: &mut Vec<Statement>,
+    state_bindings: &HashSet<String>,
 ) {
     match content {
         ElementContent::DirectText(expr) => {
@@ -1102,7 +1398,7 @@ fn emit_element_content(
             )));
 
             // Build template literal + dep functions.
-            let (template_expr, dep_fns) = build_template_effect(parts);
+            let (template_expr, dep_fns) = build_template_effect(parts, state_bindings);
             // `$.template_effect((args...) => $.set_text(text, TEMPLATE), [deps])`
             // For 1+ exprs: pass deps as array; for 0 exprs we wouldn't be here.
             let mut params: Vec<Pattern> = Vec::new();
@@ -1138,7 +1434,10 @@ fn emit_element_content(
 /// - The template literal expression for `set_text` (e.g.
 ///   `` `Count is ${$0 ?? ''}` ``).
 /// - The deps array entries `() => exprN`.
-fn build_template_effect(parts: &[TextPart]) -> (Expression, Vec<Expression>) {
+fn build_template_effect(
+    parts: &[TextPart],
+    state_bindings: &HashSet<String>,
+) -> (Expression, Vec<Expression>) {
     let mut quasis: Vec<String> = Vec::with_capacity(parts.len() + 1);
     let mut subs: Vec<Expression> = Vec::new();
     let mut dep_fns: Vec<Expression> = Vec::new();
@@ -1162,10 +1461,12 @@ fn build_template_effect(parts: &[TextPart]) -> (Expression, Vec<Expression>) {
                     span: Span::ZERO,
                 }));
                 subs.push(placeholder);
-                // dep: `() => EXPR`
+                // dep: `() => EXPR` — rewrite state-binding reads inside EXPR.
+                let mut dep_expr = (*e).clone();
+                rewrite_expr_for_state(&mut dep_expr, state_bindings);
                 dep_fns.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
-                    body: ArrowBody::Expression((*e).clone()),
+                    body: ArrowBody::Expression(dep_expr),
                     r#async: false,
                     span: Span::ZERO,
                 })));
