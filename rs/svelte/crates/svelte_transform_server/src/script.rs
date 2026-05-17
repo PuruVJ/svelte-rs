@@ -277,8 +277,10 @@ fn try_rewrite_rune_call(e: &Expression, ctx: &mut Ctx) -> Option<Expression> {
         "$state" | "$state.raw" | "$state.eager" => {
             Some(first_arg_or_undefined(&c.arguments))
         }
-        // $derived(x) / $derived.by(x) → x  (no-arg → undefined)
-        "$derived" | "$derived.by" => Some(first_arg_or_undefined(&c.arguments)),
+        // $derived(EXPR) → $.derived(() => EXPR)
+        // $derived.by(fn) → $.derived(fn) (the .by form takes a function directly)
+        "$derived" => Some(wrap_derived_arrow(&c.arguments)),
+        "$derived.by" => Some(wrap_derived_call(&c.arguments)),
         // $bindable(default) → default  (no-arg → undefined)
         "$bindable" => Some(first_arg_or_undefined(&c.arguments)),
         // $effect(...) / $inspect(...) / $host() → undefined
@@ -294,6 +296,46 @@ fn try_rewrite_rune_call(e: &Expression, ctx: &mut Ctx) -> Option<Expression> {
         }
         _ => None,
     }
+}
+
+/// `$derived(EXPR)` → `$.derived(() => EXPR)`. Wraps the user expression
+/// in a zero-arg arrow so the derived computation is lazy.
+fn wrap_derived_arrow(args: &[Argument]) -> Expression {
+    let inner = first_arg_or_undefined(args);
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(inner),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    derived_call(arrow)
+}
+
+/// `$derived.by(fn)` → `$.derived(fn)`. The `.by` form takes a function directly.
+fn wrap_derived_call(args: &[Argument]) -> Expression {
+    let inner = first_arg_or_undefined(args);
+    derived_call(inner)
+}
+
+fn derived_call(arg: Expression) -> Expression {
+    Expression::Call(Box::new(CallExpression {
+        callee: Expression::Member(Box::new(MemberExpression {
+            object: Expression::Identifier(Identifier {
+                name: "$".to_string(),
+                span: Span::ZERO,
+            }),
+            property: MemberProperty::Identifier(Identifier {
+                name: "derived".to_string(),
+                span: Span::ZERO,
+            }),
+            computed: false,
+            optional: false,
+            span: Span::ZERO,
+        })),
+        arguments: vec![Argument::Expression(arg)],
+        optional: false,
+        span: Span::ZERO,
+    }))
 }
 
 fn first_arg_or_undefined(args: &[Argument]) -> Expression {

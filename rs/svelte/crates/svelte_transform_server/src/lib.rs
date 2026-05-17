@@ -89,6 +89,7 @@ fn lower_fragment_with_marker(
                 FragmentChild::Component(c) => out.push(lower_component_server(c)?),
                 FragmentChild::SvelteElement(el) => out.push(lower_svelte_element_server(el)?),
                 FragmentChild::EachBlock(eb) => out.extend(lower_each_block_server(eb)?),
+                FragmentChild::AwaitBlock(ab) => out.extend(lower_await_block_server(ab)?),
                 _ => return None,
             }
         }
@@ -232,6 +233,59 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         })),
         push_template("<!--]-->"),
     ])
+}
+
+/// `{#await EXPR [as PAT][:then PAT][:catch PAT]}...{/await}` →
+/// `$.await($$renderer, EXPR, pending_arrow, then_arrow, catch_arrow?);`
+/// Returns the call statement; caller appends a trailing `<!--]-->` marker.
+fn lower_await_block_server(
+    ab: &svelte_ast::blocks::AwaitBlock,
+) -> Option<Vec<Statement>> {
+    // pending arrow: `() => { ...pending body... }`
+    let pending = build_block_arrow(None, ab.pending.as_ref())?;
+    // then arrow: `(value) => { ...then body... }`
+    let then = build_block_arrow(ab.value.as_ref(), ab.then.as_ref())?;
+
+    let mut args = vec![
+        Argument::Expression(t::id("$$renderer")),
+        Argument::Expression(ab.expression.clone()),
+        Argument::Expression(pending),
+        Argument::Expression(then),
+    ];
+    if ab.error.is_some() || ab.catch_.is_some() {
+        let catch_arrow = build_block_arrow(ab.error.as_ref(), ab.catch_.as_ref())?;
+        args.push(Argument::Expression(catch_arrow));
+    }
+
+    Some(vec![t::stmt(Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$"), "await"),
+        arguments: args,
+        optional: false,
+        span: Span::ZERO,
+    })))])
+}
+
+fn build_block_arrow(
+    param: Option<&svelte_js_ast::Pattern>,
+    body: Option<&svelte_ast::fragment::Fragment>,
+) -> Option<Expression> {
+    let params = match param {
+        Some(p) => vec![p.clone()],
+        None => Vec::new(),
+    };
+    let body_stmts = match body {
+        Some(f) => lower_fragment_with_marker(f, body_needs_marker(f))?,
+        None => Vec::new(),
+    };
+    Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params,
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: body_stmts,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    })))
 }
 
 /// `$$renderer.push(\`STR\`);`
@@ -387,8 +441,10 @@ fn append_value_attribute(
 ) -> Option<()> {
     match value {
         AttributeValue::Empty => {
+            // HTML5 emits `name=""` for bare attribute presence (matches upstream).
             buf.push_str(" ");
             buf.push_str(name);
+            buf.push_str("=\"\"");
             Some(())
         }
         AttributeValue::Single(tag) => {
