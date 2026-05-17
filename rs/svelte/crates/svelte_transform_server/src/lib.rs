@@ -256,13 +256,17 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             Some(())
         }
         FragmentChild::ExpressionTag(tag) => {
-            // `${$.escape(expr)}`
-            buf.push_expr(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "escape"),
-                arguments: vec![Argument::Expression(tag.expression.clone())],
-                optional: false,
-                span: Span::ZERO,
-            })));
+            // Constant-fold literal expressions (no `$.escape` wrap, just inline).
+            if let Some(s) = literal_expr_to_string(&tag.expression) {
+                buf.push_str(&escape_text(&s));
+            } else {
+                buf.push_expr(Expression::Call(Box::new(CallExpression {
+                    callee: t::member_id(t::id("$"), "escape"),
+                    arguments: vec![Argument::Expression(tag.expression.clone())],
+                    optional: false,
+                    span: Span::ZERO,
+                })));
+            }
             Some(())
         }
         FragmentChild::RegularElement(el) => {
@@ -452,6 +456,32 @@ fn escape_attribute_text(s: &str) -> String {
     out
 }
 
+/// Constant-fold an ExpressionTag's inner expression to a plain string if it's
+/// a primitive Literal. Returns None for non-literals.
+fn literal_expr_to_string(e: &Expression) -> Option<String> {
+    match e {
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::String(s) => Some(s.value.clone()),
+            Literal::Number(n) => Some(format_number(n.value)),
+            Literal::Boolean(b) => Some(b.value.to_string()),
+            // `{null}` and `{undefined}` render as empty string in templates.
+            Literal::Null(_) => Some(String::new()),
+            _ => None,
+        },
+        // `{undefined}` is parsed as Identifier { name: "undefined" } not Null.
+        Expression::Identifier(i) if i.name == "undefined" => Some(String::new()),
+        _ => None,
+    }
+}
+
+fn format_number(n: f64) -> String {
+    if n == n.trunc() && n.is_finite() && n.abs() < 1e21 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
 fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -506,24 +536,14 @@ impl TemplateBuf {
     }
 
     /// Flush to a `$$renderer.push(\`...\`)` statement (or None when empty
-    /// or whitespace-only). Leading whitespace in parts[0] and trailing
-    /// whitespace in parts.last() are trimmed (matches upstream's
-    /// `preserveWhitespace: false` boundary collapse).
+    /// or whitespace-only). Boundary whitespace is handled at the fragment
+    /// level by `trim_boundary_whitespace`, not here.
     fn flush(&mut self) -> Option<Statement> {
         if self.is_empty() || self.is_whitespace_only() {
-            // Reset buffer state and drop the whitespace.
             self.parts.clear();
             self.parts.push(String::new());
             self.exprs.clear();
             return None;
-        }
-        // Trim leading whitespace from the first chunk.
-        if let Some(first) = self.parts.first_mut() {
-            *first = first.trim_start().to_string();
-        }
-        // Trim trailing whitespace from the last chunk.
-        if let Some(last) = self.parts.last_mut() {
-            *last = last.trim_end().to_string();
         }
         let parts = std::mem::take(&mut self.parts);
         let exprs = std::mem::take(&mut self.exprs);
