@@ -50,6 +50,14 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
     let mut html = String::with_capacity(64);
     let mut body_stmts: Vec<Statement> = Vec::new();
 
+    // Bail on single-root cases not handled by typed_fast — if the single
+    // root has no expressions/components, typed_fast wins. If it's an
+    // interp/component case, we'd need different nav (`var x = root();`
+    // directly). Skip these for now so typed_fast can route the static ones.
+    if !is_multi_root {
+        return None;
+    }
+
     let mut prev_var: Option<String> = None;
     let mut var_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -60,13 +68,13 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
             NodeKind::StaticElement(el) => {
                 serialize_element(el, &mut html, /*body*/ true)?;
                 let var = unique_var(&el.name, &mut var_counts);
-                emit_nav(&mut body_stmts, &var, prev_var.as_deref(), is_multi_root);
+                emit_nav(&mut body_stmts, &var, prev_var.as_deref());
                 prev_var = Some(var);
             }
             NodeKind::InterpElement(el, expr) => {
                 serialize_element(el, &mut html, /*body*/ false)?;
                 let var = unique_var(&el.name, &mut var_counts);
-                emit_nav(&mut body_stmts, &var, prev_var.as_deref(), is_multi_root);
+                emit_nav(&mut body_stmts, &var, prev_var.as_deref());
                 // `var.textContent = EXPR;`
                 let target = Expression::Member(Box::new(MemberExpression {
                     object: t::id(&var),
@@ -89,48 +97,23 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
                 prev_var = Some(var);
             }
             NodeKind::Component(c) => {
-                // `<!>` placeholder in template; `Component(node, {...})` in body.
                 html.push_str("<!>");
                 let var = unique_var("node", &mut var_counts);
-                emit_nav(&mut body_stmts, &var, prev_var.as_deref(), is_multi_root);
+                emit_nav(&mut body_stmts, &var, prev_var.as_deref());
                 body_stmts.push(component_call(c, &var)?);
                 prev_var = Some(var);
             }
         }
-        // Append a single space between top-level siblings (matches upstream
-        // whitespace-collapsed serialization).
         if i < last_idx {
             html.push(' ');
         }
     }
 
-    // `$.append($$anchor, fragment)` (multi-root) / `$.append($$anchor, TAG)` (single).
-    let root_holder = if is_multi_root {
-        "fragment".to_string()
-    } else {
-        prev_var.clone().unwrap_or_else(|| "fragment".to_string())
-    };
-    if is_multi_root {
-        // Prepend `var fragment = root();` before the navigation statements.
-        body_stmts.insert(0, t::var("fragment", t::call(t::id("root"), vec![])));
-    } else if let Some(name) = &prev_var {
-        // For single-root, the very first nav assigned `name = root()` — we
-        // emitted `$.first_child(...)` though. Replace with `root()` call:
-        // actually the single-root navigation differs. Bail for now if
-        // single-root reached this point (the existing typed_fast path
-        // handles pure-static single roots).
-        let _ = name;
-    }
+    body_stmts.insert(0, t::var("fragment", t::call(t::id("root"), vec![])));
     body_stmts.push(t::stmt(t::call(
         t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&root_holder)],
+        vec![t::id("$$anchor"), t::id("fragment")],
     )));
-
-    // Bail if single-root — typed_fast covers static, and we don't yet have a
-    // single-root non-static navigation pattern matching upstream's output.
-    if !is_multi_root {
-        return None;
-    }
 
     // Module-level: `var root = $.from_html(\`HTML\`, 1);`
     let mut from_html_args = vec![t::template_raw(vec![html], vec![])];
@@ -158,7 +141,7 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
 }
 
 /// `var name = $.first_child(fragment);` (first nav) or `var name = $.sibling(prev, 2);`.
-fn emit_nav(out: &mut Vec<Statement>, name: &str, prev: Option<&str>, _is_multi_root: bool) {
+fn emit_nav(out: &mut Vec<Statement>, name: &str, prev: Option<&str>) {
     let init = if let Some(p) = prev {
         // `$.sibling(prev, 2)` — 2 skips the whitespace text between siblings.
         t::call(
@@ -191,7 +174,8 @@ enum NodeKind<'a> {
 fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
     match n {
         FragmentChild::RegularElement(el) => {
-            if !el.attributes.is_empty() {
+            // All attributes must be static-text values (or empty).
+            if !all_static_attrs(&el.attributes) {
                 return None;
             }
             // Examine children: either all static, or exactly one ExpressionTag
@@ -221,6 +205,50 @@ fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
             }
         }
         FragmentChild::Component(c) => Some(NodeKind::Component(c)),
+        _ => None,
+    }
+}
+
+fn all_static_attrs(attrs: &[ElementAttribute]) -> bool {
+    attrs.iter().all(|a| match a {
+        ElementAttribute::Attribute(a) => match &a.value {
+            AttributeValue::Empty => true,
+            AttributeValue::Many(parts) => parts
+                .iter()
+                .all(|p| matches!(p, AttributeValuePart::Text(_))),
+            AttributeValue::Single(_) => false,
+        },
+        _ => false,
+    })
+}
+
+fn write_static_attr(a: &Attribute, out: &mut String) -> Option<()> {
+    match &a.value {
+        AttributeValue::Empty => {
+            out.push(' ');
+            out.push_str(&a.name);
+            Some(())
+        }
+        AttributeValue::Many(parts) => {
+            out.push(' ');
+            out.push_str(&a.name);
+            out.push_str("=\"");
+            for p in parts {
+                if let AttributeValuePart::Text(t) = p {
+                    for ch in t.data.chars() {
+                        match ch {
+                            '"' => out.push_str("&quot;"),
+                            '&' => out.push_str("&amp;"),
+                            '`' => out.push_str("\\`"),
+                            '\\' => out.push_str("\\\\"),
+                            _ => out.push(ch),
+                        }
+                    }
+                }
+            }
+            out.push('"');
+            Some(())
+        }
         _ => None,
     }
 }
@@ -275,10 +303,18 @@ fn serialize_element(
 ) -> Option<()> {
     out.push('<');
     out.push_str(&el.name);
-    out.push('>');
+    for attr in &el.attributes {
+        if let ElementAttribute::Attribute(a) = attr {
+            write_static_attr(a, out)?;
+        } else {
+            return None;
+        }
+    }
     if is_void(&el.name) {
+        out.push_str("/>");
         return Some(());
     }
+    out.push('>');
     if include_body {
         for c in &el.fragment.nodes {
             serialize_static_child(c, out)?;

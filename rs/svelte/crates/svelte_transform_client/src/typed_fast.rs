@@ -93,22 +93,27 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, bool)> {
     // Single non-WS root: use the element's name as the variable.
     if non_ws.len() == 1 {
         if let FragmentChild::RegularElement(el) = non_ws[0] {
-            if !el.attributes.is_empty() {
-                // typed_component handles attributed elements.
-                return None;
-            }
             let mut html = String::with_capacity(32);
             html.push('<');
             html.push_str(&el.name);
+            for attr in &el.attributes {
+                if let svelte_ast::attributes::ElementAttribute::Attribute(a) = attr {
+                    append_static_attr(a, &mut html)?;
+                } else {
+                    return None;
+                }
+            }
+            if is_void(&el.name) {
+                html.push_str("/>");
+                return Some((el.name.clone(), html, false));
+            }
             html.push('>');
             for child in &el.fragment.nodes {
                 append_static(child, &mut html)?;
             }
-            if !is_void(&el.name) {
-                html.push_str("</");
-                html.push_str(&el.name);
-                html.push('>');
-            }
+            html.push_str("</");
+            html.push_str(&el.name);
+            html.push('>');
             return Some((el.name.clone(), html, false));
         }
         return None;
