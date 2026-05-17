@@ -62,9 +62,9 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     // Apply template-only transforms: substitute script constants AND
     // call-wrap every Identifier that refers to a $derived binding.
     let mut fragment = root.fragment.clone();
-    if !consts.is_empty() {
-        substitute_consts_in_fragment(&mut fragment, &consts);
-    }
+    // Always run: even with no consts, the fold pass folds pure Math.*
+    // calls into number literals.
+    substitute_consts_in_fragment(&mut fragment, &consts);
     let derived = &derived_bindings;
     if !derived.is_empty() {
         call_derived_in_fragment(&mut fragment, derived);

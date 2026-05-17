@@ -585,6 +585,10 @@ fn fold(e: &mut Expression) {
                     fold(e);
                 }
             }
+            // Math.X(literal-numbers...) → literal number.
+            if let Some(folded) = try_fold_math_call(c) {
+                *e = folded;
+            }
         }
         Expression::Member(m) => fold(&mut m.object),
         Expression::Unary(u) => fold(&mut u.argument),
@@ -609,6 +613,99 @@ fn fold(e: &mut Expression) {
         }
         _ => {}
     }
+}
+
+/// `Math.X(literal_numbers...)` → number literal, when `X` is a known pure
+/// math function. Mirrors the `globals` whitelist in
+/// `packages/svelte/src/compiler/phases/scope.js:26-74`.
+fn try_fold_math_call(c: &CallExpression) -> Option<Expression> {
+    let m = match &c.callee {
+        Expression::Member(m) => m,
+        _ => return None,
+    };
+    if m.computed || m.optional {
+        return None;
+    }
+    let obj = match &m.object {
+        Expression::Identifier(i) => i.name.as_str(),
+        _ => return None,
+    };
+    let prop = match &m.property {
+        MemberProperty::Identifier(i) => i.name.as_str(),
+        _ => return None,
+    };
+    if obj != "Math" {
+        return None;
+    }
+    let mut nums: Vec<f64> = Vec::with_capacity(c.arguments.len());
+    for a in &c.arguments {
+        let e = match a {
+            Argument::Expression(e) => e,
+            _ => return None,
+        };
+        let n = match e {
+            Expression::Literal(lit) => match lit.as_ref() {
+                Literal::Number(n) => n.value,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        nums.push(n);
+    }
+    let result: f64 = match prop {
+        "min" => nums.iter().cloned().fold(f64::INFINITY, f64::min),
+        "max" => nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        "abs" if nums.len() == 1 => nums[0].abs(),
+        "floor" if nums.len() == 1 => nums[0].floor(),
+        "ceil" if nums.len() == 1 => nums[0].ceil(),
+        "round" if nums.len() == 1 => nums[0].round(),
+        "trunc" if nums.len() == 1 => nums[0].trunc(),
+        "sign" if nums.len() == 1 => nums[0].signum(),
+        "sqrt" if nums.len() == 1 => nums[0].sqrt(),
+        "cbrt" if nums.len() == 1 => nums[0].cbrt(),
+        "pow" if nums.len() == 2 => nums[0].powf(nums[1]),
+        "atan2" if nums.len() == 2 => nums[0].atan2(nums[1]),
+        "log" if nums.len() == 1 => nums[0].ln(),
+        "log10" if nums.len() == 1 => nums[0].log10(),
+        "log2" if nums.len() == 1 => nums[0].log2(),
+        "log1p" if nums.len() == 1 => nums[0].ln_1p(),
+        "exp" if nums.len() == 1 => nums[0].exp(),
+        "expm1" if nums.len() == 1 => nums[0].exp_m1(),
+        "sin" if nums.len() == 1 => nums[0].sin(),
+        "cos" if nums.len() == 1 => nums[0].cos(),
+        "tan" if nums.len() == 1 => nums[0].tan(),
+        "asin" if nums.len() == 1 => nums[0].asin(),
+        "acos" if nums.len() == 1 => nums[0].acos(),
+        "atan" if nums.len() == 1 => nums[0].atan(),
+        "sinh" if nums.len() == 1 => nums[0].sinh(),
+        "cosh" if nums.len() == 1 => nums[0].cosh(),
+        "tanh" if nums.len() == 1 => nums[0].tanh(),
+        "asinh" if nums.len() == 1 => nums[0].asinh(),
+        "acosh" if nums.len() == 1 => nums[0].acosh(),
+        "atanh" if nums.len() == 1 => nums[0].atanh(),
+        "fround" if nums.len() == 1 => nums[0] as f32 as f64,
+        "imul" if nums.len() == 2 => ((nums[0] as i32).wrapping_mul(nums[1] as i32)) as f64,
+        "clz32" if nums.len() == 1 => (nums[0] as u32).leading_zeros() as f64,
+        _ => return None,
+    };
+    Some(Expression::Literal(Box::new(Literal::Number(NumberLiteral {
+        value: result,
+        raw: Some(format_num(result)),
+        span: Span::ZERO,
+    }))))
+}
+
+fn format_num(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() };
+    }
+    if n.fract() == 0.0 && n.abs() < 1e21 {
+        return format!("{}", n as i64);
+    }
+    format!("{n}")
 }
 
 /// `Some(true)` if `e` is a non-null/non-undefined literal. `Some(false)`
