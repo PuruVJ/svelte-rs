@@ -57,6 +57,14 @@ pub fn literal_null() -> Expression {
     Expression::Literal(Box::new(Literal::Null(Span::ZERO)))
 }
 
+pub fn lit_number(n: f64) -> Expression {
+    Expression::Literal(Box::new(Literal::Number(NumberLiteral {
+        value: n,
+        raw: Some(format!("{n}")),
+        span: Span::ZERO,
+    })))
+}
+
 pub fn template_raw(parts: Vec<String>, exprs: Vec<Expression>) -> Expression {
     // parts has N entries; exprs has N-1. Build alternating quasi/expr.
     let mut quasis = Vec::with_capacity(parts.len());

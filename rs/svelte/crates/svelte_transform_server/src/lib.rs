@@ -63,24 +63,32 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     Some(t::program(top))
 }
 
-/// Lower an entire fragment to a sequence of server-side statements.
-///
-/// Walks `f.nodes` collecting static + dynamic content into a rolling
-/// template literal that's pushed via `$$renderer.push(\`...\`)`. Nodes
-/// that don't fit (Component, SvelteElement, blocks) flush the buffer
-/// and emit their own statement.
+/// Lower an entire root-level fragment to a sequence of server statements.
 fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<Statement>> {
+    lower_fragment_with_marker(f, false)
+}
+
+/// Lower a fragment with an optional leading `<!---->` marker (prepended
+/// to the first push if the first non-whitespace child needs it).
+fn lower_fragment_with_marker(
+    f: &svelte_ast::fragment::Fragment,
+    needs_marker: bool,
+) -> Option<Vec<Statement>> {
     let mut out = Vec::new();
     let mut buf = TemplateBuf::new();
-    for n in &f.nodes {
+    if needs_marker {
+        buf.push_str("<!---->");
+    }
+    let nodes = trim_boundary_whitespace(&f.nodes);
+    for n in nodes {
         if append_node_to_template(n, &mut buf).is_none() {
-            // Flush + emit non-template node.
             if let Some(stmt) = buf.flush() {
                 out.push(stmt);
             }
             match n {
                 FragmentChild::Component(c) => out.push(lower_component_server(c)?),
                 FragmentChild::SvelteElement(el) => out.push(lower_svelte_element_server(el)?),
+                FragmentChild::EachBlock(eb) => out.extend(lower_each_block_server(eb)?),
                 _ => return None,
             }
         }
@@ -89,6 +97,154 @@ fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<State
         out.push(stmt);
     }
     Some(out)
+}
+
+/// True when the first non-whitespace child is a tag/block/component
+/// (something that needs a `<!---->` anchor marker in the output).
+fn body_needs_marker(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes
+        .iter()
+        .find(|n| !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
+        .map(|n| {
+            matches!(
+                n,
+                FragmentChild::ExpressionTag(_)
+                    | FragmentChild::HtmlTag(_)
+                    | FragmentChild::EachBlock(_)
+                    | FragmentChild::IfBlock(_)
+                    | FragmentChild::AwaitBlock(_)
+                    | FragmentChild::KeyBlock(_)
+                    | FragmentChild::Component(_)
+                    | FragmentChild::SvelteElement(_)
+                    | FragmentChild::SvelteComponent(_)
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// `{#each EXPR as PATTERN[, INDEX]}body{/each}` →
+///
+/// ```text
+/// $$renderer.push(`<!--[-->`);
+/// const each_array = $.ensure_array_like(EXPR);
+/// for (let INDEX = 0, $$length = each_array.length; INDEX < $$length; INDEX++) {
+///     let PATTERN = each_array[INDEX];
+///     ...body...
+/// }
+/// $$renderer.push(`<!--]-->`);
+/// ```
+fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Statement>> {
+    // Index name — explicit when given, `$$index` otherwise. No-context form
+    // (no `as`) still uses the explicit index if present.
+    let index_name = eb.index.clone().unwrap_or_else(|| "$$index".to_string());
+
+    // for-loop init: `let INDEX = 0, $$length = each_array.length`
+    let init = Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Let,
+        declarations: vec![
+            VariableDeclarator {
+                id: t::pat_id(&index_name),
+                init: Some(t::lit_number(0.0)),
+                span: Span::ZERO,
+            },
+            VariableDeclarator {
+                id: t::pat_id("$$length"),
+                init: Some(Expression::Member(Box::new(MemberExpression {
+                    object: t::id("each_array"),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "length".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                span: Span::ZERO,
+            },
+        ],
+        span: Span::ZERO,
+    }));
+
+    let test = Expression::Binary(Box::new(BinaryExpression {
+        left: t::id(&index_name),
+        operator: BinaryOperator::Lt,
+        right: t::id("$$length"),
+        span: Span::ZERO,
+    }));
+    let update = Expression::Update(Box::new(UpdateExpression {
+        operator: UpdateOperator::Increment,
+        argument: t::id(&index_name),
+        prefix: false,
+        span: Span::ZERO,
+    }));
+
+    // Inside the loop: `let PATTERN = each_array[INDEX];` then body.
+    let mut body_stmts: Vec<Statement> = Vec::new();
+    if let Some(ctx) = &eb.context {
+        body_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Let,
+            declarations: vec![VariableDeclarator {
+                id: ctx.clone(),
+                init: Some(Expression::Member(Box::new(MemberExpression {
+                    object: t::id("each_array"),
+                    property: MemberProperty::Expression(t::id(&index_name)),
+                    computed: true,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        })));
+    }
+
+    let needs_marker = body_needs_marker(&eb.body);
+    body_stmts.extend(lower_fragment_with_marker(&eb.body, needs_marker)?);
+
+    Some(vec![
+        push_template("<!--[-->"),
+        Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Const,
+            declarations: vec![VariableDeclarator {
+                id: t::pat_id("each_array"),
+                init: Some(Expression::Call(Box::new(CallExpression {
+                    callee: t::member_id(t::id("$"), "ensure_array_like"),
+                    arguments: vec![Argument::Expression(eb.expression.clone())],
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        })),
+        Statement::For(Box::new(ForStatement {
+            init: Some(ForInit::Declaration(Box::new(match init {
+                Statement::Variable(v) => *v,
+                _ => unreachable!(),
+            }))),
+            test: Some(test),
+            update: Some(update),
+            body: Statement::Block(Box::new(BlockStatement {
+                body: body_stmts,
+                span: Span::ZERO,
+            })),
+            span: Span::ZERO,
+        })),
+        push_template("<!--]-->"),
+    ])
+}
+
+/// `$$renderer.push(\`STR\`);`
+fn push_template(s: &str) -> Statement {
+    t::stmt(Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$$renderer"), "push"),
+        arguments: vec![Argument::Expression(t::template_raw(
+            vec![s.to_string()],
+            Vec::new(),
+        ))],
+        optional: false,
+        span: Span::ZERO,
+    })))
 }
 
 /// Append a fragment child to the template literal buffer. Returns `None`
