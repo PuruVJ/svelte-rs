@@ -5,7 +5,7 @@
 //! Phase 2 scaffolding clarity; once `state/element.js` is fully ported it
 //! can call into this helper.
 
-use svelte_ast::{Comment, CommentKind};
+use svelte_ast::{Comment, };
 use svelte_diagnostics::{errors, CompileDiagnostic};
 
 use crate::parser::Parser;
@@ -36,7 +36,6 @@ pub fn read_comment(parser: &mut Parser<'_>) -> Result<Comment, CompileDiagnosti
     parser.index += 3; // skip `-->`
 
     Ok(Comment {
-        kind: CommentKind::Comment,
         start,
         end: parser.index as u32,
         data,

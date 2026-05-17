@@ -118,8 +118,11 @@ fn analyze_rule(rule: &Rule, a: &mut CssAnalysis, parent_rule: Option<&Rule>) {
 
     // First pass: detect `:global { ... }` block-rule. Walks complex
     // selectors looking for a `:global` PseudoClassSelector with no args
-    // at the head. Mirrors css-analyze.js:201-264.
+    // at the head. Mirrors css-analyze.js:201-264. Also propagates
+    // `is_global_like = true` to relative selectors that follow a `:global`
+    // within the same complex selector (so `:global div` → div is_global_like).
     for complex in &rule.prelude.children {
+        let mut after_global = false;
         for rel in &complex.children {
             if rel
                 .selectors
@@ -127,6 +130,12 @@ fn analyze_rule(rule: &Rule, a: &mut CssAnalysis, parent_rule: Option<&Rule>) {
                 .is_some_and(is_global_block_selector)
             {
                 meta.is_global_block = true;
+                after_global = true;
+            } else if after_global {
+                a.relative_selector_metadata
+                    .entry(node_key(rel.start, rel.end))
+                    .or_default()
+                    .is_global_like = true;
             }
         }
     }
@@ -243,8 +252,13 @@ fn analyze_relative_selector(rel: &RelativeSelector, a: &mut CssAnalysis) {
         meta.is_global_like = true;
     }
 
-    a.relative_selector_metadata
-        .insert(node_key(rel.start, rel.end), meta);
+    // Merge into any prior partial metadata (e.g. is_global_like already
+    // set by the rule-level :global propagation pass).
+    let key = node_key(rel.start, rel.end);
+    let entry = a.relative_selector_metadata.entry(key).or_default();
+    entry.is_global = entry.is_global || meta.is_global;
+    entry.is_global_like = entry.is_global_like || meta.is_global_like;
+    // .scoped is set by css_prune later — preserve.
 
     // Recurse into pseudo-class args (e.g. `:is(.foo)`) — they may contain
     // more rules.
@@ -306,19 +320,23 @@ fn is_unscoped_pseudo_class(s: &SimpleSelector) -> bool {
     let SimpleSelector::PseudoClassSelector(p) = s else {
         return false;
     };
-    let scoping = matches!(p.name.as_str(), "has" | "is" | "where");
-    if !scoping && p.name != "not" {
+    // First branch: non-scoping pseudo (`:hover`, `:focus`, etc.) — always
+    // unscoped. For `:not`, args must be single-relative-selector form.
+    let is_non_scoping = !matches!(p.name.as_str(), "has" | "is" | "where")
+        && (p.name != "not"
+            || p.args.is_none()
+            || p.args
+                .as_ref()
+                .is_some_and(|args| {
+                    args.children.iter().all(|c| {
+                        c.children.len() == 1 && c.children[0].selectors.len() == 1
+                    })
+                }));
+    if is_non_scoping {
         return true;
     }
-    // `:not(.x .y)` is NOT global — the single-selector rule applies.
-    if p.name == "not" {
-        if let Some(args) = &p.args {
-            if !args.children.iter().all(|c| c.children.len() == 1) {
-                return false;
-            }
-        }
-    }
-    // Selectors with has/is/where/not are global only if all their children are global.
+    // Second branch: `:has/:is/:where(...)` whose contents are all global —
+    // counts as unscoped too. Mirrors upstream utils.js:138-156.
     match &p.args {
         None => true,
         Some(args) => args

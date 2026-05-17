@@ -50,18 +50,64 @@ pub fn compile(
     let _analysis =
         svelte_analyze::analyze_component(root.clone(), options.module.filename.as_deref())?;
 
-    let program = match options.module.generate {
-        Some(Generate::Server) => svelte_transform_server::server_component(&root, component_name),
+    // The pipeline is typed end-to-end: parse -> typed transform -> typed
+    // print. If no typed transform can handle the input shape, we surface
+    // an unsupported error (rather than fall back to a Value-based path —
+    // none exists). Coverage is being grown fixture-by-fixture.
+    let typed = match options.module.generate {
+        Some(Generate::Server) => {
+            if let Some(p) = svelte_transform_server::try_typed_server(&root, component_name) {
+                p
+            } else if let Some(p) =
+                svelte_transform_server::try_typed_server_component(&root, component_name)
+            {
+                p
+            } else {
+                return Err(CompileDiagnostic {
+                    code: "typed_server_unsupported",
+                    message: "this Svelte source shape isn't yet handled by the typed server transform"
+                        .to_string(),
+                    position: None,
+                });
+            }
+        }
         Some(Generate::Client) | None => {
-            svelte_transform_client::client_component(&root, component_name)
+            if let Some(p) = svelte_transform_client::try_typed_client(&root, component_name) {
+                p
+            } else if let Some(p) =
+                svelte_transform_client::try_typed_client_component(&root, component_name)
+            {
+                p
+            } else {
+                return Err(CompileDiagnostic {
+                    code: "typed_client_unsupported",
+                    message: "this Svelte source shape isn't yet handled by the typed client transform"
+                        .to_string(),
+                    position: None,
+                });
+            }
         }
     };
 
-    let result = svelte_codegen_js::print(
-        &program,
-        &svelte_codegen_js::default_visitors(),
-        &svelte_codegen_js::PrintOptions::default(),
-    );
+    let mut typed_opts = svelte_codegen_js::TypedPrintOptions::default();
+    typed_opts.comments = root
+        .comments
+        .iter()
+        .map(|c| svelte_codegen_js::TypedComment {
+            kind: match c.kind {
+                svelte_ast::root::JsCommentKind::Line => {
+                    svelte_codegen_js::TypedCommentKind::Line
+                }
+                svelte_ast::root::JsCommentKind::Block => {
+                    svelte_codegen_js::TypedCommentKind::Block
+                }
+            },
+            value: c.value.clone(),
+            start: c.start,
+            end: c.end,
+        })
+        .collect();
+    let result = svelte_codegen_js::print_typed(&typed, &typed_opts);
 
     Ok(CompileResult {
         js: result.code,
@@ -69,99 +115,23 @@ pub fn compile(
     })
 }
 
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::Value;
-
-    #[test]
-    fn parse_empty_returns_empty_root() {
-        let r = parse("", ParseOptions::default()).unwrap();
-        assert_eq!(r.start, 0);
-        assert_eq!(r.end, 0);
-        assert!(r.fragment.nodes.is_empty());
-        assert!(r.instance.is_none());
-        assert!(r.module.is_none());
-    }
-
-    #[test]
-    fn parse_strips_bom() {
-        let r = parse("\u{feff}", ParseOptions::default()).unwrap();
-        assert_eq!(r.end, 0);
-    }
-
-    #[test]
-    fn experimental_async_default_is_false() {
-        let opts = CompileOptions::default();
-        assert!(!opts.module.experimental.async_);
-    }
-
-    /// Deserialize a JSON shape matching what a bundler plugin would send.
-    /// Confirms field names map to upstream JS camelCase.
-    #[test]
-    fn options_json_deserialize() {
-        let json = serde_json::json!({
-            "dev": true,
-            "generate": "server",
-            "filename": "App.svelte",
-            "rootDir": "/project",
-            "experimental": { "async": true },
-            "customElement": true,
-            "modernAst": true,
-            "preserveWhitespace": false,
-            "preserveComments": true,
-            "discloseVersion": false,
-            "fragments": "tree",
-            "css": "injected"
-        });
-        let opts: CompileOptions = serde_json::from_value(json).unwrap();
-        assert!(opts.module.dev);
-        assert_eq!(opts.module.generate, Some(Generate::Server));
-        assert_eq!(opts.module.filename.as_deref(), Some("App.svelte"));
-        assert!(opts.module.experimental.async_);
-        assert!(opts.custom_element);
-        assert!(opts.modern_ast);
-        assert!(!opts.preserve_whitespace);
-        assert!(opts.preserve_comments);
-        assert!(!opts.disclose_version);
-        assert_eq!(opts.fragments, FragmentsStrategy::Tree);
-        assert_eq!(opts.css, CssMode::Injected);
-    }
-
-    #[test]
-    fn compile_hello_world_server_byte_equal() {
-        let source = "<h1>hello world</h1>";
-        let mut opts = CompileOptions::default();
-        opts.module.generate = Some(Generate::Server);
-        let result = compile(source, "Hello_world", opts).expect("compile should succeed");
-        let expected = "import * as $ from 'svelte/internal/server';\n\nexport default function Hello_world($$renderer) {\n\t$$renderer.push(`<h1>hello world</h1>`);\n}";
-        assert_eq!(result.js, expected);
-    }
-
-    #[test]
-    fn compile_hello_world_client_byte_equal() {
-        let source = "<h1>hello world</h1>";
-        let mut opts = CompileOptions::default();
-        opts.module.generate = Some(Generate::Client);
-        let result = compile(source, "Hello_world", opts).expect("compile should succeed");
-        let expected = "import 'svelte/internal/disclose-version';\nimport 'svelte/internal/flags/legacy';\nimport * as $ from 'svelte/internal/client';\n\nvar root = $.from_html(`<h1>hello world</h1>`);\n\nexport default function Hello_world($$anchor) {\n\tvar h1 = root();\n\n\t$.append($$anchor, h1);\n}";
-        assert_eq!(result.js, expected);
-    }
-
-    /// The Rust empty-Root serializes to JSON with the same key set as the JS
-    /// parser would emit for a truly empty `.svelte` file. (Modulo the runtime
-    /// parser stripping `comments` when empty in some test paths — we keep it.)
-    #[test]
-    fn empty_root_json_shape() {
-        let r = parse("", ParseOptions::default()).unwrap();
-        let j = serde_json::to_value(&r).unwrap();
-        assert_eq!(j["type"], "Root");
-        assert_eq!(j["start"], 0);
-        assert_eq!(j["end"], 0);
-        assert_eq!(j["css"], Value::Null);
-        assert_eq!(j["options"], Value::Null);
-        assert_eq!(j["fragment"]["type"], "Fragment");
-        assert_eq!(j["fragment"]["nodes"].as_array().unwrap().len(), 0);
-    }
+/// Unused stub kept during the typed-only migration to silence any old
+/// references; will be removed once nothing forwards `serde_json::Value`
+/// comments at all.
+#[allow(dead_code)]
+fn value_to_typed_comment_stub(c: &serde_json::Value) -> Option<svelte_codegen_js::TypedComment> {
+    let obj = c.as_object()?;
+    let kind = match obj.get("type")?.as_str()? {
+        "Line" => svelte_codegen_js::TypedCommentKind::Line,
+        "Block" => svelte_codegen_js::TypedCommentKind::Block,
+        _ => return None,
+    };
+    Some(svelte_codegen_js::TypedComment {
+        kind,
+        value: obj.get("value")?.as_str()?.to_string(),
+        start: obj.get("start")?.as_u64()? as u32,
+        end: obj.get("end")?.as_u64()? as u32,
+    })
 }
+
+

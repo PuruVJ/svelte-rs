@@ -9,6 +9,11 @@ description = "wasm-bindgen surface for svelte_compiler — returns JS-shaped ob
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.wasm-pack.profile.release]
+# Bundled wasm-opt rejects bulk-memory ops our toolchain emits. The pre-opt
+# artifact is functionally correct — disable the post-build optimization.
+wasm-opt = false
+
 [dependencies]
 svelte_compiler = { workspace = true }
 svelte_preprocess = { workspace = true }

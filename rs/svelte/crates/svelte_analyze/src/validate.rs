@@ -71,22 +71,16 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
 /// scripts. Used by `component_name_lowercase` detection.
 fn collect_imported_names(root: &Root) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
-    fn walk_program(program: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
-        let Some(body) = program.get("body").and_then(|v| v.as_array()) else {
-            return;
-        };
-        for stmt in body {
-            if stmt.get("type").and_then(|v| v.as_str()) != Some("ImportDeclaration") {
-                continue;
-            }
-            let Some(specs) = stmt.get("specifiers").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for s in specs {
-                if let Some(local) = s.get("local") {
-                    if let Some(name) = local.get("name").and_then(|v| v.as_str()) {
-                        out.insert(name.to_string());
-                    }
+    fn walk_program(program: &svelte_js_ast::Program, out: &mut std::collections::HashSet<String>) {
+        for stmt in &program.body {
+            if let svelte_js_ast::Statement::Import(decl) = stmt {
+                for spec in &decl.specifiers {
+                    let name = match spec {
+                        svelte_js_ast::ImportSpecifierKind::Named(s) => &s.local.name,
+                        svelte_js_ast::ImportSpecifierKind::Default(s) => &s.local.name,
+                        svelte_js_ast::ImportSpecifierKind::Namespace(s) => &s.local.name,
+                    };
+                    out.insert(name.clone());
                 }
             }
         }
@@ -104,57 +98,25 @@ fn collect_imported_names(root: &Root) -> std::collections::HashSet<String> {
 /// validators. `is_instance` is true for `<script>` (non-module) — the
 /// only scope upstream's LabeledStatement check considers a reactive
 /// statement context.
-fn visit_program(program: &serde_json::Value, is_instance: bool, state: &mut ValidateState) {
-    let Some(body) = program.get("body").and_then(|v| v.as_array()) else {
-        return;
-    };
-    for node in body {
-        // Top-level statements get the full visitor (including
-        // LabeledStatement's "is this `$:`?" check, which only fires at
-        // Program scope).
-        visit_js_node(node, is_instance, /*top_level=*/ true, state);
-    }
-}
-
-fn visit_js_node(
-    node: &serde_json::Value,
+fn visit_program(
+    program: &svelte_js_ast::Program,
     is_instance: bool,
-    top_level: bool,
     state: &mut ValidateState,
 ) {
-    let Some(t) = node.get("type").and_then(|v| v.as_str()) else {
-        return;
-    };
-    match t {
-        "ImportDeclaration" => visit_import_declaration(node, state),
-        "LabeledStatement" if top_level => visit_labeled_statement(node, is_instance, state),
-        _ => {}
-    }
-    // Recurse into child JS nodes (nested level — no longer top-level).
-    if let serde_json::Value::Object(map) = node {
-        for (key, v) in map {
-            if matches!(
-                key.as_str(),
-                "loc" | "start" | "end" | "name" | "raw" | "value"
-                    | "operator" | "computed" | "shorthand" | "method"
-            ) {
-                continue;
-            }
-            visit_js_value(v, is_instance, state);
-        }
+    for stmt in &program.body {
+        visit_js_top_stmt(stmt, is_instance, state);
     }
 }
 
-fn visit_js_value(v: &serde_json::Value, is_instance: bool, state: &mut ValidateState) {
-    match v {
-        serde_json::Value::Object(_) if v.get("type").is_some() => {
-            visit_js_node(v, is_instance, /*top_level=*/ false, state);
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                visit_js_value(item, is_instance, state);
-            }
-        }
+fn visit_js_top_stmt(
+    s: &svelte_js_ast::Statement,
+    is_instance: bool,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::Statement as S;
+    match s {
+        S::Import(d) => visit_import_declaration(d, state),
+        S::Labeled(l) => visit_labeled_statement(l, is_instance, state),
         _ => {}
     }
 }
@@ -760,7 +722,7 @@ fn visit_svelte_boundary<'a>(
         }
         let ElementAttribute::Attribute(attr) = a else { continue };
         let value_ok = match &attr.value {
-            AttributeValue::Empty(_) => false,
+            AttributeValue::Empty => false,
             AttributeValue::Single(_) => true,
             AttributeValue::Many(parts) => {
                 parts.len() == 1 && matches!(parts[0], AttributeValuePart::ExpressionTag(_))
@@ -972,13 +934,13 @@ fn visit_snippet_block<'a>(
 ) {
     validate_block_not_empty(Some(&b.body), state);
     for arg in &b.parameters {
-        let t = arg.get("type").and_then(|v| v.as_str());
-        if t == Some("RestElement") {
-            let start = arg.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let end = arg.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        if let svelte_js_ast::Pattern::Rest(r) = arg {
             state
                 .errors
-                .push(errors::snippet_invalid_rest_parameter(Some((start, end))));
+                .push(errors::snippet_invalid_rest_parameter(Some((
+                    r.span.start,
+                    r.span.end,
+                ))));
         }
     }
     visit_fragment(&b.body, state);
@@ -989,14 +951,16 @@ fn visit_snippet_block<'a>(
 /// - `import from 'svelte/internal*'` → `import_svelte_internal_forbidden`
 /// - `import { beforeUpdate | afterUpdate } from 'svelte'` →
 ///   `runes_mode_invalid_import`
-fn visit_import_declaration(node: &serde_json::Value, state: &mut ValidateState) {
+fn visit_import_declaration(
+    d: &svelte_js_ast::ImportDeclaration,
+    state: &mut ValidateState,
+) {
     if !state.is_runes {
         return;
     }
-    let source = node.get("source").and_then(|v| v.get("value")).and_then(|v| v.as_str());
-    let Some(source) = source else { return };
-    let start = node.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let end = node.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let source = d.source.value.as_str();
+    let start = d.span.start;
+    let end = d.span.end;
     if source.starts_with("svelte/internal") {
         state
             .errors
@@ -1004,29 +968,17 @@ fn visit_import_declaration(node: &serde_json::Value, state: &mut ValidateState)
         return;
     }
     if source == "svelte" {
-        if let Some(specifiers) = node.get("specifiers").and_then(|v| v.as_array()) {
-            for s in specifiers {
-                if s.get("type").and_then(|v| v.as_str()) == Some("ImportSpecifier") {
-                    let imported = s.get("imported");
-                    let imp_type = imported
-                        .and_then(|v| v.get("type"))
-                        .and_then(|v| v.as_str());
-                    if imp_type == Some("Identifier") {
-                        let imp_name = imported
-                            .and_then(|v| v.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if imp_name == "beforeUpdate" || imp_name == "afterUpdate" {
-                            let s_start =
-                                s.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                            let s_end =
-                                s.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                            state.errors.push(errors::runes_mode_invalid_import(
-                                Some((s_start, s_end)),
-                                imp_name,
-                            ));
-                        }
-                    }
+        for spec in &d.specifiers {
+            if let svelte_js_ast::ImportSpecifierKind::Named(s) = spec {
+                let imp_name = match &s.imported {
+                    svelte_js_ast::ModuleExportName::Identifier(i) => i.name.as_str(),
+                    svelte_js_ast::ModuleExportName::String(s) => s.value.as_str(),
+                };
+                if imp_name == "beforeUpdate" || imp_name == "afterUpdate" {
+                    state.errors.push(errors::runes_mode_invalid_import(
+                        Some((s.span.start, s.span.end)),
+                        imp_name,
+                    ));
                 }
             }
         }
@@ -1038,24 +990,15 @@ fn visit_import_declaration(node: &serde_json::Value, state: &mut ValidateState)
 /// error. The dependency-tracking part of the upstream visitor is
 /// deferred.
 fn visit_labeled_statement(
-    node: &serde_json::Value,
+    l: &svelte_js_ast::LabeledStatement,
     is_instance: bool,
     state: &mut ValidateState,
 ) {
-    let label_name = node
-        .get("label")
-        .and_then(|v| v.get("name"))
-        .and_then(|v| v.as_str());
-    if label_name != Some("$") {
+    if l.label.name != "$" {
         return;
     }
-    let start = node.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let end = node.get("end").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    // `$:` is only valid as a top-level statement in the *instance* script.
-    // - In module script (or any non-instance program): emit
-    //   `reactive_declaration_invalid_placement` warning.
-    // - In instance + runes mode: hard error (legacy_reactive_statement_invalid).
-    // Otherwise: valid reactive statement (handled in transform phase).
+    let start = l.span.start;
+    let end = l.span.end;
     if !is_instance {
         state
             .warnings

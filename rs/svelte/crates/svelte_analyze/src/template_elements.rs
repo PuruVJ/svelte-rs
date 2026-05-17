@@ -207,6 +207,24 @@ fn walk_fragment(
     siblings
 }
 
+/// Walk a fragment that's nested inside a control-flow block (IfBlock,
+/// EachBlock, etc.). Returns the contributed elements but DOES NOT call
+/// `link_siblings` because the parent's first_child/sibling chain is owned
+/// by the outer fragment walker — we just contribute child nodes.
+fn walk_fragment_inline(
+    fragment: &Fragment,
+    parent: Option<usize>,
+    existence: Existence,
+    tree: &mut ElementTree,
+) -> Vec<usize> {
+    let mut siblings: Vec<usize> = Vec::new();
+    for node in &fragment.nodes {
+        let added = walk_child(node, parent, existence, tree);
+        siblings.extend(added);
+    }
+    siblings
+}
+
 fn link_siblings(siblings: &[usize], tree: &mut ElementTree) {
     for i in 0..siblings.len() {
         let prev = if i > 0 { Some(siblings[i - 1]) } else { None };
@@ -250,15 +268,16 @@ fn walk_child(
             vec![idx]
         }
         FragmentChild::Component(c) => {
+            let own_existence = Existence::min(existence, Existence::Probable);
             let idx = push_element(
                 NodeKind::Component,
                 Some(c.name.clone()),
                 &c.attributes,
                 parent,
-                existence,
+                own_existence,
                 tree,
             );
-            walk_fragment(&c.fragment, Some(idx), existence, tree);
+            walk_fragment(&c.fragment, Some(idx), own_existence, tree);
             vec![idx]
         }
         FragmentChild::TitleElement(el) => {
@@ -274,15 +293,16 @@ fn walk_child(
             vec![idx]
         }
         FragmentChild::SlotElement(el) => {
+            let own_existence = Existence::min(existence, Existence::Probable);
             let idx = push_element(
                 NodeKind::SlotElement,
                 Some("slot".to_string()),
                 &el.attributes,
                 parent,
-                existence,
+                own_existence,
                 tree,
             );
-            walk_fragment(&el.fragment, Some(idx), existence, tree);
+            walk_fragment(&el.fragment, Some(idx), own_existence, tree);
             vec![idx]
         }
         FragmentChild::SvelteBody(el) => {
@@ -324,15 +344,16 @@ fn walk_child(
             walk_fragment(&el.fragment, parent, existence, tree)
         }
         FragmentChild::SvelteElement(el) => {
+            let own_existence = Existence::min(existence, Existence::Probable);
             let idx = push_element(
                 NodeKind::SvelteElement,
                 None,
                 &el.attributes,
                 parent,
-                existence,
+                own_existence,
                 tree,
             );
-            walk_fragment(&el.fragment, Some(idx), existence, tree);
+            walk_fragment(&el.fragment, Some(idx), own_existence, tree);
             vec![idx]
         }
         FragmentChild::SvelteWindow(_)
@@ -340,17 +361,17 @@ fn walk_child(
         | FragmentChild::SvelteOptions(_) => Vec::new(),
         FragmentChild::IfBlock(b) => {
             let inner = Existence::min(existence, Existence::Probable);
-            let mut out = walk_fragment(&b.consequent, parent, inner, tree);
+            let mut out = walk_fragment_inline(&b.consequent, parent, inner, tree);
             if let Some(alt) = &b.alternate {
-                out.extend(walk_fragment(alt, parent, inner, tree));
+                out.extend(walk_fragment_inline(alt, parent, inner, tree));
             }
             out
         }
         FragmentChild::EachBlock(b) => {
             let inner = Existence::min(existence, Existence::Probable);
-            let mut out = walk_fragment(&b.body, parent, inner, tree);
+            let mut out = walk_fragment_inline(&b.body, parent, inner, tree);
             if let Some(fb) = &b.fallback {
-                out.extend(walk_fragment(fb, parent, inner, tree));
+                out.extend(walk_fragment_inline(fb, parent, inner, tree));
             }
             out
         }
@@ -358,29 +379,31 @@ fn walk_child(
             let inner = Existence::min(existence, Existence::Probable);
             let mut out = Vec::new();
             if let Some(f) = &b.pending {
-                out.extend(walk_fragment(f, parent, inner, tree));
+                out.extend(walk_fragment_inline(f, parent, inner, tree));
             }
             if let Some(f) = &b.then {
-                out.extend(walk_fragment(f, parent, inner, tree));
+                out.extend(walk_fragment_inline(f, parent, inner, tree));
             }
             if let Some(f) = &b.catch_ {
-                out.extend(walk_fragment(f, parent, inner, tree));
+                out.extend(walk_fragment_inline(f, parent, inner, tree));
             }
             out
         }
-        FragmentChild::KeyBlock(b) => walk_fragment(&b.fragment, parent, existence, tree),
+        FragmentChild::KeyBlock(b) => walk_fragment_inline(&b.fragment, parent, existence, tree),
         FragmentChild::SnippetBlock(_) => Vec::new(),
         FragmentChild::RenderTag(rt) => {
             // {@render} renders a snippet's content — its identity is a
             // tag, not an element, but `apply_combinator` treats it as a
             // sibling-position placeholder. Mirror that by emitting an
-            // entry with kind=RenderTag and no tag name.
+            // entry with kind=RenderTag and no tag name. Per upstream's
+            // `get_possible_element_siblings` (css-prune.js:1043), RenderTag
+            // is always treated as `NODE_PROBABLY_EXISTS`.
             let idx = tree.elements.len();
             tree.elements.push(ElementInfo {
                 kind: Some(NodeKind::RenderTag),
                 tag: None,
                 parent,
-                existence,
+                existence: Existence::min(existence, Existence::Probable),
                 ..ElementInfo::default()
             });
             let _ = rt;
@@ -469,7 +492,7 @@ fn describe_element(
 
 fn collect_attribute_values(value: &AttributeValue, out: &mut AttrValueSet) {
     match value {
-        AttributeValue::Empty(_) => {
+        AttributeValue::Empty => {
             out.add_known(String::new());
         }
         AttributeValue::Single(tag) => {
@@ -500,20 +523,15 @@ fn collect_attribute_values(value: &AttributeValue, out: &mut AttrValueSet) {
     }
 }
 
-fn collect_expression_values(expr: &serde_json::Value, out: &mut AttrValueSet) {
-    let t = expr.get("type").and_then(|v| v.as_str());
-    match t {
-        Some("Literal") => {
-            if let Some(s) = expr.get("value").and_then(|v| v.as_str()) {
-                out.add_known(s.to_string());
-            } else if let Some(b) = expr.get("value").and_then(|v| v.as_bool()) {
-                out.add_known(b.to_string());
-            } else if let Some(n) = expr.get("value").and_then(|v| v.as_f64()) {
-                out.add_known(n.to_string());
-            } else {
-                out.add_unknown();
-            }
-        }
+fn collect_expression_values(expr: &svelte_js_ast::Expression, out: &mut AttrValueSet) {
+    use svelte_js_ast::{Expression, Literal};
+    match expr {
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::String(s) => out.add_known(s.value.clone()),
+            Literal::Boolean(b) => out.add_known(b.value.to_string()),
+            Literal::Number(n) => out.add_known(n.value.to_string()),
+            _ => out.add_unknown(),
+        },
         _ => out.add_unknown(),
     }
 }

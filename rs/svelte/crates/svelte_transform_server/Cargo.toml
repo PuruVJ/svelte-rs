@@ -4,21 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Phase 3 server transform. Mirrors packages/svelte/src/compiler/phases/3-transform/server/."
-
-[dev-dependencies]
-svelte_parse = { workspace = true }
-svelte_codegen_js = { workspace = true }
+description = "Server typed transform: Svelte Root → svelte_js_ast::Program."
 
 [dependencies]
 svelte_ast = { workspace = true }
-svelte_analyze = { workspace = true }
-svelte_diagnostics = { workspace = true }
-svelte_codegen_js = { workspace = true }
-svelte_magic_string = { workspace = true }
-svelte_devalue = { workspace = true }
+svelte_js_ast = { workspace = true }
 svelte_transform_shared = { workspace = true }
+
+[dev-dependencies]
 svelte_parse = { workspace = true }
-oxc_ast = { workspace = true }
-oxc_span = { workspace = true }
-serde_json = { workspace = true }

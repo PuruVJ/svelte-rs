@@ -16,6 +16,7 @@ pub mod css_analyze;
 pub mod css_possible_values;
 pub mod css_prune;
 pub mod css_prune_data;
+pub mod css_render;
 pub mod css_warn;
 pub mod scope;
 pub mod template_elements;

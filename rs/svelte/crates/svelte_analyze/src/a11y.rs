@@ -513,8 +513,8 @@ fn fragment_has_caption_track(f: &Fragment) -> bool {
 /// dynamic, or non-text values.
 fn attr_static_string(value: Option<&AttributeValue>) -> Option<String> {
     match value? {
-        AttributeValue::Empty(true) => Some(String::new()),
-        AttributeValue::Empty(false) => None,
+        AttributeValue::Empty => Some(String::new()),
+        AttributeValue::Empty => None,
         AttributeValue::Many(parts) => {
             let mut text = String::new();
             for p in parts {

@@ -7,10 +7,4 @@ publish.workspace = true
 description = "Shared helpers used by both client and server transforms. Mirrors packages/svelte/src/compiler/phases/3-transform/shared/."
 
 [dependencies]
-svelte_ast = { workspace = true }
-svelte_analyze = { workspace = true }
-svelte_diagnostics = { workspace = true }
-svelte_magic_string = { workspace = true }
-oxc_ast = { workspace = true }
-oxc_span = { workspace = true }
-serde_json = { workspace = true }
+svelte_js_ast = { workspace = true }

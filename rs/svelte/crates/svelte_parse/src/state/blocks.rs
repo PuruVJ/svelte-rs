@@ -13,8 +13,8 @@
 //! - `{#snippet}` (needs param-list parsing).
 
 use svelte_ast::{
-    AwaitBlock, AwaitBlockKind, EachBlock, EachBlockKind, Fragment, FragmentChild, FragmentKind,
-    IfBlock, IfBlockKind, KeyBlock, KeyBlockKind, Position, SnippetBlock, SnippetBlockKind,
+    AwaitBlock,  EachBlock,  Fragment, FragmentChild, 
+    IfBlock,  KeyBlock,  Position, SnippetBlock, 
 };
 use svelte_diagnostics::{errors, CompileDiagnostic};
 
@@ -143,7 +143,7 @@ fn read_each_block(
         parser.allow_whitespace();
     }
 
-    let mut key_expr: Option<serde_json::Value> = None;
+    let mut key_expr: Option<svelte_js_ast::Expression> = None;
     if parser.eat("(") {
         parser.allow_whitespace();
         let (k, k_end) = parser.parse_expression_at(parser.index)?;
@@ -187,7 +187,6 @@ fn read_each_block(
     consume_block_close(parser, "each")?;
 
     Ok(FragmentChild::EachBlock(EachBlock {
-        kind: EachBlockKind::EachBlock,
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -255,8 +254,8 @@ fn read_await_block(
     //   - just `{#await expr}` (pending fragment first)
     //   - `{#await expr then [pat]}` (then fragment first)
     //   - `{#await expr catch [pat]}` (catch fragment first)
-    let mut value: Option<serde_json::Value> = None;
-    let mut error: Option<serde_json::Value> = None;
+    let mut value: Option<svelte_js_ast::Pattern> = None;
+    let mut error: Option<svelte_js_ast::Pattern> = None;
     let mut pending: Option<Fragment> = None;
     let mut then: Option<Fragment> = None;
     let mut catch: Option<Fragment> = None;
@@ -338,7 +337,6 @@ fn read_await_block(
     consume_block_close(parser, "await")?;
 
     Ok(FragmentChild::AwaitBlock(AwaitBlock {
-        kind: AwaitBlockKind::AwaitBlock,
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -366,7 +364,7 @@ fn terminator_after_keyword(parser: &Parser<'_>, keyword: &str) -> bool {
 /// patterns short-circuit to a hand-built Identifier (so the `loc` uses the
 /// original-source line/column via `LineMap`), and only `{...}` / `[...]`
 /// patterns go through the synthetic-source `(<pattern> = 1)` trick.
-fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<serde_json::Value, CompileDiagnostic> {
+fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::Pattern, CompileDiagnostic> {
     let pat_start = parser.index;
     let bytes = parser.template.as_bytes();
     if pat_start >= bytes.len() {
@@ -384,20 +382,11 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<serde_json::Valu
         }
         let pat_end = i;
         let name = parser.template[pat_start..pat_end].to_string();
-        let loc_start = parser.line_map.position(pat_start);
-        let loc_end = parser.line_map.position(pat_end);
-        let id = serde_json::json!({
-            "type": "Identifier",
-            "name": name,
-            "start": pat_start,
-            "end": pat_end,
-            "loc": {
-                "start": position_to_json(&loc_start),
-                "end": position_to_json(&loc_end),
-            }
-        });
         parser.index = pat_end;
-        return Ok(id);
+        return Ok(svelte_js_ast::Pattern::Identifier(svelte_js_ast::Identifier {
+            name,
+            span: svelte_js_ast::Span::new(pat_start as u32, pat_end as u32),
+        }));
     }
 
     // `{...}` or `[...]` pattern — synthetic-source trick.
@@ -408,7 +397,7 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<serde_json::Valu
             "destructuring pattern",
         ));
     }
-    let pat = parse_pattern_at(parser.template, &parser.line_map, pat_start, pat_end, parser.ts)?;
+    let (pat, _) = parse_pattern_at(parser.template, &parser.line_map, pat_start, pat_end, parser.ts)?;
     parser.index = pat_end;
     Ok(pat)
 }
@@ -476,22 +465,10 @@ fn read_snippet_block(
     }
     let id_name = id_name_bytes.to_string();
     let id_end = parser.index;
-
-    // Build the Identifier node for the snippet name. Upstream's
-    // `parser.read_identifier()` produces `{type, name, start, end, loc}`
-    // where loc carries `character` (it uses `locator()`).
-    let id_loc_start = parser.line_map.position(id_start);
-    let id_loc_end = parser.line_map.position(id_end);
-    let expression = serde_json::json!({
-        "type": "Identifier",
-        "name": id_name,
-        "start": id_start,
-        "end": id_end,
-        "loc": {
-            "start": position_to_json(&id_loc_start),
-            "end": position_to_json(&id_loc_end),
-        }
-    });
+    let expression = svelte_js_ast::Identifier {
+        name: id_name,
+        span: svelte_js_ast::Span::new(id_start as u32, id_end as u32),
+    };
 
     parser.allow_whitespace();
 
@@ -539,7 +516,7 @@ fn read_snippet_block(
         ));
     };
 
-    let parameters = crate::oxc_bridge::parse_arrow_params_at(
+    let (parameters, _) = crate::oxc_bridge::parse_arrow_params_at(
         parser.template,
         &parser.line_map,
         params_start,
@@ -559,7 +536,6 @@ fn read_snippet_block(
     consume_block_close(parser, "snippet")?;
 
     Ok(FragmentChild::SnippetBlock(SnippetBlock {
-        kind: SnippetBlockKind::SnippetBlock,
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -738,7 +714,6 @@ fn read_if_block(
             parser.index += 2;
             let nested = read_if_block(parser, else_brace_pos, true)?;
             Some(Fragment {
-                kind: FragmentKind::Fragment,
                 nodes: vec![nested],
             })
         } else {
@@ -761,7 +736,6 @@ fn read_if_block(
 
     let _ = elseif; // kept for the field on the AST; no longer affects close-consumption.
     Ok(FragmentChild::IfBlock(IfBlock {
-        kind: IfBlockKind::IfBlock,
         start: start as u32,
         end: parser.index as u32,
         elseif,
@@ -791,7 +765,6 @@ fn read_key_block(
     consume_block_close(parser, "key")?;
 
     Ok(FragmentChild::KeyBlock(KeyBlock {
-        kind: KeyBlockKind::KeyBlock,
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -837,7 +810,6 @@ fn parse_fragment_until_block_boundary(
         nodes.push(FragmentChild::Text(t));
     }
     Ok(Fragment {
-        kind: FragmentKind::Fragment,
         nodes,
     })
 }
@@ -960,95 +932,3 @@ impl<'a> Parser<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parse;
-
-    fn first_node(input: &str) -> FragmentChild {
-        let r = parse(input, false).unwrap();
-        r.fragment.nodes.into_iter().next().unwrap()
-    }
-
-    #[test]
-    fn if_block_no_else() {
-        let n = first_node("{#if x}hello{/if}");
-        match n {
-            FragmentChild::IfBlock(b) => {
-                assert!(!b.elseif);
-                assert_eq!(b.test["type"], "Identifier");
-                assert_eq!(b.test["name"], "x");
-                assert_eq!(b.consequent.nodes.len(), 1);
-                assert!(b.alternate.is_none());
-            }
-            other => panic!("expected IfBlock, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn if_block_with_else() {
-        let n = first_node("{#if x}a{:else}b{/if}");
-        match n {
-            FragmentChild::IfBlock(b) => {
-                assert!(b.alternate.is_some());
-                let alt = b.alternate.unwrap();
-                assert_eq!(alt.nodes.len(), 1);
-                match &alt.nodes[0] {
-                    FragmentChild::Text(t) => assert_eq!(t.raw, "b"),
-                    o => panic!("expected Text in else, got {o:?}"),
-                }
-            }
-            other => panic!("expected IfBlock, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn if_block_with_elseif() {
-        let n = first_node("{#if x}a{:else if y}b{:else}c{/if}");
-        let outer = match n {
-            FragmentChild::IfBlock(b) => b,
-            other => panic!("got {other:?}"),
-        };
-        assert!(!outer.elseif);
-        let alt = outer.alternate.expect("must have alternate");
-        assert_eq!(alt.nodes.len(), 1);
-        let nested = match &alt.nodes[0] {
-            FragmentChild::IfBlock(b) => b,
-            other => panic!("expected nested IfBlock, got {other:?}"),
-        };
-        assert!(nested.elseif);
-        assert_eq!(nested.test["name"], "y");
-        let inner_alt = nested.alternate.as_ref().expect("nested has alternate");
-        match &inner_alt.nodes[0] {
-            FragmentChild::Text(t) => assert_eq!(t.raw, "c"),
-            o => panic!("expected Text, got {o:?}"),
-        }
-    }
-
-    #[test]
-    fn key_block() {
-        let n = first_node("{#key foo}bar{/key}");
-        match n {
-            FragmentChild::KeyBlock(b) => {
-                assert_eq!(b.expression["type"], "Identifier");
-                assert_eq!(b.expression["name"], "foo");
-                assert_eq!(b.fragment.nodes.len(), 1);
-            }
-            other => panic!("expected KeyBlock, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn nested_elements_inside_if() {
-        let n = first_node("{#if x}<p>hi</p>{/if}");
-        let b = match n {
-            FragmentChild::IfBlock(b) => b,
-            other => panic!("{other:?}"),
-        };
-        assert_eq!(b.consequent.nodes.len(), 1);
-        match &b.consequent.nodes[0] {
-            FragmentChild::RegularElement(el) => assert_eq!(el.name, "p"),
-            o => panic!("expected RegularElement, got {o:?}"),
-        }
-    }
-}

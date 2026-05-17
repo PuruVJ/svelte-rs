@@ -460,7 +460,7 @@ fn apply_combinator(
             parent_matched
                 || (direction == Direction::Backward
                     && (!is_adjacent || !has_definite_elements(&parents))
-                    && every_is_global(selectors, from, to))
+                    && every_is_global(selectors, from, to, css_meta))
         }
         "+" | "~" => {
             let siblings = get_possible_element_siblings(tree, el_idx, direction, combinator.name == "+");
@@ -493,23 +493,44 @@ fn apply_combinator(
             sibling_matched
                 || (direction == Direction::Backward
                     && get_element_parent(tree, el_idx).is_none()
-                    && every_is_global(selectors, from, to))
+                    && every_is_global(selectors, from, to, css_meta))
         }
         _ => true,
     }
 }
 
 /// `every_is_global(...)` — css-prune.js:368-382.
-fn every_is_global(selectors: &[RelativeSelector], from: usize, to: usize) -> bool {
+fn every_is_global(
+    selectors: &[RelativeSelector],
+    from: usize,
+    to: usize,
+    css_meta: &CssAnalysis,
+) -> bool {
     if from >= to {
         return false;
     }
-    for i in from..to {
-        if !is_global(&selectors[i]) {
+    for sel in selectors.iter().take(to).skip(from) {
+        if !is_global_for_prune(sel, css_meta) {
             return false;
         }
     }
     true
+}
+
+/// Mirrors the local `is_global(selector, rule)` in css-prune.js:384 —
+/// returns true when the relative selector's analyze metadata flags it as
+/// `:global` or `:global_like` (which is how `:host`/`:root`/etc. propagate
+/// to the prune fallback). Falls back to the syntactic check.
+fn is_global_for_prune(rel: &RelativeSelector, css_meta: &CssAnalysis) -> bool {
+    let m = css_meta
+        .relative_selector_metadata
+        .get(&(rel.start, rel.end))
+        .copied()
+        .unwrap_or_default();
+    if m.is_global || m.is_global_like {
+        return true;
+    }
+    is_global(rel)
 }
 
 /// `has_definite_elements(result)` — css-prune.js:1162-1177.

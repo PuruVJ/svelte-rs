@@ -18,653 +18,283 @@
 //! - Object/array destructuring patterns introduce bindings in the
 //!   enclosing function/block scope.
 
-use serde_json::Value;
-
 use svelte_ast::Root;
 
 use crate::scope::{BindingKind, DeclarationKind, Scope, ScopePtr};
 
 /// Walk a Program node (the `content` field of a `Script`) and populate
 /// `root_scope` and its descendants.
-pub fn build_program_scope(program: &Value, root_scope: &ScopePtr) {
-    let Some(body) = program.get("body").and_then(|v| v.as_array()) else {
-        return;
-    };
-    // Two passes — first hoist function/var declarations (they're visible
-    // before their textual position), then walk normally. Simplification of
-    // upstream's full hoisting algorithm.
-    for stmt in body {
-        hoist_declarations(stmt, root_scope);
+pub fn build_program_scope(program: &svelte_js_ast::Program, root_scope: &ScopePtr) {
+    for stmt in &program.body {
+        hoist_typed(stmt, root_scope);
     }
-    for stmt in body {
-        visit_statement(stmt, root_scope);
+    for stmt in &program.body {
+        visit_stmt(stmt, root_scope);
     }
 }
 
-/// Pre-pass: declare hoisted bindings (`var` and `function` declarations
-/// only) so they're visible to forward references.
-fn hoist_declarations(node: &Value, scope: &ScopePtr) {
-    let Some(t) = node.get("type").and_then(|v| v.as_str()) else {
-        return;
-    };
-    match t {
-        "VariableDeclaration" => {
-            if node.get("kind").and_then(|v| v.as_str()) == Some("var") {
-                visit_variable_declaration(node, scope);
+fn hoist_typed(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
+    use svelte_js_ast::Statement as S;
+    match s {
+        S::Variable(v) if matches!(v.kind, svelte_js_ast::VariableKind::Var) => {
+            declare_var_declaration(v, scope);
+        }
+        S::Function(f) => {
+            if let Some(id) = &f.id {
+                scope.borrow_mut().declare(
+                    id.name.clone(),
+                    BindingKind::Normal,
+                    DeclarationKind::Function,
+                    id.clone(),
+                );
             }
         }
-        "FunctionDeclaration" => visit_function_declaration_decl_only(node, scope),
-        "ExportNamedDeclaration" | "ExportDefaultDeclaration" => {
-            if let Some(decl) = node.get("declaration") {
-                hoist_declarations(decl, scope);
+        S::ExportNamed(e) => {
+            if let Some(d) = &e.declaration {
+                hoist_typed(d, scope);
             }
         }
-        _ => {}
-    }
-}
-
-fn visit_statement(node: &Value, scope: &ScopePtr) {
-    let Some(t) = node.get("type").and_then(|v| v.as_str()) else {
-        return;
-    };
-    match t {
-        // Declarations.
-        "VariableDeclaration" => {
-            if node.get("kind").and_then(|v| v.as_str()) != Some("var") {
-                visit_variable_declaration(node, scope);
-            }
-        }
-        "FunctionDeclaration" => visit_function(node, scope, /*as_decl=*/ true),
-        "ClassDeclaration" => visit_class(node, scope, /*as_decl=*/ true),
-        "ImportDeclaration" => visit_import_declaration(node, scope),
-        "ExportNamedDeclaration" => {
-            if let Some(decl) = node.get("declaration") {
-                visit_statement(decl, scope);
-            }
-        }
-        "ExportDefaultDeclaration" => {
-            if let Some(decl) = node.get("declaration") {
-                let dt = decl.get("type").and_then(|v| v.as_str());
-                match dt {
-                    Some("FunctionDeclaration") => visit_function(decl, scope, true),
-                    Some("ClassDeclaration") => visit_class(decl, scope, true),
-                    _ => visit_expression(decl, scope),
-                }
-            }
-        }
-
-        // Control flow / blocks that introduce nested scope.
-        "BlockStatement" => {
-            let block_scope = Scope::child(scope, /*is_block=*/ true);
-            visit_block(node, &block_scope);
-        }
-        "IfStatement" => {
-            if let Some(test) = node.get("test") {
-                visit_expression(test, scope);
-            }
-            if let Some(cons) = node.get("consequent") {
-                visit_statement(cons, scope);
-            }
-            if let Some(alt) = node.get("alternate") {
-                visit_statement(alt, scope);
-            }
-        }
-        "ForStatement" => {
-            let for_scope = Scope::child(scope, true);
-            if let Some(init) = node.get("init") {
-                if init.get("type").and_then(|v| v.as_str()) == Some("VariableDeclaration") {
-                    visit_variable_declaration(init, &for_scope);
-                } else {
-                    visit_expression(init, &for_scope);
-                }
-            }
-            if let Some(test) = node.get("test") {
-                visit_expression(test, &for_scope);
-            }
-            if let Some(update) = node.get("update") {
-                visit_expression(update, &for_scope);
-            }
-            if let Some(body) = node.get("body") {
-                visit_statement(body, &for_scope);
-            }
-        }
-        "ForInStatement" | "ForOfStatement" => {
-            let for_scope = Scope::child(scope, true);
-            if let Some(left) = node.get("left") {
-                if left.get("type").and_then(|v| v.as_str()) == Some("VariableDeclaration") {
-                    visit_variable_declaration(left, &for_scope);
-                } else {
-                    visit_expression(left, &for_scope);
-                }
-            }
-            if let Some(right) = node.get("right") {
-                visit_expression(right, &for_scope);
-            }
-            if let Some(body) = node.get("body") {
-                visit_statement(body, &for_scope);
-            }
-        }
-        "WhileStatement" | "DoWhileStatement" => {
-            if let Some(test) = node.get("test") {
-                visit_expression(test, scope);
-            }
-            if let Some(body) = node.get("body") {
-                visit_statement(body, scope);
-            }
-        }
-        "TryStatement" => {
-            if let Some(block) = node.get("block") {
-                visit_statement(block, scope);
-            }
-            if let Some(handler) = node.get("handler") {
-                let catch_scope = Scope::child(scope, true);
-                if let Some(param) = handler.get("param") {
-                    collect_pattern_names(param, &catch_scope, DeclarationKind::Let);
-                }
-                if let Some(body) = handler.get("body") {
-                    visit_statement(body, &catch_scope);
-                }
-            }
-            if let Some(finalizer) = node.get("finalizer") {
-                visit_statement(finalizer, scope);
-            }
-        }
-        "SwitchStatement" => {
-            if let Some(disc) = node.get("discriminant") {
-                visit_expression(disc, scope);
-            }
-            let switch_scope = Scope::child(scope, true);
-            if let Some(cases) = node.get("cases").and_then(|v| v.as_array()) {
-                for case in cases {
-                    if let Some(test) = case.get("test") {
-                        if !test.is_null() {
-                            visit_expression(test, &switch_scope);
-                        }
-                    }
-                    if let Some(consequent) = case.get("consequent").and_then(|v| v.as_array()) {
-                        for stmt in consequent {
-                            visit_statement(stmt, &switch_scope);
-                        }
-                    }
-                }
-            }
-        }
-        "LabeledStatement" => {
-            if let Some(body) = node.get("body") {
-                visit_statement(body, scope);
-            }
-        }
-        "ReturnStatement" | "ThrowStatement" => {
-            if let Some(arg) = node.get("argument") {
-                if !arg.is_null() {
-                    visit_expression(arg, scope);
-                }
-            }
-        }
-        "ExpressionStatement" => {
-            if let Some(expr) = node.get("expression") {
-                visit_expression(expr, scope);
-            }
-        }
-        _ => {
-            // Unknown / unhandled statement — descend into any child Values
-            // that look like nodes so we don't miss references.
-            descend_unknown(node, scope);
-        }
-    }
-}
-
-fn visit_block(block: &Value, scope: &ScopePtr) {
-    // Hoist pass for the block (var + function declarations bubble up).
-    if let Some(body) = block.get("body").and_then(|v| v.as_array()) {
-        for stmt in body {
-            hoist_declarations(stmt, scope);
-        }
-        for stmt in body {
-            visit_statement(stmt, scope);
-        }
-    }
-}
-
-fn visit_variable_declaration(node: &Value, scope: &ScopePtr) {
-    let kind = node
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .map(|k| match k {
-            "let" => DeclarationKind::Let,
-            "const" => DeclarationKind::Const,
-            "using" => DeclarationKind::Using,
-            "await using" => DeclarationKind::AwaitUsing,
-            _ => DeclarationKind::Var,
-        })
-        .unwrap_or(DeclarationKind::Var);
-
-    let Some(decls) = node.get("declarations").and_then(|v| v.as_array()) else {
-        return;
-    };
-    for d in decls {
-        let init = d.get("init").filter(|v| !v.is_null());
-        if let Some(id) = d.get("id") {
-            declare_pattern(id, scope, kind, init);
-        }
-        // Walk into init for references.
-        if let Some(init) = init {
-            visit_expression(init, scope);
-        }
-    }
-}
-
-fn visit_function_declaration_decl_only(node: &Value, scope: &ScopePtr) {
-    let Some(id) = node.get("id") else { return };
-    if id.is_null() {
-        return;
-    }
-    let Some(name) = id.get("name").and_then(|v| v.as_str()) else {
-        return;
-    };
-    scope.borrow_mut().declare(
-        name.to_string(),
-        BindingKind::Normal,
-        DeclarationKind::Function,
-        id.clone(),
-    );
-}
-
-fn visit_function(node: &Value, parent_scope: &ScopePtr, as_decl: bool) {
-    // For declarations, the name binds in the enclosing scope. (For
-    // function expressions, the name binds inside the function's own scope
-    // — but we don't yet model that distinction.)
-    if as_decl {
-        visit_function_declaration_decl_only(node, parent_scope);
-    }
-    let fn_scope = Scope::child(parent_scope, /*is_block=*/ false);
-    if let Some(params) = node.get("params").and_then(|v| v.as_array()) {
-        for p in params {
-            declare_pattern(p, &fn_scope, DeclarationKind::Param, None);
-        }
-    }
-    if let Some(body) = node.get("body") {
-        let body_type = body.get("type").and_then(|v| v.as_str());
-        match body_type {
-            Some("BlockStatement") => visit_block(body, &fn_scope),
-            _ => visit_expression(body, &fn_scope), // arrow expr body
-        }
-    }
-}
-
-fn visit_class(node: &Value, parent_scope: &ScopePtr, as_decl: bool) {
-    if as_decl {
-        if let Some(id) = node.get("id") {
-            if !id.is_null() {
-                if let Some(name) = id.get("name").and_then(|v| v.as_str()) {
-                    parent_scope.borrow_mut().declare(
-                        name.to_string(),
+        S::ExportDefault(e) => {
+            if let svelte_js_ast::ExportDefault::Function(f) = &e.declaration {
+                if let Some(id) = &f.id {
+                    scope.borrow_mut().declare(
+                        id.name.clone(),
                         BindingKind::Normal,
-                        DeclarationKind::Let,
+                        DeclarationKind::Function,
                         id.clone(),
                     );
                 }
             }
         }
+        _ => {}
     }
-    // SuperClass + decorators live in parent scope.
-    if let Some(sc) = node.get("superClass") {
-        if !sc.is_null() {
-            visit_expression(sc, parent_scope);
+}
+
+fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
+    use svelte_js_ast::Statement as S;
+    match s {
+        S::Variable(v) => {
+            if !matches!(v.kind, svelte_js_ast::VariableKind::Var) {
+                declare_var_declaration(v, scope);
+            }
         }
+        S::Function(f) => visit_function_body(f, scope),
+        S::Class(c) => visit_class(c, scope),
+        S::Import(i) => {
+            for spec in &i.specifiers {
+                let local = match spec {
+                    svelte_js_ast::ImportSpecifierKind::Named(s) => &s.local,
+                    svelte_js_ast::ImportSpecifierKind::Default(s) => &s.local,
+                    svelte_js_ast::ImportSpecifierKind::Namespace(s) => &s.local,
+                };
+                scope.borrow_mut().declare(
+                    local.name.clone(),
+                    BindingKind::Normal,
+                    DeclarationKind::Import,
+                    local.clone(),
+                );
+            }
+        }
+        S::ExportNamed(e) => {
+            if let Some(d) = &e.declaration {
+                visit_stmt(d, scope);
+            }
+        }
+        S::ExportDefault(e) => match &e.declaration {
+            svelte_js_ast::ExportDefault::Function(f) => visit_function_body(f, scope),
+            svelte_js_ast::ExportDefault::Class(c) => visit_class(c, scope),
+            svelte_js_ast::ExportDefault::Expression(_) => {}
+        },
+        S::Block(b) => {
+            let child = Scope::child(scope, true);
+            for s in &b.body {
+                hoist_typed(s, &child);
+            }
+            for s in &b.body {
+                visit_stmt(s, &child);
+            }
+        }
+        S::If(i) => {
+            visit_stmt(&i.consequent, scope);
+            if let Some(a) = &i.alternate {
+                visit_stmt(a, scope);
+            }
+        }
+        S::For(f) => {
+            let child = Scope::child(scope, true);
+            if let Some(svelte_js_ast::ForInit::Declaration(d)) = &f.init {
+                if matches!(d.kind, svelte_js_ast::VariableKind::Var) {
+                    declare_var_declaration(d, scope);
+                } else {
+                    declare_var_declaration(d, &child);
+                }
+            }
+            visit_stmt(&f.body, &child);
+        }
+        S::ForIn(f) => {
+            let child = Scope::child(scope, true);
+            if let svelte_js_ast::ForInit::Declaration(d) = &f.left {
+                if matches!(d.kind, svelte_js_ast::VariableKind::Var) {
+                    declare_var_declaration(d, scope);
+                } else {
+                    declare_var_declaration(d, &child);
+                }
+            }
+            visit_stmt(&f.body, &child);
+        }
+        S::ForOf(f) => {
+            let child = Scope::child(scope, true);
+            if let svelte_js_ast::ForInit::Declaration(d) = &f.left {
+                if matches!(d.kind, svelte_js_ast::VariableKind::Var) {
+                    declare_var_declaration(d, scope);
+                } else {
+                    declare_var_declaration(d, &child);
+                }
+            }
+            visit_stmt(&f.body, &child);
+        }
+        S::While(w) => visit_stmt(&w.body, scope),
+        S::DoWhile(w) => visit_stmt(&w.body, scope),
+        S::Try(t) => {
+            for s in &t.block.body {
+                visit_stmt(s, scope);
+            }
+            if let Some(h) = &t.handler {
+                let catch_scope = Scope::child(scope, true);
+                if let Some(p) = &h.param {
+                    declare_pattern(p, &catch_scope, BindingKind::Normal, DeclarationKind::Let);
+                }
+                for s in &h.body.body {
+                    visit_stmt(s, &catch_scope);
+                }
+            }
+            if let Some(f) = &t.finalizer {
+                for s in &f.body {
+                    visit_stmt(s, scope);
+                }
+            }
+        }
+        S::Switch(sw) => {
+            let switch_scope = Scope::child(scope, true);
+            for c in &sw.cases {
+                for s in &c.consequent {
+                    visit_stmt(s, &switch_scope);
+                }
+            }
+        }
+        S::Labeled(l) => visit_stmt(&l.body, scope),
+        S::With(w) => visit_stmt(&w.body, scope),
+        _ => {}
     }
-    let class_scope = Scope::child(parent_scope, /*is_block=*/ false);
-    if let Some(body) = node.get("body") {
-        if let Some(body_arr) = body.get("body").and_then(|v| v.as_array()) {
-            for member in body_arr {
-                let mt = member.get("type").and_then(|v| v.as_str());
-                match mt {
-                    Some("MethodDefinition") | Some("PropertyDefinition") => {
-                        if let Some(value) = member.get("value") {
-                            if !value.is_null() {
-                                visit_expression(value, &class_scope);
-                            }
-                        }
-                        if let Some(key) = member.get("key") {
-                            if member.get("computed").and_then(|v| v.as_bool()) == Some(true) {
-                                visit_expression(key, &class_scope);
-                            }
-                        }
+}
+
+fn declare_var_declaration(v: &svelte_js_ast::VariableDeclaration, scope: &ScopePtr) {
+    let decl_kind = match v.kind {
+        svelte_js_ast::VariableKind::Var => DeclarationKind::Var,
+        svelte_js_ast::VariableKind::Let => DeclarationKind::Let,
+        svelte_js_ast::VariableKind::Const => DeclarationKind::Const,
+    };
+    for d in &v.declarations {
+        // Classify by the initializer's rune call, if any.
+        let kind = d
+            .init
+            .as_ref()
+            .and_then(get_rune_keypath_typed)
+            .as_deref()
+            .map(rune_to_binding_kind)
+            .filter(|k| !matches!(k, BindingKind::Normal))
+            .unwrap_or(BindingKind::Normal);
+        declare_pattern(&d.id, scope, kind, decl_kind);
+    }
+}
+
+fn declare_pattern(
+    p: &svelte_js_ast::Pattern,
+    scope: &ScopePtr,
+    kind: BindingKind,
+    decl_kind: DeclarationKind,
+) {
+    use svelte_js_ast::Pattern as P;
+    match p {
+        P::Identifier(id) => {
+            scope
+                .borrow_mut()
+                .declare(id.name.clone(), kind, decl_kind, id.clone());
+        }
+        P::Array(a) => {
+            for el in a.elements.iter().flatten() {
+                declare_pattern(el, scope, kind, decl_kind);
+            }
+        }
+        P::Object(o) => {
+            for m in &o.properties {
+                match m {
+                    svelte_js_ast::ObjectPatternMember::Property(p) => {
+                        declare_pattern(&p.value, scope, kind, decl_kind);
                     }
-                    _ => {
-                        descend_unknown(member, &class_scope);
+                    svelte_js_ast::ObjectPatternMember::Rest(r) => {
+                        // `let { ...rest } = $props()` — rest of props.
+                        let rest_kind = if matches!(kind, BindingKind::Prop) {
+                            BindingKind::RestProp
+                        } else {
+                            kind
+                        };
+                        declare_pattern(&r.argument, scope, rest_kind, decl_kind);
                     }
                 }
             }
         }
+        P::Rest(r) => {
+            declare_pattern(&r.argument, scope, kind, DeclarationKind::RestParam);
+        }
+        P::Assignment(a) => {
+            declare_pattern(&a.left, scope, kind, decl_kind);
+        }
+        P::Member(_) => {}
     }
 }
 
-fn visit_import_declaration(node: &Value, scope: &ScopePtr) {
-    let Some(specifiers) = node.get("specifiers").and_then(|v| v.as_array()) else {
-        return;
-    };
-    for spec in specifiers {
-        let Some(local) = spec.get("local") else { continue };
-        let Some(name) = local.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        scope.borrow_mut().declare(
-            name.to_string(),
+fn visit_function_body(f: &svelte_js_ast::FunctionDeclaration, parent: &ScopePtr) {
+    let fn_scope = Scope::child(parent, false);
+    for param in &f.params {
+        declare_pattern(param, &fn_scope, BindingKind::Normal, DeclarationKind::Param);
+    }
+    for s in &f.body.body {
+        hoist_typed(s, &fn_scope);
+    }
+    for s in &f.body.body {
+        visit_stmt(s, &fn_scope);
+    }
+}
+
+fn visit_class(c: &svelte_js_ast::ClassDeclaration, parent: &ScopePtr) {
+    if let Some(id) = &c.id {
+        parent.borrow_mut().declare(
+            id.name.clone(),
             BindingKind::Normal,
-            DeclarationKind::Import,
-            local.clone(),
+            DeclarationKind::Let,
+            id.clone(),
         );
     }
+    // Method bodies use their own scope but we don't descend for now —
+    // transforms get them via a fresh scope when needed.
 }
 
-/// Walk an Expression. Records identifier references against `scope` (when
-/// the resolver lands) and recurses into nested function/class scopes.
-fn visit_expression(node: &Value, scope: &ScopePtr) {
-    let Some(t) = node.get("type").and_then(|v| v.as_str()) else {
-        return;
-    };
-    match t {
-        "Identifier" => {
-            if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
-                Scope::reference_chain(
-                    scope,
-                    name.to_string(),
-                    crate::scope::Reference {
-                        node: node.clone(),
-                        path: Vec::new(),
-                    },
-                );
-            }
-        }
-        "Literal" | "TemplateElement" | "ThisExpression" | "Super" | "MetaProperty" => {}
-        "FunctionExpression" => visit_function(node, scope, /*as_decl=*/ false),
-        "ArrowFunctionExpression" => visit_function(node, scope, /*as_decl=*/ false),
-        "ClassExpression" => visit_class(node, scope, /*as_decl=*/ false),
-        // MemberExpression: walk object; only walk property when computed.
-        "MemberExpression" => {
-            if let Some(obj) = node.get("object") {
-                visit_expression(obj, scope);
-            }
-            if node.get("computed").and_then(|v| v.as_bool()) == Some(true) {
-                if let Some(prop) = node.get("property") {
-                    visit_expression(prop, scope);
-                }
-            }
-        }
-        "ObjectExpression" => {
-            if let Some(props) = node.get("properties").and_then(|v| v.as_array()) {
-                for p in props {
-                    let pt = p.get("type").and_then(|v| v.as_str());
-                    if pt == Some("Property") {
-                        if p.get("computed").and_then(|v| v.as_bool()) == Some(true) {
-                            if let Some(key) = p.get("key") {
-                                visit_expression(key, scope);
-                            }
-                        }
-                        if let Some(value) = p.get("value") {
-                            visit_expression(value, scope);
-                        }
-                    } else if pt == Some("SpreadElement") {
-                        if let Some(arg) = p.get("argument") {
-                            visit_expression(arg, scope);
-                        }
-                    }
-                }
-            }
-        }
-        _ => descend_unknown(node, scope),
-    }
-}
-
-/// Last-resort: recursively visit every child Value, treating anything with
-/// a `type` field as an expression-like node. Used for AST shapes we don't
-/// have a dedicated handler for yet.
-fn descend_unknown(node: &Value, scope: &ScopePtr) {
-    match node {
-        Value::Object(map) => {
-            for (key, v) in map {
-                // Skip metadata-ish fields that shouldn't be walked.
-                if matches!(
-                    key.as_str(),
-                    "loc"
-                        | "type"
-                        | "start"
-                        | "end"
-                        | "kind"
-                        | "operator"
-                        | "name"
-                        | "value"
-                        | "raw"
-                        | "regex"
-                        | "bigint"
-                        | "sourceType"
-                        | "directive"
-                        | "shorthand"
-                        | "computed"
-                        | "method"
-                        | "static"
-                        | "generator"
-                        | "async"
-                        | "expression"
-                        | "delegate"
-                        | "prefix"
-                        | "tail"
-                        | "leadingComments"
-                        | "trailingComments"
-                ) {
-                    continue;
-                }
-                match v {
-                    Value::Object(_) if v.get("type").is_some() => {
-                        // Looks like a node — visit as expression.
-                        visit_expression(v, scope);
-                    }
-                    Value::Array(arr) => {
-                        for item in arr {
-                            if item.is_object() && item.get("type").is_some() {
-                                visit_expression(item, scope);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Walk a pattern and declare every binding identifier inside, with the
-/// kind inferred from `init` (so `let foo = $state(...)` declares a
-/// `State` binding). Mirrors `extract_identifiers` + the rune-classifying
-/// step in `phases/2-analyze/visitors/CallExpression.js`.
-fn declare_pattern(
-    pattern: &Value,
-    scope: &ScopePtr,
-    decl_kind: DeclarationKind,
-    init: Option<&Value>,
-) {
-    let pat_type = pattern.get("type").and_then(|v| v.as_str());
-    let init_rune = init.and_then(get_rune_keypath);
-
-    // For destructured props (`let { foo } = $props()`) every name in the
-    // pattern is a Prop. For `let foo = $state(...)` it's State / Derived /
-    // etc. For other init shapes, the kind depends per-binder (could be
-    // BindableProp if the init has `$bindable()`).
-    if matches!(pat_type, Some("Identifier")) {
-        if let Some(name) = pattern.get("name").and_then(|v| v.as_str()) {
-            let kind = init_rune
-                .as_deref()
-                .map(rune_to_binding_kind)
-                .unwrap_or(BindingKind::Normal);
-            scope.borrow_mut().declare(
-                name.to_string(),
-                kind,
-                decl_kind,
-                pattern.clone(),
-            );
-        }
-        return;
-    }
-
-    // For destructuring patterns, walk children and classify each.
-    let pattern_kind = match init_rune.as_deref() {
-        Some("$props") => BindingKind::Prop,
-        Some(other) => rune_to_binding_kind(other),
-        None => BindingKind::Normal,
-    };
-
-    declare_destructuring(pattern, scope, decl_kind, pattern_kind);
-}
-
-fn declare_destructuring(
-    pattern: &Value,
-    scope: &ScopePtr,
-    decl_kind: DeclarationKind,
-    default_kind: BindingKind,
-) {
-    let Some(t) = pattern.get("type").and_then(|v| v.as_str()) else {
-        return;
-    };
-    match t {
-        "Identifier" => {
-            if let Some(name) = pattern.get("name").and_then(|v| v.as_str()) {
-                scope.borrow_mut().declare(
-                    name.to_string(),
-                    default_kind,
-                    decl_kind,
-                    pattern.clone(),
-                );
-            }
-        }
-        "ObjectPattern" => {
-            if let Some(props) = pattern.get("properties").and_then(|v| v.as_array()) {
-                for p in props {
-                    let pt = p.get("type").and_then(|v| v.as_str());
-                    match pt {
-                        Some("Property") => {
-                            let value = p.get("value");
-                            // If the property's value is `AssignmentPattern`
-                            // whose `right` is `$bindable()`, the destructured
-                            // name is a BindableProp.
-                            let elem_kind =
-                                value.and_then(detect_bindable).unwrap_or(default_kind);
-                            if let Some(value) = value {
-                                declare_destructuring(value, scope, decl_kind, elem_kind);
-                            }
-                        }
-                        Some("RestElement") => {
-                            if let Some(arg) = p.get("argument") {
-                                let rest_kind = if matches!(default_kind, BindingKind::Prop) {
-                                    BindingKind::RestProp
-                                } else {
-                                    default_kind
-                                };
-                                declare_destructuring(arg, scope, decl_kind, rest_kind);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        "ArrayPattern" => {
-            if let Some(elements) = pattern.get("elements").and_then(|v| v.as_array()) {
-                for el in elements {
-                    if el.is_null() {
-                        continue;
-                    }
-                    declare_destructuring(el, scope, decl_kind, default_kind);
-                }
-            }
-        }
-        "RestElement" => {
-            if let Some(arg) = pattern.get("argument") {
-                let rest_kind = if matches!(default_kind, BindingKind::Prop) {
-                    BindingKind::RestProp
-                } else {
-                    default_kind
-                };
-                declare_destructuring(arg, scope, decl_kind, rest_kind);
-            }
-        }
-        "AssignmentPattern" => {
-            if let Some(left) = pattern.get("left") {
-                let elem_kind =
-                    detect_bindable(pattern).unwrap_or(default_kind);
-                declare_destructuring(left, scope, decl_kind, elem_kind);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// If `node` is an `AssignmentPattern` whose `right` is a `$bindable()`
-/// call, return `Some(BindingKind::BindableProp)`. Mirrors the upstream
-/// `$bindable` detection in CallExpression / VariableDeclarator visitors.
-fn detect_bindable(node: &Value) -> Option<BindingKind> {
-    if node.get("type").and_then(|v| v.as_str()) != Some("AssignmentPattern") {
+/// `$state(...)` / `$props()` / etc. → the rune keypath when initializer is
+/// a CallExpression with a rune-shaped callee.
+fn get_rune_keypath_typed(init: &svelte_js_ast::Expression) -> Option<String> {
+    let svelte_js_ast::Expression::Call(c) = init else {
         return None;
-    }
-    let right = node.get("right")?;
-    let rune = get_rune_keypath(right)?;
-    match rune.as_str() {
-        "$bindable" => Some(BindingKind::BindableProp),
-        _ => None,
-    }
-}
-
-/// Pattern variant of `collect_pattern_names` retained for callers that
-/// don't have an init (e.g. function params, `catch` clauses) and so
-/// shouldn't classify by rune.
-fn collect_pattern_names(pattern: &Value, scope: &ScopePtr, kind: DeclarationKind) {
-    declare_destructuring(pattern, scope, kind, BindingKind::Normal);
-}
-
-/// If `node` is a `CallExpression` whose callee resolves to a rune, return
-/// the dotted keypath (e.g. `$state.raw`, `$derived`). Mirrors `get_rune`
-/// + `get_global_keypath` in scope.js:1429-1480.
-///
-/// This is a simplified version that doesn't consult the scope chain — we
-/// trust the caller to only invoke this on initializers where the rune
-/// keyword wasn't shadowed by a local binding. (Upstream's full version
-/// checks the scope; we'll add that when reference resolution lands.)
-fn get_rune_keypath(node: &Value) -> Option<String> {
-    if node.get("type").and_then(|v| v.as_str()) != Some("CallExpression") {
-        return None;
-    }
-    let callee = node.get("callee")?;
-    let key = global_keypath(callee)?;
-    if is_rune(&key) {
-        Some(key)
+    };
+    let path = global_keypath_typed(&c.callee)?;
+    if is_rune(&path) {
+        Some(path)
     } else {
         None
     }
 }
 
-fn global_keypath(node: &Value) -> Option<String> {
-    let mut n = node;
-    let mut joined = String::new();
-    while n.get("type").and_then(|v| v.as_str()) == Some("MemberExpression") {
-        if n.get("computed").and_then(|v| v.as_bool()) == Some(true) {
-            return None;
-        }
-        let prop = n.get("property")?;
-        if prop.get("type").and_then(|v| v.as_str()) != Some("Identifier") {
-            return None;
-        }
-        let name = prop.get("name").and_then(|v| v.as_str())?;
-        joined = format!(".{name}{joined}");
-        n = n.get("object")?;
-    }
-    if n.get("type").and_then(|v| v.as_str()) != Some("Identifier") {
-        return None;
-    }
-    let base = n.get("name").and_then(|v| v.as_str())?;
-    Some(format!("{base}{joined}"))
-}
-
+#[allow(dead_code)]
 fn is_rune(name: &str) -> bool {
     matches!(
         name,
@@ -703,7 +333,6 @@ fn rune_to_binding_kind(rune: &str) -> BindingKind {
 
 /// Returns true if the component uses any rune (`$state`, `$derived`,
 /// `$effect`, `$props`, `$bindable`, `$inspect`, `$host`, plus `.raw` /
-/// `.by` / etc. variants).
 pub fn detect_runes(root: &Root) -> bool {
     // <svelte:options runes /> or <svelte:options runes={true} /> → explicit opt-in.
     if let Some(options) = &root.options {
@@ -711,38 +340,186 @@ pub fn detect_runes(root: &Root) -> bool {
             return true;
         }
     }
-    fn walk(node: &Value) -> bool {
-        match node {
-            Value::Object(map) => {
-                if map.get("type").and_then(|v| v.as_str()) == Some("CallExpression") {
-                    if let Some(callee) = map.get("callee") {
-                        if let Some(key) = global_keypath(callee) {
-                            if is_rune(&key) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                for (_, v) in map.iter() {
-                    if walk(v) {
-                        return true;
-                    }
-                }
-                false
-            }
-            Value::Array(arr) => arr.iter().any(walk),
-            _ => false,
-        }
-    }
     if let Some(s) = root.module.as_ref() {
-        if walk(&s.content) {
+        if program_uses_runes(&s.content) {
             return true;
         }
     }
     if let Some(s) = root.instance.as_ref() {
-        if walk(&s.content) {
+        if program_uses_runes(&s.content) {
             return true;
         }
     }
     false
+}
+
+/// Walk a typed `Program` looking for a rune call expression.
+fn program_uses_runes(p: &svelte_js_ast::Program) -> bool {
+    p.body.iter().any(stmt_uses_runes)
+}
+
+fn stmt_uses_runes(s: &svelte_js_ast::Statement) -> bool {
+    use svelte_js_ast::Statement as S;
+    match s {
+        S::Block(b) => b.body.iter().any(stmt_uses_runes),
+        S::Expression(e) => expr_uses_runes(&e.expression),
+        S::Return(r) => r.argument.as_ref().is_some_and(expr_uses_runes),
+        S::If(i) => {
+            expr_uses_runes(&i.test)
+                || stmt_uses_runes(&i.consequent)
+                || i.alternate.as_ref().is_some_and(stmt_uses_runes)
+        }
+        S::DoWhile(w) => stmt_uses_runes(&w.body) || expr_uses_runes(&w.test),
+        S::While(w) => expr_uses_runes(&w.test) || stmt_uses_runes(&w.body),
+        S::For(f) => {
+            f.init.as_ref().is_some_and(for_init_uses_runes)
+                || f.test.as_ref().is_some_and(expr_uses_runes)
+                || f.update.as_ref().is_some_and(expr_uses_runes)
+                || stmt_uses_runes(&f.body)
+        }
+        S::ForIn(f) => {
+            for_init_uses_runes(&f.left) || expr_uses_runes(&f.right) || stmt_uses_runes(&f.body)
+        }
+        S::ForOf(f) => {
+            for_init_uses_runes(&f.left) || expr_uses_runes(&f.right) || stmt_uses_runes(&f.body)
+        }
+        S::Throw(t) => expr_uses_runes(&t.argument),
+        S::Try(t) => {
+            t.block.body.iter().any(stmt_uses_runes)
+                || t.handler.as_ref().is_some_and(|h| h.body.body.iter().any(stmt_uses_runes))
+                || t.finalizer.as_ref().is_some_and(|f| f.body.iter().any(stmt_uses_runes))
+        }
+        S::Switch(sw) => {
+            expr_uses_runes(&sw.discriminant)
+                || sw.cases.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_uses_runes)
+                        || c.consequent.iter().any(stmt_uses_runes)
+                })
+        }
+        S::With(w) => expr_uses_runes(&w.object) || stmt_uses_runes(&w.body),
+        S::Labeled(l) => stmt_uses_runes(&l.body),
+        S::Variable(v) => v
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().is_some_and(expr_uses_runes)),
+        S::Function(f) => f.body.body.iter().any(stmt_uses_runes),
+        S::Class(c) => c.body.body.iter().any(class_member_uses_runes),
+        S::ExportNamed(e) => e.declaration.as_ref().is_some_and(|d| stmt_uses_runes(d)),
+        S::ExportDefault(e) => match &e.declaration {
+            svelte_js_ast::ExportDefault::Function(f) => {
+                f.body.body.iter().any(stmt_uses_runes)
+            }
+            svelte_js_ast::ExportDefault::Class(c) => {
+                c.body.body.iter().any(class_member_uses_runes)
+            }
+            svelte_js_ast::ExportDefault::Expression(e) => expr_uses_runes(e),
+        },
+        _ => false,
+    }
+}
+
+fn for_init_uses_runes(init: &svelte_js_ast::ForInit) -> bool {
+    match init {
+        svelte_js_ast::ForInit::Declaration(d) => d
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().is_some_and(expr_uses_runes)),
+        svelte_js_ast::ForInit::Expression(e) => expr_uses_runes(e),
+    }
+}
+
+fn class_member_uses_runes(m: &svelte_js_ast::ClassMember) -> bool {
+    match m {
+        svelte_js_ast::ClassMember::Method(md) => md.value.body.body.iter().any(stmt_uses_runes),
+        svelte_js_ast::ClassMember::Property(p) => {
+            p.value.as_ref().is_some_and(expr_uses_runes)
+        }
+        svelte_js_ast::ClassMember::StaticBlock(s) => s.body.iter().any(stmt_uses_runes),
+    }
+}
+
+fn expr_uses_runes(e: &svelte_js_ast::Expression) -> bool {
+    use svelte_js_ast::Expression as E;
+    match e {
+        E::Call(c) => {
+            if let Some(keypath) = global_keypath_typed(&c.callee) {
+                if is_rune(&keypath) {
+                    return true;
+                }
+            }
+            expr_uses_runes(&c.callee) || c.arguments.iter().any(argument_uses_runes)
+        }
+        E::New(n) => expr_uses_runes(&n.callee) || n.arguments.iter().any(argument_uses_runes),
+        E::Member(m) => {
+            expr_uses_runes(&m.object)
+                || match &m.property {
+                    svelte_js_ast::MemberProperty::Expression(e) => expr_uses_runes(e),
+                    _ => false,
+                }
+        }
+        E::Binary(b) => expr_uses_runes(&b.left) || expr_uses_runes(&b.right),
+        E::Logical(l) => expr_uses_runes(&l.left) || expr_uses_runes(&l.right),
+        E::Assignment(a) => expr_uses_runes(&a.right),
+        E::Update(u) => expr_uses_runes(&u.argument),
+        E::Unary(u) => expr_uses_runes(&u.argument),
+        E::Conditional(c) => {
+            expr_uses_runes(&c.test) || expr_uses_runes(&c.consequent) || expr_uses_runes(&c.alternate)
+        }
+        E::Sequence(s) => s.expressions.iter().any(expr_uses_runes),
+        E::Spread(s) => expr_uses_runes(&s.argument),
+        E::Yield(y) => y.argument.as_ref().is_some_and(|a| expr_uses_runes(a)),
+        E::Await(a) => expr_uses_runes(&a.argument),
+        E::Tagged(t) => {
+            expr_uses_runes(&t.tag) || t.quasi.expressions.iter().any(expr_uses_runes)
+        }
+        E::Template(t) => t.expressions.iter().any(expr_uses_runes),
+        E::Paren(p) => expr_uses_runes(&p.expression),
+        E::Array(a) => a.elements.iter().any(|el| match el {
+            svelte_js_ast::ArrayElement::Expression(e) => expr_uses_runes(e),
+            svelte_js_ast::ArrayElement::Spread(s) => expr_uses_runes(&s.argument),
+            svelte_js_ast::ArrayElement::Elision => false,
+        }),
+        E::Object(o) => o.properties.iter().any(|p| match p {
+            svelte_js_ast::ObjectMember::Property(prop) => expr_uses_runes(&prop.value),
+            svelte_js_ast::ObjectMember::Spread(s) => expr_uses_runes(&s.argument),
+        }),
+        E::Arrow(a) => match &a.body {
+            svelte_js_ast::ArrowBody::Block(b) => b.body.iter().any(stmt_uses_runes),
+            svelte_js_ast::ArrowBody::Expression(e) => expr_uses_runes(e),
+        },
+        E::Function(f) => f.body.body.iter().any(stmt_uses_runes),
+        E::Class(c) => c.body.body.iter().any(class_member_uses_runes),
+        _ => false,
+    }
+}
+
+fn argument_uses_runes(a: &svelte_js_ast::Argument) -> bool {
+    match a {
+        svelte_js_ast::Argument::Expression(e) => expr_uses_runes(e),
+        svelte_js_ast::Argument::Spread(s) => expr_uses_runes(&s.argument),
+    }
+}
+
+/// Walk a possibly-chained `MemberExpression` whose root is an identifier,
+/// joining the parts as `a.b.c`. Returns `None` for computed access or
+/// non-identifier roots.
+fn global_keypath_typed(e: &svelte_js_ast::Expression) -> Option<String> {
+    let mut joined = String::new();
+    let mut cur = e;
+    while let svelte_js_ast::Expression::Member(m) = cur {
+        if m.computed {
+            return None;
+        }
+        let name = match &m.property {
+            svelte_js_ast::MemberProperty::Identifier(i) => &i.name,
+            _ => return None,
+        };
+        joined = format!(".{name}{joined}");
+        cur = &m.object;
+    }
+    if let svelte_js_ast::Expression::Identifier(i) = cur {
+        Some(format!("{}{joined}", i.name))
+    } else {
+        None
+    }
 }

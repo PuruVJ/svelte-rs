@@ -4,7 +4,7 @@
 //! Reads characters until the next `<` or `{` (or EOF), then emits a `Text`
 //! node carrying both the raw source slice and the entity-decoded form.
 
-use svelte_ast::{Text, TextKind};
+use svelte_ast::{Text, };
 
 use crate::parser::Parser;
 use crate::utils::entities::decode_character_references;
@@ -25,7 +25,6 @@ pub fn read_text(parser: &mut Parser<'_>) -> Text {
 
     let raw = &parser.template[start as usize..parser.index];
     Text {
-        kind: TextKind::Text,
         start,
         end: parser.index as u32,
         raw: raw.to_string(),

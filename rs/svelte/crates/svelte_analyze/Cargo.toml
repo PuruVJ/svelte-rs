@@ -10,8 +10,10 @@ description = "Phase 2: scope, runes, binding analysis, CSS analyze/prune/warn. 
 serde = { workspace = true }
 serde_json = { workspace = true }
 svelte_ast = { workspace = true }
+svelte_js_ast = { workspace = true }
 svelte_diagnostics = { workspace = true }
 svelte_css_parser = { workspace = true }
+svelte_magic_string = { workspace = true }
 svelte_is_reference = { workspace = true }
 svelte_aria_data = { workspace = true }
 oxc_ast = { workspace = true }

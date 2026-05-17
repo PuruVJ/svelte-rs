@@ -931,6 +931,8 @@ dependencies = [
  "svelte_css_parser",
  "svelte_diagnostics",
  "svelte_is_reference",
+ "svelte_js_ast",
+ "svelte_magic_string",
  "svelte_parse",
 ]
 
@@ -945,11 +947,7 @@ dependencies = [
 name = "svelte_ast"
 version = "0.0.0"
 dependencies = [
- "oxc_allocator",
- "oxc_ast",
- "oxc_span",
- "serde",
- "serde_json",
+ "svelte_js_ast",
 ]
 
 [[package]]
@@ -958,6 +956,10 @@ version = "0.0.0"
 dependencies = [
  "serde_json",
  "sourcemap",
+ "svelte_analyze",
+ "svelte_js_ast",
+ "svelte_parse",
+ "svelte_transform_client",
 ]
 
 [[package]]
@@ -970,6 +972,7 @@ dependencies = [
  "svelte_ast",
  "svelte_codegen_js",
  "svelte_diagnostics",
+ "svelte_js_ast",
  "svelte_migrate",
  "svelte_parse",
  "svelte_preprocess",
@@ -1011,6 +1014,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "svelte_js_ast"
+version = "0.0.0"
+
+[[package]]
 name = "svelte_magic_string"
 version = "0.0.0"
 dependencies = [
@@ -1038,12 +1045,14 @@ dependencies = [
  "oxc_estree",
  "oxc_parser",
  "oxc_span",
+ "oxc_syntax",
  "serde",
  "serde_json",
  "svelte_analyze",
  "svelte_ast",
  "svelte_css_parser",
  "svelte_diagnostics",
+ "svelte_js_ast",
 ]
 
 [[package]]
@@ -1070,14 +1079,8 @@ dependencies = [
 name = "svelte_transform_client"
 version = "0.0.0"
 dependencies = [
- "oxc_ast",
- "oxc_span",
- "serde_json",
- "svelte_analyze",
  "svelte_ast",
- "svelte_codegen_js",
- "svelte_diagnostics",
- "svelte_magic_string",
+ "svelte_js_ast",
  "svelte_parse",
  "svelte_transform_shared",
 ]
@@ -1086,15 +1089,8 @@ dependencies = [
 name = "svelte_transform_server"
 version = "0.0.0"
 dependencies = [
- "oxc_ast",
- "oxc_span",
- "serde_json",
- "svelte_analyze",
  "svelte_ast",
- "svelte_codegen_js",
- "svelte_devalue",
- "svelte_diagnostics",
- "svelte_magic_string",
+ "svelte_js_ast",
  "svelte_parse",
  "svelte_transform_shared",
 ]
@@ -1103,13 +1099,7 @@ dependencies = [
 name = "svelte_transform_shared"
 version = "0.0.0"
 dependencies = [
- "oxc_ast",
- "oxc_span",
- "serde_json",
- "svelte_analyze",
- "svelte_ast",
- "svelte_diagnostics",
- "svelte_magic_string",
+ "svelte_js_ast",
 ]
 
 [[package]]

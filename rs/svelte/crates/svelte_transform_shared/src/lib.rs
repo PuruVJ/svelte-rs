@@ -1,8 +1,7 @@
 //! Shared transform utilities (used by both client and server transforms).
 //!
-//! Mirrors `packages/svelte/src/compiler/phases/3-transform/shared/` and
-//! `packages/svelte/src/compiler/utils/builders.js`.
+//! Builders construct typed `svelte_js_ast` nodes — no `serde_json::Value`.
 
 #![forbid(unsafe_code)]
 
-pub mod builders;
+pub mod builders_typed;

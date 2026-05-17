@@ -1,21 +1,17 @@
-//! Port of `esrap@2.2.4` — estree-shaped JSON → JavaScript string + sourcemap.
+//! Typed-AST JS codegen.
 //!
-//! Ported from `node_modules/esrap@2.2.4/src/{index,context}.js` and
-//! `node_modules/esrap@2.2.4/src/languages/ts/index.js`.
+//! Consumes `svelte_js_ast::Program` and emits a JS source string + decoded
+//! sourcemap segments. Layout decisions (line wrapping, comment placement,
+//! parenthesization) match esrap (`node_modules/esrap@2.2.4`).
 //!
-//! Output is byte-equivalent to upstream esrap, as gated by
-//! `packages/svelte/tests/snapshot/samples/*/_expected/{client,server}/*.svelte.js`.
-//!
-//! Input AST is `serde_json::Value` in the same acorn-shaped wire format that
-//! `svelte_parse::oxc_bridge` produces and that the transform crates consume.
+//! Output is byte-equivalent to upstream esrap, as gated by the snapshot
+//! suite in `packages/svelte/tests/snapshot/samples/*/_expected/{client,server}/*.svelte.js`.
 
 #![forbid(unsafe_code)]
 
-pub mod comments;
-pub mod context;
-pub mod print;
-pub mod visitors;
+pub mod typed;
 
-pub use context::{Command, CommentState, Context, PrintOptions};
-pub use print::{print, PrintResult};
-pub use visitors::default_visitors;
+pub use typed::{
+    print_typed, LineMap, Segment, TypedComment, TypedCommentKind, TypedPrintOptions,
+    TypedPrintResult,
+};

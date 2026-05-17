@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use svelte_js_ast::{Expression, Identifier};
 
 /// What semantic role a binding plays in Svelte. Mirrors `BindingKind` in
 /// `packages/svelte/src/compiler/types/index.d.ts:275-288`.
@@ -86,13 +86,11 @@ pub struct Binding {
     pub name: String,
     pub kind: BindingKind,
     pub declaration_kind: DeclarationKind,
-    /// Position of the declaring Identifier in the source. Stored as the
-    /// JSON of the Identifier node so we can round-trip through the wire
-    /// format without owning a typed AST.
-    pub node: Value,
+    /// Declaring `Identifier` node.
+    pub node: Identifier,
     /// What the value was initialized with — for destructured props such as
     /// `let { foo = 'bar' } = $props()` this is `'bar'`, NOT `$props()`.
-    pub initial: Option<Value>,
+    pub initial: Option<Expression>,
     /// Every read reference (Identifier nodes that resolve to this binding).
     pub references: Vec<Reference>,
     /// Every write reference. Includes the initial declaration.
@@ -108,15 +106,12 @@ pub struct Binding {
 
 #[derive(Debug, Clone)]
 pub struct Reference {
-    /// Path through `SvelteNode`-typed ancestors at the reference site —
-    /// stored as JSON for now until the typed AST gets richer.
-    pub path: Vec<Value>,
-    pub node: Value,
+    pub node: Identifier,
 }
 
 #[derive(Debug, Clone)]
 pub struct Assignment {
-    pub value: Value,
+    pub value: Expression,
     pub scope: WeakScope,
 }
 
@@ -206,7 +201,7 @@ impl Scope {
         name: String,
         kind: BindingKind,
         declaration_kind: DeclarationKind,
-        node: Value,
+        node: Identifier,
     ) -> Rc<RefCellBinding> {
         let binding = Binding {
             name: name.clone(),

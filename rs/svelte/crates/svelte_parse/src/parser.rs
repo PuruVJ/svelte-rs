@@ -5,8 +5,8 @@
 //! upstream behavior. Where Rust diverges from JS (e.g. recursive descent
 //! instead of a `state, stack, fragments` triple), the divergence is noted.
 
-use serde_json::Value;
 use svelte_diagnostics::CompileDiagnostic;
+use svelte_js_ast::Expression;
 
 use crate::oxc_bridge::{parse_expression_at_with_comments, RawComment};
 use crate::utils::locator::LineMap;
@@ -57,11 +57,11 @@ impl<'src> Parser<'src> {
     pub fn parse_expression_at(
         &mut self,
         start: usize,
-    ) -> Result<(Value, usize), CompileDiagnostic> {
-        let (value, end, comments) =
+    ) -> Result<(Expression, usize), CompileDiagnostic> {
+        let (expr, end, comments) =
             parse_expression_at_with_comments(self.template, &self.line_map, start, self.ts)?;
         self.comments.extend(comments);
-        Ok((value, end))
+        Ok((expr, end))
     }
 
     pub fn template_remaining(&self) -> &'src str {

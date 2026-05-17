@@ -1,101 +1,58 @@
 //! `{#each}`, `{#if}`, `{#await}`, `{#key}`, `{#snippet}` blocks.
-//!
-//! Ported from `packages/svelte/src/compiler/types/template.d.ts:451-537`.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use svelte_js_ast::{Expression, Identifier, Pattern};
 
 use crate::fragment::Fragment;
 use crate::position::Offset;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EachBlock {
-    #[serde(rename = "type")]
-    pub kind: EachBlockKind,
     pub start: Offset,
     pub end: Offset,
-    pub expression: Value,
-    pub context: Option<Value>,
+    pub expression: Expression,
+    pub context: Option<Pattern>,
     pub body: Fragment,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Fragment>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub index: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key: Option<Value>,
+    pub key: Option<Expression>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum EachBlockKind {
-    EachBlock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IfBlock {
-    #[serde(rename = "type")]
-    pub kind: IfBlockKind,
     pub start: Offset,
     pub end: Offset,
     pub elseif: bool,
-    pub test: Value,
+    pub test: Expression,
     pub consequent: Fragment,
     pub alternate: Option<Fragment>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum IfBlockKind {
-    IfBlock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AwaitBlock {
-    #[serde(rename = "type")]
-    pub kind: AwaitBlockKind,
     pub start: Offset,
     pub end: Offset,
-    pub expression: Value,
-    pub value: Option<Value>,
-    pub error: Option<Value>,
+    pub expression: Expression,
+    pub value: Option<Pattern>,
+    pub error: Option<Pattern>,
     pub pending: Option<Fragment>,
     pub then: Option<Fragment>,
-    #[serde(rename = "catch")]
     pub catch_: Option<Fragment>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum AwaitBlockKind {
-    AwaitBlock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KeyBlock {
-    #[serde(rename = "type")]
-    pub kind: KeyBlockKind,
     pub start: Offset,
     pub end: Offset,
-    pub expression: Value,
+    pub expression: Expression,
     pub fragment: Fragment,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum KeyBlockKind {
-    KeyBlock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SnippetBlock {
-    #[serde(rename = "type")]
-    pub kind: SnippetBlockKind,
     pub start: Offset,
     pub end: Offset,
-    pub expression: Value,
-    pub parameters: Vec<Value>,
-    #[serde(rename = "typeParams", skip_serializing_if = "Option::is_none")]
+    pub expression: Identifier,
+    pub parameters: Vec<Pattern>,
     pub type_params: Option<String>,
     pub body: Fragment,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SnippetBlockKind {
-    SnippetBlock,
 }

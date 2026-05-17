@@ -21,18 +21,18 @@
 
 use serde_json::{json, Value};
 use svelte_ast::{
-    AnimateDirective, AnimateDirectiveKind, AttachTag, AttachTagKind, Attribute, AttributeKind,
-    AttributeValue, AttributeValuePart, BindDirective, BindDirectiveKind, ClassDirective,
-    ClassDirectiveKind, ElementAttribute, ExpressionTag, ExpressionTagKind,
-    Fragment, FragmentChild, FragmentKind, LetDirective, LetDirectiveKind, OnDirective,
-    OnDirectiveKind, RegularElement, RegularElementKind, SlotElement, SlotElementKind, SlotName,
-    SourceLocation, StyleDirective, StyleDirectiveKind, SvelteBody, SvelteBodyKind, SvelteBodyName,
-    SvelteBoundary, SvelteBoundaryKind, SvelteBoundaryName, SvelteDocument, SvelteDocumentKind,
-    SvelteDocumentName, SvelteFragment, SvelteFragmentKind, SvelteFragmentName, SvelteHead,
-    SvelteHeadKind, SvelteHeadName, SvelteOptionsRaw, SvelteOptionsRawKind, SvelteOptionsRawName,
-    SvelteSelf, SvelteSelfKind, SvelteSelfName, SvelteWindow, SvelteWindowKind, SvelteWindowName,
-    Text, TextKind, TitleElement, TitleElementKind, TitleName, TransitionDirective,
-    TransitionDirectiveKind, UseDirective, UseDirectiveKind,
+    AnimateDirective,  AttachTag,  Attribute, 
+    AttributeValue, AttributeValuePart, BindDirective,  ClassDirective,
+     ElementAttribute, ExpressionTag, 
+    Fragment, FragmentChild,  LetDirective,  OnDirective,
+     RegularElement,  SlotElement,  
+    SourceLocation, StyleDirective,  SvelteBody,  
+    SvelteBoundary,   SvelteDocument, 
+     SvelteFragment,   SvelteHead,
+      SvelteOptionsRaw,  
+    SvelteSelf,   SvelteWindow,  
+    Text,  TitleElement,   TransitionDirective,
+     UseDirective, 
 };
 use svelte_diagnostics::{errors, CompileDiagnostic};
 
@@ -250,91 +250,71 @@ fn build_element(
         // `<slot>` inside a `<template shadowrootmode>` ancestor is a real
         // DOM slot element, not Svelte's SlotElement (element.js:174).
         "slot" if !inside_shadowroot => FragmentChild::SlotElement(SlotElement {
-            kind: SlotElementKind::SlotElement,
             start,
             end,
-            name: SlotName::Slot,
             name_loc,
             attributes,
             fragment,
         }),
         "title" => FragmentChild::TitleElement(TitleElement {
-            kind: TitleElementKind::TitleElement,
             start,
             end,
-            name: TitleName::Title,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:body" => FragmentChild::SvelteBody(SvelteBody {
-            kind: SvelteBodyKind::SvelteBody,
             start,
             end,
-            name: SvelteBodyName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:boundary" => FragmentChild::SvelteBoundary(SvelteBoundary {
-            kind: SvelteBoundaryKind::SvelteBoundary,
             start,
             end,
-            name: SvelteBoundaryName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:document" => FragmentChild::SvelteDocument(SvelteDocument {
-            kind: SvelteDocumentKind::SvelteDocument,
             start,
             end,
-            name: SvelteDocumentName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:fragment" => FragmentChild::SvelteFragment(SvelteFragment {
-            kind: SvelteFragmentKind::SvelteFragment,
             start,
             end,
-            name: SvelteFragmentName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:head" => FragmentChild::SvelteHead(SvelteHead {
-            kind: SvelteHeadKind::SvelteHead,
             start,
             end,
-            name: SvelteHeadName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:options" => FragmentChild::SvelteOptions(SvelteOptionsRaw {
-            kind: SvelteOptionsRawKind::SvelteOptions,
             start,
             end,
-            name: SvelteOptionsRawName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:self" => FragmentChild::SvelteSelf(SvelteSelf {
-            kind: SvelteSelfKind::SvelteSelf,
             start,
             end,
-            name: SvelteSelfName::Value,
             name_loc,
             attributes,
             fragment,
         }),
         "svelte:window" => FragmentChild::SvelteWindow(SvelteWindow {
-            kind: SvelteWindowKind::SvelteWindow,
             start,
             end,
-            name: SvelteWindowName::Value,
             name_loc,
             attributes,
             fragment,
@@ -346,10 +326,8 @@ fn build_element(
             let expression = build_svelte_this_expression(&this_value, &name);
             let _ = &mut attrs;
             FragmentChild::SvelteComponent(svelte_ast::SvelteComponent {
-                kind: svelte_ast::SvelteComponentKind::SvelteComponent,
                 start,
                 end,
-                name: svelte_ast::SvelteComponentName::Value,
                 name_loc,
                 attributes: attrs,
                 fragment,
@@ -362,10 +340,8 @@ fn build_element(
             let (attrs, this_value) = extract_this_attribute(attributes);
             let tag = build_svelte_this_expression(&this_value, &name);
             FragmentChild::SvelteElement(svelte_ast::SvelteElement {
-                kind: svelte_ast::SvelteElementKind::SvelteElement,
                 start,
                 end,
-                name: svelte_ast::SvelteElementName::Value,
                 name_loc,
                 attributes: attrs,
                 fragment,
@@ -373,7 +349,6 @@ fn build_element(
             })
         }
         n if is_component_name(n) => FragmentChild::Component(svelte_ast::Component {
-            kind: svelte_ast::ComponentKind::Component,
             start,
             end,
             name,
@@ -382,7 +357,6 @@ fn build_element(
             fragment,
         }),
         _ => FragmentChild::RegularElement(RegularElement {
-            kind: RegularElementKind::RegularElement,
             start,
             end,
             name,
@@ -410,19 +384,26 @@ fn extract_this_attribute(
     (attributes, None)
 }
 
-/// Build the `expression` / `tag` JSON Value for a `<svelte:component>` /
-/// `<svelte:element>` from its extracted `this` attribute. Returns a Literal
-/// for string values and unwraps ExpressionTag.expression for mustache values.
-/// When `this` is missing or `true`, returns `null` (acceptable wire-format
-/// — upstream errors via `e.svelte_*_missing_this`, but we keep parsing).
-fn build_svelte_this_expression(value: &Option<AttributeValue>, _tag_name: &str) -> Value {
-    let Some(v) = value else { return Value::Null };
+/// Build the typed `Expression` for `<svelte:component>` / `<svelte:element>`'s
+/// `this={...}` attribute. Unwraps `ExpressionTag.expression`; for string
+/// values builds a `StringLiteral`. Falls back to a placeholder Identifier
+/// when missing — upstream errors via `e.svelte_*_missing_this`, but we
+/// keep parsing.
+fn build_svelte_this_expression(
+    value: &Option<AttributeValue>,
+    _tag_name: &str,
+) -> svelte_js_ast::Expression {
+    fn placeholder() -> svelte_js_ast::Expression {
+        svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
+            name: "__missing_this__".to_string(),
+            span: svelte_js_ast::Span::ZERO,
+        })
+    }
+    let Some(v) = value else { return placeholder() };
     match v {
-        AttributeValue::Empty(_) => Value::Null,
+        AttributeValue::Empty => placeholder(),
         AttributeValue::Single(tag) => tag.expression.clone(),
         AttributeValue::Many(parts) => {
-            // Strip empty leading/trailing text. If a single ExpressionTag
-            // remains, unwrap; if a single Text remains, build a Literal.
             let non_empty: Vec<&AttributeValuePart> = parts
                 .iter()
                 .filter(|p| match p {
@@ -433,16 +414,18 @@ fn build_svelte_this_expression(value: &Option<AttributeValue>, _tag_name: &str)
             if non_empty.len() == 1 {
                 match non_empty[0] {
                     AttributeValuePart::ExpressionTag(e) => e.expression.clone(),
-                    AttributeValuePart::Text(t) => serde_json::json!({
-                        "type": "Literal",
-                        "value": t.data,
-                        "raw": format!("'{}'", t.raw),
-                        "start": t.start,
-                        "end": t.end,
-                    }),
+                    AttributeValuePart::Text(t) => {
+                        svelte_js_ast::Expression::Literal(Box::new(
+                            svelte_js_ast::Literal::String(svelte_js_ast::StringLiteral {
+                                value: t.data.clone(),
+                                raw: Some(format!("'{}'", t.raw)),
+                                span: svelte_js_ast::Span::new(t.start, t.end),
+                            }),
+                        ))
+                    }
                 }
             } else {
-                Value::Null
+                placeholder()
             }
         }
     }
@@ -553,7 +536,6 @@ fn read_braced_attribute(
             ));
         }
         return Ok(ElementAttribute::SpreadAttribute(svelte_ast::SpreadAttribute {
-            kind: svelte_ast::SpreadAttributeKind::SpreadAttribute,
             start: start as u32,
             end: parser.index as u32,
             expression,
@@ -586,22 +568,15 @@ fn read_braced_attribute(
 
     let id_loc_start = parser.line_map.position(id_start);
     let id_loc_end = parser.line_map.position(id_end);
-    let id_json = serde_json::json!({
-        "type": "Identifier",
-        "name": id_name.clone(),
-        "start": id_start,
-        "end": id_end,
-        "loc": {
-            "start": position_to_json(&id_loc_start),
-            "end": position_to_json(&id_loc_end),
-        }
+    let id_expr = svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
+        name: id_name.clone(),
+        span: svelte_js_ast::Span::new(id_start as u32, id_end as u32),
     });
 
     let expression_tag = ExpressionTag {
-        kind: ExpressionTagKind::ExpressionTag,
         start: id_start as u32,
         end: id_end as u32,
-        expression: id_json,
+        expression: id_expr,
     };
 
     let name_loc = SourceLocation {
@@ -610,7 +585,6 @@ fn read_braced_attribute(
     };
 
     Ok(ElementAttribute::Attribute(Attribute {
-        kind: AttributeKind::Attribute,
         start: start as u32,
         end: parser.index as u32,
         name: id_name,
@@ -724,7 +698,6 @@ fn read_attach_tag(parser: &mut Parser<'_>) -> Result<AttachTag, CompileDiagnost
         ));
     }
     Ok(AttachTag {
-        kind: AttachTagKind::AttachTag,
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -748,7 +721,6 @@ fn read_expression_tag(parser: &mut Parser<'_>) -> Result<ExpressionTag, Compile
         ));
     }
     Ok(ExpressionTag {
-        kind: ExpressionTagKind::ExpressionTag,
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -822,7 +794,6 @@ fn read_attribute(
             let char_start = parser.index;
             parser.index += 1;
             AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-                kind: TextKind::Text,
                 start: char_start as u32,
                 end: (char_start + 1) as u32,
                 raw: "/".to_string(),
@@ -834,7 +805,7 @@ fn read_attribute(
             read_attribute_value(parser)?
         }
     } else {
-        AttributeValue::Empty(true)
+        AttributeValue::Empty
     };
     let end = parser.index;
 
@@ -872,7 +843,6 @@ fn read_attribute(
     } // close `if !static_only`
 
     Ok(ElementAttribute::Attribute(Attribute {
-        kind: AttributeKind::Attribute,
         start: start as u32,
         end: end as u32,
         name: raw_name,
@@ -911,7 +881,6 @@ fn read_static_attribute_value(
         parser.index += 1; // closing quote
         let raw = parser.template[text_start..text_end].to_string();
         return Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-            kind: TextKind::Text,
             start: text_start as u32,
             end: text_end as u32,
             raw: raw.clone(),
@@ -935,7 +904,6 @@ fn read_static_attribute_value(
         ));
     }
     Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-        kind: TextKind::Text,
         start: start as u32,
         end: end as u32,
         raw: raw.to_string(),
@@ -959,7 +927,6 @@ fn build_directive(
     // (element.js:654-666).
     if matches!(kind, DirectiveKind::Style) {
         return Ok(ElementAttribute::StyleDirective(StyleDirective {
-            kind: StyleDirectiveKind::StyleDirective,
             start: start as u32,
             end: end as u32,
             name: directive_name,
@@ -975,8 +942,8 @@ fn build_directive(
     // ExpressionTag and nothing else → unwrap that expression (legacy form,
     // `on:click="{handler}"`). Anything else (text content, multiple chunks)
     // → directive_invalid_value error.
-    let expression: Option<Value> = match value {
-        AttributeValue::Empty(_) => None,
+    let expression: Option<svelte_js_ast::Expression> = match value {
+        AttributeValue::Empty => None,
         AttributeValue::Single(tag) => Some(tag.expression),
         AttributeValue::Many(parts) => {
             // Drop empty leading/trailing Text nodes (zero-length sentinels
@@ -1010,7 +977,6 @@ fn build_directive(
 
     let directive = match kind {
         DirectiveKind::Use => ElementAttribute::UseDirective(UseDirective {
-            kind: UseDirectiveKind::UseDirective,
             start: start as u32,
             end: end as u32,
             name: directive_name,
@@ -1019,7 +985,6 @@ fn build_directive(
             modifiers,
         }),
         DirectiveKind::Animate => ElementAttribute::AnimateDirective(AnimateDirective {
-            kind: AnimateDirectiveKind::AnimateDirective,
             start: start as u32,
             end: end as u32,
             name: directive_name,
@@ -1032,15 +997,15 @@ fn build_directive(
             // (element.js:707-718). The synthesized Identifier carries `start`
             // and `end` but no `loc`.
             let expr = expression.unwrap_or_else(|| {
-                json!({
-                    "start": start + colon_index + 1,
-                    "end": end,
-                    "type": "Identifier",
-                    "name": directive_name,
+                svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
+                    name: directive_name.clone(),
+                    span: svelte_js_ast::Span::new(
+                        (start + colon_index + 1) as u32,
+                        end as u32,
+                    ),
                 })
             });
             ElementAttribute::BindDirective(BindDirective {
-                kind: BindDirectiveKind::BindDirective,
                 start: start as u32,
                 end: end as u32,
                 name: directive_name,
@@ -1051,15 +1016,15 @@ fn build_directive(
         }
         DirectiveKind::Class => {
             let expr = expression.unwrap_or_else(|| {
-                json!({
-                    "start": start + colon_index + 1,
-                    "end": end,
-                    "type": "Identifier",
-                    "name": directive_name,
+                svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
+                    name: directive_name.clone(),
+                    span: svelte_js_ast::Span::new(
+                        (start + colon_index + 1) as u32,
+                        end as u32,
+                    ),
                 })
             });
             ElementAttribute::ClassDirective(ClassDirective {
-                kind: ClassDirectiveKind::ClassDirective,
                 start: start as u32,
                 end: end as u32,
                 name: directive_name,
@@ -1069,7 +1034,6 @@ fn build_directive(
             })
         }
         DirectiveKind::On => ElementAttribute::OnDirective(OnDirective {
-            kind: OnDirectiveKind::OnDirective,
             start: start as u32,
             end: end as u32,
             name: directive_name,
@@ -1078,7 +1042,6 @@ fn build_directive(
             modifiers,
         }),
         DirectiveKind::Let => ElementAttribute::LetDirective(LetDirective {
-            kind: LetDirectiveKind::LetDirective,
             start: start as u32,
             end: end as u32,
             name: directive_name,
@@ -1091,7 +1054,6 @@ fn build_directive(
             let intro = prefix == "in" || prefix == "transition";
             let outro = prefix == "out" || prefix == "transition";
             ElementAttribute::TransitionDirective(TransitionDirective {
-                kind: TransitionDirectiveKind::TransitionDirective,
                 start: start as u32,
                 end: end as u32,
                 name: directive_name,
@@ -1141,7 +1103,6 @@ fn read_attribute_value(parser: &mut Parser<'_>) -> Result<AttributeValue, Compi
             let pos = parser.index;
             parser.index += 1;
             return Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-                kind: TextKind::Text,
                 start: pos as u32,
                 end: pos as u32,
                 raw: String::new(),
@@ -1198,7 +1159,6 @@ fn read_attr_sequence(
         if end > start {
             let raw = &tpl[start..end];
             parts.push(AttributeValuePart::Text(Text {
-                kind: TextKind::Text,
                 start: start as u32,
                 end: end as u32,
                 raw: raw.to_string(),
@@ -1261,7 +1221,6 @@ fn read_textarea_fragment(
         if end > start {
             let raw = &tpl[start..end];
             nodes.push(FragmentChild::Text(Text {
-                kind: TextKind::Text,
                 start: start as u32,
                 end: end as u32,
                 raw: raw.to_string(),
@@ -1291,7 +1250,6 @@ fn read_textarea_fragment(
 
     flush_text(&mut nodes, text_start, parser.index, parser.template);
     Ok(Fragment {
-        kind: FragmentKind::Fragment,
         nodes,
     })
 }
@@ -1360,9 +1318,7 @@ fn read_raw_until_close_tag(
     let end = parser.index;
     let raw = parser.template[start..end].to_string();
     Ok(Fragment {
-        kind: FragmentKind::Fragment,
         nodes: vec![FragmentChild::Text(Text {
-            kind: TextKind::Text,
             start: start as u32,
             end: end as u32,
             raw: raw.clone(),
@@ -1498,7 +1454,6 @@ fn parse_fragment_until_close_tag(
     }
     Ok((
         Fragment {
-            kind: FragmentKind::Fragment,
             nodes,
         },
         implicit_close,
@@ -1601,7 +1556,7 @@ mod tests {
                 match &el.attributes[0] {
                     ElementAttribute::Attribute(a) => {
                         assert_eq!(a.name, "disabled");
-                        assert!(matches!(a.value, AttributeValue::Empty(true)));
+                        assert!(matches!(a.value, AttributeValue::Empty));
                     }
                     other => panic!("expected Attribute, got {other:?}"),
                 }

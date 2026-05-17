@@ -9,13 +9,13 @@
 
 pub mod hoist;
 pub mod oxc_bridge;
+pub mod oxc_to_typed;
 pub mod parser;
 pub mod state;
 pub mod utils;
 
 use svelte_ast::{
-    Fragment, FragmentChild, FragmentKind, JsComment, JsCommentKind, Position, Root, RootKind,
-    SourceLocation,
+    Fragment, FragmentChild, JsComment, JsCommentKind, Position, Root, SourceLocation,
 };
 use svelte_diagnostics::CompileDiagnostic;
 
@@ -54,9 +54,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
         js: vec![],
         start: 0,
         end: source.len() as u32,
-        kind: RootKind::Root,
         fragment: Fragment {
-            kind: FragmentKind::Fragment,
             // `fragment_start` is unused at the moment but will matter once
             // we track fragment boundaries inside blocks.
             nodes: {

@@ -18,9 +18,11 @@ pub fn parse(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     } else {
         serde_wasm_bindgen::from_value(options).map_err(|e| JsValue::from_str(&e.to_string()))?
     };
-    let root = svelte_compiler::parse(source, parse_options)
+    // STUB: typed Root no longer serializes; wasm parse() returns null
+    // until Phase D ports a typed -> estree wire-format walker.
+    let _root = svelte_compiler::parse(source, parse_options)
         .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
-    serde_wasm_bindgen::to_value(&root).map_err(|e| JsValue::from_str(&e.to_string()))
+    Ok(JsValue::NULL)
 }
 
 /// `preprocess(source, processed)` — combine the outputs of already-invoked

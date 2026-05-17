@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/svelte_ast",
+    "crates/svelte_js_ast",
     "crates/svelte_diagnostics",
     "crates/svelte_magic_string",
     "crates/svelte_codegen_js",
@@ -31,6 +32,7 @@ publish = false
 [workspace.dependencies]
 # Internal crates (path deps)
 svelte_ast = { path = "crates/svelte_ast" }
+svelte_js_ast = { path = "crates/svelte_js_ast" }
 svelte_diagnostics = { path = "crates/svelte_diagnostics" }
 svelte_magic_string = { path = "crates/svelte_magic_string" }
 svelte_codegen_js = { path = "crates/svelte_codegen_js" }

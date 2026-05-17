@@ -74,7 +74,7 @@ pub struct CompileOptions {
     pub custom_element: bool,
     #[serde(default)]
     pub accessors: bool,
-    #[serde(default = "default_namespace")]
+    #[serde(default = "default_namespace", skip)]
     pub namespace: Namespace,
     #[serde(default)]
     pub immutable: bool,

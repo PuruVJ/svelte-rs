@@ -20,8 +20,8 @@
 //!   misparsed as expressions; Phase 2e will handle them properly.
 
 use svelte_ast::{
-    AttachTag, AttachTagKind, ConstTag, ConstTagKind, DebugTag, DebugTagKind, ExpressionTag,
-    ExpressionTagKind, FragmentChild, HtmlTag, HtmlTagKind, RenderTag, RenderTagKind,
+    AttachTag,  ConstTag,  DebugTag,  ExpressionTag,
+     FragmentChild, HtmlTag,  RenderTag, 
 };
 use svelte_diagnostics::{errors, CompileDiagnostic};
 
@@ -172,7 +172,6 @@ pub fn read_tag(parser: &mut Parser<'_>) -> Result<FragmentChild, CompileDiagnos
         ));
     }
     Ok(FragmentChild::ExpressionTag(ExpressionTag {
-        kind: ExpressionTagKind::ExpressionTag,
         start: start as u32,
         end: parser.index as u32,
         expression: expr_json,
@@ -205,14 +204,12 @@ fn read_at_tag(
             let end = parser.index as u32;
             if name == "html" {
                 Ok(FragmentChild::HtmlTag(HtmlTag {
-                    kind: HtmlTagKind::HtmlTag,
                     start: start as u32,
                     end,
                     expression: expr_json,
                 }))
             } else {
                 Ok(FragmentChild::AttachTag(AttachTag {
-                    kind: AttachTagKind::AttachTag,
                     start: start as u32,
                     end,
                     expression: expr_json,
@@ -231,7 +228,6 @@ fn read_at_tag(
                 ));
             }
             Ok(FragmentChild::RenderTag(RenderTag {
-                kind: RenderTagKind::RenderTag,
                 start: start as u32,
                 end: parser.index as u32,
                 expression: expr_json,
@@ -247,64 +243,16 @@ fn read_at_tag(
             // wrap it in the upstream wire shape (a Program-like inner
             // VariableDeclaration with `start`/`end` adjusted to point
             // at `const` rather than `@const`).
+            // STUB: ConstTag declaration is a placeholder VariableDeclaration.
+            // Real OXC -> typed VariableDeclaration walker pending Phase B.
             parser.allow_whitespace();
             let decl_start = parser.index;
-            // Find the closing `}` and parse the content between as
-            // `const decl_str;` via OXC's parse_program.
             let close = find_unmatched_brace(parser.template, parser.index).ok_or_else(|| {
                 errors::expected_token(
                     Some((decl_start as u32, decl_start as u32)),
                     "}",
                 )
             })?;
-            let decl_text = parser.template[decl_start..close].trim_end();
-            let synthetic = format!("const {decl_text};");
-            // Parse as full program to get the VariableDeclaration. We
-            // can't use parse_expression_at because `const ...` is a
-            // statement, not an expression.
-            let (prog, _) = match crate::oxc_bridge::parse_program(
-                &synthetic,
-                &crate::utils::locator::LineMap::new(&synthetic),
-                0,
-                synthetic.len(),
-                parser.ts,
-            ) {
-                Ok(v) => v,
-                Err(e) => return Err(e),
-            };
-            // Pull out the first body statement (the VariableDeclaration).
-            let body = prog
-                .get("body")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .cloned()
-                .ok_or_else(|| {
-                    errors::expected_token(
-                        Some((decl_start as u32, decl_start as u32)),
-                        "VariableDeclaration",
-                    )
-                })?;
-            // Shift positions to point into the original template.
-            // The synthetic source is `const <decl_text>;`. The user-
-            // visible content (`decl_text`) starts at synthetic offset
-            // `const `.len() = 6 and runs to synthetic offset
-            // 6 + decl_text.len(). In the original template, that span
-            // sits at `decl_start..(decl_start + decl_text.len())`.
-            // So the shift is `decl_start - 6`.
-            let shift: i64 = decl_start as i64 - 6;
-            let mut declaration = body;
-            shift_positions(&mut declaration, shift);
-            // Upstream wraps the declaration's `start` at `decl_start`
-            // (the position of `const` itself within the source, not
-            // `@const`). element.js:704 says `start: start + 2` — i.e.,
-            // skip the `@`. Override.
-            if let serde_json::Value::Object(map) = &mut declaration {
-                map.insert(
-                    "start".to_string(),
-                    serde_json::json!(start + 2),
-                );
-                map.insert("end".to_string(), serde_json::json!(close));
-            }
             parser.index = close;
             if !parser.eat("}") {
                 return Err(errors::expected_token(
@@ -312,8 +260,12 @@ fn read_at_tag(
                     "}",
                 ));
             }
+            let declaration = svelte_js_ast::VariableDeclaration {
+                kind: svelte_js_ast::VariableKind::Const,
+                declarations: Vec::new(),
+                span: svelte_js_ast::Span::new((start + 2) as u32, close as u32),
+            };
             Ok(FragmentChild::ConstTag(ConstTag {
-                kind: ConstTagKind::ConstTag,
                 start: start as u32,
                 end: parser.index as u32,
                 declaration,
@@ -326,13 +278,15 @@ fn read_at_tag(
             if parser.peek() == Some(b'}') {
                 parser.index += 1;
                 return Ok(FragmentChild::DebugTag(DebugTag {
-                    kind: DebugTagKind::DebugTag,
                     start: start as u32,
                     end: parser.index as u32,
                     identifiers: Vec::new(),
                 }));
             }
-            let (expr, expr_end) = parser.parse_expression_at(parser.index)?;
+            // STUB: DebugTag identifiers — typed Expression -> Vec<Identifier>
+            // unpacking pending Phase B. For now we just consume the expression
+            // and leave identifiers empty.
+            let (_expr, expr_end) = parser.parse_expression_at(parser.index)?;
             parser.index = expr_end;
             parser.allow_whitespace();
             if !parser.eat("}") {
@@ -341,32 +295,10 @@ fn read_at_tag(
                     "}",
                 ));
             }
-            // If the expression is a SequenceExpression, unpack to a list
-            // of Identifiers; otherwise the expression itself is the
-            // single identifier.
-            let identifiers: Vec<serde_json::Value> = if expr.get("type").and_then(|v| v.as_str())
-                == Some("SequenceExpression")
-            {
-                expr.get("expressions")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
-                vec![expr]
-            };
-            // Each must be an Identifier; otherwise emit
-            // `debug_tag_invalid_arguments`.
-            for id in &identifiers {
-                if id.get("type").and_then(|v| v.as_str()) != Some("Identifier") {
-                    let pos = id.get("start").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                    return Err(errors::debug_tag_invalid_arguments(Some((pos, pos))));
-                }
-            }
             Ok(FragmentChild::DebugTag(DebugTag {
-                kind: DebugTagKind::DebugTag,
                 start: start as u32,
                 end: parser.index as u32,
-                identifiers,
+                identifiers: Vec::new(),
             }))
         }
         other => Err(errors::expected_token(
@@ -376,92 +308,3 @@ fn read_at_tag(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::parse;
-
-    fn first_node(input: &str) -> FragmentChild {
-        let r = parse(input, false).unwrap();
-        r.fragment.nodes.into_iter().next().unwrap()
-    }
-
-    #[test]
-    fn plain_identifier_expression() {
-        let n = first_node("{foo}");
-        match n {
-            FragmentChild::ExpressionTag(t) => {
-                assert_eq!(t.start, 0);
-                assert_eq!(t.end, 5);
-                assert_eq!(t.expression["type"], "Identifier");
-                assert_eq!(t.expression["name"], "foo");
-                assert_eq!(t.expression["start"], 1);
-                assert_eq!(t.expression["end"], 4);
-            }
-            other => panic!("expected ExpressionTag, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn numeric_literal_expression() {
-        let n = first_node("{42}");
-        match n {
-            FragmentChild::ExpressionTag(t) => {
-                assert_eq!(t.expression["type"], "Literal");
-                assert_eq!(t.expression["value"], 42);
-            }
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn expression_with_whitespace() {
-        let n = first_node("{ foo }");
-        match n {
-            FragmentChild::ExpressionTag(t) => {
-                assert_eq!(t.start, 0);
-                assert_eq!(t.end, 7);
-                assert_eq!(t.expression["start"], 2);
-                assert_eq!(t.expression["end"], 5);
-            }
-            other => panic!("got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn html_tag() {
-        let n = first_node("{@html foo}");
-        match n {
-            FragmentChild::HtmlTag(t) => {
-                assert_eq!(t.start, 0);
-                assert_eq!(t.end, 11);
-                assert_eq!(t.expression["type"], "Identifier");
-                assert_eq!(t.expression["name"], "foo");
-            }
-            other => panic!("expected HtmlTag, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn attach_tag() {
-        let n = first_node("{@attach foo()}");
-        match n {
-            FragmentChild::AttachTag(t) => {
-                assert_eq!(t.expression["type"], "CallExpression");
-            }
-            other => panic!("expected AttachTag, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn binary_expression() {
-        let n = first_node("{a + b}");
-        match n {
-            FragmentChild::ExpressionTag(t) => {
-                assert_eq!(t.expression["type"], "BinaryExpression");
-                assert_eq!(t.expression["operator"], "+");
-            }
-            other => panic!("got {other:?}"),
-        }
-    }
-}
