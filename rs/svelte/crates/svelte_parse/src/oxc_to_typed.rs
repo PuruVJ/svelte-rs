@@ -1173,6 +1173,13 @@ fn argument(a: &oxc::Argument<'_>, shift: Shift) -> Argument {
 }
 
 fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
+    // Argument inherits all of Expression's variants. Delegate via the
+    // OXC-provided `to_expression()` accessor (panics on SpreadElement —
+    // we handle that branch above before reaching here).
+    if let Some(e) = a.as_expression() {
+        return expression(e, shift);
+    }
+    // Fallback for any unexpected non-Expression branch.
     use oxc::Argument as A;
     match a {
         A::SpreadElement(_) => unreachable!(),

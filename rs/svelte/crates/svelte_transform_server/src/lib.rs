@@ -110,28 +110,27 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             Some(())
         }
         FragmentChild::RegularElement(el) => {
-            // Serialize the open tag — attributes must all be plain
-            // static text (no directives/spread/dynamic expressions).
             buf.push_str("<");
             buf.push_str(&el.name);
             for attr in &el.attributes {
-                match attr {
-                    ElementAttribute::Attribute(a) => append_static_attribute(a, buf)?,
-                    _ => return None,
+                append_element_attribute_server(attr, buf)?;
+            }
+            if is_void(&el.name) {
+                // Self-closing void element form: `<br/>`.
+                buf.push_str("/>");
+                Some(())
+            } else {
+                buf.push_str(">");
+                // Strip whitespace-only Text at the element-body boundaries.
+                let children = trim_boundary_whitespace(&el.fragment.nodes);
+                for c in children {
+                    append_node_to_template(c, buf)?;
                 }
-            }
-            buf.push_str(">");
-            // Strip whitespace-only Text at the element-body boundaries.
-            let children = trim_boundary_whitespace(&el.fragment.nodes);
-            for c in children {
-                append_node_to_template(c, buf)?;
-            }
-            if !is_void(&el.name) {
                 buf.push_str("</");
                 buf.push_str(&el.name);
                 buf.push_str(">");
+                Some(())
             }
-            Some(())
         }
         FragmentChild::Comment(_) => Some(()), // HTML comments dropped server-side
         _ => None,
@@ -180,34 +179,107 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
-/// Serialize a static attribute (`name="value"` or `name`) into the template
-/// buffer. Returns None when the attribute is dynamic (single Expression /
-/// multi-part) — caller handles via `$.attr(...)` interpolations.
-fn append_static_attribute(a: &Attribute, buf: &mut TemplateBuf) -> Option<()> {
-    match &a.value {
+/// Server-side: serialize one element attribute or directive into the
+/// template buffer. Static text → ` name="value"`. Dynamic single-expression
+/// → `${$.attr('name', expr)}` interpolation. Event-handlers and most
+/// directives are dropped. `bind:X={expr}` becomes an `$.attr('X', expr)`
+/// interpolation (server emits the current value as an attribute).
+fn append_element_attribute_server(
+    attr: &ElementAttribute,
+    buf: &mut TemplateBuf,
+) -> Option<()> {
+    match attr {
+        ElementAttribute::Attribute(a) => {
+            // Drop event-handler attributes (`onclick`, `onfoo`, ...).
+            if is_event_handler_name(&a.name) {
+                return Some(());
+            }
+            append_value_attribute(&a.name, &a.value, buf)
+        }
+        ElementAttribute::BindDirective(b) => {
+            // Server treats `bind:X={expr}` as `X={expr}` for attribute output.
+            // `bind:this` is dropped (refs are runtime-only).
+            if b.name == "this" {
+                return Some(());
+            }
+            buf.push_expr(Expression::Call(Box::new(CallExpression {
+                callee: t::member_id(t::id("$"), "attr"),
+                arguments: vec![
+                    Argument::Expression(string_lit(&b.name)),
+                    Argument::Expression(b.expression.clone()),
+                ],
+                optional: false,
+                span: Span::ZERO,
+            })));
+            Some(())
+        }
+        // Other directives (on:/use:/transition:/animate:/let:/class:/style:/attach) drop server-side.
+        _ => Some(()),
+    }
+}
+
+/// Emit one `name=value`-flavored attribute. Static → literal in template;
+/// dynamic → `${$.attr('name', expr)}` interpolation.
+fn append_value_attribute(
+    name: &str,
+    value: &AttributeValue,
+    buf: &mut TemplateBuf,
+) -> Option<()> {
+    match value {
         AttributeValue::Empty => {
             buf.push_str(" ");
-            buf.push_str(&a.name);
+            buf.push_str(name);
             Some(())
         }
-        AttributeValue::Single(_) => None,
-        AttributeValue::Many(parts) => {
-            // Only handle all-Text parts (no interpolation).
-            if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
-                return None;
-            }
-            buf.push_str(" ");
-            buf.push_str(&a.name);
-            buf.push_str("=\"");
-            for p in parts {
-                if let AttributeValuePart::Text(t) = p {
-                    buf.push_str(&escape_attribute_text(&t.data));
-                }
-            }
-            buf.push_str("\"");
+        AttributeValue::Single(tag) => {
+            buf.push_expr(Expression::Call(Box::new(CallExpression {
+                callee: t::member_id(t::id("$"), "attr"),
+                arguments: vec![
+                    Argument::Expression(string_lit(name)),
+                    Argument::Expression(tag.expression.clone()),
+                ],
+                optional: false,
+                span: Span::ZERO,
+            })));
             Some(())
+        }
+        AttributeValue::Many(parts) => {
+            if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                // Static text value.
+                buf.push_str(" ");
+                buf.push_str(name);
+                buf.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        buf.push_str(&escape_attribute_text(&t.data));
+                    }
+                }
+                buf.push_str("\"");
+                Some(())
+            } else {
+                // TODO: concat parts via template literal + $.attr.
+                None
+            }
         }
     }
+}
+
+fn string_lit(s: &str) -> Expression {
+    Expression::Literal(Box::new(Literal::String(StringLiteral {
+        value: s.to_string(),
+        raw: Some(format!("'{s}'")),
+        span: Span::ZERO,
+    })))
+}
+
+/// Returns true for DOM event-handler attribute names like `onclick`,
+/// `onmouseenter`. Lowercase-only; `on-foo` (SVG style) is preserved.
+fn is_event_handler_name(name: &str) -> bool {
+    if !name.starts_with("on") || name.len() < 3 {
+        return false;
+    }
+    let third = name.as_bytes()[2];
+    third.is_ascii_lowercase()
 }
 
 fn escape_attribute_text(s: &str) -> String {
