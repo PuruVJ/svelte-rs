@@ -831,11 +831,208 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
                     rewrite_statement(s, ctx);
                 }
             }
+            ExportDefault::Class(c) => rewrite_class_body(c, ctx),
             ExportDefault::Expression(e) => rewrite_expression(e, ctx),
-            _ => {}
         },
+        S::Class(c) => rewrite_class_body(c, ctx),
         _ => {}
     }
+}
+
+/// Rewrite a class body in-place: erase `$state(x)` field initializers and
+/// transform `$derived(x)` fields into private fields with getter/setter
+/// accessor pairs. Ports
+/// `packages/svelte/src/compiler/phases/3-transform/server/visitors/ClassBody.js`.
+fn rewrite_class_body(c: &mut ClassDeclaration, ctx: &mut Ctx) {
+    let mut new_members: Vec<ClassMember> = Vec::with_capacity(c.body.body.len());
+    for member in std::mem::take(&mut c.body.body) {
+        match member {
+            ClassMember::Property(mut p) => {
+                let kind = property_rune_kind(&p.value);
+                match kind {
+                    Some(ClassFieldRune::State) => {
+                        // `name = $state(x)` → `name = x`; `name = $state()` → `name;`
+                        let inner = property_rune_inner(p.value.as_ref().unwrap());
+                        p.value = inner;
+                        new_members.push(ClassMember::Property(p));
+                    }
+                    Some(ClassFieldRune::Derived(by)) => {
+                        // Rename key to private and wrap value as $.derived(...).
+                        let public_key = match &p.key {
+                            PropertyKey::Identifier(id) => id.name.clone(),
+                            PropertyKey::Private(pi) => pi.name.clone(),
+                            _ => {
+                                // Unsupported key shape — leave as-is.
+                                new_members.push(ClassMember::Property(p));
+                                continue;
+                            }
+                        };
+                        let was_private = matches!(p.key, PropertyKey::Private(_));
+                        let private_key = if was_private {
+                            public_key.clone()
+                        } else {
+                            public_key.clone()
+                        };
+                        let arg = property_rune_inner(p.value.as_ref().unwrap())
+                            .unwrap_or_else(undefined_expr);
+                        let derived_expr = if by {
+                            derived_call(arg)
+                        } else {
+                            derived_call(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                                params: Vec::new(),
+                                body: ArrowBody::Expression(arg),
+                                r#async: false,
+                                span: Span::ZERO,
+                            })))
+                        };
+                        p.key = PropertyKey::Private(PrivateIdentifier {
+                            name: private_key.clone(),
+                            span: Span::ZERO,
+                        });
+                        p.value = Some(derived_expr);
+                        new_members.push(ClassMember::Property(p));
+                        if !was_private {
+                            // Add getter and setter accessor pair.
+                            new_members.push(make_derived_getter(&public_key, &private_key));
+                            new_members.push(make_derived_setter(&public_key, &private_key));
+                        }
+                    }
+                    None => {
+                        // Plain field — recurse into its initializer for any nested runes.
+                        if let Some(v) = &mut p.value {
+                            rewrite_expression(v, ctx);
+                        }
+                        new_members.push(ClassMember::Property(p));
+                    }
+                }
+            }
+            ClassMember::Method(mut m) => {
+                for s in &mut m.value.body.body {
+                    rewrite_statement(s, ctx);
+                }
+                new_members.push(ClassMember::Method(m));
+            }
+            ClassMember::StaticBlock(mut sb) => {
+                for s in &mut sb.body {
+                    rewrite_statement(s, ctx);
+                }
+                new_members.push(ClassMember::StaticBlock(sb));
+            }
+        }
+    }
+    c.body.body = new_members;
+}
+
+enum ClassFieldRune {
+    State,
+    /// `$derived(...)` (false) vs `$derived.by(...)` (true).
+    Derived(bool),
+}
+
+fn property_rune_kind(value: &Option<Expression>) -> Option<ClassFieldRune> {
+    let e = value.as_ref()?;
+    let Expression::Call(c) = e else { return None };
+    let kp = global_keypath(&c.callee)?;
+    match kp.as_str() {
+        "$state" | "$state.raw" | "$state.eager" => Some(ClassFieldRune::State),
+        "$derived" => Some(ClassFieldRune::Derived(false)),
+        "$derived.by" => Some(ClassFieldRune::Derived(true)),
+        _ => None,
+    }
+}
+
+fn property_rune_inner(e: &Expression) -> Option<Expression> {
+    let Expression::Call(c) = e else { return None };
+    c.arguments.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e.clone()),
+        _ => None,
+    })
+}
+
+/// `get NAME() { return this.#PRIVATE(); }`
+fn make_derived_getter(public_name: &str, private_name: &str) -> ClassMember {
+    let body = vec![Statement::Return(Box::new(ReturnStatement {
+        argument: Some(Expression::Call(Box::new(CallExpression {
+            callee: Expression::Member(Box::new(MemberExpression {
+                object: Expression::This(Span::ZERO),
+                property: MemberProperty::Private(PrivateIdentifier {
+                    name: private_name.to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            })),
+            arguments: Vec::new(),
+            optional: false,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }))];
+    ClassMember::Method(Box::new(MethodDefinition {
+        key: PropertyKey::Identifier(Identifier {
+            name: public_name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: FunctionExpression {
+            id: None,
+            params: Vec::new(),
+            body: BlockStatement { body, span: Span::ZERO },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        },
+        kind: MethodKind::Get,
+        computed: false,
+        r#static: false,
+        span: Span::ZERO,
+    }))
+}
+
+/// `set NAME($$value) { return this.#PRIVATE($$value); }`
+fn make_derived_setter(public_name: &str, private_name: &str) -> ClassMember {
+    let body = vec![Statement::Return(Box::new(ReturnStatement {
+        argument: Some(Expression::Call(Box::new(CallExpression {
+            callee: Expression::Member(Box::new(MemberExpression {
+                object: Expression::This(Span::ZERO),
+                property: MemberProperty::Private(PrivateIdentifier {
+                    name: private_name.to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            })),
+            arguments: vec![Argument::Expression(Expression::Identifier(Identifier {
+                name: "$$value".to_string(),
+                span: Span::ZERO,
+            }))],
+            optional: false,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }))];
+    ClassMember::Method(Box::new(MethodDefinition {
+        key: PropertyKey::Identifier(Identifier {
+            name: public_name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: FunctionExpression {
+            id: None,
+            params: vec![Pattern::Identifier(Identifier {
+                name: "$$value".to_string(),
+                span: Span::ZERO,
+            })],
+            body: BlockStatement { body, span: Span::ZERO },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        },
+        kind: MethodKind::Set,
+        computed: false,
+        r#static: false,
+        span: Span::ZERO,
+    }))
 }
 
 fn rewrite_for_init(init: &mut ForInit, ctx: &mut Ctx) {
