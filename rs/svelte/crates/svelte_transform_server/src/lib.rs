@@ -37,9 +37,13 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     let mut script_imports: Vec<Statement> = Vec::new();
     let mut script_rest: Vec<Statement> = Vec::new();
     let mut uses_props = false;
+    let mut consts: std::collections::HashMap<String, Expression> =
+        std::collections::HashMap::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
-        uses_props = script::rewrite_program_for_server(&mut content);
+        let (uses, rune_bindings) = script::rewrite_program_for_server(&mut content);
+        uses_props = uses;
+        consts = script::collect_script_constants(&content, &rune_bindings);
         let (imports, rest) = partition_imports(&content.body)?;
         script_imports = imports;
         script_rest = rest;
@@ -47,7 +51,12 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
 
     // Build the function body: rune-rewritten script statements first, then template.
     let mut func_body: Vec<Statement> = script_rest;
-    let template_body = lower_fragment_server(&root.fragment)?;
+    // Substitute script constants into every template expression.
+    let mut fragment = root.fragment.clone();
+    if !consts.is_empty() {
+        substitute_consts_in_fragment(&mut fragment, &consts);
+    }
+    let template_body = lower_fragment_server(&fragment)?;
     func_body.extend(template_body);
 
     // Build the parameter list. Runes-mode uses_props adds $$props.
@@ -880,6 +889,107 @@ fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment) -> bool {
         }
     }
     f.nodes.iter().all(is_static)
+}
+
+/// Walk every Expression in a fragment and apply substitute_and_fold.
+fn substitute_consts_in_fragment(
+    f: &mut svelte_ast::fragment::Fragment,
+    consts: &std::collections::HashMap<String, Expression>,
+) {
+    for n in &mut f.nodes {
+        substitute_consts_in_node(n, consts);
+    }
+}
+
+fn substitute_consts_in_node(
+    n: &mut FragmentChild,
+    consts: &std::collections::HashMap<String, Expression>,
+) {
+    match n {
+        FragmentChild::ExpressionTag(t) => script::substitute_and_fold(&mut t.expression, consts),
+        FragmentChild::HtmlTag(t) => script::substitute_and_fold(&mut t.expression, consts),
+        FragmentChild::RegularElement(el) => {
+            for attr in &mut el.attributes {
+                substitute_consts_in_attr(attr, consts);
+            }
+            substitute_consts_in_fragment(&mut el.fragment, consts);
+        }
+        FragmentChild::Component(c) => {
+            for attr in &mut c.attributes {
+                substitute_consts_in_attr(attr, consts);
+            }
+            substitute_consts_in_fragment(&mut c.fragment, consts);
+        }
+        FragmentChild::SvelteElement(el) => {
+            script::substitute_and_fold(&mut el.tag, consts);
+            for attr in &mut el.attributes {
+                substitute_consts_in_attr(attr, consts);
+            }
+            substitute_consts_in_fragment(&mut el.fragment, consts);
+        }
+        FragmentChild::EachBlock(eb) => {
+            script::substitute_and_fold(&mut eb.expression, consts);
+            if let Some(k) = &mut eb.key {
+                script::substitute_and_fold(k, consts);
+            }
+            substitute_consts_in_fragment(&mut eb.body, consts);
+            if let Some(f) = &mut eb.fallback {
+                substitute_consts_in_fragment(f, consts);
+            }
+        }
+        FragmentChild::IfBlock(ib) => {
+            script::substitute_and_fold(&mut ib.test, consts);
+            substitute_consts_in_fragment(&mut ib.consequent, consts);
+            if let Some(a) = &mut ib.alternate {
+                substitute_consts_in_fragment(a, consts);
+            }
+        }
+        FragmentChild::AwaitBlock(ab) => {
+            script::substitute_and_fold(&mut ab.expression, consts);
+            if let Some(p) = &mut ab.pending {
+                substitute_consts_in_fragment(p, consts);
+            }
+            if let Some(t) = &mut ab.then {
+                substitute_consts_in_fragment(t, consts);
+            }
+            if let Some(c) = &mut ab.catch_ {
+                substitute_consts_in_fragment(c, consts);
+            }
+        }
+        FragmentChild::KeyBlock(kb) => {
+            script::substitute_and_fold(&mut kb.expression, consts);
+            substitute_consts_in_fragment(&mut kb.fragment, consts);
+        }
+        _ => {}
+    }
+}
+
+fn substitute_consts_in_attr(
+    attr: &mut ElementAttribute,
+    consts: &std::collections::HashMap<String, Expression>,
+) {
+    match attr {
+        ElementAttribute::Attribute(a) => match &mut a.value {
+            AttributeValue::Single(tag) => {
+                script::substitute_and_fold(&mut tag.expression, consts);
+            }
+            AttributeValue::Many(parts) => {
+                for p in parts {
+                    if let AttributeValuePart::ExpressionTag(t) = p {
+                        script::substitute_and_fold(&mut t.expression, consts);
+                    }
+                }
+            }
+            _ => {}
+        },
+        ElementAttribute::SpreadAttribute(s) => {
+            script::substitute_and_fold(&mut s.expression, consts);
+        }
+        ElementAttribute::BindDirective(b) => {
+            script::substitute_and_fold(&mut b.expression, consts);
+        }
+        _ => {}
+    }
 }
 
 #[allow(dead_code)]

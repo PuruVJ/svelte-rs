@@ -12,17 +12,388 @@
 //!
 //! Walks every Expression/Statement and rewrites in place.
 
+use std::collections::{HashMap, HashSet};
+
 use svelte_js_ast::*;
 
 /// Rewrite a Program in-place to erase server-irrelevant rune calls.
-/// Returns `true` if the program references `$props` / `$$props` (caller
-/// needs to thread `$$props` as a 2nd function parameter).
-pub fn rewrite_program_for_server(p: &mut Program) -> bool {
+/// Returns `(uses_props, rune_bindings)`:
+/// - `uses_props`: program references `$props` / `$$props`
+/// - `rune_bindings`: names of `let X = $state(...)`-style bindings whose
+///   initializer was a rune call. These should NOT be substituted as
+///   compile-time constants even though they look like plain literals
+///   after erasure (they're reactive bindings semantically).
+pub fn rewrite_program_for_server(p: &mut Program) -> (bool, HashSet<String>) {
+    // Pre-pass: collect identifiers bound to rune initializers.
+    let mut rune_bindings: HashSet<String> = HashSet::new();
+    for s in &p.body {
+        collect_rune_bindings_stmt(s, &mut rune_bindings);
+    }
+    // Rune erasure.
     let mut ctx = Ctx { uses_props: false };
     for s in &mut p.body {
         rewrite_statement(s, &mut ctx);
     }
-    ctx.uses_props
+    (ctx.uses_props, rune_bindings)
+}
+
+fn collect_rune_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
+    match s {
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    if is_rune_call(init) {
+                        // Collect every identifier in the LHS pattern.
+                        collect_pattern_names(&d.id, out);
+                    }
+                }
+            }
+        }
+        Statement::Block(b) => {
+            for s in &b.body {
+                collect_rune_bindings_stmt(s, out);
+            }
+        }
+        Statement::ExportNamed(e) => {
+            if let Some(d) = &e.declaration {
+                collect_rune_bindings_stmt(d, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_rune_call(e: &Expression) -> bool {
+    let Expression::Call(c) = e else { return false };
+    let Some(kp) = global_keypath(&c.callee) else { return false };
+    matches!(
+        kp.as_str(),
+        "$state"
+            | "$state.raw"
+            | "$state.eager"
+            | "$derived"
+            | "$derived.by"
+            | "$bindable"
+            | "$props"
+            | "$props.id"
+            | "$effect"
+            | "$inspect"
+    )
+}
+
+fn collect_pattern_names(p: &Pattern, out: &mut HashSet<String>) {
+    match p {
+        Pattern::Identifier(i) => {
+            out.insert(i.name.clone());
+        }
+        Pattern::Array(a) => {
+            for el in a.elements.iter().flatten() {
+                collect_pattern_names(el, out);
+            }
+        }
+        Pattern::Object(o) => {
+            for m in &o.properties {
+                match m {
+                    ObjectPatternMember::Property(p) => collect_pattern_names(&p.value, out),
+                    ObjectPatternMember::Rest(r) => collect_pattern_names(&r.argument, out),
+                }
+            }
+        }
+        Pattern::Rest(r) => collect_pattern_names(&r.argument, out),
+        Pattern::Assignment(a) => collect_pattern_names(&a.left, out),
+        Pattern::Member(_) => {}
+    }
+}
+
+/// Find script bindings that are non-rune, non-mutated, initialized to a
+/// primitive literal — these get inlined at template expression positions.
+/// Returns a map `name -> literal Expression`.
+///
+/// Conservative: requires `let X = LITERAL` (no destructuring, no reassign).
+pub fn collect_script_constants(
+    p: &Program,
+    skip: &HashSet<String>,
+) -> HashMap<String, Expression> {
+    // First pass: collect candidates.
+    let mut candidates: HashMap<String, Expression> = HashMap::new();
+    for s in &p.body {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let Pattern::Identifier(id) = &d.id {
+                    if skip.contains(&id.name) {
+                        continue;
+                    }
+                    if let Some(init) = &d.init {
+                        if is_inlineable_literal(init) {
+                            candidates.insert(id.name.clone(), init.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return candidates;
+    }
+    // Second pass: drop any candidate that's ever reassigned or updated.
+    let mut mutated: HashSet<String> = HashSet::new();
+    for s in &p.body {
+        collect_mutations_stmt(s, &mut mutated);
+    }
+    candidates.retain(|name, _| !mutated.contains(name));
+    candidates
+}
+
+fn is_inlineable_literal(e: &Expression) -> bool {
+    match e {
+        Expression::Literal(_) => true,
+        Expression::Identifier(i) => i.name == "undefined",
+        _ => false,
+    }
+}
+
+fn collect_mutations_stmt(s: &Statement, out: &mut HashSet<String>) {
+    match s {
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    collect_mutations_expr(init, out);
+                }
+            }
+        }
+        Statement::Expression(e) => collect_mutations_expr(&e.expression, out),
+        Statement::Block(b) => {
+            for s in &b.body {
+                collect_mutations_stmt(s, out);
+            }
+        }
+        Statement::Return(r) => {
+            if let Some(a) = &r.argument {
+                collect_mutations_expr(a, out);
+            }
+        }
+        Statement::If(i) => {
+            collect_mutations_expr(&i.test, out);
+            collect_mutations_stmt(&i.consequent, out);
+            if let Some(a) = &i.alternate {
+                collect_mutations_stmt(a, out);
+            }
+        }
+        Statement::For(f) => {
+            if let Some(t) = &f.test {
+                collect_mutations_expr(t, out);
+            }
+            if let Some(u) = &f.update {
+                collect_mutations_expr(u, out);
+            }
+            collect_mutations_stmt(&f.body, out);
+        }
+        Statement::While(w) => {
+            collect_mutations_expr(&w.test, out);
+            collect_mutations_stmt(&w.body, out);
+        }
+        Statement::DoWhile(w) => {
+            collect_mutations_stmt(&w.body, out);
+            collect_mutations_expr(&w.test, out);
+        }
+        Statement::Function(f) => {
+            for s in &f.body.body {
+                collect_mutations_stmt(s, out);
+            }
+        }
+        Statement::ExportNamed(e) => {
+            if let Some(d) = &e.declaration {
+                collect_mutations_stmt(d, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_mutations_expr(e: &Expression, out: &mut HashSet<String>) {
+    match e {
+        Expression::Assignment(a) => {
+            if let AssignmentTarget::Pattern(Pattern::Identifier(i)) = &a.left {
+                out.insert(i.name.clone());
+            }
+            collect_mutations_expr(&a.right, out);
+        }
+        Expression::Update(u) => {
+            if let Expression::Identifier(i) = &u.argument {
+                out.insert(i.name.clone());
+            }
+        }
+        Expression::Call(c) => {
+            collect_mutations_expr(&c.callee, out);
+            for a in &c.arguments {
+                if let Argument::Expression(e) = a {
+                    collect_mutations_expr(e, out);
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            collect_mutations_expr(&b.left, out);
+            collect_mutations_expr(&b.right, out);
+        }
+        Expression::Logical(l) => {
+            collect_mutations_expr(&l.left, out);
+            collect_mutations_expr(&l.right, out);
+        }
+        Expression::Conditional(c) => {
+            collect_mutations_expr(&c.test, out);
+            collect_mutations_expr(&c.consequent, out);
+            collect_mutations_expr(&c.alternate, out);
+        }
+        Expression::Arrow(a) => match &a.body {
+            ArrowBody::Block(b) => {
+                for s in &b.body {
+                    collect_mutations_stmt(s, out);
+                }
+            }
+            ArrowBody::Expression(e) => collect_mutations_expr(e, out),
+        },
+        Expression::Function(f) => {
+            for s in &f.body.body {
+                collect_mutations_stmt(s, out);
+            }
+        }
+        Expression::Member(m) => collect_mutations_expr(&m.object, out),
+        Expression::Sequence(s) => {
+            for e in &s.expressions {
+                collect_mutations_expr(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Substitute identifier references in `e` with literals from `consts`,
+/// then apply simple constant-fold rules (nullish-coalesce of literals,
+/// member access of literals).
+pub fn substitute_and_fold(e: &mut Expression, consts: &HashMap<String, Expression>) {
+    // First substitute identifiers.
+    substitute(e, consts);
+    // Then fold.
+    fold(e);
+}
+
+fn substitute(e: &mut Expression, consts: &HashMap<String, Expression>) {
+    match e {
+        Expression::Identifier(i) => {
+            if let Some(lit) = consts.get(&i.name) {
+                *e = lit.clone();
+            }
+        }
+        Expression::Logical(l) => {
+            substitute(&mut l.left, consts);
+            substitute(&mut l.right, consts);
+        }
+        Expression::Binary(b) => {
+            substitute(&mut b.left, consts);
+            substitute(&mut b.right, consts);
+        }
+        Expression::Conditional(c) => {
+            substitute(&mut c.test, consts);
+            substitute(&mut c.consequent, consts);
+            substitute(&mut c.alternate, consts);
+        }
+        Expression::Call(c) => {
+            substitute(&mut c.callee, consts);
+            for a in &mut c.arguments {
+                if let Argument::Expression(e) = a {
+                    substitute(e, consts);
+                }
+            }
+        }
+        Expression::Member(m) => substitute(&mut m.object, consts),
+        Expression::Unary(u) => substitute(&mut u.argument, consts),
+        Expression::Sequence(s) => {
+            for e in &mut s.expressions {
+                substitute(e, consts);
+            }
+        }
+        Expression::Template(t) => {
+            for ex in &mut t.expressions {
+                substitute(ex, consts);
+            }
+        }
+        Expression::Paren(p) => substitute(&mut p.expression, consts),
+        _ => {}
+    }
+}
+
+fn fold(e: &mut Expression) {
+    match e {
+        Expression::Logical(l) => {
+            fold(&mut l.left);
+            fold(&mut l.right);
+            // `LIT ?? X` → LIT when LIT is non-nullish.
+            if matches!(l.operator, LogicalOperator::Coalesce) {
+                if let Some(true) = is_non_nullish_literal(&l.left) {
+                    let left = std::mem::replace(
+                        &mut l.left,
+                        Expression::Identifier(Identifier {
+                            name: String::new(),
+                            span: Span::ZERO,
+                        }),
+                    );
+                    *e = left;
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            fold(&mut b.left);
+            fold(&mut b.right);
+        }
+        Expression::Conditional(c) => {
+            fold(&mut c.test);
+            fold(&mut c.consequent);
+            fold(&mut c.alternate);
+        }
+        Expression::Call(c) => {
+            fold(&mut c.callee);
+            for a in &mut c.arguments {
+                if let Argument::Expression(e) = a {
+                    fold(e);
+                }
+            }
+        }
+        Expression::Member(m) => fold(&mut m.object),
+        Expression::Unary(u) => fold(&mut u.argument),
+        Expression::Sequence(s) => {
+            for e in &mut s.expressions {
+                fold(e);
+            }
+        }
+        Expression::Paren(p) => {
+            fold(&mut p.expression);
+            // Drop the paren wrapper if its inner is already a literal.
+            if matches!(p.expression, Expression::Literal(_)) {
+                let inner = std::mem::replace(
+                    &mut p.expression,
+                    Expression::Identifier(Identifier {
+                        name: String::new(),
+                        span: Span::ZERO,
+                    }),
+                );
+                *e = inner;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Some(true)` if `e` is a non-null/non-undefined literal. `Some(false)`
+/// if it's explicitly null/undefined. `None` for non-literal.
+fn is_non_nullish_literal(e: &Expression) -> Option<bool> {
+    match e {
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::Null(_) => Some(false),
+            _ => Some(true),
+        },
+        Expression::Identifier(i) if i.name == "undefined" => Some(false),
+        _ => None,
+    }
 }
 
 struct Ctx {
