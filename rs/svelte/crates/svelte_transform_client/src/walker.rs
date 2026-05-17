@@ -27,6 +27,14 @@ use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
 pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Program> {
+    try_typed_client_walker_with(root, component_name, false)
+}
+
+pub fn try_typed_client_walker_with(
+    root: &Root,
+    component_name: &str,
+    use_tree: bool,
+) -> Option<Program> {
     if root.css.is_some() || root.module.is_some() {
         return None;
     }
@@ -52,6 +60,12 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
     let classified: Vec<NodeKind> = nodes.iter().map(|n| classify(n)).collect::<Option<_>>()?;
 
     let is_multi_root = nodes.len() > 1;
+    // Tree-mode: skip the html/body walking entirely and emit a fully-static
+    // `$.from_tree(...)` template + minimal body. Only static fragments are
+    // supported in tree mode for now.
+    if use_tree {
+        return emit_tree_program(&classified, component_name, is_multi_root);
+    }
     let mut html = String::with_capacity(64);
     let mut body_stmts: Vec<Statement> = Vec::new();
     let mut effects: Vec<Statement> = Vec::new(); // emitted after navigation
@@ -156,6 +170,205 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
     prog.push(root_decl);
     prog.push(export);
     Some(t::program(prog))
+}
+
+// ---------------------------------------------------------------------------
+// Tree-mode template emission ($.from_tree)
+// ---------------------------------------------------------------------------
+
+fn emit_tree_program(
+    classified: &[NodeKind],
+    component_name: &str,
+    is_multi_root: bool,
+) -> Option<Program> {
+    // Tree mode currently only supports fully-static templates (every node
+    // serializes to a tree literal). Build the nested array.
+    let mut tree_elements: Vec<Expression> = Vec::new();
+    let last = classified.len() - 1;
+    for (i, kind) in classified.iter().enumerate() {
+        match kind {
+            NodeKind::StaticElement(el) => {
+                tree_elements.push(element_to_tree(el)?);
+            }
+            _ => return None,
+        }
+        if is_multi_root && i < last {
+            tree_elements.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: " ".to_string(),
+                raw: None,
+                span: Span::ZERO,
+            }))));
+        }
+    }
+    let array_expr = Expression::Array(Box::new(ArrayExpression {
+        elements: tree_elements.into_iter().map(ArrayElement::Expression).collect(),
+        span: Span::ZERO,
+    }));
+    let mut from_tree_args = vec![array_expr];
+    if is_multi_root {
+        from_tree_args.push(t::lit_number(1.0));
+    }
+    let root_decl = t::var(
+        "root",
+        t::call(t::member_id(t::id("$"), "from_tree"), from_tree_args),
+    );
+
+    // Body: `var fragment = root(); $.next(N); $.append($$anchor, fragment);`
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var("fragment", t::call(t::id("root"), vec![])));
+    if is_multi_root {
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            vec![t::lit_number(classified.len() as f64)],
+        )));
+    }
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let export = t::export_default_function(
+        component_name,
+        vec![t::pat_id("$$anchor")],
+        body,
+    );
+
+    Some(t::program(vec![
+        t::import_side_effect("svelte/internal/disclose-version"),
+        t::import_side_effect("svelte/internal/flags/legacy"),
+        t::import_namespace("$", "svelte/internal/client"),
+        root_decl,
+        export,
+    ]))
+}
+
+/// Build `[tagname, attrs_or_null, ...children]` for a static element.
+fn element_to_tree(el: &RegularElement) -> Option<Expression> {
+    let mut parts: Vec<Expression> = Vec::new();
+    parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
+        value: el.name.clone(),
+        raw: None,
+        span: Span::ZERO,
+    }))));
+    // Attrs: `null` if empty, else `{ k: v, ... }`.
+    if el.attributes.is_empty() {
+        parts.push(Expression::Literal(Box::new(Literal::Null(Span::ZERO))));
+    } else {
+        let mut props: Vec<ObjectMember> = Vec::new();
+        for attr in &el.attributes {
+            if let ElementAttribute::Attribute(a) = attr {
+                let value = match &a.value {
+                    AttributeValue::Empty => Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                        value: true,
+                        span: Span::ZERO,
+                    }))),
+                    AttributeValue::Many(parts) => {
+                        if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                            return None;
+                        }
+                        let mut s = String::new();
+                        for p in parts {
+                            if let AttributeValuePart::Text(t) = p {
+                                s.push_str(&t.data);
+                            }
+                        }
+                        Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: s,
+                            raw: None,
+                            span: Span::ZERO,
+                        })))
+                    }
+                    _ => return None,
+                };
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: a.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value,
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            } else {
+                return None;
+            }
+        }
+        parts.push(Expression::Object(Box::new(ObjectExpression {
+            properties: props,
+            span: Span::ZERO,
+        })));
+    }
+    // Children: text strings + nested element arrays. Whitespace runs collapse
+    // to a single space.
+    let children = trim_boundary_ws(&el.fragment.nodes);
+    let mut pending_text = String::new();
+    for c in children {
+        match c {
+            FragmentChild::Text(t) => pending_text.push_str(&t.data),
+            FragmentChild::RegularElement(child) => {
+                if !pending_text.is_empty() {
+                    parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
+                        value: collapse_ws(&std::mem::take(&mut pending_text)),
+                        raw: None,
+                        span: Span::ZERO,
+                    }))));
+                }
+                parts.push(element_to_tree(child)?);
+            }
+            _ => return None,
+        }
+    }
+    if !pending_text.is_empty() {
+        parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
+            value: collapse_ws(&pending_text),
+            raw: None,
+            span: Span::ZERO,
+        }))));
+    }
+    Some(Expression::Array(Box::new(ArrayExpression {
+        elements: parts.into_iter().map(ArrayElement::Expression).collect(),
+        span: Span::ZERO,
+    })))
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out
+}
+
+fn trim_boundary_ws(nodes: &[FragmentChild]) -> &[FragmentChild] {
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end {
+        if matches!(&nodes[start], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        if matches!(&nodes[end - 1], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    &nodes[start..end]
 }
 
 // ---------------------------------------------------------------------------

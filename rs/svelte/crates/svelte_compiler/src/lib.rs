@@ -75,10 +75,18 @@ pub fn compile(
             // Apply compile-time Math.X(literal-nums) fold to the fragment
             // before pattern matching so the walker sees constants.
             svelte_transform_client::walker_fold_in_fragment(&mut root.fragment);
-            if let Some(p) = svelte_transform_client::try_typed_client(&root, component_name) {
+            let use_tree = matches!(options.fragments, FragmentsStrategy::Tree);
+            // In tree mode, skip typed_client (static-only $.from_html path)
+            // and route directly to the walker which knows the tree shape.
+            let fast = if use_tree {
+                None
+            } else {
+                svelte_transform_client::try_typed_client(&root, component_name)
+            };
+            if let Some(p) = fast {
                 p
             } else if let Some(p) =
-                svelte_transform_client::try_typed_client_walker(&root, component_name)
+                svelte_transform_client::try_typed_client_walker_with(&root, component_name, use_tree)
             {
                 p
             } else if let Some(p) =
