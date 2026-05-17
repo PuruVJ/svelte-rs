@@ -37,13 +37,18 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     let mut script_imports: Vec<Statement> = Vec::new();
     let mut script_rest: Vec<Statement> = Vec::new();
     let mut uses_props = false;
+    let mut needs_component_wrap = false;
     let mut consts: std::collections::HashMap<String, Expression> =
         std::collections::HashMap::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
-        let (uses, rune_bindings) = script::rewrite_program_for_server(&mut content);
-        uses_props = uses;
-        consts = script::collect_script_constants(&content, &rune_bindings);
+        let info = script::rewrite_program_for_server(&mut content);
+        uses_props = info.uses_props;
+        needs_component_wrap = info.needs_component_wrap();
+        if let Some(name) = &info.single_id_props {
+            script::rewrite_props_destructure(&mut content, name);
+        }
+        consts = script::collect_script_constants(&content, &info.rune_bindings);
         let (imports, rest) = partition_imports(&content.body)?;
         script_imports = imports;
         script_rest = rest;
@@ -58,6 +63,26 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     }
     let template_body = lower_fragment_server(&fragment)?;
     func_body.extend(template_body);
+
+    // When script triggers component-context: wrap the whole body in
+    // `$$renderer.component(($$renderer) => { ... });`.
+    if needs_component_wrap {
+        let inner = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: func_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        func_body = vec![t::stmt(Expression::Call(Box::new(CallExpression {
+            callee: t::member_id(t::id("$$renderer"), "component"),
+            arguments: vec![Argument::Expression(inner)],
+            optional: false,
+            span: Span::ZERO,
+        })))];
+    }
 
     // Build the parameter list. Runes-mode uses_props adds $$props.
     let mut params = vec![t::pat_id("$$renderer")];

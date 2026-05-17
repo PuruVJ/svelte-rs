@@ -16,25 +16,148 @@ use std::collections::{HashMap, HashSet};
 
 use svelte_js_ast::*;
 
+/// Result of `rewrite_program_for_server`.
+pub struct RewriteInfo {
+    pub uses_props: bool,
+    pub rune_bindings: HashSet<String>,
+    /// `Some(name)` when the script has `let name = $props()` — a single
+    /// identifier destructure. Triggers the `$$renderer.component(...)`
+    /// wrap and `let { $$slots, $$events, ...name } = $$props` rewrite.
+    pub single_id_props: Option<String>,
+    /// Set when the script contains a class with rune-initialized fields
+    /// (`a = $state(...)`, `foo = $derived(...)`, etc.) — triggers the
+    /// `$$renderer.component(...)` wrap.
+    pub has_class_with_runes: bool,
+}
+
+impl RewriteInfo {
+    pub fn needs_component_wrap(&self) -> bool {
+        self.single_id_props.is_some() || self.has_class_with_runes
+    }
+}
+
 /// Rewrite a Program in-place to erase server-irrelevant rune calls.
-/// Returns `(uses_props, rune_bindings)`:
-/// - `uses_props`: program references `$props` / `$$props`
-/// - `rune_bindings`: names of `let X = $state(...)`-style bindings whose
-///   initializer was a rune call. These should NOT be substituted as
-///   compile-time constants even though they look like plain literals
-///   after erasure (they're reactive bindings semantically).
-pub fn rewrite_program_for_server(p: &mut Program) -> (bool, HashSet<String>) {
-    // Pre-pass: collect identifiers bound to rune initializers.
+pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
     let mut rune_bindings: HashSet<String> = HashSet::new();
+    let mut single_id_props: Option<String> = None;
+    let mut has_class_with_runes = false;
     for s in &p.body {
         collect_rune_bindings_stmt(s, &mut rune_bindings);
+        check_single_id_props_stmt(s, &mut single_id_props);
+        if stmt_has_class_with_runes(s) {
+            has_class_with_runes = true;
+        }
     }
-    // Rune erasure.
     let mut ctx = Ctx { uses_props: false };
     for s in &mut p.body {
         rewrite_statement(s, &mut ctx);
     }
-    (ctx.uses_props, rune_bindings)
+    if single_id_props.is_some() || has_class_with_runes {
+        ctx.uses_props = true; // emit $$props parameter
+    }
+    RewriteInfo {
+        uses_props: ctx.uses_props,
+        rune_bindings,
+        single_id_props,
+        has_class_with_runes,
+    }
+}
+
+fn check_single_id_props_stmt(s: &Statement, out: &mut Option<String>) {
+    if let Statement::Variable(v) = s {
+        for d in &v.declarations {
+            if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                if is_props_call(init) {
+                    *out = Some(id.name.clone());
+                }
+            }
+        }
+    }
+}
+
+fn is_props_call(e: &Expression) -> bool {
+    if let Expression::Call(c) = e {
+        if let Some(kp) = global_keypath(&c.callee) {
+            return kp == "$props";
+        }
+    }
+    false
+}
+
+fn stmt_has_class_with_runes(s: &Statement) -> bool {
+    match s {
+        Statement::Class(c) => class_has_rune_fields(c),
+        Statement::ExportDefault(e) => match &e.declaration {
+            ExportDefault::Class(c) => class_has_rune_fields(c),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn class_has_rune_fields(c: &ClassDeclaration) -> bool {
+    c.body.body.iter().any(|m| {
+        if let ClassMember::Property(p) = m {
+            if let Some(value) = &p.value {
+                return is_rune_call(value);
+            }
+        }
+        false
+    })
+}
+
+/// Rewrite a single `let X = $$props;` (post rune-erasure) into
+/// `let { $$slots, $$events, ...X } = $$props;`. Used by the component-wrap path.
+pub fn rewrite_props_destructure(p: &mut Program, identifier: &str) {
+    for s in &mut p.body {
+        if let Statement::Variable(v) = s {
+            for d in &mut v.declarations {
+                if let Pattern::Identifier(id) = &d.id {
+                    if id.name == identifier {
+                        // Replace with `{ $$slots, $$events, ...identifier }`.
+                        d.id = Pattern::Object(Box::new(ObjectPattern {
+                            properties: vec![
+                                ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
+                                    key: PropertyKey::Identifier(Identifier {
+                                        name: "$$slots".to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    value: Pattern::Identifier(Identifier {
+                                        name: "$$slots".to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    computed: false,
+                                    shorthand: true,
+                                    span: Span::ZERO,
+                                })),
+                                ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
+                                    key: PropertyKey::Identifier(Identifier {
+                                        name: "$$events".to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    value: Pattern::Identifier(Identifier {
+                                        name: "$$events".to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    computed: false,
+                                    shorthand: true,
+                                    span: Span::ZERO,
+                                })),
+                                ObjectPatternMember::Rest(Box::new(RestElement {
+                                    argument: Pattern::Identifier(Identifier {
+                                        name: identifier.to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    span: Span::ZERO,
+                                })),
+                            ],
+                            span: Span::ZERO,
+                        }));
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn collect_rune_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
