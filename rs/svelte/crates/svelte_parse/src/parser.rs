@@ -64,6 +64,15 @@ impl<'src> Parser<'src> {
         Ok((expr, end))
     }
 
+    /// Parse the body of `{@const ...}` as a VariableDeclaration.
+    pub fn parse_const_decl_at(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<svelte_js_ast::VariableDeclaration, CompileDiagnostic> {
+        crate::oxc_bridge::parse_const_decl_at(self.template, &self.line_map, start, end, self.ts)
+    }
+
     pub fn template_remaining(&self) -> &'src str {
         &self.template[self.index..]
     }

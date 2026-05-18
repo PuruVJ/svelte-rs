@@ -145,6 +145,39 @@ pub fn parse_expression_at_with_comments(
     }
 }
 
+/// Parse a `NAME = EXPR` slice (the body of `{@const NAME = EXPR}`) as a
+/// VariableDeclaration. Wraps the text with `const ` then runs OXC, extracts
+/// the single VariableDeclaration, and shifts spans back to the original
+/// source coordinates.
+pub fn parse_const_decl_at(
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    end: usize,
+    ts: bool,
+) -> Result<svelte_js_ast::VariableDeclaration, CompileDiagnostic> {
+    let body = &full_source[start..end];
+    let synthetic = format!("const {body};");
+    let allocator = Allocator::default();
+    let source_type = SourceType::default().with_typescript(ts).with_module(true);
+    let parser = OxcParser::new(&allocator, &synthetic, source_type).with_options(opts());
+    let ret = parser.parse();
+    if !ret.errors.is_empty() {
+        let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        return Err(js_diag(start, end, msg));
+    }
+    let prefix_len = 6u32; // "const "
+    let shift = Shift((start as i64 - prefix_len as i64).max(0) as u32);
+    let prog = walker::program(&ret.program, shift);
+    // Expect a single Variable statement.
+    for stmt in prog.body {
+        if let svelte_js_ast::Statement::Variable(v) = stmt {
+            return Ok(*v);
+        }
+    }
+    Err(js_diag(start, end, "expected const declaration".into()))
+}
+
 pub fn parse_pattern_at(
     full_source: &str,
     _line_map: &LineMap,

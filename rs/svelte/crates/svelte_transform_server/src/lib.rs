@@ -415,6 +415,11 @@ fn node_has_async(n: &FragmentChild) -> bool {
     match n {
         FragmentChild::ExpressionTag(t) => expr_has_await_top(&t.expression),
         FragmentChild::HtmlTag(t) => expr_has_await_top(&t.expression),
+        FragmentChild::ConstTag(ct) => ct
+            .declaration
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, expr_has_await_top)),
         FragmentChild::RegularElement(el) => {
             el.attributes.iter().any(attr_has_async) || fragment_has_async(&el.fragment)
         }
@@ -906,16 +911,18 @@ fn lower_if_block_server(
     ib: &svelte_ast::blocks::IfBlock,
 ) -> Option<Vec<Statement>> {
     let test_is_async = expr_has_await_top(&ib.test);
+    let consequent_has_const_await = fragment_has_const_with_await(&ib.consequent);
+    let use_async_marker = test_is_async || consequent_has_const_await;
 
     let mut consequent_body: Vec<Statement> = Vec::new();
-    consequent_body.push(if test_is_async {
+    consequent_body.push(if use_async_marker {
         push_string("<!--[0-->")
     } else {
         push_template("<!--[0-->")
     });
     if test_is_async {
         consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
-    } else if fragment_has_const_with_await(&ib.consequent) {
+    } else if consequent_has_const_await {
         // Non-async test but body has `{@const X = await ...}` — promote to
         // nested-run pattern with a local `promises` var.
         consequent_body.extend(lower_fragment_with_const_await(&ib.consequent)?);
@@ -927,7 +934,7 @@ fn lower_if_block_server(
     }
 
     let mut alternate_body: Vec<Statement> = Vec::new();
-    alternate_body.push(if test_is_async {
+    alternate_body.push(if use_async_marker {
         push_string("<!--[-1-->")
     } else {
         push_template("<!--[-1-->")

@@ -237,14 +237,10 @@ fn read_at_tag(
             // `{@const NAME = EXPR}` — ported from
             // `phases/1-parse/state/tag.js:674-711`.
             //
-            // We parse the slice between `{@const ` and the closing `}`
-            // as the synthetic `const NAME = EXPR;` statement via OXC
-            // (it's a VariableDeclaration with one declarator). We then
-            // wrap it in the upstream wire shape (a Program-like inner
-            // VariableDeclaration with `start`/`end` adjusted to point
-            // at `const` rather than `@const`).
-            // STUB: ConstTag declaration is a placeholder VariableDeclaration.
-            // Real OXC -> typed VariableDeclaration walker pending Phase B.
+            // Parse the slice between `{@const ` and the closing `}` as a
+            // synthetic `const NAME = EXPR;` statement via OXC, extract the
+            // VariableDeclaration, and shift spans back to the original
+            // source coordinates.
             parser.allow_whitespace();
             let decl_start = parser.index;
             let close = find_unmatched_brace(parser.template, parser.index).ok_or_else(|| {
@@ -253,6 +249,7 @@ fn read_at_tag(
                     "}",
                 )
             })?;
+            let declaration = parser.parse_const_decl_at(decl_start, close)?;
             parser.index = close;
             if !parser.eat("}") {
                 return Err(errors::expected_token(
@@ -260,11 +257,6 @@ fn read_at_tag(
                     "}",
                 ));
             }
-            let declaration = svelte_js_ast::VariableDeclaration {
-                kind: svelte_js_ast::VariableKind::Const,
-                declarations: Vec::new(),
-                span: svelte_js_ast::Span::new((start + 2) as u32, close as u32),
-            };
             Ok(FragmentChild::ConstTag(ConstTag {
                 start: start as u32,
                 end: parser.index as u32,
