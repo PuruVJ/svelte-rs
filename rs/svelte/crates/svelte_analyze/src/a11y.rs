@@ -690,7 +690,7 @@ fn is_strictly_interactive_html_element(
     matches!(
         tag,
         "button" | "select" | "textarea" | "summary" | "details"
-        | "menuitem" | "option" | "tr"
+        | "menuitem" | "option" | "tr" | "dialog"
     )
 }
 

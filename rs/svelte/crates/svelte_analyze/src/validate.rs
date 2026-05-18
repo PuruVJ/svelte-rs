@@ -76,6 +76,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
         validate_script_attributes(&s.attributes, &mut state);
         visit_program(&s.content, /*is_instance=*/ true, &mut state);
         validate_props_identifier(&s.content, &mut state);
+        validate_legacy_component_creation(&s.content, &mut state);
         if state.is_runes {
             validate_store_rune_conflict(&s.content, &mut state);
             validate_perf_avoid_class(&s.content, /*is_instance=*/ true, &mut state);
@@ -102,6 +103,58 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
             .push(errors::mixed_event_handler_syntaxes(Some((start, end)), &name));
     }
     (state.warnings, state.errors)
+}
+
+/// `legacy_component_creation`: emit when `new Component({ target: ... })`
+/// is called on a default import from a `.svelte` file. Mirrors
+/// `visitors/ExpressionStatement.js`.
+fn validate_legacy_component_creation(
+    program: &svelte_js_ast::Program,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    // Build a map of default-svelte-import identifiers from the program.
+    let mut default_svelte_imports: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for stmt in &program.body {
+        if let Statement::Import(d) = stmt {
+            let src = &d.source.value;
+            if !src.ends_with(".svelte") {
+                continue;
+            }
+            for spec in &d.specifiers {
+                if let ImportSpecifierKind::Default(s) = spec {
+                    default_svelte_imports.insert(s.local.name.clone());
+                }
+            }
+        }
+    }
+    if default_svelte_imports.is_empty() {
+        return;
+    }
+    for stmt in &program.body {
+        let Statement::Expression(es) = stmt else { continue };
+        let Expression::New(n) = &es.expression else { continue };
+        if n.arguments.len() != 1 {
+            continue;
+        }
+        let Expression::Identifier(id) = &n.callee else { continue };
+        if !default_svelte_imports.contains(&id.name) {
+            continue;
+        }
+        let Argument::Expression(Expression::Object(obj)) = &n.arguments[0] else {
+            continue;
+        };
+        let has_target = obj.properties.iter().any(|p| matches!(p, ObjectMember::Property(prop) if matches!(&prop.key, PropertyKey::Identifier(k) if k.name == "target")));
+        if has_target {
+            state
+                .warnings
+                .push(warnings::legacy_component_creation(Some((
+                    n.span.start,
+                    n.span.end,
+                ))));
+        }
+    }
 }
 
 /// `perf_avoid_inline_class` + `perf_avoid_nested_class`. Walks the
@@ -636,7 +689,8 @@ fn parse_svelte_ignore(comment: &str) -> Vec<String> {
         return Vec::new();
     };
     after
-        .split_whitespace()
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
         .map(|s| {
             // Upstream accepts both `a11y-foo` and `a11y_foo` syntax. Convert
             // the dash-syntax variant into the underscore-canonical form so
@@ -648,8 +702,9 @@ fn parse_svelte_ignore(comment: &str) -> Vec<String> {
 
 fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
     // Track svelte-ignore codes from sibling Comment nodes — they apply to the
-    // next non-comment, non-whitespace-text node. Text nodes between the
-    // comment and the target element don't clear pending ignores.
+    // *next* non-comment/non-whitespace sibling and (via visit_node recursion)
+    // its descendants, then reset. Comma-separated codes inside a single
+    // comment are supported. Multiple consecutive comments stack.
     let mut pending_ignores: Vec<String> = Vec::new();
     for node in &fragment.nodes {
         match node {
@@ -1016,39 +1071,55 @@ fn classify_custom_tag(tag: &str) -> CustomElementCheck {
     CustomElementCheck::Ok
 }
 
-/// Walk a Pattern and call `cb` for each `Rest(Identifier)` we find.
+/// Walk a Pattern and call `cb` for each `Rest`-introduced name we find.
+/// A "rest" creates a new object/array, so any `bind:` to that name is
+/// disconnected from the original — that's what `bind_invalid_each_rest`
+/// warns about. We walk recursively to surface names hidden inside nested
+/// rest patterns like `[first, ...[third, ...{ length }]]`.
 fn collect_rest_binding_names<F: FnMut(&str, (u32, u32))>(
     pat: &svelte_js_ast::Pattern,
     cb: &mut F,
 ) {
+    fn walk_inside_rest<F: FnMut(&str, (u32, u32))>(
+        p: &svelte_js_ast::Pattern,
+        cb: &mut F,
+    ) {
+        use svelte_js_ast::*;
+        match p {
+            Pattern::Identifier(id) => cb(&id.name, (id.span.start, id.span.end)),
+            Pattern::Object(obj) => {
+                for m in &obj.properties {
+                    match m {
+                        ObjectPatternMember::Property(p) => walk_inside_rest(&p.value, cb),
+                        ObjectPatternMember::Rest(r) => walk_inside_rest(&r.argument, cb),
+                    }
+                }
+            }
+            Pattern::Array(arr) => {
+                for el in arr.elements.iter().flatten() {
+                    walk_inside_rest(el, cb);
+                }
+            }
+            Pattern::Rest(r) => walk_inside_rest(&r.argument, cb),
+            _ => {}
+        }
+    }
     use svelte_js_ast::*;
     match pat {
         Pattern::Object(obj) => {
             for m in &obj.properties {
                 match m {
-                    ObjectPatternMember::Property(p) => {
-                        collect_rest_binding_names(&p.value, cb);
-                    }
-                    ObjectPatternMember::Rest(r) => {
-                        if let Pattern::Identifier(id) = &r.argument {
-                            cb(&id.name, (id.span.start, id.span.end));
-                        }
-                    }
+                    ObjectPatternMember::Property(p) => collect_rest_binding_names(&p.value, cb),
+                    ObjectPatternMember::Rest(r) => walk_inside_rest(&r.argument, cb),
                 }
             }
         }
         Pattern::Array(arr) => {
-            for el in &arr.elements {
-                if let Some(p) = el {
-                    collect_rest_binding_names(p, cb);
-                }
+            for el in arr.elements.iter().flatten() {
+                collect_rest_binding_names(el, cb);
             }
         }
-        Pattern::Rest(r) => {
-            if let Pattern::Identifier(id) = &r.argument {
-                cb(&id.name, (id.span.start, id.span.end));
-            }
-        }
+        Pattern::Rest(r) => walk_inside_rest(&r.argument, cb),
         _ => {}
     }
 }
