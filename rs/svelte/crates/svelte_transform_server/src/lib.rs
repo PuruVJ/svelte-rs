@@ -695,7 +695,22 @@ fn lower_fragment_server_async_with(
         buf.push_str("<!---->");
     }
 
+    // Track Comment-before-Text collapse, same rule as `lower_fragment_with_marker`.
+    let mut after_dropped_comment = false;
     for n in nodes.iter() {
+        if after_dropped_comment {
+            if let FragmentChild::Text(t) = n {
+                let escaped = escape_text(&collapse_ws(&t.data));
+                buf.push_str_after_comment(&escaped);
+                after_dropped_comment = false;
+                continue;
+            }
+            after_dropped_comment = false;
+        }
+        if let FragmentChild::Comment(_) = n {
+            after_dropped_comment = true;
+            continue;
+        }
         match n {
             FragmentChild::RegularElement(el) => {
                 // Detect: element whose only non-ws child is an
@@ -1219,6 +1234,12 @@ fn lower_fragment_with_marker(
     let nodes = trim_boundary_text(nodes);
     let mut emitted_static_push = false;
     let mut last_was_component = false;
+    // True when the previous node was a Comment whose leading whitespace
+    // pairs with the following text's leading whitespace — strip the lead
+    // so we collapse the `text<comment>text` whitespace bridge to ONE space.
+    // Extracted SnippetBlocks DON'T set this (they preserve the boundary
+    // and let two adjacent texts emit two spaces).
+    let mut after_dropped_comment = false;
     for n in nodes.iter() {
         // Before processing this node, if the previous node was a Component
         // and we're now about to emit non-Component content, push `<!---->`
@@ -1228,6 +1249,21 @@ fn lower_fragment_with_marker(
                 buf.push_str("<!---->");
                 last_was_component = false;
             }
+        }
+        // Text immediately after a dropped Comment: collapse leading
+        // whitespace against the previous trailing whitespace.
+        if after_dropped_comment {
+            if let FragmentChild::Text(t) = n {
+                let escaped = escape_text(&collapse_ws(&t.data));
+                buf.push_str_after_comment(&escaped);
+                after_dropped_comment = false;
+                continue;
+            }
+            after_dropped_comment = false;
+        }
+        if let FragmentChild::Comment(_) = n {
+            after_dropped_comment = true;
+            continue;
         }
         // `<option>` ANYWHERE (even outside `<select>`) becomes
         // `$$renderer.option(...)` — mirrors upstream's `is_option_special`
@@ -1704,7 +1740,7 @@ fn build_if_chain_for_select(
         let children = trim_boundary_whitespace(&ib.consequent.nodes);
         let children = trim_boundary_text(children);
         for c in children.iter() {
-            lower_select_child(c, &mut inner_buf, &mut consequent_body, each_counter)?;
+            lower_select_child_loop_body(c, &mut inner_buf, &mut consequent_body, each_counter)?;
         }
         if let Some(stmt) = inner_buf.flush() {
             consequent_body.push(stmt);
@@ -1716,7 +1752,7 @@ fn build_if_chain_for_select(
         let children = trim_boundary_whitespace(&alt.nodes);
         let children = trim_boundary_text(children);
         for c in children.iter() {
-            lower_select_child(c, &mut inner_buf, &mut alternate_body, each_counter)?;
+            lower_select_child_loop_body(c, &mut inner_buf, &mut alternate_body, each_counter)?;
         }
         if let Some(stmt) = inner_buf.flush() {
             alternate_body.push(stmt);
@@ -2903,11 +2939,14 @@ impl TemplateBuf {
     }
 
     fn push_str(&mut self, s: &str) {
+        self.parts.last_mut().unwrap().push_str(s);
+    }
+
+    /// Append `s` but dedupe a leading whitespace char when the buf already
+    /// ends in space. Used after a Comment is dropped to collapse the
+    /// text-comment-text whitespace bridge.
+    fn push_str_after_comment(&mut self, s: &str) {
         let last = self.parts.last_mut().unwrap();
-        // Collapse runs of whitespace across pushes: if the last char of the
-        // buffer is space and the incoming text starts with whitespace, drop
-        // the leading whitespace. This matches upstream's behavior of treating
-        // `text\nwhitespace<!--comment-->\nmore_text` as a single space.
         if last.ends_with(' ') {
             let trimmed = s.trim_start_matches(|c: char| c.is_whitespace());
             last.push_str(trimmed);
