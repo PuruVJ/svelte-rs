@@ -90,6 +90,9 @@ pub fn try_typed_client_walker_with(
         if let FragmentChild::SvelteElement(se) = nodes[0] {
             return emit_single_svelte_element_program(se, component_name, &script);
         }
+        if let FragmentChild::Component(c) = nodes[0] {
+            return emit_single_component_program(c, component_name, &script);
+        }
     }
 
     let classified: Vec<NodeKind> = nodes.iter().map(|n| classify(n)).collect::<Option<_>>()?;
@@ -527,6 +530,239 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
 
     let params = vec![t::pat_id("$$anchor"), t::pat_id("$$props")];
     let export = t::export_default_function(component_name, params, body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+// ---------------------------------------------------------------------------
+// Single top-level <Component> emission
+// ---------------------------------------------------------------------------
+
+fn emit_single_component_program(
+    c: &Component,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    let mut props: Vec<ObjectMember> = Vec::new();
+    for attr in &c.attributes {
+        match attr {
+            ElementAttribute::Attribute(a) => {
+                let value: Expression = match &a.value {
+                    AttributeValue::Empty => Expression::Literal(Box::new(Literal::Boolean(
+                        BooleanLiteral {
+                            value: true,
+                            span: Span::ZERO,
+                        },
+                    ))),
+                    AttributeValue::Single(tag) => {
+                        let mut v = tag.expression.clone();
+                        rewrite_expr_for_state(&mut v, &script.state_bindings);
+                        v
+                    }
+                    AttributeValue::Many(parts) => {
+                        if parts.len() == 1 {
+                            match &parts[0] {
+                                AttributeValuePart::Text(t) => {
+                                    Expression::Literal(Box::new(Literal::String(StringLiteral {
+                                        value: t.data.clone(),
+                                        raw: None,
+                                        span: Span::ZERO,
+                                    })))
+                                }
+                                AttributeValuePart::ExpressionTag(e) => {
+                                    let mut v = e.expression.clone();
+                                    rewrite_expr_for_state(&mut v, &script.state_bindings);
+                                    v
+                                }
+                            }
+                        } else {
+                            return None;
+                        }
+                    }
+                };
+                // Detect shorthand: `{onmouseup}` parses to `Attribute name=onmouseup,
+                // value=Single(ExpressionTag(Identifier "onmouseup"))`. Emit as
+                // shorthand when the value is exactly an identifier matching the key.
+                let shorthand = matches!(&value, Expression::Identifier(i) if i.name == a.name);
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: a.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value,
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            }
+            ElementAttribute::SpreadAttribute(s) => {
+                props.push(ObjectMember::Spread(Box::new(SpreadElement {
+                    argument: s.expression.clone(),
+                    span: Span::ZERO,
+                })));
+            }
+            _ => return None,
+        }
+    }
+
+    // Default slot from the component body, if non-empty.
+    let body_non_ws: Vec<&FragmentChild> = c
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        })
+        .collect();
+    if !body_non_ws.is_empty() {
+        // Build a children arrow: `($$anchor, $$slotProps) => { ... }`
+        // Currently only handle text-only body (mix of text + expressions).
+        let mut parts: Vec<TextPart> = Vec::new();
+        for child in &c.fragment.nodes {
+            match child {
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
+                _ => return None,
+            }
+        }
+        // Drop entirely-whitespace boundary Static parts.
+        while parts
+            .first()
+            .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+            .unwrap_or(false)
+        {
+            parts.remove(0);
+        }
+        while parts
+            .last()
+            .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+            .unwrap_or(false)
+        {
+            parts.pop();
+        }
+        // Trim leading whitespace inside the FIRST Static part and trailing
+        // whitespace inside the LAST.
+        if let Some(TextPart::Static(s)) = parts.first_mut() {
+            *s = s.trim_start().to_string();
+        }
+        if let Some(TextPart::Static(s)) = parts.last_mut() {
+            *s = s.trim_end().to_string();
+        }
+
+        let mut slot_body: Vec<Statement> = Vec::new();
+        slot_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            Vec::new(),
+        )));
+        slot_body.push(t::var(
+            "text",
+            t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        ));
+        let inline = build_inline_template(&parts, &script.state_bindings);
+        let fn_body = t::call(
+            t::member_id(t::id("$"), "set_text"),
+            vec![t::id("text"), inline],
+        );
+        let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(fn_body),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        slot_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![fn_arrow],
+        )));
+        slot_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id("$$anchor"), t::id("text")],
+        )));
+        let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: slot_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: "children".to_string(),
+                span: Span::ZERO,
+            }),
+            value: children_arrow,
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
+        // `$$slots: { default: true }`
+        props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: "$$slots".to_string(),
+                span: Span::ZERO,
+            }),
+            value: Expression::Object(Box::new(ObjectExpression {
+                properties: vec![ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: "default".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    value: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                        value: true,
+                        span: Span::ZERO,
+                    }))),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                }))],
+                span: Span::ZERO,
+            })),
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
+    }
+
+    let component_call = Expression::Call(Box::new(CallExpression {
+        callee: t::id(&c.name),
+        arguments: vec![
+            Argument::Expression(t::id("$$anchor")),
+            Argument::Expression(Expression::Object(Box::new(ObjectExpression {
+                properties: props,
+                span: Span::ZERO,
+            }))),
+        ],
+        optional: false,
+        span: Span::ZERO,
+    }));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::stmt(component_call));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
@@ -1884,7 +2120,52 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                     rewrite_stmt_for_state(s, state);
                 }
             }
-            ArrowBody::Expression(e) => rewrite_expr_for_state(e, state),
+            ArrowBody::Expression(body_expr) => {
+                // Special case: `() => X = V` where X is a state binding and
+                // the operator is plain `=`. The arrow body's expression
+                // value is observed (event handler return value), so emit
+                // `$.set(X, V, true)` with the notify flag.
+                let mut handled = false;
+                if let E::Assignment(asgn) = body_expr {
+                    if matches!(asgn.operator, AssignmentOperator::Assign) {
+                        let lhs_name = match &asgn.left {
+                            AssignmentTarget::Expression(E::Identifier(id)) => {
+                                Some(id.name.clone())
+                            }
+                            AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
+                                Some(id.name.clone())
+                            }
+                            _ => None,
+                        };
+                        if let Some(name) = lhs_name {
+                            if state.contains(&name) {
+                                rewrite_expr_for_state(&mut asgn.right, state);
+                                let rhs = std::mem::replace(
+                                    &mut asgn.right,
+                                    Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                                );
+                                *body_expr = t::call(
+                                    t::member_id(t::id("$"), "set"),
+                                    vec![
+                                        t::id(&name),
+                                        rhs,
+                                        Expression::Literal(Box::new(Literal::Boolean(
+                                            BooleanLiteral {
+                                                value: true,
+                                                span: Span::ZERO,
+                                            },
+                                        ))),
+                                    ],
+                                );
+                                handled = true;
+                            }
+                        }
+                    }
+                }
+                if !handled {
+                    rewrite_expr_for_state(body_expr, state);
+                }
+            }
         },
         E::Function(f) => {
             for s in &mut f.body.body {
