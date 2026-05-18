@@ -517,13 +517,82 @@ fn emit_single_each_program(
     let mut hoisted: Vec<Statement> = Vec::new();
     let mut body_stmts: Vec<Statement> = Vec::new();
 
+    let mut delegated_events: HashSet<String> = HashSet::new();
     if body_nodes.len() == 1 {
         if let FragmentChild::RegularElement(el) = body_nodes[0] {
-            // Wrapper element body. Hoist `var root_1 = $.from_html(\`<el></el>\`);`
-            // and inside the each callback: `var p = root_1(); p.textContent = ...; \$.append($$anchor, p)`.
-            // Only support the simple single-expression DirectText case here.
+            // Wrapper element body. Categorize attributes: static (HTML),
+            // dynamic (\$.set_attribute), event (\$.delegated).
+            let mut static_attrs: Vec<&Attribute> = Vec::new();
+            let mut dyn_attrs: Vec<(&Attribute, &Expression)> = Vec::new();
+            let mut events: Vec<(String, &Expression)> = Vec::new();
+            for attr in &el.attributes {
+                match attr {
+                    ElementAttribute::Attribute(a) => {
+                        if is_event_name(&a.name) {
+                            if let AttributeValue::Single(tag) = &a.value {
+                                events.push((a.name[2..].to_string(), &tag.expression));
+                                continue;
+                            }
+                            return None;
+                        }
+                        match &a.value {
+                            AttributeValue::Empty => static_attrs.push(a),
+                            AttributeValue::Many(parts) => {
+                                if parts
+                                    .iter()
+                                    .all(|p| matches!(p, AttributeValuePart::Text(_)))
+                                {
+                                    static_attrs.push(a);
+                                } else {
+                                    return None;
+                                }
+                            }
+                            AttributeValue::Single(tag) => {
+                                dyn_attrs.push((a, &tag.expression));
+                            }
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+
+            // Hoist `var root_1 = \$.from_html(\`<el ...>body</el>\`);`
             let mut html = String::new();
-            serialize_element(el, &mut html, /*body*/ false, /*reactive*/ false)?;
+            html.push('<');
+            html.push_str(&el.name);
+            for a in &static_attrs {
+                write_static_attr(a, &mut html)?;
+            }
+            // Classify the body children: collect text + expression parts.
+            let mut body_parts: Vec<TextPart> = Vec::new();
+            let mut body_is_static = true;
+            if !is_void(&el.name) {
+                for c in &el.fragment.nodes {
+                    match c {
+                        FragmentChild::Text(t) => {
+                            body_parts.push(TextPart::Static(t.data.clone()));
+                        }
+                        FragmentChild::ExpressionTag(et) => {
+                            body_parts.push(TextPart::Expr(&et.expression));
+                            body_is_static = false;
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            if is_void(&el.name) {
+                html.push_str("/>");
+            } else {
+                html.push('>');
+                if body_is_static {
+                    for c in &el.fragment.nodes {
+                        serialize_static_child(c, &mut html)?;
+                    }
+                }
+                html.push_str("</");
+                html.push_str(&el.name);
+                html.push('>');
+            }
             hoisted.push(t::var(
                 "root_1",
                 t::call(
@@ -533,65 +602,90 @@ fn emit_single_each_program(
             ));
             let var = el.name.clone();
             body_stmts.push(t::var(&var, t::call(t::id("root_1"), vec![])));
-            // Inspect children: at most one ExpressionTag adjacent to optional
-            // static text. If purely static, leave the textContent in the
-            // template literal. If single expression that's a context/index
-            // identifier, emit `p.textContent = \`...${ident}\``.
-            let mut parts: Vec<TextPart> = Vec::new();
-            for c in &el.fragment.nodes {
-                match c {
-                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
-                    FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
-                    _ => return None,
+
+            // Body interpolation: `el.textContent = \`...\`` if expressions present.
+            if !body_is_static {
+                let mut quasis: Vec<String> = Vec::new();
+                let mut subs: Vec<Expression> = Vec::new();
+                let mut current = String::new();
+                // Trim boundary whitespace.
+                let mut trimmed = body_parts.clone();
+                while trimmed
+                    .first()
+                    .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+                    .unwrap_or(false)
+                {
+                    trimmed.remove(0);
                 }
-            }
-            while parts
-                .first()
-                .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
-                .unwrap_or(false)
-            {
-                parts.remove(0);
-            }
-            while parts
-                .last()
-                .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
-                .unwrap_or(false)
-            {
-                parts.pop();
-            }
-            // Build textContent template literal.
-            let mut quasis: Vec<String> = Vec::new();
-            let mut subs: Vec<Expression> = Vec::new();
-            let mut current = String::new();
-            for p in &parts {
-                match p {
-                    TextPart::Static(s) => current.push_str(s),
-                    TextPart::Expr(e) => {
-                        quasis.push(std::mem::take(&mut current));
-                        subs.push((*e).clone());
+                while trimmed
+                    .last()
+                    .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+                    .unwrap_or(false)
+                {
+                    trimmed.pop();
+                }
+                for p in &trimmed {
+                    match p {
+                        TextPart::Static(s) => current.push_str(s),
+                        TextPart::Expr(e) => {
+                            quasis.push(std::mem::take(&mut current));
+                            subs.push((*e).clone());
+                        }
                     }
                 }
+                quasis.push(current);
+                let tmpl = t::template_raw(quasis, subs);
+                let target = Expression::Member(Box::new(MemberExpression {
+                    object: t::id(&var),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "textContent".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }));
+                body_stmts.push(t::stmt(Expression::Assignment(Box::new(
+                    AssignmentExpression {
+                        left: AssignmentTarget::Expression(target),
+                        operator: AssignmentOperator::Assign,
+                        right: tmpl,
+                        span: Span::ZERO,
+                    },
+                ))));
             }
-            quasis.push(current);
-            let tmpl = t::template_raw(quasis, subs);
-            let target = Expression::Member(Box::new(MemberExpression {
-                object: t::id(&var),
-                property: MemberProperty::Identifier(Identifier {
-                    name: "textContent".to_string(),
-                    span: Span::ZERO,
-                }),
-                computed: false,
-                optional: false,
-                span: Span::ZERO,
-            }));
-            body_stmts.push(t::stmt(Expression::Assignment(Box::new(
-                AssignmentExpression {
-                    left: AssignmentTarget::Expression(target),
-                    operator: AssignmentOperator::Assign,
-                    right: tmpl,
-                    span: Span::ZERO,
-                },
-            ))));
+
+            // Dynamic attribute setters.
+            for (a, expr) in &dyn_attrs {
+                body_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "set_attribute"),
+                    vec![
+                        t::id(&var),
+                        Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: a.name.clone(),
+                            raw: None,
+                            span: Span::ZERO,
+                        }))),
+                        (*expr).clone(),
+                    ],
+                )));
+            }
+            // Event delegation.
+            for (event, handler) in &events {
+                delegated_events.insert(event.clone());
+                body_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "delegated"),
+                    vec![
+                        Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: event.clone(),
+                            raw: None,
+                            span: Span::ZERO,
+                        }))),
+                        t::id(&var),
+                        (*handler).clone(),
+                    ],
+                )));
+            }
             body_stmts.push(t::stmt(t::call(
                 t::member_id(t::id("$"), "append"),
                 vec![t::id("$$anchor"), t::id(&var)],
@@ -711,7 +805,7 @@ fn emit_single_each_program(
 
     let export = t::export_default_function(component_name, vec![t::pat_id("$$anchor")], func_body);
 
-    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len() + hoisted.len());
+    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len() + hoisted.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
@@ -720,6 +814,29 @@ fn emit_single_each_program(
     prog.extend(script.imports.clone());
     prog.extend(hoisted);
     prog.push(export);
+    if !delegated_events.is_empty() {
+        let mut names: Vec<String> = delegated_events.into_iter().collect();
+        names.sort();
+        let arr = Expression::Array(Box::new(ArrayExpression {
+            elements: names
+                .into_iter()
+                .map(|n| {
+                    ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
+                        StringLiteral {
+                            value: n,
+                            raw: None,
+                            span: Span::ZERO,
+                        },
+                    ))))
+                })
+                .collect(),
+            span: Span::ZERO,
+        }));
+        prog.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "delegate"),
+            vec![arr],
+        )));
+    }
     Some(t::program(prog))
 }
 
@@ -1620,7 +1737,7 @@ enum ElementContent<'a> {
     Reactive(Vec<TextPart<'a>>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum TextPart<'a> {
     Static(String),
     Expr(&'a Expression),
