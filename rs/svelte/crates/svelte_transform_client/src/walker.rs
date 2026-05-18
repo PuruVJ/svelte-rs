@@ -142,6 +142,31 @@ pub fn try_typed_client_walker_with(
         }
     }
 
+    // Multi-IfBlock async case: top-level non-trivial nodes are IfBlocks
+    // (comments and whitespace text dropped) AND the script is in async
+    // mode → route to the dedicated emitter (matches async-if-chain).
+    if script.async_info.is_some() {
+        let block_nodes: Vec<&FragmentChild> = nodes
+            .iter()
+            .filter(|n| !matches!(n, FragmentChild::Comment(_)))
+            .copied()
+            .collect();
+        if block_nodes.len() >= 2
+            && block_nodes
+                .iter()
+                .all(|n| matches!(n, FragmentChild::IfBlock(_)))
+        {
+            let if_blocks: Vec<&svelte_ast::blocks::IfBlock> = block_nodes
+                .iter()
+                .filter_map(|n| match n {
+                    FragmentChild::IfBlock(ib) => Some(ib),
+                    _ => None,
+                })
+                .collect();
+            return emit_async_if_chain_program(&if_blocks, component_name, &script);
+        }
+    }
+
     // Pre-process: coalesce runs of consecutive Text + ExpressionTag at
     // top-level into a single TopLevelText group so they share one
     // text-node anchor. Other nodes pass through unchanged.
@@ -1677,6 +1702,773 @@ fn array_expression_from_exprs(exprs: Vec<Expression>) -> ArrayExpression {
     }
 }
 
+/// Shared counter pool used by `emit_async_if_chain_program`. Each
+/// `next_X` returns the next "bare" name (index 0) or `name_N` for higher.
+#[derive(Default)]
+struct ChainCounters {
+    consequent: usize,
+    alternate: usize,
+    text: usize,
+    node: usize,
+    fragment: usize,
+    d: usize,
+}
+
+fn nth_name(prefix: &str, idx: usize) -> String {
+    if idx == 0 {
+        prefix.to_string()
+    } else {
+        format!("{prefix}_{idx}")
+    }
+}
+
+impl ChainCounters {
+    fn next_consequent(&mut self) -> String {
+        let s = nth_name("consequent", self.consequent);
+        self.consequent += 1;
+        s
+    }
+    fn next_alternate(&mut self) -> String {
+        let s = nth_name("alternate", self.alternate);
+        self.alternate += 1;
+        s
+    }
+    fn next_text(&mut self) -> String {
+        let s = nth_name("text", self.text);
+        self.text += 1;
+        s
+    }
+    fn next_node(&mut self) -> String {
+        let s = nth_name("node", self.node);
+        self.node += 1;
+        s
+    }
+    fn next_fragment(&mut self) -> String {
+        let s = nth_name("fragment", self.fragment);
+        self.fragment += 1;
+        s
+    }
+    fn next_d(&mut self) -> String {
+        let s = if self.d == 0 { "d".to_string() } else { format!("d_{}", self.d) };
+        self.d += 1;
+        s
+    }
+}
+
+/// Compile a sequence of top-level IfBlocks in async mode (the async-if-chain
+/// shape). Each IfBlock either gets a `$.async(...)` wrap (when it has
+/// blockers and/or async-test) or stays as a plain `{}` block.
+fn emit_async_if_chain_program(
+    if_blocks: &[&svelte_ast::blocks::IfBlock],
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    let ai = script.async_info.as_ref()?;
+
+    // Module-level template: N `<!>` placeholders separated by single spaces.
+    let template_html = (0..if_blocks.len())
+        .map(|_| "<!>")
+        .collect::<Vec<_>>()
+        .join(" ");
+    let root_decl = t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec![template_html], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    );
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    // `script.body` already contains the async setup statements when
+    // `async_info.is_some()` (set by `analyze_script`).
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::id("root"), Vec::new()),
+    ));
+
+    let mut counters = ChainCounters::default();
+    // The top-level `var fragment = root();` consumes the bare `fragment`
+    // name (counter slot 0) so subsequent break-out fragments get
+    // `fragment_1`, `fragment_2`, ...
+    let _ = counters.next_fragment();
+    let mut prev_node_name: String = counters.next_node(); // "node"
+    func_body.push(t::var(
+        &prev_node_name,
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+
+    for (i, ib) in if_blocks.iter().enumerate() {
+        let node_name = if i == 0 {
+            prev_node_name.clone()
+        } else {
+            let new_name = counters.next_node();
+            func_body.push(t::var(
+                &new_name,
+                t::call(
+                    t::member_id(t::id("$"), "sibling"),
+                    vec![t::id(&prev_node_name), t::lit_number(2.0)],
+                ),
+            ));
+            new_name
+        };
+        let stmt = emit_async_if_block(
+            ib,
+            &node_name,
+            ai,
+            &script.derived_bindings,
+            &mut counters,
+            false,
+        )?;
+        func_body.push(stmt);
+        prev_node_name = node_name;
+    }
+
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/async"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(root_decl);
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit a single if-block at the given node anchor. Returns either a
+/// `$.async(node, …)` Statement or a `{…}` plain block.
+///
+/// `nested` = true when this if-block is itself the result of an elseif
+/// break-out (different node-variable naming from a top-level $.async).
+fn emit_async_if_block(
+    ib: &svelte_ast::blocks::IfBlock,
+    node_name: &str,
+    ai: &AsyncInfo,
+    derived_bindings: &HashSet<String>,
+    counters: &mut ChainCounters,
+    in_async_ctx: bool,
+) -> Option<Statement> {
+    let test_is_async = expr_top_await(&ib.test);
+    let mut blocker_indices: std::collections::BTreeSet<usize> =
+        std::collections::BTreeSet::new();
+    collect_chain_blockers(ib, &ai.blocker_bindings, &mut blocker_indices);
+    let indices_vec: Vec<usize> = blocker_indices.iter().copied().collect();
+    let has_blockers = !indices_vec.is_empty();
+    let needs_async_wrap = test_is_async || has_blockers;
+
+    // Build the if-chain body inside the closure. Each branch produces a
+    // consequent (or alternate for the final else) ARROW VAR declared in the
+    // current closure scope, plus its $$render(...) call.
+    let mut chain_body: Vec<Statement> = Vec::new();
+
+    // Track allocated consequent/alternate names + their tests for the $.if call.
+    let mut branches: Vec<(String, Expression, i32)> = Vec::new();
+    let mut alt_arrow_name: Option<String> = None;
+
+    // The first branch is the IfBlock itself; flatten elseif chain unless it
+    // breaks out (await test or new blockers).
+    let mut cur = ib;
+    let mut branch_idx: i32 = 0;
+    let mut chain_parent_blockers = blocker_indices.clone();
+    loop {
+        let consequent_name = counters.next_consequent();
+        let arrow = build_branch_arrow(
+            &cur.consequent,
+            ai,
+            derived_bindings,
+            counters,
+        )?;
+        chain_body.push(t::var(&consequent_name, arrow));
+
+        // Test rewrite — three forms:
+        //   1. First branch in async-test wrap → `$.get($$condition)`
+        //   2. Test has a CallExpression (user-fn call) AND we're NOT in
+        //      async wrap → hoist to `var d_N = $.derived(() => TEST)` and
+        //      use `$.get(d_N)`
+        //   3. Otherwise → straight rewrite (with derived `$.get` wrapping)
+        let test_expr = if branch_idx == 0 && test_is_async {
+            t::call(t::member_id(t::id("$"), "get"), vec![t::id("$$condition")])
+        } else if !needs_async_wrap && expr_has_user_call(&cur.test, derived_bindings) {
+            let d_name = counters.next_d();
+            let derived_call = t::call(
+                t::member_id(t::id("$"), "derived"),
+                vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(cur.test.clone()),
+                    r#async: false,
+                    span: Span::ZERO,
+                }))],
+            );
+            chain_body.push(t::var(&d_name, derived_call));
+            t::call(t::member_id(t::id("$"), "get"), vec![t::id(&d_name)])
+        } else {
+            rewrite_chain_test(&cur.test, &ai.blocker_bindings, derived_bindings, counters)
+        };
+        branches.push((consequent_name, test_expr, branch_idx));
+
+        // Look at the alternate to decide flatten vs break-out.
+        let alt = match &cur.alternate {
+            Some(a) => a,
+            None => break,
+        };
+        let non_ws: Vec<&FragmentChild> = alt
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        if non_ws.len() == 1 {
+            if let FragmentChild::IfBlock(inner) = non_ws[0] {
+                if inner.elseif {
+                    let inner_test_async = expr_top_await(&inner.test);
+                    let mut inner_blockers = std::collections::BTreeSet::new();
+                    collect_chain_blockers(inner, &ai.blocker_bindings, &mut inner_blockers);
+                    let new_blockers = inner_blockers.iter().any(|i| !chain_parent_blockers.contains(i));
+                    if inner_test_async || new_blockers {
+                        // Break-out: emit the rest as an alternate that
+                        // contains a nested $.async/$.if construct. Build
+                        // the inner arrow FIRST (so its counters consume
+                        // their slots), then allocate the outer alternate
+                        // name — matches upstream's naming where the inner
+                        // alternate gets the lower index.
+                        let alt_arrow = build_breakout_alternate_arrow(
+                            inner,
+                            ai,
+                            derived_bindings,
+                            counters,
+                        )?;
+                        let alt_name = counters.next_alternate();
+                        chain_body.push(t::var(&alt_name, alt_arrow));
+                        alt_arrow_name = Some(alt_name);
+                        break;
+                    }
+                    // Flatten: keep walking.
+                    cur = inner;
+                    branch_idx += 1;
+                    chain_parent_blockers.extend(inner_blockers);
+                    continue;
+                }
+            }
+        }
+        // Final else (non-elseif content).
+        let alt_name = counters.next_alternate();
+        let arrow = build_branch_arrow(alt, ai, derived_bindings, counters)?;
+        chain_body.push(t::var(&alt_name, arrow));
+        alt_arrow_name = Some(alt_name);
+        break;
+    }
+
+    // Build `$.if(node, ($$render) => { ... }, true?)`. The 3rd `true` arg
+    // is set ONLY when this if-block is a NESTED break-out (in_async_ctx=true).
+    // Top-level `$.async` wraps pass no 3rd arg.
+    let render_body = build_render_body(&branches, alt_arrow_name.as_deref(), false);
+    let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$render")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![render_body],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let if_args = if in_async_ctx {
+        vec![
+            t::id(node_name),
+            render_arrow,
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            }))),
+        ]
+    } else {
+        vec![t::id(node_name), render_arrow]
+    };
+    chain_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "if"),
+        if_args,
+    )));
+
+    if needs_async_wrap {
+        // Wrap in $.async(node, [BLOCKERS], TESTS_OR_VOID0, callback).
+        let blockers_arr = Expression::Array(Box::new(ArrayExpression {
+            elements: indices_vec
+                .iter()
+                .map(|i| {
+                    ArrayElement::Expression(Expression::Member(Box::new(MemberExpression {
+                        object: t::id("$$promises"),
+                        property: MemberProperty::Expression(t::lit_number(*i as f64)),
+                        computed: true,
+                        optional: false,
+                        span: Span::ZERO,
+                    })))
+                })
+                .collect(),
+            span: Span::ZERO,
+        }));
+        let tests_arg = if test_is_async {
+            // If the test is `Expression::Await(X)` directly, strip the
+            // outer await and emit `[() => X]` (sync arrow). Otherwise
+            // rewrite each inner `await Y` to `(await $.save(Y))()` and emit
+            // `[async () => REWRITTEN]`.
+            let (body_expr, is_async_arrow) = if let Expression::Await(a) = &ib.test {
+                (a.argument.clone(), false)
+            } else {
+                (rewrite_async_test_client(&ib.test), true)
+            };
+            let test_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(body_expr),
+                r#async: is_async_arrow,
+                span: Span::ZERO,
+            }));
+            Expression::Array(Box::new(ArrayExpression {
+                elements: vec![ArrayElement::Expression(test_arrow)],
+                span: Span::ZERO,
+            }))
+        } else {
+            // void 0 — test has no top-level await, only blocker-bindings.
+            void_zero_client()
+        };
+        let cb_params = if matches!(&tests_arg, Expression::Array(_)) {
+            vec![t::pat_id(node_name), t::pat_id("$$condition")]
+        } else {
+            vec![t::pat_id(node_name)]
+        };
+        let cb = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: cb_params,
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: chain_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        Some(t::stmt(t::call(
+            t::member_id(t::id("$"), "async"),
+            vec![t::id(node_name), blockers_arr, tests_arg, cb],
+        )))
+    } else {
+        // Plain `{ ... }` block.
+        Some(Statement::Block(Box::new(BlockStatement {
+            body: chain_body,
+            span: Span::ZERO,
+        })))
+    }
+}
+
+fn is_top_level_chain(in_async_ctx: bool) -> bool {
+    // The 3rd `true` arg of `$.if` is set when we're inside a nested
+    // break-out (in_async_ctx=true). Top-level $.async wrap is NOT
+    // considered "inside async ctx" for the 3rd arg purposes.
+    in_async_ctx
+}
+
+fn is_only_blocker_derived(
+    _e: &Expression,
+    _blocker_bindings: &HashMap<String, usize>,
+    _derived_bindings: &HashSet<String>,
+) -> bool {
+    // Reserved for future use — currently always false (caller treats
+    // every binding ref as reactive).
+    false
+}
+
+/// Returns true iff `e` contains a CallExpression whose callee is a regular
+/// user-function reference (not a derived-binding read or other compiler-
+/// inserted call). Used to decide if an if-chain test should be hoisted to
+/// a `$.derived(...)` for reactive caching.
+fn expr_has_user_call(e: &Expression, derived_bindings: &HashSet<String>) -> bool {
+    match e {
+        Expression::Call(c) => {
+            // A call whose callee is a derived binding (e.g. `blocking()`)
+            // doesn't count — those are sync reads. Anything else does.
+            if let Expression::Identifier(id) = &c.callee {
+                if derived_bindings.contains(&id.name) {
+                    return c.arguments.iter().any(|a| match a {
+                        Argument::Expression(e) => expr_has_user_call(e, derived_bindings),
+                        Argument::Spread(s) => expr_has_user_call(&s.argument, derived_bindings),
+                    });
+                }
+            }
+            true
+        }
+        Expression::Binary(b) => {
+            expr_has_user_call(&b.left, derived_bindings)
+                || expr_has_user_call(&b.right, derived_bindings)
+        }
+        Expression::Logical(l) => {
+            expr_has_user_call(&l.left, derived_bindings)
+                || expr_has_user_call(&l.right, derived_bindings)
+        }
+        Expression::Unary(u) => expr_has_user_call(&u.argument, derived_bindings),
+        Expression::Conditional(c) => {
+            expr_has_user_call(&c.test, derived_bindings)
+                || expr_has_user_call(&c.consequent, derived_bindings)
+                || expr_has_user_call(&c.alternate, derived_bindings)
+        }
+        Expression::Paren(p) => expr_has_user_call(&p.expression, derived_bindings),
+        Expression::Member(m) => expr_has_user_call(&m.object, derived_bindings),
+        _ => false,
+    }
+}
+
+fn collect_chain_blockers(
+    ib: &svelte_ast::blocks::IfBlock,
+    blocker_bindings: &HashMap<String, usize>,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    collect_blocker_indices_in_expr(&ib.test, blocker_bindings, out);
+    if let Some(alt) = &ib.alternate {
+        let non_ws: Vec<&FragmentChild> = alt
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        if non_ws.len() == 1 {
+            if let FragmentChild::IfBlock(inner) = non_ws[0] {
+                if inner.elseif && !expr_top_await(&inner.test) {
+                    collect_chain_blockers(inner, blocker_bindings, out);
+                }
+            }
+        }
+    }
+}
+
+fn collect_blocker_indices_in_expr(
+    e: &Expression,
+    blocker_bindings: &HashMap<String, usize>,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    match e {
+        Expression::Identifier(id) => {
+            if let Some(idx) = blocker_bindings.get(&id.name) {
+                out.insert(*idx);
+            }
+        }
+        Expression::Call(c) => {
+            collect_blocker_indices_in_expr(&c.callee, blocker_bindings, out);
+            for a in &c.arguments {
+                match a {
+                    Argument::Expression(e) => {
+                        collect_blocker_indices_in_expr(e, blocker_bindings, out)
+                    }
+                    Argument::Spread(s) => {
+                        collect_blocker_indices_in_expr(&s.argument, blocker_bindings, out)
+                    }
+                }
+            }
+        }
+        Expression::Member(m) => collect_blocker_indices_in_expr(&m.object, blocker_bindings, out),
+        Expression::Binary(b) => {
+            collect_blocker_indices_in_expr(&b.left, blocker_bindings, out);
+            collect_blocker_indices_in_expr(&b.right, blocker_bindings, out);
+        }
+        Expression::Logical(l) => {
+            collect_blocker_indices_in_expr(&l.left, blocker_bindings, out);
+            collect_blocker_indices_in_expr(&l.right, blocker_bindings, out);
+        }
+        Expression::Unary(u) => collect_blocker_indices_in_expr(&u.argument, blocker_bindings, out),
+        Expression::Await(a) => collect_blocker_indices_in_expr(&a.argument, blocker_bindings, out),
+        Expression::Paren(p) => {
+            collect_blocker_indices_in_expr(&p.expression, blocker_bindings, out)
+        }
+        _ => {}
+    }
+}
+
+/// Build a branch body for a simple branch with text-only content:
+/// `($$anchor) => { var text_N = $.text('FOO'); $.append($$anchor, text_N); }`
+fn build_branch_arrow(
+    fragment: &svelte_ast::fragment::Fragment,
+    _ai: &AsyncInfo,
+    _derived_bindings: &HashSet<String>,
+    counters: &mut ChainCounters,
+) -> Option<Expression> {
+    // Concatenate the fragment's text nodes (trimmed) — that's the literal
+    // we pass to `$.text(...)`.
+    let mut text_value = String::new();
+    for n in &fragment.nodes {
+        if let FragmentChild::Text(t) = n {
+            text_value.push_str(t.data.trim_matches(|c: char| c.is_whitespace() && c != ' '));
+        }
+    }
+    let trimmed = text_value.trim().to_string();
+    let text_name = counters.next_text();
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        &text_name,
+        t::call(
+            t::member_id(t::id("$"), "text"),
+            vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: trimmed.clone(),
+                raw: Some(format!("'{}'", trimmed)),
+                span: Span::ZERO,
+            })))],
+        ),
+    ));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&text_name)],
+    )));
+    Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    })))
+}
+
+/// Build the alternate arrow for a break-out elseif. Wraps a nested
+/// `$.async(...)` (or `{ }` block) targeting the inner if-chain.
+fn build_breakout_alternate_arrow(
+    inner: &svelte_ast::blocks::IfBlock,
+    ai: &AsyncInfo,
+    derived_bindings: &HashSet<String>,
+    counters: &mut ChainCounters,
+) -> Option<Expression> {
+    let fragment_name = counters.next_fragment();
+    let node_name = counters.next_node();
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        &fragment_name,
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    body.push(t::var(
+        &node_name,
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id(&fragment_name)],
+        ),
+    ));
+    let inner_stmt = emit_async_if_block(inner, &node_name, ai, derived_bindings, counters, true)?;
+    body.push(inner_stmt);
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&fragment_name)],
+    )));
+    Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    })))
+}
+
+/// Build the `if (...) $$render(consequent); else if (...) $$render(c_1, 1); else $$render(alt, -1);`
+/// chain. `in_async_ctx_pass_true_to_dollar_if` is unused here — the 3rd
+/// `true` arg is set by the caller of $.if.
+fn build_render_body(
+    branches: &[(String, Expression, i32)],
+    alternate: Option<&str>,
+    _in_async_ctx_pass_true_to_dollar_if: bool,
+) -> Statement {
+    // Build right-associative if/else if/else chain.
+    let mut acc: Option<Statement> = alternate.map(|name| {
+        t::stmt(t::call(
+            t::id("$$render"),
+            vec![t::id(name), t::lit_number(-1.0)],
+        ))
+    });
+    for (i, (cname, test, branch_idx)) in branches.iter().enumerate().rev() {
+        let call = if i == 0 {
+            t::stmt(t::call(t::id("$$render"), vec![t::id(cname)]))
+        } else {
+            t::stmt(t::call(
+                t::id("$$render"),
+                vec![t::id(cname), t::lit_number(*branch_idx as f64)],
+            ))
+        };
+        let if_stmt = Statement::If(Box::new(IfStatement {
+            test: test.clone(),
+            consequent: call,
+            alternate: acc,
+            span: Span::ZERO,
+        }));
+        acc = Some(if_stmt);
+    }
+    acc.unwrap_or_else(|| {
+        // Should be unreachable given the loop above always runs at least once.
+        Statement::Block(Box::new(BlockStatement {
+            body: Vec::new(),
+            span: Span::ZERO,
+        }))
+    })
+}
+
+/// Rewrite a non-async test expression for use inside a `$.if(...)` body.
+/// References to derived bindings become `$.get(NAME)`; references to other
+/// blocker bindings outside the test-array path become `$.get(NAME)` too.
+fn rewrite_chain_test(
+    e: &Expression,
+    blocker_bindings: &HashMap<String, usize>,
+    derived_bindings: &HashSet<String>,
+    counters: &mut ChainCounters,
+) -> Expression {
+    let _ = counters; // reserved for future $.derived hoisting
+    rewrite_chain_expr(e, blocker_bindings, derived_bindings)
+}
+
+fn rewrite_chain_expr(
+    e: &Expression,
+    blocker_bindings: &HashMap<String, usize>,
+    derived_bindings: &HashSet<String>,
+) -> Expression {
+    let _ = blocker_bindings;
+    match e {
+        Expression::Identifier(id) => {
+            // Only `$derived(...)` (and `$state(...)`) bindings get `$.get`
+            // wrapped at read sites. Non-derived `let` names — even when
+            // touched by an async statement — stay raw, because they're
+            // resolved synchronously inside the $.async callback.
+            if derived_bindings.contains(&id.name) {
+                t::call(
+                    t::member_id(t::id("$"), "get"),
+                    vec![Expression::Identifier(id.clone())],
+                )
+            } else {
+                e.clone()
+            }
+        }
+        Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+            callee: rewrite_chain_expr(&c.callee, blocker_bindings, derived_bindings),
+            arguments: c
+                .arguments
+                .iter()
+                .map(|a| match a {
+                    Argument::Expression(e) => {
+                        Argument::Expression(rewrite_chain_expr(e, blocker_bindings, derived_bindings))
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+            optional: c.optional,
+            span: c.span,
+        })),
+        Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
+            object: rewrite_chain_expr(&m.object, blocker_bindings, derived_bindings),
+            property: m.property.clone(),
+            computed: m.computed,
+            optional: m.optional,
+            span: m.span,
+        })),
+        Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+            operator: b.operator,
+            left: rewrite_chain_expr(&b.left, blocker_bindings, derived_bindings),
+            right: rewrite_chain_expr(&b.right, blocker_bindings, derived_bindings),
+            span: b.span,
+        })),
+        Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+            operator: l.operator,
+            left: rewrite_chain_expr(&l.left, blocker_bindings, derived_bindings),
+            right: rewrite_chain_expr(&l.right, blocker_bindings, derived_bindings),
+            span: l.span,
+        })),
+        Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+            operator: u.operator,
+            argument: rewrite_chain_expr(&u.argument, blocker_bindings, derived_bindings),
+            prefix: u.prefix,
+            span: u.span,
+        })),
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: rewrite_chain_expr(&p.expression, blocker_bindings, derived_bindings),
+            span: p.span,
+        })),
+        e => e.clone(),
+    }
+}
+
+/// Rewrite an async test for the `$.async(..., [async () => REWRITTEN], ...)`
+/// form: each `await X` becomes `(await $.save(X))()`. Mirrors server's
+/// `wrap_async_test` but kept separate so we can evolve them independently.
+fn rewrite_async_test_client(e: &Expression) -> Expression {
+    match e {
+        Expression::Await(a) => {
+            let inner = rewrite_async_test_client(&a.argument);
+            let saved = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+            let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
+                expression: Expression::Await(Box::new(AwaitExpression {
+                    argument: saved,
+                    span: Span::ZERO,
+                })),
+                span: Span::ZERO,
+            }));
+            t::call(awaited, Vec::new())
+        }
+        Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+            operator: b.operator,
+            left: rewrite_async_test_client(&b.left),
+            right: rewrite_async_test_client(&b.right),
+            span: b.span,
+        })),
+        Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+            operator: l.operator,
+            left: rewrite_async_test_client(&l.left),
+            right: rewrite_async_test_client(&l.right),
+            span: l.span,
+        })),
+        Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+            operator: u.operator,
+            argument: rewrite_async_test_client(&u.argument),
+            prefix: u.prefix,
+            span: u.span,
+        })),
+        Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+            callee: rewrite_async_test_client(&c.callee),
+            arguments: c
+                .arguments
+                .iter()
+                .map(|a| match a {
+                    Argument::Expression(e) => Argument::Expression(rewrite_async_test_client(e)),
+                    other => other.clone(),
+                })
+                .collect(),
+            optional: c.optional,
+            span: c.span,
+        })),
+        Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
+            object: rewrite_async_test_client(&m.object),
+            property: m.property.clone(),
+            computed: m.computed,
+            optional: m.optional,
+            span: m.span,
+        })),
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: rewrite_async_test_client(&p.expression),
+            span: p.span,
+        })),
+        e => e.clone(),
+    }
+}
+
 /// `(await $.save(X))()` — wrap an expression for the async-const setter form.
 fn save_await_call_client(inner: Expression) -> Expression {
     let saved = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
@@ -2480,6 +3272,12 @@ struct AsyncInfo {
     setup_stmts: Vec<Statement>,
     async_bindings: HashSet<String>,
     last_group_idx: usize,
+    /// All `let`/`const` script bindings (no functions). Used to decide when
+    /// an if-block test references a binding-with-blocker for `$.async` wrap.
+    script_let_bindings: HashSet<String>,
+    /// Per-binding-name, the group index of the `$$promises[N]` slot that
+    /// blocks reads of that name. Mirrors server's `binding.blocker`.
+    blocker_bindings: HashMap<String, usize>,
 }
 
 fn analyze_script(
@@ -2663,7 +3461,63 @@ fn analyze_script(
 }
 
 fn has_top_level_await_in_body(body: &[Statement]) -> bool {
-    body.iter().any(stmt_top_await)
+    body.iter().any(stmt_top_await) || body.iter().any(stmt_has_async_derived_init)
+}
+
+fn stmt_has_async_derived_init(s: &Statement) -> bool {
+    if let Statement::Variable(v) = s {
+        v.declarations
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, |i| rewrite_async_derived_client(i).is_some()))
+    } else {
+        false
+    }
+}
+
+/// Port of server's `rewrite_async_derived`. If `e` is `$.derived(arrow)`
+/// where `arrow.body` is `await X` (or contains a top-level await), return
+/// `await $.async_derived(() => X)` (or wrapping form). Otherwise `None`.
+fn rewrite_async_derived_client(e: &Expression) -> Option<Expression> {
+    let Expression::Call(c) = e else { return None };
+    if global_keypath(&c.callee).as_deref() != Some("$.derived") {
+        return None;
+    }
+    let arg = c.arguments.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e),
+        _ => None,
+    })?;
+    let arrow = match arg {
+        Expression::Arrow(a) => a,
+        _ => return None,
+    };
+    if arrow.r#async {
+        return None;
+    }
+    let body = match &arrow.body {
+        ArrowBody::Expression(e) => e,
+        _ => return None,
+    };
+    let (new_body, new_async) = if let Expression::Await(a) = body {
+        (ArrowBody::Expression(a.argument.clone()), false)
+    } else if expr_top_await(body) {
+        (ArrowBody::Expression(body.clone()), true)
+    } else {
+        return None;
+    };
+    let new_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: new_body,
+        r#async: new_async,
+        span: Span::ZERO,
+    }));
+    let async_derived_call = t::call(
+        t::member_id(t::id("$"), "async_derived"),
+        vec![new_arrow],
+    );
+    Some(Expression::Await(Box::new(AwaitExpression {
+        argument: async_derived_call,
+        span: Span::ZERO,
+    })))
 }
 
 fn stmt_top_await(s: &Statement) -> bool {
@@ -2706,6 +3560,25 @@ fn expr_top_await(e: &Expression) -> bool {
 }
 
 fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
+    // Pre-async statements (before the first await/async-derived) stay as
+    // setup. The async transform only kicks in for statements at-or-after
+    // the first async one. Mirrors server's `transform_async_script_server`.
+    let first_async_idx = body.iter().position(|s| {
+        if let Statement::Variable(v) = s {
+            v.declarations.iter().any(|d| {
+                d.init.as_ref().map_or(false, |i| {
+                    expr_top_await(i) || rewrite_async_derived_client(i).is_some()
+                })
+            })
+        } else if let Statement::Expression(e) = s {
+            expr_top_await(&e.expression)
+        } else {
+            false
+        }
+    })?;
+    let pre_async: Vec<Statement> = body[..first_async_idx].to_vec();
+    let body = &body[first_async_idx..];
+
     let mut hoisted_names: Vec<String> = Vec::new();
     let mut hoisted_spans: Vec<Span> = Vec::new();
     enum Lowered {
@@ -2725,6 +3598,15 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                             .init
                             .clone()
                             .unwrap_or_else(|| void_zero_client());
+                        // `$.derived(() => await E)` pattern → rewrite to
+                        // `await $.async_derived(() => E)`.
+                        if let Some(rewritten) = rewrite_async_derived_client(&init) {
+                            lowered.push(Lowered::AsyncSet {
+                                name: id.name.clone(),
+                                init: rewritten,
+                            });
+                            continue;
+                        }
                         if expr_top_await(&init) {
                             lowered.push(Lowered::AsyncSet {
                                 name: id.name.clone(),
@@ -2770,6 +3652,9 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                         }
                     }
                 }
+                lowered.push(Lowered::Sync(s.clone()));
+            }
+            Statement::Function(_) => {
                 lowered.push(Lowered::Sync(s.clone()));
             }
             _ => return None,
@@ -2831,16 +3716,18 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
             }
         }
     }
-    if !current_sync.is_empty() || last_was_async {
-        if current_sync.is_empty() {
-            current_sync.push(t::stmt(void_zero_client()));
-        }
+    // Trailing sync group: only when there are actual sync statements after
+    // the last async. Empty trailing groups are not emitted.
+    let _ = last_was_async;
+    if !current_sync.is_empty() {
         flush_sync(&mut groups, &mut current_sync);
     }
 
     let last_group_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
 
+    // Setup: pre_async (kept verbatim) + `var X, Y, Z;` hoisted + `var $$promises = $.run([...])`.
     let mut setup_stmts: Vec<Statement> = Vec::new();
+    setup_stmts.extend(pre_async.clone());
     if !hoisted_names.is_empty() {
         let decls: Vec<VariableDeclarator> = hoisted_names
             .iter()
@@ -2872,11 +3759,126 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
     ));
 
     let async_bindings: HashSet<String> = hoisted_names.into_iter().collect();
+    // Collect script let/const bindings — used for "ref-with-blocker"
+    // detection during template lowering. Mirrors server's
+    // `script_let_bindings`.
+    let mut script_let_bindings: HashSet<String> = async_bindings.clone();
+    for s in pre_async.iter().chain(body.iter()) {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let Pattern::Identifier(id) = &d.id {
+                    script_let_bindings.insert(id.name.clone());
+                }
+            }
+        }
+    }
+    // Compute blocker_bindings: simulate the group counting. Same logic as
+    // server's `transform_async_script_server` blocker pass.
+    let mut blocker_bindings: HashMap<String, usize> = HashMap::new();
+    {
+        let mut groups_count: usize = 0;
+        let mut sync_pending: bool = false;
+        let mut awaited_seen: bool = false;
+        for s in body.iter() {
+            if let Statement::Variable(v) = s {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        let init = d.init.as_ref();
+                        let is_async = init.map_or(false, |i| {
+                            expr_top_await(i) || rewrite_async_derived_client(i).is_some()
+                        });
+                        if is_async {
+                            if sync_pending {
+                                groups_count += 1;
+                                sync_pending = false;
+                            }
+                            let idx = groups_count;
+                            blocker_bindings.entry(id.name.clone()).or_insert(idx);
+                            if let Some(init) = init {
+                                let mut touched: HashSet<String> = HashSet::new();
+                                collect_touched_async_client(init, &mut touched);
+                                for name in touched {
+                                    if script_let_bindings.contains(&name) {
+                                        blocker_bindings.entry(name).or_insert(idx);
+                                    }
+                                }
+                            }
+                            groups_count += 1;
+                            awaited_seen = true;
+                        } else {
+                            if awaited_seen {
+                                blocker_bindings
+                                    .entry(id.name.clone())
+                                    .or_insert(groups_count);
+                            }
+                            sync_pending = true;
+                        }
+                    }
+                }
+            } else if matches!(s, Statement::Function(_)) {
+                // Functions are sync setup; don't count.
+            } else {
+                sync_pending = true;
+            }
+        }
+    }
     Some(AsyncInfo {
         setup_stmts,
         async_bindings,
         last_group_idx,
+        script_let_bindings,
+        blocker_bindings,
     })
+}
+
+/// Collect "touched" identifier names: identifiers eagerly read, walking
+/// into function/arrow bodies (mirrors server's `collect_touched_in_expr`).
+fn collect_touched_async_client(e: &Expression, out: &mut HashSet<String>) {
+    match e {
+        Expression::Identifier(id) => {
+            if id.name != "undefined" {
+                out.insert(id.name.clone());
+            }
+        }
+        Expression::Call(c) => {
+            collect_touched_async_client(&c.callee, out);
+            for a in &c.arguments {
+                match a {
+                    Argument::Expression(e) => collect_touched_async_client(e, out),
+                    Argument::Spread(s) => collect_touched_async_client(&s.argument, out),
+                }
+            }
+        }
+        Expression::Member(m) => {
+            collect_touched_async_client(&m.object, out);
+        }
+        Expression::Binary(b) => {
+            collect_touched_async_client(&b.left, out);
+            collect_touched_async_client(&b.right, out);
+        }
+        Expression::Logical(l) => {
+            collect_touched_async_client(&l.left, out);
+            collect_touched_async_client(&l.right, out);
+        }
+        Expression::Unary(u) => collect_touched_async_client(&u.argument, out),
+        Expression::Await(a) => collect_touched_async_client(&a.argument, out),
+        Expression::Conditional(c) => {
+            collect_touched_async_client(&c.test, out);
+            collect_touched_async_client(&c.consequent, out);
+            collect_touched_async_client(&c.alternate, out);
+        }
+        Expression::Paren(p) => collect_touched_async_client(&p.expression, out),
+        Expression::Sequence(s) => {
+            for e in &s.expressions {
+                collect_touched_async_client(e, out);
+            }
+        }
+        Expression::Arrow(a) => match &a.body {
+            ArrowBody::Expression(e) => collect_touched_async_client(e, out),
+            ArrowBody::Block(_) => {} // upstream skips block-body for client touch
+        },
+        _ => {}
+    }
 }
 
 fn expr_contains_ident(e: &Expression, name: &str) -> bool {
