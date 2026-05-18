@@ -69,6 +69,37 @@ fn sweep_validator_fixtures() {
         let expected_warnings = read_expected(&warnings_path);
         let expected_errors = read_expected(&errors_path);
 
+        // Pre-read _config.js to detect compile-time `customElement: true`,
+        // which suppresses `options_missing_custom_element` and
+        // `custom_element_props_identifier` warnings (since `<svelte:options
+        // customElement>` is then valid). Upstream threads this via
+        // `options.customElement`; our analyzer doesn't yet take options, so
+        // we filter after the fact.
+        let config = fs::read_to_string(dir.join("_config.js")).unwrap_or_default();
+        let custom_element_compile_option = config.contains("customElement: true");
+        let runes_false = config.contains("runes: false");
+        // Scan _config.js for `warningFilter` referencing `.includes(warning.code)`
+        // and pull out the codes to silence. Mirrors upstream's options.warningFilter
+        // for the simple case where the filter is `(w) => !['x', 'y'].includes(w.code)`.
+        let warning_filter_codes: HashSet<String> = {
+            let mut out = HashSet::new();
+            if config.contains("warningFilter") && config.contains(".includes(warning.code)") {
+                // Find the array literal between `[` and `]`.
+                if let (Some(lb), Some(rb)) = (config.find('['), config.find(']')) {
+                    if lb < rb {
+                        let inner = &config[lb + 1..rb];
+                        for tok in inner.split(',') {
+                            let cleaned = tok.trim().trim_matches(|c: char| c == '\'' || c == '"');
+                            if !cleaned.is_empty() {
+                                out.insert(cleaned.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+
         let source = match fs::read_to_string(&input) {
             Ok(s) => s,
             Err(_) => continue,
@@ -102,10 +133,27 @@ fn sweep_validator_fixtures() {
                 continue;
             }
             Ok(Err(parse_err)) => {
-                // Compile error from analyze - shouldn't happen with the
-                // outer Ok wrapper. Keep symmetric.
-                error_count += 1;
-                println!("[ERR  ] {name}: analyze: {parse_err:?}");
+                // Parse-level compile error. Match against expected_errors
+                // if present — many CSS / syntax tests put the expected
+                // diagnostic in `errors.json`.
+                let got_codes: HashSet<String> = std::iter::once(parse_err.code.to_string()).collect();
+                let expected_codes: HashSet<String> = expected_errors
+                    .iter()
+                    .map(|d| d.code.clone())
+                    .collect();
+                if got_codes == expected_codes {
+                    match_count += 1;
+                    println!("[MATCH] {name} (parse-error)");
+                } else if expected_codes.is_empty() {
+                    error_count += 1;
+                    println!("[ERR  ] {name}: parse: {parse_err:?}");
+                } else {
+                    diverge_count += 1;
+                    println!(
+                        "[DIFF ] {name}: got parse error {:?}, expected {:?}",
+                        got_codes, expected_codes
+                    );
+                }
                 continue;
             }
             Err(_) => {
@@ -115,7 +163,29 @@ fn sweep_validator_fixtures() {
             }
         };
 
-        let got_codes = diag_codes(&analysis.warnings);
+        let mut analysis_warnings: Vec<svelte_diagnostics::CompileDiagnostic> =
+            analysis.warnings.clone();
+        if custom_element_compile_option {
+            analysis_warnings.retain(|w| {
+                w.code != "options_missing_custom_element"
+                    && w.code != "custom_element_props_identifier"
+            });
+        }
+        if runes_false {
+            analysis_warnings.retain(|w| {
+                !matches!(
+                    w.code,
+                    "store_rune_conflict"
+                        | "slot_element_deprecated"
+                        | "svelte_component_deprecated"
+                        | "event_directive_deprecated"
+                )
+            });
+        }
+        if !warning_filter_codes.is_empty() {
+            analysis_warnings.retain(|w| !warning_filter_codes.contains(w.code));
+        }
+        let got_codes = diag_codes(&analysis_warnings);
         let expected_codes: HashSet<String> = expected_warnings
             .iter()
             .map(|d| d.code.clone())

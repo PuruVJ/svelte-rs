@@ -61,7 +61,13 @@ pub fn analyze_component(
 
     let runes = walker::detect_runes(&root);
     let css = root.css.clone();
-    let mut css_meta = css.as_ref().map(css_analyze::analyze_css).unwrap_or_default();
+    let (mut css_meta, css_err) = match css.as_ref() {
+        Some(sheet) => css_analyze::analyze_css_with_errors(sheet),
+        None => (Default::default(), None),
+    };
+    if let Some(e) = css_err {
+        return Err(e);
+    }
 
     // CSS prune — match each selector against template elements, then
     // emit `css_unused_selector` warnings for the leftovers.
@@ -102,6 +108,29 @@ pub fn analyze_component(
     // `phases/2-analyze/index.js`.
     let (validator_warnings, validator_errors) = validate::validate(&analysis.root, &analysis);
     analysis.warnings.extend(validator_warnings);
+    // Apply top-level `<!-- svelte-ignore css_* -->` comments to CSS
+    // warnings (they target the hoisted `<style>` which `visit_fragment`
+    // can't pair with by the time we visit). Mirrors the
+    // `state.ignores_at_top` handling in upstream's analyze entry.
+    let css_global_ignores: std::collections::HashSet<String> = analysis
+        .root
+        .fragment
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            svelte_ast::fragment::FragmentChild::Comment(c) => {
+                Some(parse_svelte_ignore_codes(&c.data))
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter(|code| code.starts_with("css_"))
+        .collect();
+    if !css_global_ignores.is_empty() {
+        analysis
+            .warnings
+            .retain(|w| !css_global_ignores.contains(w.code));
+    }
     if let Some(first_error) = validator_errors.into_iter().next() {
         // Upstream throws on the first error; we surface it the same way
         // so `compile()` can fail fast. Subsequent errors are dropped
@@ -109,6 +138,22 @@ pub fn analyze_component(
         return Err(first_error);
     }
     Ok(analysis)
+}
+
+/// Local copy of `parse_svelte_ignore` used at the top of analysis to filter
+/// CSS warnings against `<!-- svelte-ignore css_* -->` comments. Mirrors the
+/// dash-syntax handling in `validate.rs::parse_svelte_ignore`.
+fn parse_svelte_ignore_codes(comment: &str) -> Vec<String> {
+    let trimmed = comment.trim();
+    let after = if let Some(s) = trimmed.strip_prefix("svelte-ignore") {
+        s
+    } else {
+        return Vec::new();
+    };
+    after
+        .split_whitespace()
+        .map(|s| s.replace('-', "_"))
+        .collect()
 }
 
 /// Sanitize a filename stem into a JS identifier. `foo-bar` → `Foo_bar`,

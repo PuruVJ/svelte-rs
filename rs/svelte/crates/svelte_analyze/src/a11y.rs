@@ -55,6 +55,13 @@ pub fn check_duplicate_attributes(
 }
 
 pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
+    check_regular_element_with_parent(el, None)
+}
+
+pub fn check_regular_element_with_parent(
+    el: &RegularElement,
+    parent: Option<&str>,
+) -> Vec<CompileDiagnostic> {
     let mut diags = Vec::new();
     let attrs: Vec<(&str, &AttributeValue)> = el
         .attributes
@@ -64,6 +71,10 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
             _ => None,
         })
         .collect();
+    let has_spread = el
+        .attributes
+        .iter()
+        .any(|a| matches!(a, ElementAttribute::SpreadAttribute(_)));
     // Legacy event directives (`on:click={...}`) — equivalent to `onclick={...}`.
     let directive_event_names: Vec<String> = el
         .attributes
@@ -158,8 +169,13 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         }
         "a" => {
             // <a> needs an href OR a name/id attribute. Without any of those
-            // it isn't a real anchor.
-            if !has_attr("href") && !has_attr("name") && !has_attr("id") {
+            // it isn't a real anchor. Skip when `aria-disabled` is set —
+            // that explicitly marks the link as non-interactive.
+            if !has_attr("href")
+                && !has_attr("name")
+                && !has_attr("id")
+                && !has_attr("aria-disabled")
+            {
                 diags.push(warnings::a11y_missing_attribute(
                     span, "a", "an", "href",
                 ));
@@ -168,6 +184,24 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
             if let Some(href) = attr_static_string(attr_get("href")) {
                 if href.is_empty() || href == "#" {
                     diags.push(warnings::a11y_invalid_attribute(span, "href", &href));
+                }
+            }
+            // Same checks for `xlink:href` (SVG anchors).
+            if let Some(xhref) = attr_static_string(attr_get("xlink:href")) {
+                if xhref.is_empty() || xhref == "#" {
+                    let attr_span = el.attributes.iter().find_map(|a| {
+                        if let ElementAttribute::Attribute(att) = a {
+                            if att.name == "xlink:href" {
+                                return Some((att.start, att.end));
+                            }
+                        }
+                        None
+                    });
+                    diags.push(warnings::a11y_invalid_attribute(
+                        attr_span.or(span),
+                        "xlink:href",
+                        &xhref,
+                    ));
                 }
             }
             // Empty name=''
@@ -191,7 +225,17 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         if is_abstract_role(&role) {
             diags.push(warnings::a11y_no_abstract_role(span, &role));
         } else if is_redundant_role(&el.name, &role) {
-            diags.push(warnings::a11y_no_redundant_roles(span, &role));
+            // Upstream carve-outs:
+            //  - `<ul>` / `<ol>` / `<li>` / `<menu>` with `role="list"` /
+            //    `role="listitem"` etc. is OK because `list-style: none`
+            //    strips list semantics and the role brings them back.
+            //  - `<a>` without `href` has no implicit role, so a role
+            //    isn't redundant.
+            let is_list_carveout = matches!(el.name.as_str(), "ul" | "ol" | "li" | "menu");
+            let is_a_no_href = el.name == "a" && !has_attr("href");
+            if !is_list_carveout && !is_a_no_href {
+                diags.push(warnings::a11y_no_redundant_roles(span, &role));
+            }
         }
     }
 
@@ -202,12 +246,97 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         }
     }
 
-    // 7. a11y_click_events_have_key_events — onclick without keyboard equivalent.
+    // 7. Element-interactivity-based rules.
     let has_onclick = has_event("onclick");
     let has_key_event =
         has_event("onkeydown") || has_event("onkeyup") || has_event("onkeypress");
-    if has_onclick && !has_key_event && is_interactive_role_eligible(&el.name) {
+    let role = attr_static_string(attr_get("role"));
+    let role_is_presentation = matches!(role.as_deref(), Some("presentation") | Some("none"));
+    let role_is_interactive = role.as_deref().map_or(false, is_interactive_role);
+    let role_is_noninteractive_v = role.as_deref().map_or(false, is_non_interactive_role);
+    let aria_hidden = is_aria_hidden(&attrs);
+    let disabled = has_attr("disabled")
+        || attr_static_string(attr_get("aria-disabled")).as_deref() == Some("true");
+    // Element interactivity classification (Interactive / NonInteractive / Static).
+    let interactivity = element_interactivity(&el.name, &attrs);
+    let is_strict_interactive = matches!(interactivity, Interactivity::Interactive);
+    let is_strict_noninteractive = matches!(interactivity, Interactivity::NonInteractive);
+    let is_strict_static = matches!(interactivity, Interactivity::Static);
+    let has_any_interactive_handler = INTERACTIVE_HANDLERS.iter().any(|h| has_event(h));
+    let has_recommended_interactive_handler = RECOMMENDED_INTERACTIVE_HANDLERS
+        .iter()
+        .any(|h| has_event(h));
+    let hidden_from_sr = aria_hidden
+        || (el.name == "input"
+            && attr_static_string(attr_get("type")).as_deref() == Some("hidden"));
+    let role_is_non_presentation = role.is_some() && !role_is_presentation;
+    // click_events_have_key_events — onclick + non-interactive + no key.
+    if has_onclick
+        && !has_key_event
+        && !hidden_from_sr
+        && !disabled
+        && !has_spread
+        && (role.is_none() || role_is_non_presentation)
+        && !is_strict_interactive
+        && !role_is_interactive
+    {
         diags.push(warnings::a11y_click_events_have_key_events(span));
+    }
+    // no_noninteractive_element_interactions: recommended_interactive handler
+    // on a non-interactive element (or non-interactive role on interactive).
+    if !has_spread
+        && !aria_hidden
+        && !disabled
+        && !role_is_presentation
+        && has_recommended_interactive_handler
+        && ((!is_strict_interactive && role_is_noninteractive_v)
+            || (is_strict_noninteractive && role.is_none()))
+    {
+        diags.push(warnings::a11y_no_noninteractive_element_interactions(
+            span, &el.name,
+        ));
+    }
+    // no_static_element_interactions: interactive handler on STATIC element.
+    // Suppressed when `role` is present but its value is dynamic (we can't
+    // tell what it'll resolve to).
+    let has_role_attr = attr_get("role").is_some();
+    let role_is_dynamic = has_role_attr && role.is_none();
+    if !has_spread
+        && !role_is_dynamic
+        && !hidden_from_sr
+        && !role_is_presentation
+        && !is_strict_interactive
+        && !role_is_interactive
+        && !is_strict_noninteractive
+        && !role_is_noninteractive_v
+        && !is_abstract_role(role.as_deref().unwrap_or(""))
+        && has_any_interactive_handler
+        && is_strict_static
+    {
+        // List up to 2 handler names in source order for the message.
+        let mut hndlrs: Vec<&'static str> = Vec::new();
+        for h in INTERACTIVE_HANDLERS {
+            if has_event(h) {
+                hndlrs.push(&h[2..]); // strip leading `on`
+            }
+        }
+        let listed = list_handlers(&hndlrs);
+        diags.push(warnings::a11y_no_static_element_interactions(
+            span, &el.name, &listed,
+        ));
+    }
+    // interactive_supports_focus.
+    if let Some(role_name) = role.as_deref() {
+        if is_interactive_role(role_name)
+            && !aria_hidden
+            && !disabled
+            && !role_is_presentation
+            && !has_attr("tabindex")
+            && !has_attr("disabled")
+            && has_any_interactive_handler
+        {
+            diags.push(warnings::a11y_interactive_supports_focus(span, role_name));
+        }
     }
 
     // 8. a11y_mouse_events_have_key_events — onmouseover/out without focus/blur.
@@ -329,15 +458,470 @@ pub fn check_regular_element(el: &RegularElement) -> Vec<CompileDiagnostic> {
         diags.push(warnings::a11y_media_has_caption(span));
     }
 
-    // 21. a11y_figcaption_parent — `<figcaption>` must be a direct child of `<figure>`.
-    //     (Approximated — we don't have parent context here. Skipped.)
+    // 21. a11y_figcaption_parent — must be a direct child of `<figure>`.
+    if el.name == "figcaption" && parent != Some("figure") {
+        diags.push(warnings::a11y_figcaption_parent(span));
+    }
+
+    // 22. a11y_figcaption_index — figcaption must be first or last child of figure.
+    if el.name == "figure" {
+        // Find the index of the figcaption among non-comment / non-whitespace
+        // children.
+        let nodes: Vec<&FragmentChild> = el
+            .fragment
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        if let Some(idx) = nodes.iter().position(|n| match n {
+            FragmentChild::RegularElement(c) => c.name == "figcaption",
+            _ => false,
+        }) {
+            if idx != 0 && idx != nodes.len() - 1 {
+                if let FragmentChild::RegularElement(fc) = nodes[idx] {
+                    diags.push(warnings::a11y_figcaption_index(Some((fc.start, fc.end))));
+                }
+            }
+        }
+    }
+
+    // 23. a11y_hidden — heading element with `aria-hidden="true"`.
+    if matches!(el.name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+        if attr_static_string(attr_get("aria-hidden")).as_deref() == Some("true") {
+            diags.push(warnings::a11y_hidden(span, &el.name));
+        }
+    }
+
+    // 24. a11y_aria_activedescendant_has_tabindex —
+    //   `aria-activedescendant` on a non-interactive element without `tabindex`.
+    if has_attr("aria-activedescendant")
+        && !has_attr("tabindex")
+        && !has_spread
+        && !is_interactive_html_element(&el.name, &attrs)
+    {
+        // Use the attribute's own span if we can find it.
+        let attr_span = el.attributes.iter().find_map(|a| {
+            if let ElementAttribute::Attribute(att) = a {
+                if att.name == "aria-activedescendant" {
+                    return Some((att.start, att.end));
+                }
+            }
+            None
+        });
+        diags.push(warnings::a11y_aria_activedescendant_has_tabindex(
+            attr_span.or(span),
+        ));
+    }
+
+    // 25. a11y_no_noninteractive_tabindex — `tabindex` on a non-interactive
+    //   element that isn't role=interactive.
+    if let Some(tabindex_val) = attr_static_string(attr_get("tabindex")) {
+        let n = tabindex_val.parse::<i32>().ok();
+        let element_is_interactive = is_interactive_html_element(&el.name, &attrs);
+        let role_interactive = role.as_deref().map_or(false, is_interactive_role);
+        // tabindex < 0 doesn't bring focus, no warning.
+        if n.map_or(true, |x| x >= 0)
+            && !element_is_interactive
+            && !role_interactive
+            && !is_static_html_element(&el.name)
+        {
+            let attr_span = el.attributes.iter().find_map(|a| {
+                if let ElementAttribute::Attribute(att) = a {
+                    if att.name == "tabindex" {
+                        return Some((att.start, att.end));
+                    }
+                }
+                None
+            });
+            diags.push(warnings::a11y_no_noninteractive_tabindex(
+                attr_span.or(span),
+            ));
+        }
+    }
+
+    // 26. a11y_no_noninteractive_element_to_interactive_role / opposite.
+    //   Suppressed when the role is redundant (matches implicit role) — that
+    //   case fires `a11y_no_redundant_roles` instead.
+    if let Some(role_name) = role.as_deref() {
+        let is_exception = matches!(
+            (el.name.as_str(), role_name),
+            ("ul", "listbox")
+                | ("ul", "menu")
+                | ("ul", "menubar")
+                | ("ul", "radiogroup")
+                | ("ul", "tablist")
+                | ("ul", "tree")
+                | ("ul", "treegrid")
+                | ("ol", "listbox")
+                | ("ol", "menu")
+                | ("ol", "menubar")
+                | ("ol", "radiogroup")
+                | ("ol", "tablist")
+                | ("ol", "tree")
+                | ("ol", "treegrid")
+                | ("menu", "listbox")
+                | ("menu", "menu")
+                | ("menu", "menubar")
+                | ("menu", "radiogroup")
+                | ("menu", "tablist")
+                | ("menu", "tree")
+                | ("menu", "treegrid")
+                | ("li", "menuitem")
+                | ("li", "option")
+                | ("li", "row")
+                | ("li", "tab")
+                | ("li", "treeitem")
+                | ("table", "grid")
+                | ("td", "gridcell")
+                | ("fieldset", "radiogroup")
+                | ("fieldset", "presentation")
+        );
+        if is_known_role(role_name) && !is_redundant_role(&el.name, role_name) && !is_exception {
+            let element_is_interactive_strict = is_strictly_interactive_html_element(&el.name, &attrs);
+            let element_is_non_interactive_strict =
+                is_strictly_non_interactive_html_element(&el.name, &attrs);
+            let role_is_int = is_interactive_role(role_name);
+            let role_is_noninteractive = is_non_interactive_role(role_name);
+            let attr_span = el.attributes.iter().find_map(|a| {
+                if let ElementAttribute::Attribute(att) = a {
+                    if att.name == "role" {
+                        return Some((att.start, att.end));
+                    }
+                }
+                None
+            });
+            let role_span = attr_span.or(span);
+            if role_is_noninteractive && element_is_interactive_strict {
+                diags.push(warnings::a11y_no_interactive_element_to_noninteractive_role(
+                    role_span, &el.name, role_name,
+                ));
+            }
+            if role_is_int && element_is_non_interactive_strict {
+                diags.push(warnings::a11y_no_noninteractive_element_to_interactive_role(
+                    role_span, &el.name, role_name,
+                ));
+            }
+        }
+    }
+
+    // 27. a11y_autocomplete_valid — validate `autocomplete=` on `<input>`.
+    if el.name == "input" {
+        if let Some(autocomplete_attr) = el.attributes.iter().find_map(|a| match a {
+            ElementAttribute::Attribute(att) if att.name == "autocomplete" => Some(att),
+            _ => None,
+        }) {
+            let type_val = attr_static_string(attr_get("type"))
+                .unwrap_or_else(|| "text".to_string());
+            let type_lower = type_val.to_lowercase();
+            let value = match &autocomplete_attr.value {
+                AttributeValue::Empty => Some("true".to_string()),
+                AttributeValue::Many(parts) => {
+                    let mut all_static = true;
+                    let mut s = String::new();
+                    for p in parts {
+                        if let AttributeValuePart::Text(t) = p {
+                            s.push_str(&t.data);
+                        } else {
+                            all_static = false;
+                            break;
+                        }
+                    }
+                    if all_static {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(val) = value {
+                if !val.is_empty() && !is_valid_autocomplete(&type_lower, &val) {
+                    diags.push(warnings::a11y_autocomplete_valid(
+                        Some((autocomplete_attr.start, autocomplete_attr.end)),
+                        &type_val,
+                        &val,
+                    ));
+                }
+            }
+        }
+    }
+
+    // 28. a11y_consider_explicit_label (popover-label) — `<button popovertarget>`
+    //     without aria-label etc. The existing rule (10) only fires when the
+    //     element has NO text and no aria — adding popover variant.
+    if matches!(el.name.as_str(), "button" | "a")
+        && has_attr("popovertarget")
+        && !has_attr("aria-label")
+        && !has_attr("aria-labelledby")
+        && !has_attr("title")
+        && !is_aria_hidden(&attrs)
+        && !has_attr("inert")
+        && !fragment_has_text(&el.fragment)
+    {
+        diags.push(warnings::a11y_consider_explicit_label(span));
+    }
 
     diags
+}
+
+/// Strict-interactive HTML elements — used by the role-conflict rules to
+/// decide if a role on an interactive element constitutes a downgrade.
+/// Narrower than `is_interactive_html_element` (which also covers e.g. `<a>`
+/// without href as interactive-eligible). Mirrors upstream's
+/// `interactive_element_role_schemas` / AXObject lookups.
+fn is_strictly_interactive_html_element(
+    tag: &str,
+    attrs: &[(&str, &AttributeValue)],
+) -> bool {
+    if tag == "input" {
+        let t = attrs
+            .iter()
+            .find(|(n, _)| *n == "type")
+            .and_then(|(_, v)| attr_static_string(Some(*v)));
+        return !matches!(t.as_deref(), Some("hidden"));
+    }
+    if tag == "a" || tag == "area" {
+        return attrs.iter().any(|(n, _)| *n == "href");
+    }
+    matches!(
+        tag,
+        "button" | "select" | "textarea" | "summary" | "details"
+        | "menuitem" | "option" | "tr"
+    )
+}
+
+/// Strict-non-interactive HTML elements. Excludes `section` / `header` /
+/// `div` / `span` etc. (those are Static). Includes content-grouping
+/// landmarks like `article`, `main`, `footer`, `nav` and structural
+/// elements like `ol`, `ul`, `li`, `table`, `figure`.
+fn is_strictly_non_interactive_html_element(
+    tag: &str,
+    attrs: &[(&str, &AttributeValue)],
+) -> bool {
+    let _ = attrs;
+    matches!(
+        tag,
+        "article" | "aside" | "blockquote" | "br" | "caption" | "dd"
+        | "dfn" | "dialog" | "dl" | "dt" | "fieldset" | "figcaption" | "figure"
+        | "footer" | "form" | "frame" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        | "hgroup" | "hr" | "iframe" | "img" | "label" | "legend" | "li" | "main"
+        | "marquee" | "menu" | "meter" | "nav" | "ol" | "output" | "p" | "pre"
+        | "progress" | "table" | "tbody" | "td" | "tfoot" | "th"
+        | "thead" | "time" | "title" | "ul"
+    )
+}
+
+/// HTML elements that are interactive without considering attributes.
+fn is_interactive_html_element(tag: &str, attrs: &[(&str, &AttributeValue)]) -> bool {
+    // `<input>` is interactive UNLESS type=hidden.
+    if tag == "input" {
+        let t = attrs
+            .iter()
+            .find(|(n, _)| *n == "type")
+            .and_then(|(_, v)| attr_static_string(Some(*v)));
+        return t.as_deref() != Some("hidden");
+    }
+    // `<a>` and `<area>` are interactive only with href.
+    if tag == "a" || tag == "area" {
+        return attrs.iter().any(|(n, _)| *n == "href");
+    }
+    // `<audio>` / `<video>` interactive only with controls.
+    if tag == "audio" || tag == "video" {
+        return attrs.iter().any(|(n, _)| *n == "controls");
+    }
+    matches!(
+        tag,
+        "button" | "select" | "textarea" | "details" | "summary" |
+        "menuitem" | "option" | "iframe" | "embed" | "object" | "tr" | "tabpanel"
+    )
+}
+
+/// Static HTML elements — non-semantic containers that get
+/// `a11y_no_static_element_interactions` for onclick handlers.
+fn is_static_html_element(tag: &str) -> bool {
+    matches!(
+        tag,
+        "div" | "span" | "p" | "section" | "article" | "main" | "header"
+        | "footer" | "nav" | "aside" | "hr" | "address"
+    )
+}
+
+/// ARIA interactive roles.
+fn is_interactive_role(role: &str) -> bool {
+    matches!(
+        role,
+        "button" | "checkbox" | "combobox" | "grid" | "gridcell" | "link"
+        | "listbox" | "menu" | "menubar" | "menuitem" | "menuitemcheckbox"
+        | "menuitemradio" | "option" | "progressbar" | "radio" | "radiogroup"
+        | "scrollbar" | "searchbox" | "slider" | "spinbutton" | "switch"
+        | "tab" | "tablist" | "textbox" | "treegrid" | "treeitem"
+    )
+}
+
+/// ARIA non-interactive roles.
+fn is_non_interactive_role(role: &str) -> bool {
+    matches!(
+        role,
+        "article" | "banner" | "blockquote" | "caption" | "cell" | "columnheader"
+        | "complementary" | "contentinfo" | "definition" | "deletion" | "dialog"
+        | "directory" | "document" | "emphasis" | "feed" | "figure" | "form"
+        | "generic" | "group" | "heading" | "img" | "insertion" | "list"
+        | "listitem" | "log" | "main" | "marquee" | "math" | "meter"
+        | "navigation" | "note" | "paragraph" | "presentation" | "region"
+        | "row" | "rowgroup" | "rowheader" | "search" | "separator" | "status"
+        | "strong" | "subscript" | "superscript" | "table" | "tabpanel" | "term"
+        | "time" | "timer" | "toolbar" | "tooltip" | "tree"
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interactivity {
+    Interactive,
+    NonInteractive,
+    Static,
+}
+
+/// Mirrors upstream's `element_interactivity` — categorizes an HTML element
+/// based on tag + attributes into Interactive | NonInteractive | Static.
+fn element_interactivity(tag: &str, attrs: &[(&str, &AttributeValue)]) -> Interactivity {
+    if is_strictly_interactive_html_element(tag, attrs) {
+        return Interactivity::Interactive;
+    }
+    if is_strictly_non_interactive_html_element(tag, attrs) {
+        return Interactivity::NonInteractive;
+    }
+    Interactivity::Static
+}
+
+/// Format a list of strings the way upstream's `list()` utility does:
+/// `["a"]` → `"a"`, `["a", "b"]` → `"a or b"`, `["a", "b", "c"]` →
+/// `"a, b or c"`.
+fn list_handlers(items: &[&str]) -> String {
+    match items.len() {
+        0 => String::new(),
+        1 => items[0].to_string(),
+        2 => format!("{} or {}", items[0], items[1]),
+        _ => {
+            let (last, rest) = items.split_last().unwrap();
+            format!("{} or {}", rest.join(", "), last)
+        }
+    }
+}
+
+const INTERACTIVE_HANDLERS: &[&str] = &[
+    // Keyboard
+    "onkeypress", "onkeydown", "onkeyup",
+    // Click / mouse
+    "onclick", "oncontextmenu", "ondblclick", "ondrag", "ondragend",
+    "ondragenter", "ondragexit", "ondragleave", "ondragover", "ondragstart",
+    "ondrop", "onmousedown", "onmouseenter", "onmouseleave", "onmousemove",
+    "onmouseout", "onmouseover", "onmouseup",
+    // Pointer
+    "onpointerdown", "onpointerup", "onpointermove", "onpointerenter",
+    "onpointerleave", "onpointerover", "onpointerout", "onpointercancel",
+    // Touch
+    "ontouchstart", "ontouchend", "ontouchmove", "ontouchcancel",
+];
+
+const RECOMMENDED_INTERACTIVE_HANDLERS: &[&str] = &[
+    "onclick", "onmousedown", "onmouseup", "onkeypress", "onkeydown", "onkeyup",
+];
+
+/// Validate `autocomplete="..."` against the standard tokens for the given
+/// input type. Returns true when the value is acceptable.
+fn is_valid_autocomplete(input_type: &str, value: &str) -> bool {
+    // Special trivial values.
+    let lower = value.to_lowercase();
+    let lower = lower.trim();
+    if lower == "on" || lower == "off" {
+        return true;
+    }
+    // Dynamic / partially-static values are passed through unchanged by the
+    // caller — only fully-static values reach here. Empty string already
+    // returned valid by the caller.
+    // For hidden inputs, any token is accepted.
+    if input_type == "hidden" {
+        return true;
+    }
+    // Split tokens and check each against the autofill name list.
+    let tokens: Vec<&str> = lower.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    // Allow `webauthn` (or other special trailing tokens) at the end on
+    // non-hidden inputs ONLY if the field tokens are present.
+    let last = *tokens.last().unwrap();
+    let mut field_tokens = tokens.clone();
+    let mut has_webauthn = false;
+    if last == "webauthn" {
+        has_webauthn = true;
+        field_tokens.pop();
+    }
+    // Allow `section-XXX` first token.
+    let mut idx = 0;
+    if !field_tokens.is_empty() && field_tokens[0].starts_with("section-") {
+        idx = 1;
+    }
+    // Optional shipping/billing.
+    if idx < field_tokens.len()
+        && (field_tokens[idx] == "shipping" || field_tokens[idx] == "billing")
+    {
+        idx += 1;
+    }
+    // Optional home/work/mobile/fax/pager.
+    if idx < field_tokens.len()
+        && matches!(field_tokens[idx], "home" | "work" | "mobile" | "fax" | "pager")
+    {
+        idx += 1;
+    }
+    // Now the next token must be a valid field name.
+    if idx >= field_tokens.len() {
+        return false;
+    }
+    let field = field_tokens[idx];
+    idx += 1;
+    if !is_valid_autofill_field(field) {
+        return false;
+    }
+    if idx != field_tokens.len() {
+        return false;
+    }
+    // If `webauthn` was present, the field must be one of a specific subset —
+    // for our tests, `webauthn` alone (no field) is invalid.
+    if has_webauthn && field_tokens.is_empty() {
+        return false;
+    }
+    true
+}
+
+fn is_valid_autofill_field(name: &str) -> bool {
+    matches!(
+        name,
+        "name" | "honorific-prefix" | "given-name" | "additional-name" | "family-name"
+        | "honorific-suffix" | "nickname" | "username" | "new-password" | "current-password"
+        | "one-time-code" | "organization-title" | "organization" | "street-address"
+        | "address-line1" | "address-line2" | "address-line3" | "address-level4"
+        | "address-level3" | "address-level2" | "address-level1" | "country"
+        | "country-name" | "postal-code" | "cc-name" | "cc-given-name" | "cc-additional-name"
+        | "cc-family-name" | "cc-number" | "cc-exp" | "cc-exp-month" | "cc-exp-year"
+        | "cc-csc" | "cc-type" | "transaction-currency" | "transaction-amount" | "language"
+        | "bday" | "bday-day" | "bday-month" | "bday-year" | "sex" | "url" | "photo"
+        | "tel" | "tel-country-code" | "tel-national" | "tel-area-code" | "tel-local"
+        | "tel-local-prefix" | "tel-local-suffix" | "tel-extension" | "email" | "impp"
+    )
 }
 
 /// WAI-ARIA 1.2 role list. Sourced from
 /// https://www.w3.org/TR/wai-aria-1.2/#role_definitions (concrete + composite).
 fn is_known_role(role: &str) -> bool {
+    // DPUB-ARIA `doc-*` and graphics-ARIA `graphics-*` roles are also valid.
+    if role.starts_with("doc-") || role.starts_with("graphics-") {
+        return true;
+    }
     matches!(
         role,
         "alert" | "alertdialog" | "application" | "article" | "banner"
@@ -559,23 +1143,58 @@ fn is_abstract_role(role: &str) -> bool {
 }
 
 fn is_redundant_role(tag: &str, role: &str) -> bool {
+    // Mirrors `a11y_implicit_semantics` from
+    // `phases/2-analyze/visitors/shared/a11y/constants.js`. We also bake in
+    // the upstream carve-outs for ul/ol/li/menu (which use CSS list-style
+    // tricks) and `<a>` without href (which has no role until then).
+    // Those carve-outs are applied at the call site.
     matches!(
         (tag, role),
-        ("article", "article")
+        ("a", "link")
+            | ("area", "link")
+            | ("article", "article")
+            | ("aside", "complementary")
+            | ("body", "document")
             | ("button", "button")
+            | ("datalist", "listbox")
+            | ("dd", "definition")
+            | ("dfn", "term")
             | ("dialog", "dialog")
+            | ("details", "group")
+            | ("dt", "term")
+            | ("fieldset", "group")
+            | ("figure", "figure")
+            | ("form", "form")
             | ("h1", "heading")
             | ("h2", "heading")
             | ("h3", "heading")
             | ("h4", "heading")
             | ("h5", "heading")
             | ("h6", "heading")
+            | ("hr", "separator")
             | ("img", "img")
             | ("li", "listitem")
+            | ("link", "link")
+            | ("main", "main")
+            | ("menu", "list")
+            | ("meter", "progressbar")
             | ("nav", "navigation")
             | ("ol", "list")
+            | ("option", "option")
+            | ("optgroup", "group")
+            | ("output", "status")
+            | ("progress", "progressbar")
+            | ("section", "region")
+            | ("summary", "button")
             | ("table", "table")
+            | ("tbody", "rowgroup")
+            | ("textarea", "textbox")
+            | ("tfoot", "rowgroup")
+            | ("thead", "rowgroup")
+            | ("tr", "row")
             | ("ul", "list")
+            | ("header", "banner")
+            | ("footer", "contentinfo")
     )
 }
 

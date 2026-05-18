@@ -340,6 +340,21 @@ pub fn detect_runes(root: &Root) -> bool {
             return true;
         }
     }
+    // Also walk the fragment for a SvelteOptions node — the parser doesn't
+    // always populate `root.options` and instead leaves the element in the
+    // fragment children. Check for `runes` attribute presence.
+    for n in &root.fragment.nodes {
+        if let svelte_ast::fragment::FragmentChild::SvelteOptions(opts) = n {
+            for a in &opts.attributes {
+                if let svelte_ast::attributes::ElementAttribute::Attribute(attr) = a {
+                    if attr.name == "runes" {
+                        // Empty / boolean / `runes={true}` all opt in.
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     if let Some(s) = root.module.as_ref() {
         if program_uses_runes(&s.content) {
             return true;

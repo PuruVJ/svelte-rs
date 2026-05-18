@@ -75,20 +75,39 @@ pub struct RelativeSelectorMetadata {
 
 /// Analyze a stylesheet and produce per-node metadata.
 pub fn analyze_css(stylesheet: &StyleSheet) -> CssAnalysis {
+    let (a, _err) = analyze_css_inner(stylesheet);
+    a
+}
+
+/// Like `analyze_css`, but also returns the first compile error encountered
+/// (e.g. `css_selector_invalid` for a top-level rule whose first relative
+/// selector has a combinator). Mirrors upstream's behavior where this is a
+/// hard error during analyze.
+pub fn analyze_css_with_errors(
+    stylesheet: &StyleSheet,
+) -> (CssAnalysis, Option<svelte_diagnostics::CompileDiagnostic>) {
+    analyze_css_inner(stylesheet)
+}
+
+fn analyze_css_inner(
+    stylesheet: &StyleSheet,
+) -> (CssAnalysis, Option<svelte_diagnostics::CompileDiagnostic>) {
     let mut a = CssAnalysis::default();
+    let mut err: Option<svelte_diagnostics::CompileDiagnostic> = None;
     for child in &stylesheet.children {
         match child {
-            StyleSheetChild::Rule(rule) => analyze_rule(rule, &mut a, None),
-            StyleSheetChild::Atrule(atrule) => analyze_atrule(atrule, &mut a, false),
+            StyleSheetChild::Rule(rule) => analyze_rule(rule, &mut a, None, &mut err),
+            StyleSheetChild::Atrule(atrule) => analyze_atrule(atrule, &mut a, false, &mut err),
         }
     }
-    a
+    (a, err)
 }
 
 fn analyze_atrule(
     atrule: &svelte_ast::css::Atrule,
     a: &mut CssAnalysis,
     inside_global_block: bool,
+    err: &mut Option<svelte_diagnostics::CompileDiagnostic>,
 ) {
     // `@keyframes`: track for scoping. `-global-` prefix means we shouldn't
     // rename. The name is `atrule.prelude.trim()` for `keyframes`.
@@ -103,9 +122,9 @@ fn analyze_atrule(
     if let Some(block) = &atrule.block {
         for child in &block.children {
             match child {
-                svelte_ast::css::BlockChild::Rule(r) => analyze_rule(r, a, None),
+                svelte_ast::css::BlockChild::Rule(r) => analyze_rule(r, a, None, err),
                 svelte_ast::css::BlockChild::Atrule(at) => {
-                    analyze_atrule(at, a, inside_global_block)
+                    analyze_atrule(at, a, inside_global_block, err)
                 }
                 svelte_ast::css::BlockChild::Declaration(_) => {}
             }
@@ -113,7 +132,12 @@ fn analyze_atrule(
     }
 }
 
-fn analyze_rule(rule: &Rule, a: &mut CssAnalysis, parent_rule: Option<&Rule>) {
+fn analyze_rule(
+    rule: &Rule,
+    a: &mut CssAnalysis,
+    parent_rule: Option<&Rule>,
+    err: &mut Option<svelte_diagnostics::CompileDiagnostic>,
+) {
     let mut meta = RuleMetadata::default();
 
     // First pass: detect `:global { ... }` block-rule. Walks complex
@@ -143,6 +167,25 @@ fn analyze_rule(rule: &Rule, a: &mut CssAnalysis, parent_rule: Option<&Rule>) {
     // Walk selectors to populate complex / relative metadata.
     for complex in &rule.prelude.children {
         analyze_complex_selector(complex, a);
+        // `css_selector_invalid`: a top-level (non-nested) rule whose first
+        // relative selector has a leading combinator is invalid. Mirrors
+        // `css-analyze.js:145-152`. Skip if we're inside a parent rule
+        // (nesting), since nested rules legitimately start with `&` or a
+        // combinator pointing at the parent.
+        if parent_rule.is_none() {
+            if let Some(first) = complex.children.first() {
+                if let Some(combinator) = &first.combinator {
+                    if err.is_none() {
+                        *err = Some(svelte_diagnostics::errors::css_selector_invalid(Some((
+                            combinator.start,
+                            combinator.end,
+                        ))));
+                    }
+                }
+            }
+        }
+        // `:global(...)` placement / list validity. Mirrors css-analyze.js:67-116.
+        validate_global_placement(complex, err);
     }
 
     for complex in &rule.prelude.children {
@@ -173,9 +216,9 @@ fn analyze_rule(rule: &Rule, a: &mut CssAnalysis, parent_rule: Option<&Rule>) {
     // Recurse into nested rules.
     for child in &rule.block.children {
         match child {
-            svelte_ast::css::BlockChild::Rule(nested) => analyze_rule(nested, a, Some(rule)),
+            svelte_ast::css::BlockChild::Rule(nested) => analyze_rule(nested, a, Some(rule), err),
             svelte_ast::css::BlockChild::Atrule(at) => {
-                analyze_atrule(at, a, meta.is_global_block)
+                analyze_atrule(at, a, meta.is_global_block, err)
             }
             svelte_ast::css::BlockChild::Declaration(_) => {}
         }
@@ -267,6 +310,67 @@ fn analyze_relative_selector(rel: &RelativeSelector, a: &mut CssAnalysis) {
             if let Some(args) = &p.args {
                 for complex in &args.children {
                     analyze_complex_selector(complex, a);
+                }
+            }
+        }
+    }
+}
+
+/// Validate `:global(...)` placement and selector-list contents.
+/// Mirrors `css-analyze.js:67-116`.
+fn validate_global_placement(
+    complex: &ComplexSelector,
+    err: &mut Option<svelte_diagnostics::CompileDiagnostic>,
+) {
+    if err.is_some() {
+        return;
+    }
+    // Find the `:global(...)` relative selector, if any.
+    let global_idx = complex.children.iter().position(is_global);
+    if let Some(idx) = global_idx {
+        let global = &complex.children[idx];
+        // Get the head `:global` PseudoClassSelector.
+        if let Some(SimpleSelector::PseudoClassSelector(p)) = global.selectors.first() {
+            if p.args.is_some()
+                && idx != 0
+                && idx != complex.children.len() - 1
+            {
+                // Allow multiple `:global(...)` in sequence — only flag if any
+                // following sibling is NOT itself global.
+                for rel in complex.children.iter().skip(idx + 1) {
+                    if !is_global(rel) {
+                        *err = Some(svelte_diagnostics::errors::css_global_invalid_placement(
+                            Some((p.start, p.end)),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // `:global(...)` must not contain type/universal selectors when used in
+    // a compound selector (i.e. position != 0 within its relative selector,
+    // OR a sibling exists in the compound).
+    for rel in &complex.children {
+        for i in 0..rel.selectors.len() {
+            let SimpleSelector::PseudoClassSelector(p) = &rel.selectors[i] else { continue };
+            if p.name != "global" { continue }
+            let Some(args) = &p.args else { continue };
+            // First inner relative selector's first simple selector.
+            let inner = args.children.first().and_then(|cs| cs.children.first());
+            if let Some(inner_rel) = inner {
+                if let Some(inner_first) = inner_rel.selectors.first() {
+                    if matches!(inner_first, SimpleSelector::TypeSelector(_)) && i != 0 {
+                        if err.is_none() {
+                            *err = Some(
+                                svelte_diagnostics::errors::css_global_invalid_selector_list(
+                                    Some((p.start, p.end)),
+                                ),
+                            );
+                            return;
+                        }
+                    }
                 }
             }
         }
