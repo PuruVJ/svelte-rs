@@ -146,8 +146,27 @@ pub fn try_typed_client_walker_with(
                 }
             }
             NodeKind::InterpElement(el, content, dirs) => {
-                let include_body = matches!(content, ElementContent::StaticOnly);
-                let needs_reactive_body = matches!(content, ElementContent::Reactive(_));
+                // Convert DirectText -> Reactive when the expression is
+                // async-tainted, so the element template gets a text-node
+                // anchor and the body uses `$.child(p, true)` + 4-arg
+                // template_effect.
+                let demoted: ElementContent;
+                let content_ref: &ElementContent = if let (
+                    ElementContent::DirectText(e),
+                    Some(ai),
+                ) = (content, script.async_info.as_ref())
+                {
+                    if expr_refs_any_client(e, &ai.async_bindings) {
+                        demoted = ElementContent::Reactive(vec![TextPart::Expr(*e)]);
+                        &demoted
+                    } else {
+                        content
+                    }
+                } else {
+                    content
+                };
+                let include_body = matches!(content_ref, ElementContent::StaticOnly);
+                let needs_reactive_body = matches!(content_ref, ElementContent::Reactive(_));
                 serialize_element(el, &mut html, include_body, needs_reactive_body)?;
                 let var = if is_multi_root {
                     let v = unique_var(&el.name, &mut var_counts);
@@ -166,11 +185,12 @@ pub fn try_typed_client_walker_with(
                     )));
                 }
                 emit_element_content(
-                    content,
+                    content_ref,
                     &var,
                     &mut body_stmts,
                     &mut effects,
                     &script.state_bindings,
+                    script.async_info.as_ref(),
                 );
                 emit_directives(dirs, &var, &mut effects, &script.state_bindings, &mut delegated_events);
             }
@@ -219,7 +239,9 @@ pub fn try_typed_client_walker_with(
 
     let mut prog: Vec<Statement> = Vec::with_capacity(6 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
-    if script.emit_legacy_flag {
+    if script.async_info.is_some() {
+        prog.push(t::import_side_effect("svelte/internal/flags/async"));
+    } else if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
@@ -1234,6 +1256,18 @@ struct ScriptInfo {
     /// Names bound to `let X = $props()` (identifier destructure). Static-key
     /// reads of these (e.g. `X.foo`) get rewritten to `$$props.foo`.
     rest_props_bindings: HashSet<String>,
+    /// When the script contains top-level `await`, this holds:
+    /// - the rewritten setup statements (hoisted `var`s + `$.run([...])`)
+    /// - the set of bindings touched by those groups
+    /// - the index of the last group (used in template_effect blockers)
+    async_info: Option<AsyncInfo>,
+}
+
+#[derive(Clone)]
+struct AsyncInfo {
+    setup_stmts: Vec<Statement>,
+    async_bindings: HashSet<String>,
+    last_group_idx: usize,
 }
 
 fn analyze_script(
@@ -1250,6 +1284,7 @@ fn analyze_script(
             uses_props: false,
             has_class_with_runes: false,
             rest_props_bindings: HashSet::new(),
+            async_info: None,
         });
     };
 
@@ -1367,16 +1402,284 @@ fn analyze_script(
         }
     }
 
+    // Top-level await detection + transform.
+    let mut async_info: Option<AsyncInfo> = None;
+    if has_top_level_await_in_body(&rest) {
+        async_info = transform_async_script_client(&rest);
+        if async_info.is_some() {
+            uses_runes = true; // async implies runes-like emission rules
+        }
+    }
+    let body_out = if let Some(ai) = &async_info {
+        ai.setup_stmts.clone()
+    } else {
+        rest
+    };
+
     Some(ScriptInfo {
         imports,
-        body: rest,
-        emit_legacy_flag: !uses_runes,
+        body: body_out,
+        emit_legacy_flag: !uses_runes && async_info.is_none(),
         state_bindings,
         constants,
         uses_props,
         has_class_with_runes,
         rest_props_bindings,
+        async_info,
     })
+}
+
+fn has_top_level_await_in_body(body: &[Statement]) -> bool {
+    body.iter().any(stmt_top_await)
+}
+
+fn stmt_top_await(s: &Statement) -> bool {
+    match s {
+        Statement::Variable(v) => v
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, expr_top_await)),
+        Statement::Expression(e) => expr_top_await(&e.expression),
+        _ => false,
+    }
+}
+
+fn expr_top_await(e: &Expression) -> bool {
+    match e {
+        Expression::Await(_) => true,
+        Expression::Function(f) if f.r#async => false,
+        Expression::Arrow(a) if a.r#async => false,
+        Expression::Call(c) => {
+            expr_top_await(&c.callee)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_top_await(e),
+                    Argument::Spread(s) => expr_top_await(&s.argument),
+                })
+        }
+        Expression::Binary(b) => expr_top_await(&b.left) || expr_top_await(&b.right),
+        Expression::Logical(l) => expr_top_await(&l.left) || expr_top_await(&l.right),
+        Expression::Unary(u) => expr_top_await(&u.argument),
+        Expression::Member(m) => expr_top_await(&m.object),
+        Expression::Conditional(c) => {
+            expr_top_await(&c.test)
+                || expr_top_await(&c.consequent)
+                || expr_top_await(&c.alternate)
+        }
+        Expression::Paren(p) => expr_top_await(&p.expression),
+        Expression::Sequence(s) => s.expressions.iter().any(expr_top_await),
+        Expression::Spread(s) => expr_top_await(&s.argument),
+        _ => false,
+    }
+}
+
+fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
+    let mut hoisted_names: Vec<String> = Vec::new();
+    enum Lowered {
+        AsyncSet { name: String, init: Expression },
+        Sync(Statement),
+    }
+    let mut lowered: Vec<Lowered> = Vec::new();
+
+    for s in body {
+        match s {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        hoisted_names.push(id.name.clone());
+                        let init = d
+                            .init
+                            .clone()
+                            .unwrap_or_else(|| void_zero_client());
+                        if expr_top_await(&init) {
+                            lowered.push(Lowered::AsyncSet {
+                                name: id.name.clone(),
+                                init,
+                            });
+                        } else {
+                            lowered.push(Lowered::Sync(Statement::Expression(Box::new(
+                                ExpressionStatement {
+                                    expression: Expression::Assignment(Box::new(
+                                        AssignmentExpression {
+                                            left: AssignmentTarget::Expression(t::id(&id.name)),
+                                            operator: AssignmentOperator::Assign,
+                                            right: init,
+                                            span: Span::ZERO,
+                                        },
+                                    )),
+                                    span: Span::ZERO,
+                                },
+                            ))));
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            Statement::Expression(e) => {
+                // `undefined` (post-rune-erasure `$inspect()` etc.) → `void 0`
+                if let Expression::Identifier(id) = &e.expression {
+                    if id.name == "undefined" {
+                        lowered.push(Lowered::Sync(t::stmt(void_zero_client())));
+                        continue;
+                    }
+                }
+                // `$inspect(...)` / `$inspect.trace(...)` → `void 0` in async
+                // mode. The client doesn't otherwise rewrite these (so non-
+                // async dev mode keeps them), but inside an async run-group
+                // we need the arrow body to be void 0.
+                if let Expression::Call(c) = &e.expression {
+                    if let Some(kp) = global_keypath(&c.callee) {
+                        if matches!(kp.as_str(), "$inspect" | "$inspect.trace") {
+                            lowered.push(Lowered::Sync(t::stmt(void_zero_client())));
+                            continue;
+                        }
+                    }
+                }
+                lowered.push(Lowered::Sync(s.clone()));
+            }
+            _ => return None,
+        }
+    }
+
+    let mut groups: Vec<Expression> = Vec::new();
+    let mut current_sync: Vec<Statement> = Vec::new();
+    let mut last_was_async = false;
+
+    fn flush_sync(groups: &mut Vec<Expression>, current_sync: &mut Vec<Statement>) {
+        if current_sync.len() == 1 {
+            let s = current_sync.remove(0);
+            if let Statement::Expression(es) = s {
+                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(es.expression),
+                    r#async: false,
+                    span: Span::ZERO,
+                })));
+                return;
+            }
+            current_sync.push(s);
+        }
+        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: std::mem::take(current_sync),
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        })));
+    }
+
+    for l in lowered {
+        match l {
+            Lowered::AsyncSet { name, init } => {
+                if !current_sync.is_empty() {
+                    flush_sync(&mut groups, &mut current_sync);
+                }
+                let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                    left: AssignmentTarget::Expression(t::id(&name)),
+                    operator: AssignmentOperator::Assign,
+                    right: init,
+                    span: Span::ZERO,
+                }));
+                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(assign),
+                    r#async: true,
+                    span: Span::ZERO,
+                })));
+                last_was_async = true;
+            }
+            Lowered::Sync(stmt) => {
+                current_sync.push(stmt);
+                last_was_async = false;
+            }
+        }
+    }
+    if !current_sync.is_empty() || last_was_async {
+        if current_sync.is_empty() {
+            current_sync.push(t::stmt(void_zero_client()));
+        }
+        flush_sync(&mut groups, &mut current_sync);
+    }
+
+    let last_group_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
+
+    let mut setup_stmts: Vec<Statement> = Vec::new();
+    if !hoisted_names.is_empty() {
+        let decls: Vec<VariableDeclarator> = hoisted_names
+            .iter()
+            .map(|n| VariableDeclarator {
+                id: t::pat_id(n),
+                init: None,
+                span: Span::ZERO,
+            })
+            .collect();
+        setup_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Var,
+            declarations: decls,
+            span: Span::ZERO,
+        })));
+    }
+    setup_stmts.push(t::var(
+        "$$promises",
+        t::call(
+            t::member_id(t::id("$"), "run"),
+            vec![Expression::Array(Box::new(ArrayExpression {
+                elements: groups.into_iter().map(ArrayElement::Expression).collect(),
+                span: Span::ZERO,
+            }))],
+        ),
+    ));
+
+    let async_bindings: HashSet<String> = hoisted_names.into_iter().collect();
+    Some(AsyncInfo {
+        setup_stmts,
+        async_bindings,
+        last_group_idx,
+    })
+}
+
+fn expr_refs_any_client(e: &Expression, names: &HashSet<String>) -> bool {
+    match e {
+        Expression::Identifier(i) => names.contains(&i.name),
+        Expression::Member(m) => expr_refs_any_client(&m.object, names),
+        Expression::Call(c) => {
+            expr_refs_any_client(&c.callee, names)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_refs_any_client(e, names),
+                    Argument::Spread(s) => expr_refs_any_client(&s.argument, names),
+                })
+        }
+        Expression::Binary(b) => {
+            expr_refs_any_client(&b.left, names) || expr_refs_any_client(&b.right, names)
+        }
+        Expression::Logical(l) => {
+            expr_refs_any_client(&l.left, names) || expr_refs_any_client(&l.right, names)
+        }
+        Expression::Unary(u) => expr_refs_any_client(&u.argument, names),
+        Expression::Conditional(c) => {
+            expr_refs_any_client(&c.test, names)
+                || expr_refs_any_client(&c.consequent, names)
+                || expr_refs_any_client(&c.alternate, names)
+        }
+        Expression::Paren(p) => expr_refs_any_client(&p.expression, names),
+        Expression::Template(t) => t.expressions.iter().any(|e| expr_refs_any_client(e, names)),
+        _ => false,
+    }
+}
+
+fn void_zero_client() -> Expression {
+    Expression::Unary(Box::new(UnaryExpression {
+        operator: UnaryOperator::Void,
+        argument: Expression::Literal(Box::new(Literal::Number(NumberLiteral {
+            value: 0.0,
+            raw: Some("0".to_string()),
+            span: Span::ZERO,
+        }))),
+        prefix: true,
+        span: Span::ZERO,
+    }))
 }
 
 fn replace_props_init_with_rest_props(s: &mut Statement, names: &HashSet<String>) {
@@ -3206,7 +3509,132 @@ fn emit_element_content(
     body_stmts: &mut Vec<Statement>,
     effects: &mut Vec<Statement>,
     state_bindings: &HashSet<String>,
+    async_info: Option<&AsyncInfo>,
 ) {
+    // Demote DirectText to Reactive when the expression is async-tainted —
+    // async values can't be assigned synchronously to `.textContent`.
+    if let (ElementContent::DirectText(expr), Some(ai)) = (content, async_info) {
+        if expr_refs_any_client(expr, &ai.async_bindings) {
+            let parts = vec![TextPart::Expr(*expr)];
+            let demoted = ElementContent::Reactive(parts);
+            emit_element_content(
+                &demoted,
+                parent_var,
+                body_stmts,
+                effects,
+                state_bindings,
+                async_info,
+            );
+            return;
+        }
+    }
+    // Detect async-tainted Reactive content first: emit the 4-arg
+    // `\$.template_effect` form with `\$.child(parent, true)`.
+    if let (ElementContent::Reactive(parts), Some(ai)) = (content, async_info) {
+        let async_parts: Vec<bool> = parts
+            .iter()
+            .map(|p| match p {
+                TextPart::Static(_) => false,
+                TextPart::Expr(e) => expr_refs_any_client(e, &ai.async_bindings),
+            })
+            .collect();
+        if async_parts.iter().any(|b| *b) {
+            // text-node with the second `true` arg.
+            body_stmts.push(t::var(
+                "text",
+                t::call(
+                    t::member_id(t::id("$"), "child"),
+                    vec![
+                        t::id(parent_var),
+                        Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                            value: true,
+                            span: Span::ZERO,
+                        }))),
+                    ],
+                ),
+            ));
+            body_stmts.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "reset"),
+                vec![t::id(parent_var)],
+            )));
+            // For a single expression Reactive part: pass the expression
+            // directly to set_text. For multiple parts: build a template
+            // literal without `?? ''` coalesce.
+            let expr_count = parts
+                .iter()
+                .filter(|p| matches!(p, TextPart::Expr(_)))
+                .count();
+            let set_text_arg: Expression = if parts.len() == 1 {
+                if let TextPart::Expr(e) = &parts[0] {
+                    (*e).clone()
+                } else {
+                    return;
+                }
+            } else if expr_count == 1
+                && parts.iter().all(|p| !matches!(p, TextPart::Static(s) if !s.is_empty()))
+            {
+                // Single expression with only-whitespace static parts.
+                let e = parts
+                    .iter()
+                    .find_map(|p| match p {
+                        TextPart::Expr(e) => Some((*e).clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+                e
+            } else {
+                // General template literal.
+                let mut quasis: Vec<String> = Vec::new();
+                let mut subs: Vec<Expression> = Vec::new();
+                let mut current = String::new();
+                for p in parts {
+                    match p {
+                        TextPart::Static(s) => current.push_str(s),
+                        TextPart::Expr(e) => {
+                            quasis.push(std::mem::take(&mut current));
+                            subs.push((*e).clone());
+                        }
+                    }
+                }
+                quasis.push(current);
+                t::template_raw(quasis, subs)
+            };
+            let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id("text"), set_text_arg],
+                )),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            // Blockers array: `[$$promises[N]]`
+            let blockers = Expression::Array(Box::new(ArrayExpression {
+                elements: vec![ArrayElement::Expression(Expression::Member(Box::new(
+                    MemberExpression {
+                        object: t::id("$$promises"),
+                        property: MemberProperty::Expression(t::lit_number(
+                            ai.last_group_idx as f64,
+                        )),
+                        computed: true,
+                        optional: false,
+                        span: Span::ZERO,
+                    },
+                )))],
+                span: Span::ZERO,
+            }));
+            effects.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "template_effect"),
+                vec![
+                    effect_fn,
+                    void_zero_client(),
+                    void_zero_client(),
+                    blockers,
+                ],
+            )));
+            return;
+        }
+    }
     match content {
         ElementContent::NoContent | ElementContent::StaticOnly => {}
         ElementContent::FoldedText(s) => {
