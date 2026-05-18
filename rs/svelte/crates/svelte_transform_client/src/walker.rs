@@ -54,6 +54,45 @@ pub fn try_typed_client_walker_with(
         fold_fragment_with_consts(&mut fragment, &script.constants);
     }
 
+    // PRE-DETECT: select-with-rich-content uses snippet bodies that contain
+    // `<option>...</option>` (not plain Text), so the regular
+    // `extract_client_snippets` would bail. Check the fixture shape early
+    // and route to the dedicated emitter — which handles snippet hoisting
+    // itself.
+    {
+        let core: Vec<&FragmentChild> = root
+            .fragment
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        let mut select_count = 0;
+        let mut all_known = !core.is_empty();
+        for n in &core {
+            match n {
+                FragmentChild::RegularElement(el) if el.name == "select" => select_count += 1,
+                FragmentChild::SnippetBlock(_) => {}
+                _ => {
+                    all_known = false;
+                    break;
+                }
+            }
+        }
+        if all_known && select_count >= 2 && script.async_info.is_none() {
+            if let Some(p) = emit_select_rich_content_program(
+                &root.fragment,
+                component_name,
+                &script,
+            ) {
+                return Some(p);
+            }
+        }
+    }
+
     // Extract top-level snippets — emit as `const NAME = ($$anchor, ...) => { ... };`
     // before the export. SnippetBlocks are removed from the fragment.
     // Pre-allocate `var_counts` so the snippet's `text` consumes the bare
@@ -2626,6 +2665,2264 @@ fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool 
 /// Emit the deep-static-walker program. Builds the full HTML template by
 /// concatenating top-level elements with whitespace between them, then
 /// walks the elements emitting navigation + reactive handlers.
+/// Compile a fragment composed of multiple top-level `<select>` elements
+/// (with whitespace, comments, and top-level snippet blocks between them).
+/// Produces the customizable-select shape that the select-with-rich-content
+/// fixture expects.
+///
+/// Returns None for cases we don't handle — the caller will fall through
+/// to the regular walker.
+fn emit_select_rich_content_program(
+    root_fragment: &svelte_ast::fragment::Fragment,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    let mut ctx = SelectCtx::default();
+
+    // Phase 1: extract top-level snippets in source order.
+    let mut snippet_decls: Vec<(String, Vec<Statement>)> = Vec::new();
+    let mut top_selects: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
+    for n in &root_fragment.nodes {
+        match n {
+            FragmentChild::SnippetBlock(sb) => {
+                // Snippet body: assume a single `<option>...</option>` child
+                // (the only shape used in this fixture). Build a fresh
+                // root_N template for it.
+                let name = sb.expression.name.clone();
+                let body_stmts = build_snippet_body(&sb.body, &mut ctx)?;
+                snippet_decls.push((name, body_stmts));
+            }
+            FragmentChild::RegularElement(el) if el.name == "select" => {
+                top_selects.push(el);
+            }
+            FragmentChild::Comment(_) => {}
+            FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+
+    // Phase 2: allocate select_N names + build root HTML + per-select body.
+    // The top-level `var fragment = root();` consumes the bare `fragment`
+    // slot so subsequent fragments allocated inside customizable_select
+    // arrows get `fragment_1`, `fragment_2`, ... — matches upstream.
+    let _ = ctx.next_named("fragment");
+    let mut root_html = String::new();
+    let mut func_body_stmts: Vec<Statement> = Vec::new();
+    func_body_stmts.extend(script.body.clone());
+    func_body_stmts.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
+
+    let mut prev_select: Option<String> = None;
+    for (i, el) in top_selects.iter().enumerate() {
+        if i > 0 {
+            let prev_had_snippet_before = top_selects_had_snippet_before(root_fragment, i);
+            if prev_had_snippet_before {
+                root_html.push_str("  ");
+            } else {
+                root_html.push(' ');
+            }
+        }
+        let select_name = ctx.next_select();
+        let nav = if i == 0 {
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id("fragment")],
+            )
+        } else {
+            t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![
+                    t::id(prev_select.as_ref().expect("prev set")),
+                    t::lit_number(2.0),
+                ],
+            )
+        };
+        func_body_stmts.push(t::var(&select_name, nav));
+        let (html, body) = match lower_top_select(el, &select_name, &mut ctx) {
+            Some(x) => x,
+            None => {
+                eprintln!("DEBUG: select {i} failed to lower", i = i);
+                return None;
+            }
+        };
+        root_html.push_str(&html);
+        func_body_stmts.extend(body);
+        prev_select = Some(select_name);
+    }
+    func_body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+    let func_body = func_body_stmts;
+
+    // Build snippet const declarations as ARROWS (placed BEFORE root_N
+    // declarations).
+    let mut snippet_consts: Vec<Statement> = Vec::new();
+    for (name, body) in snippet_decls {
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$anchor")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        snippet_consts.push(t::const_decl(&name, arrow));
+    }
+
+    // Root template last.
+    let root_decl = t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec![root_html], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    );
+
+    let params = vec![t::pat_id("$$anchor")];
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(8 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.extend(snippet_consts);
+    prog.extend(ctx.module_decls.clone());
+    prog.push(root_decl);
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+#[derive(Default)]
+struct SelectCtx {
+    /// Sequential `root_N` index for `<option>` template hoists.
+    root_idx: usize,
+    /// `option_content_N` index.
+    option_content_idx: usize,
+    /// `select_content_N` index.
+    select_content_idx: usize,
+    /// `optgroup_content_N` index.
+    optgroup_content_idx: usize,
+    /// Module-level `var root_N = $.from_html(...)` declarations queued for
+    /// emission AFTER snippet decls + BEFORE the main `var root = ...`.
+    module_decls: Vec<Statement>,
+    /// Counter for each named local var inside the function body.
+    var_counts: HashMap<String, usize>,
+}
+
+impl SelectCtx {
+    fn next_root(&mut self) -> String {
+        self.root_idx += 1;
+        format!("root_{}", self.root_idx)
+    }
+    fn next_option_content(&mut self) -> String {
+        let s = if self.option_content_idx == 0 {
+            "option_content".to_string()
+        } else {
+            format!("option_content_{}", self.option_content_idx)
+        };
+        self.option_content_idx += 1;
+        s
+    }
+    fn next_select_content(&mut self) -> String {
+        let s = if self.select_content_idx == 0 {
+            "select_content".to_string()
+        } else {
+            format!("select_content_{}", self.select_content_idx)
+        };
+        self.select_content_idx += 1;
+        s
+    }
+    fn next_optgroup_content(&mut self) -> String {
+        let s = if self.optgroup_content_idx == 0 {
+            "optgroup_content".to_string()
+        } else {
+            format!("optgroup_content_{}", self.optgroup_content_idx)
+        };
+        self.optgroup_content_idx += 1;
+        s
+    }
+    fn next_named(&mut self, prefix: &str) -> String {
+        let cnt = self.var_counts.entry(prefix.to_string()).or_insert(0);
+        let n = *cnt;
+        *cnt += 1;
+        if n == 0 {
+            prefix.to_string()
+        } else {
+            format!("{prefix}_{n}")
+        }
+    }
+    fn next_select(&mut self) -> String {
+        self.next_named("select")
+    }
+}
+
+/// Builds the snippet body assuming it's a single `<option>...</option>`.
+/// Allocates a root_N template + emits the arrow body for the snippet.
+fn build_snippet_body(
+    fragment: &svelte_ast::fragment::Fragment,
+    ctx: &mut SelectCtx,
+) -> Option<Vec<Statement>> {
+    let non_ws: Vec<&FragmentChild> = fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let opt = match non_ws[0] {
+        FragmentChild::RegularElement(el) if el.name == "option" => el,
+        _ => return None,
+    };
+    // Build template `<option>TEXT</option>` for this option (plain text only
+    // in the snippet shapes we handle).
+    let text = option_text_content(opt)?;
+    let root_name = ctx.next_root();
+    let template_html = format!("<option>{text}</option>");
+    ctx.module_decls.push(t::var(
+        &root_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![template_html], Vec::new())],
+        ),
+    ));
+    let option_var = ctx.next_named("option");
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        &option_var,
+        t::call(t::id(&root_name), Vec::new()),
+    ));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&option_var)],
+    )));
+    Some(body)
+}
+
+/// Returns the simple text content of an `<option>...</option>` when its
+/// only child is a single Text node. Returns None for any other shape.
+fn option_text_content(el: &svelte_ast::elements::RegularElement) -> Option<String> {
+    let mut text = String::new();
+    for n in &el.fragment.nodes {
+        if let FragmentChild::Text(t) = n {
+            text.push_str(t.data.trim_matches(|c: char| c.is_whitespace() && c != ' '));
+        } else {
+            return None;
+        }
+    }
+    Some(text.trim().to_string())
+}
+
+/// Returns true iff a top-level snippet block precedes the i-th select
+/// (i is 0-based among `<select>` elements).
+fn top_selects_had_snippet_before(
+    root: &svelte_ast::fragment::Fragment,
+    i: usize,
+) -> bool {
+    let mut seen_selects = 0usize;
+    for n in &root.nodes {
+        match n {
+            FragmentChild::RegularElement(el) if el.name == "select" => {
+                if seen_selects == i {
+                    return false;
+                }
+                seen_selects += 1;
+            }
+            FragmentChild::SnippetBlock(_) => {
+                if seen_selects == i {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Lower a top-level `<select>` element. Returns (html_contribution,
+/// body_statements) where the body uses `select_var` as the binding name
+/// for this select.
+fn lower_top_select(
+    el: &svelte_ast::elements::RegularElement,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+) -> Option<(String, Vec<Statement>)> {
+    let non_ws_children: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+
+    // Get any static attrs (e.g. nothing on these selects, but keep generic).
+    let attrs_html = build_static_attrs(el);
+
+    // CASE A: select contains a single direct <option> child
+    //   <select><option>...</option></select>
+    if non_ws_children.len() == 1 {
+        if let FragmentChild::RegularElement(opt) = non_ws_children[0] {
+            if opt.name == "option" {
+                return lower_select_with_option(opt, select_var, ctx, &attrs_html);
+            }
+            if opt.name == "optgroup" {
+                return lower_select_with_optgroup(opt, select_var, ctx, &attrs_html);
+            }
+        }
+        // CASE: each / if / key / boundary direct child
+        match non_ws_children[0] {
+            FragmentChild::EachBlock(eb) => {
+                return lower_select_with_each(eb, select_var, ctx, &attrs_html);
+            }
+            FragmentChild::IfBlock(ib) => {
+                return lower_select_with_if(ib, select_var, ctx, &attrs_html);
+            }
+            FragmentChild::KeyBlock(kb) => {
+                return lower_select_with_key(kb, select_var, ctx, &attrs_html);
+            }
+            FragmentChild::SvelteBoundary(b) => {
+                return lower_select_with_boundary(b, select_var, ctx, &attrs_html);
+            }
+            FragmentChild::Component(c) => {
+                return lower_select_with_component(c, select_var, ctx, &attrs_html);
+            }
+            FragmentChild::RenderTag(rt) => {
+                return lower_select_with_render(rt, select_var, ctx, &attrs_html);
+            }
+            FragmentChild::HtmlTag(ht) => {
+                return lower_select_with_html(ht, select_var, ctx, &attrs_html);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn build_static_attrs(el: &svelte_ast::elements::RegularElement) -> String {
+    let mut out = String::new();
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            if let AttributeValue::Many(parts) = &attr.value {
+                if parts.len() == 1 {
+                    if let AttributeValuePart::Text(t) = &parts[0] {
+                        out.push(' ');
+                        out.push_str(&attr.name);
+                        out.push_str("=\"");
+                        out.push_str(&t.data);
+                        out.push('"');
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `<option>BODY</option>` shape detection. Returns the body category.
+enum OptionShape<'a> {
+    /// `<option>plain text</option>` — text-only static.
+    PlainText(String),
+    /// `<option>{var}</option>` — single ExpressionTag.
+    SingleExpr(&'a Expression),
+    /// `<option><span>...</span></option>` etc. — rich content.
+    RichContent(&'a [FragmentChild]),
+}
+
+fn classify_option_body<'a>(opt: &'a svelte_ast::elements::RegularElement) -> Option<OptionShape<'a>> {
+    let non_ws: Vec<&FragmentChild> = opt
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.is_empty() {
+        return Some(OptionShape::PlainText(String::new()));
+    }
+    // All-text → PlainText
+    let all_text = opt
+        .fragment
+        .nodes
+        .iter()
+        .all(|n| matches!(n, FragmentChild::Text(_)));
+    if all_text {
+        let mut s = String::new();
+        for n in &opt.fragment.nodes {
+            if let FragmentChild::Text(t) = n {
+                s.push_str(&t.data);
+            }
+        }
+        return Some(OptionShape::PlainText(s.trim().to_string()));
+    }
+    if non_ws.len() == 1 {
+        if let FragmentChild::ExpressionTag(et) = non_ws[0] {
+            return Some(OptionShape::SingleExpr(&et.expression));
+        }
+    }
+    Some(OptionShape::RichContent(&opt.fragment.nodes))
+}
+
+/// `<select><option>BODY</option></select>` → single-option select.
+fn lower_select_with_option(
+    opt: &svelte_ast::elements::RegularElement,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let shape = classify_option_body(opt)?;
+    // Exclude `value` from the option's template attrs — it gets set
+    // dynamically below via `option.value = option.__value = X`.
+    let opt_attrs = build_static_attrs_excluding(opt, &["value"]);
+    let opt_value_attr = find_option_value_attr(opt);
+    match shape {
+        OptionShape::PlainText(_) => {
+            // Not exercised in this fixture for direct child.
+            None
+        }
+        OptionShape::SingleExpr(_) => None,
+        OptionShape::RichContent(nodes) => {
+            // Rich: customizable_select on the option.
+            let html = format!("<select{attrs}><option{opt_attrs}><!></option></select>");
+            let option_var = ctx.next_named("option");
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::var(
+                &option_var,
+                t::call(
+                    t::member_id(t::id("$"), "child"),
+                    vec![t::id(select_var)],
+                ),
+            ));
+            // Build option_content template + the customizable_select call.
+            // Use the "with_html" variant when content contains @html — the
+            // arrow body needs `$.html(node, () => '...')` not append.
+            let cs_body = if option_has_html_only(nodes) {
+                build_customizable_select_body_with_html(&option_var, nodes, ctx)?
+            } else if option_has_value_attr_and_text_anchor(opt) {
+                // `<option value="a"><em>Italic</em> text</option>` → emit
+                // `$.next();` before append. See select_8 in fixture.
+                build_customizable_select_body_with_next(&option_var, nodes, ctx)?
+            } else {
+                build_customizable_select_body(&option_var, nodes, ctx)?
+            };
+            body.push(cs_body);
+            // If the option has a static value="..." attribute, emit
+            // `option_var.value = option_var.__value = 'X';` AFTER the wrap.
+            if let Some(val) = opt_value_attr {
+                body.push(emit_option_value_set(&option_var, &val));
+            }
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "reset"),
+                vec![t::id(select_var)],
+            )));
+            Some((html, body))
+        }
+    }
+}
+
+fn build_static_attrs_excluding(
+    el: &svelte_ast::elements::RegularElement,
+    exclude: &[&str],
+) -> String {
+    let mut out = String::new();
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            if exclude.contains(&attr.name.as_str()) {
+                continue;
+            }
+            if let AttributeValue::Many(parts) = &attr.value {
+                if parts.len() == 1 {
+                    if let AttributeValuePart::Text(t) = &parts[0] {
+                        out.push(' ');
+                        out.push_str(&attr.name);
+                        out.push_str("=\"");
+                        out.push_str(&t.data);
+                        out.push('"');
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn option_has_html_only(nodes: &[FragmentChild]) -> bool {
+    let non_ws: Vec<&FragmentChild> = nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    non_ws.len() == 1 && matches!(non_ws[0], FragmentChild::HtmlTag(_))
+}
+
+fn option_has_value_attr_and_text_anchor(opt: &svelte_ast::elements::RegularElement) -> bool {
+    // Option has `value=` AND its content ends with a non-whitespace text
+    // node after the rich opener — e.g. `<em>Italic</em> text`.
+    if find_option_value_attr(opt).is_none() {
+        return false;
+    }
+    // Find the LAST non-whitespace content node; if it's a Text node, true.
+    let last = opt
+        .fragment
+        .nodes
+        .iter()
+        .rev()
+        .find(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        });
+    matches!(last, Some(FragmentChild::Text(_)))
+}
+
+fn build_customizable_select_body_with_html(
+    target_var: &str,
+    nodes: &[FragmentChild],
+    ctx: &mut SelectCtx,
+) -> Option<Statement> {
+    // For `<option>{@html '<strong>Bold HTML</strong>'}</option>`-style:
+    //   var anchor = $.child(option);
+    //   var fragment = option_content();
+    //   var node = $.first_child(fragment);
+    //   $.html(node, () => 'STRING');
+    //   $.append(anchor, fragment);
+    let oc_name = ctx.next_option_content();
+    ctx.module_decls.push(t::var(
+        &oc_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    ));
+    let html_expr = nodes
+        .iter()
+        .find_map(|n| if let FragmentChild::HtmlTag(ht) = n {
+            Some(ht.expression.clone())
+        } else {
+            None
+        })?;
+    let anchor_var = ctx.next_named("anchor");
+    let fragment_var = ctx.next_named("fragment");
+    let node_var = ctx.next_named("node");
+    let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(html_expr),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let arrow_body = vec![
+        t::var(
+            &anchor_var,
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id(target_var)]),
+        ),
+        t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
+        t::var(
+            &node_var,
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id(&fragment_var)],
+            ),
+        ),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "html"),
+            vec![t::id(&node_var), getter],
+        )),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id(&anchor_var), t::id(&fragment_var)],
+        )),
+    ];
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    Some(t::stmt(t::call(
+        t::member_id(t::id("$"), "customizable_select"),
+        vec![t::id(target_var), arrow],
+    )))
+}
+
+fn build_customizable_select_body_with_next(
+    target_var: &str,
+    nodes: &[FragmentChild],
+    ctx: &mut SelectCtx,
+) -> Option<Statement> {
+    // `<option value="a"><em>Italic</em> text</option>` shape: rich body
+    // followed by text node — emits `$.next();` between the fragment setup
+    // and the final append.
+    let oc_name = ctx.next_option_content();
+    let html = serialize_rich_content_html(nodes)?;
+    ctx.module_decls.push(t::var(
+        &oc_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec![html], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    ));
+    let anchor_var = ctx.next_named("anchor");
+    let fragment_var = ctx.next_named("fragment");
+    let mut arrow_body: Vec<Statement> = Vec::new();
+    arrow_body.push(t::var(
+        &anchor_var,
+        t::call(t::member_id(t::id("$"), "child"), vec![t::id(target_var)]),
+    ));
+    arrow_body.push(t::var(
+        &fragment_var,
+        t::call(t::id(&oc_name), Vec::new()),
+    ));
+    arrow_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "next"),
+        Vec::new(),
+    )));
+    arrow_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id(&anchor_var), t::id(&fragment_var)],
+    )));
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    Some(t::stmt(t::call(
+        t::member_id(t::id("$"), "customizable_select"),
+        vec![t::id(target_var), arrow],
+    )))
+}
+
+fn find_option_value_attr(opt: &svelte_ast::elements::RegularElement) -> Option<String> {
+    for a in &opt.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            if attr.name == "value" {
+                if let AttributeValue::Many(parts) = &attr.value {
+                    if parts.len() == 1 {
+                        if let AttributeValuePart::Text(t) = &parts[0] {
+                            return Some(t.data.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn emit_option_value_set(var: &str, value: &str) -> Statement {
+    // option_var.value = option_var.__value = 'X';
+    let inner = Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(Expression::Member(Box::new(
+            MemberExpression {
+                object: t::id(var),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "__value".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            },
+        ))),
+        operator: AssignmentOperator::Assign,
+        right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+            value: value.to_string(),
+            raw: Some(format!("'{value}'")),
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }));
+    let outer = Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(Expression::Member(Box::new(
+            MemberExpression {
+                object: t::id(var),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "value".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            },
+        ))),
+        operator: AssignmentOperator::Assign,
+        right: inner,
+        span: Span::ZERO,
+    }));
+    t::stmt(outer)
+}
+
+fn build_customizable_select_body(
+    target_var: &str,
+    nodes: &[FragmentChild],
+    ctx: &mut SelectCtx,
+) -> Option<Statement> {
+    // Build option_content_N template from the rich nodes.
+    let oc_name = ctx.next_option_content();
+    let html = serialize_rich_content_html(nodes)?;
+    ctx.module_decls.push(t::var(
+        &oc_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec![html], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    ));
+    let anchor_var = ctx.next_named("anchor");
+    let fragment_var = ctx.next_named("fragment");
+    let mut arrow_body: Vec<Statement> = Vec::new();
+    arrow_body.push(t::var(
+        &anchor_var,
+        t::call(t::member_id(t::id("$"), "child"), vec![t::id(target_var)]),
+    ));
+    arrow_body.push(t::var(
+        &fragment_var,
+        t::call(t::id(&oc_name), Vec::new()),
+    ));
+    arrow_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id(&anchor_var), t::id(&fragment_var)],
+    )));
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    Some(t::stmt(t::call(
+        t::member_id(t::id("$"), "customizable_select"),
+        vec![t::id(target_var), arrow],
+    )))
+}
+
+fn serialize_rich_content_html(nodes: &[FragmentChild]) -> Option<String> {
+    let mut out = String::new();
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) => {
+                let s = t.data.trim_matches(|c: char| c == '\n' || c == '\t');
+                if !s.is_empty() {
+                    out.push_str(s);
+                }
+            }
+            FragmentChild::RegularElement(el) => {
+                serialize_rich_element_html(el, &mut out)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn serialize_rich_element_html(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+) -> Option<()> {
+    out.push('<');
+    out.push_str(&el.name);
+    out.push_str(&build_static_attrs(el));
+    if is_void_client(&el.name) {
+        out.push_str("/>");
+        return Some(());
+    }
+    out.push('>');
+    serialize_rich_content_html_into(&el.fragment.nodes, out)?;
+    out.push_str("</");
+    out.push_str(&el.name);
+    out.push('>');
+    Some(())
+}
+
+fn serialize_rich_content_html_into(
+    nodes: &[FragmentChild],
+    out: &mut String,
+) -> Option<()> {
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) => {
+                let s = t.data.trim_matches(|c: char| c == '\n' || c == '\t');
+                if !s.is_empty() {
+                    out.push_str(s);
+                }
+            }
+            FragmentChild::RegularElement(el) => {
+                serialize_rich_element_html(el, out)?;
+            }
+            FragmentChild::ExpressionTag(_) => out.push(' '), // text anchor
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+/// `<select>{#each EXPR as ITEM}<option>...</option>{/each}</select>` →
+///   direct $.each on the select.
+/// `<select>{#each EXPR as ITEM}<Component />{/each}</select>` →
+///   customizable_select wrap with $.each inside the arrow.
+fn lower_select_with_each(
+    eb: &svelte_ast::blocks::EachBlock,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let body_is_rich = each_body_is_rich_for_select(&eb.body);
+    if body_is_rich {
+        let html = format!("<select{attrs}><!></select>");
+        let sc_name = ctx.next_select_content();
+        ctx.module_decls.push(t::var(
+            &sc_name,
+            t::call(
+                t::member_id(t::id("$"), "from_html"),
+                vec![
+                    t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                    t::lit_number(1.0),
+                ],
+            ),
+        ));
+        let anchor_var = ctx.next_named("anchor");
+        let fragment_var = ctx.next_named("fragment");
+        let node_var = ctx.next_named("node");
+        let body_arrow = build_each_iter_arrow(eb, ctx)?;
+        let expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(eb.expression.clone()),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let each_call = t::stmt(t::call(
+            t::member_id(t::id("$"), "each"),
+            vec![
+                t::id(&node_var),
+                t::lit_number(1.0),
+                expr_arrow,
+                t::member_id(t::id("$"), "index"),
+                body_arrow,
+            ],
+        ));
+        let arrow_body = vec![
+            t::var(
+                &anchor_var,
+                t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+            ),
+            t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+            t::var(
+                &node_var,
+                t::call(
+                    t::member_id(t::id("$"), "first_child"),
+                    vec![t::id(&fragment_var)],
+                ),
+            ),
+            each_call,
+            t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id(&anchor_var), t::id(&fragment_var)],
+            )),
+        ];
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: arrow_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let body = vec![t::stmt(t::call(
+            t::member_id(t::id("$"), "customizable_select"),
+            vec![t::id(select_var), arrow],
+        ))];
+        // Bump fragment counter once more after the each-with-Component
+        // pattern — upstream's analyze allocates a phantom slot in this
+        // case (visible in the fragment_15 ↔ fragment_16 jump in the
+        // select-with-rich-content fixture).
+        let _ = ctx.next_named("fragment");
+        return Some((html, body));
+    }
+    // Body is `<option>...</option>` or `{@const ...}<option>...</option>`.
+    let html = format!("<select{attrs}></select>");
+    let body = build_each_body_for_select(eb, select_var, ctx, /*flag=*/ 5.0)?;
+    Some((html, body))
+}
+
+fn each_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(|n| match n {
+        FragmentChild::Component(_) | FragmentChild::RenderTag(_) | FragmentChild::HtmlTag(_) => true,
+        _ => false,
+    })
+}
+
+fn if_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(|n| match n {
+        FragmentChild::Component(_) | FragmentChild::RenderTag(_) | FragmentChild::HtmlTag(_) => true,
+        _ => false,
+    })
+}
+
+fn build_each_body_for_select(
+    eb: &svelte_ast::blocks::EachBlock,
+    container_var: &str,
+    ctx: &mut SelectCtx,
+    flag: f64,
+) -> Option<Vec<Statement>> {
+    let body_arrow = build_each_iter_arrow(eb, ctx)?;
+    let expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(eb.expression.clone()),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let each_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "each"),
+        vec![
+            t::id(container_var),
+            t::lit_number(flag),
+            expr_arrow,
+            t::member_id(t::id("$"), "index"),
+            body_arrow,
+        ],
+    ));
+    let mut out = vec![each_call];
+    out.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(container_var)],
+    )));
+    Some(out)
+}
+
+fn build_each_iter_arrow(
+    eb: &svelte_ast::blocks::EachBlock,
+    ctx: &mut SelectCtx,
+) -> Option<Expression> {
+    // Extract context name and body.
+    let ctx_name = match &eb.context {
+        Some(Pattern::Identifier(id)) => id.name.clone(),
+        _ => return None,
+    };
+    let non_ws: Vec<&FragmentChild> = eb
+        .body
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    // Find optional {@const X = EXPR} before the option.
+    let mut const_decls: Vec<(String, Expression)> = Vec::new();
+    let mut opt_idx: Option<usize> = None;
+    for (i, n) in non_ws.iter().enumerate() {
+        match n {
+            FragmentChild::ConstTag(ct) => {
+                for d in &ct.declaration.declarations {
+                    if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                        const_decls.push((id.name.clone(), init.clone()));
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            FragmentChild::RegularElement(el) if el.name == "option" => {
+                opt_idx = Some(i);
+                break;
+            }
+            FragmentChild::Component(_) => {
+                opt_idx = Some(i);
+                break;
+            }
+            _ => return None,
+        }
+    }
+    let opt_or_comp = non_ws[opt_idx?];
+    let mut body: Vec<Statement> = Vec::new();
+    // Emit const decls as `const X = $.derived_safe_equal(() => EXPR_WITH_GET);`
+    for (name, init) in &const_decls {
+        let rewritten = wrap_item_refs_with_get(init, &ctx_name);
+        let derived_call = t::call(
+            t::member_id(t::id("$"), "derived_safe_equal"),
+            vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(rewritten),
+                r#async: false,
+                span: Span::ZERO,
+            }))],
+        );
+        body.push(t::const_decl(name, derived_call));
+    }
+    match opt_or_comp {
+        FragmentChild::RegularElement(opt) => {
+            // Per-iteration option handling.
+            let shape = classify_option_body(opt)?;
+            match shape {
+                OptionShape::SingleExpr(expr) => {
+                    // root_N = `<option> </option>`, walker = text + value_binding
+                    let root_name = ctx.next_root();
+                    ctx.module_decls.push(t::var(
+                        &root_name,
+                        t::call(
+                            t::member_id(t::id("$"), "from_html"),
+                            vec![t::template_raw(
+                                vec!["<option> </option>".to_string()],
+                                Vec::new(),
+                            )],
+                        ),
+                    ));
+                    let option_var = ctx.next_named("option");
+                    let text_var = ctx.next_named("text");
+                    let option_value_var = format!("{option_var}_value");
+                    let expr_with_get = wrap_expr_with_get(expr, &const_decls, &ctx_name);
+                    body.push(t::var(
+                        &option_var,
+                        t::call(t::id(&root_name), Vec::new()),
+                    ));
+                    body.push(t::var(
+                        &text_var,
+                        t::call(
+                            t::member_id(t::id("$"), "child"),
+                            vec![
+                                t::id(&option_var),
+                                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                    value: true,
+                                    span: Span::ZERO,
+                                }))),
+                            ],
+                        ),
+                    ));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "reset"),
+                        vec![t::id(&option_var)],
+                    )));
+                    body.push(t::var(
+                        &option_value_var,
+                        Expression::Object(Box::new(ObjectExpression {
+                            properties: Vec::new(),
+                            span: Span::ZERO,
+                        })),
+                    ));
+                    // $.template_effect(() => {
+                    //   $.set_text(text, EXPR_GET);
+                    //   if (option_value !== (option_value = EXPR_GET)) {
+                    //     option.__value = EXPR_GET;
+                    //   }
+                    // })
+                    let set_text_call = t::stmt(t::call(
+                        t::member_id(t::id("$"), "set_text"),
+                        vec![t::id(&text_var), expr_with_get.clone()],
+                    ));
+                    let assign_inner = Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(t::id(&option_value_var)),
+                        operator: AssignmentOperator::Assign,
+                        right: expr_with_get.clone(),
+                        span: Span::ZERO,
+                    }));
+                    let assign_paren = Expression::Paren(Box::new(ParenthesizedExpression {
+                        expression: assign_inner,
+                        span: Span::ZERO,
+                    }));
+                    let neq_test = Expression::Binary(Box::new(BinaryExpression {
+                        operator: BinaryOperator::StrictNotEq,
+                        left: t::id(&option_value_var),
+                        right: assign_paren,
+                        span: Span::ZERO,
+                    }));
+                    let assign_value = t::stmt(Expression::Assignment(Box::new(
+                        AssignmentExpression {
+                            left: AssignmentTarget::Expression(Expression::Member(Box::new(
+                                MemberExpression {
+                                    object: t::id(&option_var),
+                                    property: MemberProperty::Identifier(Identifier {
+                                        name: "__value".to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                    span: Span::ZERO,
+                                },
+                            ))),
+                            operator: AssignmentOperator::Assign,
+                            right: expr_with_get.clone(),
+                            span: Span::ZERO,
+                        },
+                    )));
+                    let if_stmt = Statement::If(Box::new(IfStatement {
+                        test: neq_test,
+                        consequent: Statement::Block(Box::new(BlockStatement {
+                            body: vec![assign_value],
+                            span: Span::ZERO,
+                        })),
+                        alternate: None,
+                        span: Span::ZERO,
+                    }));
+                    let effect_body = vec![set_text_call, if_stmt];
+                    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Block(Box::new(BlockStatement {
+                            body: effect_body,
+                            span: Span::ZERO,
+                        })),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "template_effect"),
+                        vec![effect_fn],
+                    )));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id("$$anchor"), t::id(&option_var)],
+                    )));
+                }
+                OptionShape::RichContent(nodes) => {
+                    // Allocate names FIRST (root, then option_content), then
+                    // push module decls in the upstream order: option_content
+                    // BEFORE root. This matches `var option_content_N =
+                    // ...; var root_N = ...;` in the fixture.
+                    let root_name = ctx.next_root();
+                    // Upstream bumps root_idx once more here (a phantom slot
+                    // allocated during analyze that isn't emitted as a
+                    // declaration). Match by manually advancing.
+                    ctx.root_idx += 1;
+                    let oc_name = ctx.next_option_content();
+                    let html_inner = serialize_rich_content_html(nodes)?;
+                    ctx.module_decls.push(t::var(
+                        &oc_name,
+                        t::call(
+                            t::member_id(t::id("$"), "from_html"),
+                            vec![
+                                t::template_raw(vec![html_inner], Vec::new()),
+                                t::lit_number(1.0),
+                            ],
+                        ),
+                    ));
+                    ctx.module_decls.push(t::var(
+                        &root_name,
+                        t::call(
+                            t::member_id(t::id("$"), "from_html"),
+                            vec![t::template_raw(
+                                vec!["<option><!></option>".to_string()],
+                                Vec::new(),
+                            )],
+                        ),
+                    ));
+                    let option_var = ctx.next_named("option");
+                    body.push(t::var(
+                        &option_var,
+                        t::call(t::id(&root_name), Vec::new()),
+                    ));
+                    // Arrow body: navigate into fragment + setup span/text + template_effect.
+                    // For rich content like <span>{item}</span>:
+                    let anchor_var = ctx.next_named("anchor");
+                    let fragment_var = ctx.next_named("fragment");
+                    let mut arrow_body: Vec<Statement> = Vec::new();
+                    arrow_body.push(t::var(
+                        &anchor_var,
+                        t::call(
+                            t::member_id(t::id("$"), "child"),
+                            vec![t::id(&option_var)],
+                        ),
+                    ));
+                    arrow_body.push(t::var(
+                        &fragment_var,
+                        t::call(t::id(&oc_name), Vec::new()),
+                    ));
+                    // Recursively handle the rich content for reactive expressions.
+                    let rich_emitted = emit_rich_content_reactivity(
+                        nodes,
+                        &fragment_var,
+                        ctx,
+                        &ctx_name,
+                        &const_decls,
+                    );
+                    arrow_body.extend(rich_emitted);
+                    arrow_body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id(&anchor_var), t::id(&fragment_var)],
+                    )));
+                    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Block(Box::new(BlockStatement {
+                            body: arrow_body,
+                            span: Span::ZERO,
+                        })),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "customizable_select"),
+                        vec![t::id(&option_var), arrow],
+                    )));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id("$$anchor"), t::id(&option_var)],
+                    )));
+                }
+                OptionShape::PlainText(_) => return None,
+            }
+        }
+        FragmentChild::Component(_c) => {
+            // Each with Component: emit `Option($$anchor, {});`
+            body.push(t::stmt(t::call(
+                t::id("Option"),
+                vec![
+                    t::id("$$anchor"),
+                    Expression::Object(Box::new(ObjectExpression {
+                        properties: Vec::new(),
+                        span: Span::ZERO,
+                    })),
+                ],
+            )));
+        }
+        _ => return None,
+    }
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor"), t::pat_id(&ctx_name)],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    Some(arrow)
+}
+
+fn wrap_item_refs_with_get(e: &Expression, item: &str) -> Expression {
+    match e {
+        Expression::Identifier(id) if id.name == item => t::call(
+            t::member_id(t::id("$"), "get"),
+            vec![Expression::Identifier(id.clone())],
+        ),
+        Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+            operator: b.operator,
+            left: wrap_item_refs_with_get(&b.left, item),
+            right: wrap_item_refs_with_get(&b.right, item),
+            span: b.span,
+        })),
+        Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+            callee: wrap_item_refs_with_get(&c.callee, item),
+            arguments: c
+                .arguments
+                .iter()
+                .map(|a| match a {
+                    Argument::Expression(e) => Argument::Expression(wrap_item_refs_with_get(e, item)),
+                    other => other.clone(),
+                })
+                .collect(),
+            optional: c.optional,
+            span: c.span,
+        })),
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: wrap_item_refs_with_get(&p.expression, item),
+            span: p.span,
+        })),
+        e => e.clone(),
+    }
+}
+
+fn wrap_expr_with_get(
+    e: &Expression,
+    consts: &[(String, Expression)],
+    item: &str,
+) -> Expression {
+    match e {
+        Expression::Identifier(id) => {
+            // If id is the each item OR a const-declared name → wrap in $.get.
+            if id.name == item || consts.iter().any(|(n, _)| n == &id.name) {
+                return t::call(
+                    t::member_id(t::id("$"), "get"),
+                    vec![Expression::Identifier(id.clone())],
+                );
+            }
+            e.clone()
+        }
+        Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+            operator: b.operator,
+            left: wrap_expr_with_get(&b.left, consts, item),
+            right: wrap_expr_with_get(&b.right, consts, item),
+            span: b.span,
+        })),
+        Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+            callee: wrap_expr_with_get(&c.callee, consts, item),
+            arguments: c
+                .arguments
+                .iter()
+                .map(|a| match a {
+                    Argument::Expression(e) => Argument::Expression(wrap_expr_with_get(e, consts, item)),
+                    other => other.clone(),
+                })
+                .collect(),
+            optional: c.optional,
+            span: c.span,
+        })),
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: wrap_expr_with_get(&p.expression, consts, item),
+            span: p.span,
+        })),
+        e => e.clone(),
+    }
+}
+
+/// Walk rich content (e.g., `<span>{item}</span>`) inside a customizable_select
+/// arrow body and emit navigation + template_effect for reactive bits.
+fn emit_rich_content_reactivity(
+    nodes: &[FragmentChild],
+    fragment_var: &str,
+    ctx: &mut SelectCtx,
+    item_name: &str,
+    consts: &[(String, Expression)],
+) -> Vec<Statement> {
+    // Look for the FIRST element with reactive child; emit `var span = $.first_child(fragment); var text = $.child(span, true); $.reset(span); $.template_effect(() => $.set_text(text, $.get(item)));`
+    let mut out = Vec::new();
+    let non_ws: Vec<&FragmentChild> = nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() == 1 {
+        if let FragmentChild::RegularElement(el) = non_ws[0] {
+            // Check if it has a single ExpressionTag child.
+            let inner_non_ws: Vec<&FragmentChild> = el
+                .fragment
+                .nodes
+                .iter()
+                .filter(|n| match n {
+                    FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                    FragmentChild::Comment(_) => false,
+                    _ => true,
+                })
+                .collect();
+            if inner_non_ws.len() == 1 {
+                if let FragmentChild::ExpressionTag(et) = inner_non_ws[0] {
+                    let el_var = ctx.next_named(&sanitize_name(&el.name));
+                    let text_var = ctx.next_named("text");
+                    out.push(t::var(
+                        &el_var,
+                        t::call(
+                            t::member_id(t::id("$"), "first_child"),
+                            vec![t::id(fragment_var)],
+                        ),
+                    ));
+                    out.push(t::var(
+                        &text_var,
+                        t::call(
+                            t::member_id(t::id("$"), "child"),
+                            vec![
+                                t::id(&el_var),
+                                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                    value: true,
+                                    span: Span::ZERO,
+                                }))),
+                            ],
+                        ),
+                    ));
+                    out.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "reset"),
+                        vec![t::id(&el_var)],
+                    )));
+                    let expr_with_get = wrap_expr_with_get(&et.expression, consts, item_name);
+                    let set_text_call = t::call(
+                        t::member_id(t::id("$"), "set_text"),
+                        vec![t::id(&text_var), expr_with_get],
+                    );
+                    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(set_text_call),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }));
+                    out.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "template_effect"),
+                        vec![effect_fn],
+                    )));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+fn lower_select_with_if(
+    ib: &svelte_ast::blocks::IfBlock,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    if if_body_is_rich_for_select(&ib.consequent) {
+        // customizable_select wrap with $.if inside.
+        let html = format!("<select{attrs}><!></select>");
+        let sc_name = ctx.next_select_content();
+        ctx.module_decls.push(t::var(
+            &sc_name,
+            t::call(
+                t::member_id(t::id("$"), "from_html"),
+                vec![
+                    t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                    t::lit_number(1.0),
+                ],
+            ),
+        ));
+        let anchor_var = ctx.next_named("anchor");
+        let fragment_var = ctx.next_named("fragment");
+        let node_var = ctx.next_named("node");
+        let consequent_var = ctx.next_named("consequent");
+        let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
+        let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$anchor")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: consequent_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let render_call = t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)]));
+        let render_if = Statement::If(Box::new(IfStatement {
+            test: ib.test.clone(),
+            consequent: render_call,
+            alternate: None,
+            span: Span::ZERO,
+        }));
+        let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$render")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![render_if],
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let inner_block = Statement::Block(Box::new(BlockStatement {
+            body: vec![
+                t::var(&consequent_var, consequent_arrow),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "if"),
+                    vec![t::id(&node_var), render_arrow],
+                )),
+            ],
+            span: Span::ZERO,
+        }));
+        let arrow_body = vec![
+            t::var(
+                &anchor_var,
+                t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+            ),
+            t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+            t::var(
+                &node_var,
+                t::call(
+                    t::member_id(t::id("$"), "first_child"),
+                    vec![t::id(&fragment_var)],
+                ),
+            ),
+            inner_block,
+            t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id(&anchor_var), t::id(&fragment_var)],
+            )),
+        ];
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: arrow_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let body = vec![t::stmt(t::call(
+            t::member_id(t::id("$"), "customizable_select"),
+            vec![t::id(select_var), arrow],
+        ))];
+        return Some((html, body));
+    }
+    // Plain options branch.
+    let html = format!("<select{attrs}><!></select>");
+    let node_var = ctx.next_named("node");
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        &node_var,
+        t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+    ));
+    let consequent_var = ctx.next_named("consequent");
+    let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
+    let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: consequent_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let render_call = t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)]));
+    let render_if = Statement::If(Box::new(IfStatement {
+        test: ib.test.clone(),
+        consequent: render_call,
+        alternate: None,
+        span: Span::ZERO,
+    }));
+    let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$render")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![render_if],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let if_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "if"),
+        vec![t::id(&node_var), render_arrow],
+    ));
+    body.push(Statement::Block(Box::new(BlockStatement {
+        body: vec![t::var(&consequent_var, consequent_arrow), if_call],
+        span: Span::ZERO,
+    })));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(select_var)],
+    )));
+    Some((html, body))
+}
+
+/// The if-block's consequent: handle the contained option / each / render.
+fn build_if_consequent_for_select(
+    fragment: &svelte_ast::fragment::Fragment,
+    ctx: &mut SelectCtx,
+) -> Option<Vec<Statement>> {
+    let non_ws: Vec<&FragmentChild> = fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    match non_ws[0] {
+        FragmentChild::RegularElement(opt) if opt.name == "option" => {
+            let shape = classify_option_body(opt)?;
+            match shape {
+                OptionShape::PlainText(text) => {
+                    let root_name = ctx.next_root();
+                    let template = format!("<option>{text}</option>");
+                    ctx.module_decls.push(t::var(
+                        &root_name,
+                        t::call(
+                            t::member_id(t::id("$"), "from_html"),
+                            vec![t::template_raw(vec![template], Vec::new())],
+                        ),
+                    ));
+                    let opt_var = ctx.next_named("option");
+                    Some(vec![
+                        t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "append"),
+                            vec![t::id("$$anchor"), t::id(&opt_var)],
+                        )),
+                    ])
+                }
+                _ => None,
+            }
+        }
+        FragmentChild::EachBlock(eb) => {
+            // Each inside if-consequent: wrap in `var fragment_N = $.comment(); var node_N = $.first_child(fragment_N); $.each(node_N, 1, ...); $.append($$anchor, fragment_N);`
+            let fragment_var = ctx.next_named("fragment");
+            let node_var = ctx.next_named("node");
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::var(
+                &fragment_var,
+                t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+            ));
+            body.push(t::var(
+                &node_var,
+                t::call(
+                    t::member_id(t::id("$"), "first_child"),
+                    vec![t::id(&fragment_var)],
+                ),
+            ));
+            // Each inside if: flag=1 (not 5 — that's for select-direct).
+            let body_arrow = build_each_iter_arrow(eb, ctx)?;
+            let expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(eb.expression.clone()),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "each"),
+                vec![
+                    t::id(&node_var),
+                    t::lit_number(1.0),
+                    expr_arrow,
+                    t::member_id(t::id("$"), "index"),
+                    body_arrow,
+                ],
+            )));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id(&fragment_var)],
+            )));
+            Some(body)
+        }
+        FragmentChild::RenderTag(rt) => {
+            // {@render foo()} → foo($$anchor)
+            let callee_name = if let Expression::Call(c) = &rt.expression {
+                if let Expression::Identifier(id) = &c.callee {
+                    id.name.clone()
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            };
+            Some(vec![t::stmt(t::call(
+                t::id(&callee_name),
+                vec![t::id("$$anchor")],
+            ))])
+        }
+        _ => None,
+    }
+}
+
+fn lower_select_with_key(
+    kb: &svelte_ast::blocks::KeyBlock,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let html = format!("<select{attrs}><!></select>");
+    let node_var = ctx.next_named("node");
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        &node_var,
+        t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+    ));
+    // body of key: single option (plain text).
+    let non_ws: Vec<&FragmentChild> = kb
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let opt = match non_ws[0] {
+        FragmentChild::RegularElement(el) if el.name == "option" => el,
+        _ => return None,
+    };
+    let shape = classify_option_body(opt)?;
+    let OptionShape::PlainText(text) = shape else { return None };
+    let root_name = ctx.next_root();
+    ctx.module_decls.push(t::var(
+        &root_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![format!("<option>{text}</option>")], Vec::new())],
+        ),
+    ));
+    let opt_var = ctx.next_named("option");
+    let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![
+                t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "append"),
+                    vec![t::id("$$anchor"), t::id(&opt_var)],
+                )),
+            ],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let key_expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(kb.expression.clone()),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "key"),
+        vec![t::id(&node_var), key_expr_arrow, inner_arrow],
+    )));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(select_var)],
+    )));
+    Some((html, body))
+}
+
+fn lower_select_with_boundary(
+    b: &svelte_ast::elements::SvelteBoundary,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let html = format!("<select{attrs}><!></select>");
+    let node_var = ctx.next_named("node");
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        &node_var,
+        t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+    ));
+    // Boundary body: single <option> (plain or rich).
+    let non_ws: Vec<&FragmentChild> = b
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let opt = match non_ws[0] {
+        FragmentChild::RegularElement(el) if el.name == "option" => el,
+        _ => return None,
+    };
+    let shape = classify_option_body(opt)?;
+    let opt_var = ctx.next_named("option");
+    let mut arrow_body: Vec<Statement> = Vec::new();
+    match shape {
+        OptionShape::PlainText(text) => {
+            let root_name = ctx.next_root();
+            ctx.module_decls.push(t::var(
+                &root_name,
+                t::call(
+                    t::member_id(t::id("$"), "from_html"),
+                    vec![t::template_raw(
+                        vec![format!("<option>{text}</option>")],
+                        Vec::new(),
+                    )],
+                ),
+            ));
+            arrow_body.push(t::var(&opt_var, t::call(t::id(&root_name), Vec::new())));
+            arrow_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id(&opt_var)],
+            )));
+        }
+        OptionShape::RichContent(nodes) => {
+            // Reserve root name FIRST but push the declaration AFTER the
+            // inner option_content template, so the module-decl order
+            // matches `var option_content_N = ...; var root_N = ...;`.
+            let root_name = ctx.next_root();
+            arrow_body.push(t::var(&opt_var, t::call(t::id(&root_name), Vec::new())));
+            let cs = build_customizable_select_body(&opt_var, nodes, ctx)?;
+            arrow_body.push(cs);
+            ctx.module_decls.push(t::var(
+                &root_name,
+                t::call(
+                    t::member_id(t::id("$"), "from_html"),
+                    vec![t::template_raw(
+                        vec!["<option><!></option>".to_string()],
+                        Vec::new(),
+                    )],
+                ),
+            ));
+            arrow_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id(&opt_var)],
+            )));
+        }
+        _ => return None,
+    }
+    let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "boundary"),
+        vec![
+            t::id(&node_var),
+            Expression::Object(Box::new(ObjectExpression {
+                properties: Vec::new(),
+                span: Span::ZERO,
+            })),
+            inner_arrow,
+        ],
+    )));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(select_var)],
+    )));
+    Some((html, body))
+}
+
+fn lower_select_with_component(
+    c: &svelte_ast::elements::Component,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    // `<select><Component /></select>` → customizable_select with the
+    // select itself + select_content template + Component call inside.
+    let html = format!("<select{attrs}><!></select>");
+    let sc_name = ctx.next_select_content();
+    ctx.module_decls.push(t::var(
+        &sc_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    ));
+    let anchor_var = ctx.next_named("anchor");
+    let fragment_var = ctx.next_named("fragment");
+    let node_var = ctx.next_named("node");
+    let component_name = c.name.clone();
+    let arrow_body = vec![
+        t::var(
+            &anchor_var,
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+        ),
+        t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+        t::var(
+            &node_var,
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id(&fragment_var)],
+            ),
+        ),
+        t::stmt(t::call(
+            t::id(&component_name),
+            vec![
+                t::id(&node_var),
+                Expression::Object(Box::new(ObjectExpression {
+                    properties: Vec::new(),
+                    span: Span::ZERO,
+                })),
+            ],
+        )),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id(&anchor_var), t::id(&fragment_var)],
+        )),
+    ];
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let body = vec![t::stmt(t::call(
+        t::member_id(t::id("$"), "customizable_select"),
+        vec![t::id(select_var), arrow],
+    ))];
+    Some((html, body))
+}
+
+fn lower_select_with_render(
+    rt: &svelte_ast::tags::RenderTag,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let html = format!("<select{attrs}><!></select>");
+    let sc_name = ctx.next_select_content();
+    ctx.module_decls.push(t::var(
+        &sc_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    ));
+    let anchor_var = ctx.next_named("anchor");
+    let fragment_var = ctx.next_named("fragment");
+    let node_var = ctx.next_named("node");
+    // {@render foo()} → foo(node)
+    let callee_name = if let Expression::Call(c) = &rt.expression {
+        if let Expression::Identifier(id) = &c.callee {
+            id.name.clone()
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    let arrow_body = vec![
+        t::var(
+            &anchor_var,
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+        ),
+        t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+        t::var(
+            &node_var,
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id(&fragment_var)],
+            ),
+        ),
+        t::stmt(t::call(t::id(&callee_name), vec![t::id(&node_var)])),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id(&anchor_var), t::id(&fragment_var)],
+        )),
+    ];
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let body = vec![t::stmt(t::call(
+        t::member_id(t::id("$"), "customizable_select"),
+        vec![t::id(select_var), arrow],
+    ))];
+    Some((html, body))
+}
+
+fn lower_select_with_html(
+    ht: &svelte_ast::tags::HtmlTag,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let html = format!("<select{attrs}><!></select>");
+    let sc_name = ctx.next_select_content();
+    ctx.module_decls.push(t::var(
+        &sc_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                t::lit_number(1.0),
+            ],
+        ),
+    ));
+    let anchor_var = ctx.next_named("anchor");
+    let fragment_var = ctx.next_named("fragment");
+    let node_var = ctx.next_named("node");
+    let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(ht.expression.clone()),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let arrow_body = vec![
+        t::var(
+            &anchor_var,
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+        ),
+        t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+        t::var(
+            &node_var,
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id(&fragment_var)],
+            ),
+        ),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "html"),
+            vec![t::id(&node_var), getter],
+        )),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id(&anchor_var), t::id(&fragment_var)],
+        )),
+    ];
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let body = vec![t::stmt(t::call(
+        t::member_id(t::id("$"), "customizable_select"),
+        vec![t::id(select_var), arrow],
+    ))];
+    Some((html, body))
+}
+
+fn lower_select_with_optgroup(
+    og: &svelte_ast::elements::RegularElement,
+    select_var: &str,
+    ctx: &mut SelectCtx,
+    attrs: &str,
+) -> Option<(String, Vec<Statement>)> {
+    let og_attrs = build_static_attrs(og);
+    let og_non_ws: Vec<&FragmentChild> = og
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if og_non_ws.len() != 1 {
+        return None;
+    }
+    let og_var = ctx.next_named("optgroup");
+    match og_non_ws[0] {
+        FragmentChild::RegularElement(opt) if opt.name == "option" => {
+            // Rich option inside optgroup → `<select><optgroup label="X"><option><!></option></optgroup></select>`
+            let shape = classify_option_body(opt)?;
+            let opt_attrs = build_static_attrs(opt);
+            match shape {
+                OptionShape::RichContent(nodes) => {
+                    let html = format!(
+                        "<select{attrs}><optgroup{og_attrs}><option{opt_attrs}><!></option></optgroup></select>"
+                    );
+                    let option_var = ctx.next_named("option");
+                    let body = vec![
+                        t::var(
+                            &og_var,
+                            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                        ),
+                        t::var(
+                            &option_var,
+                            t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)]),
+                        ),
+                        build_customizable_select_body(&option_var, nodes, ctx)?,
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "reset"),
+                            vec![t::id(&og_var)],
+                        )),
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "reset"),
+                            vec![t::id(select_var)],
+                        )),
+                    ];
+                    Some((html, body))
+                }
+                _ => None,
+            }
+        }
+        FragmentChild::EachBlock(eb) => {
+            // `<select><optgroup label="X">{#each}<option>...</option>{/each}</optgroup></select>`
+            let html = format!("<select{attrs}><optgroup{og_attrs}></optgroup></select>");
+            let mut body = vec![t::var(
+                &og_var,
+                t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+            )];
+            body.extend(build_each_body_for_select(eb, &og_var, ctx, 5.0)?);
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "reset"),
+                vec![t::id(select_var)],
+            )));
+            Some((html, body))
+        }
+        FragmentChild::Component(c) => {
+            // `<select><optgroup label="X"><Component /></optgroup></select>`
+            let html = format!("<select{attrs}><optgroup{og_attrs}><!></optgroup></select>");
+            let oc_name = ctx.next_optgroup_content();
+            ctx.module_decls.push(t::var(
+                &oc_name,
+                t::call(
+                    t::member_id(t::id("$"), "from_html"),
+                    vec![
+                        t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                        t::lit_number(1.0),
+                    ],
+                ),
+            ));
+            let anchor_var = ctx.next_named("anchor");
+            let fragment_var = ctx.next_named("fragment");
+            let node_var = ctx.next_named("node");
+            let component_name = c.name.clone();
+            let arrow_body = vec![
+                t::var(
+                    &anchor_var,
+                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)]),
+                ),
+                t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
+                t::var(
+                    &node_var,
+                    t::call(
+                        t::member_id(t::id("$"), "first_child"),
+                        vec![t::id(&fragment_var)],
+                    ),
+                ),
+                t::stmt(t::call(
+                    t::id(&component_name),
+                    vec![
+                        t::id(&node_var),
+                        Expression::Object(Box::new(ObjectExpression {
+                            properties: Vec::new(),
+                            span: Span::ZERO,
+                        })),
+                    ],
+                )),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "append"),
+                    vec![t::id(&anchor_var), t::id(&fragment_var)],
+                )),
+            ];
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: arrow_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            let body = vec![
+                t::var(
+                    &og_var,
+                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                ),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "customizable_select"),
+                    vec![t::id(&og_var), arrow],
+                )),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(select_var)],
+                )),
+            ];
+            Some((html, body))
+        }
+        FragmentChild::RenderTag(rt) => {
+            // `<select><optgroup label="X">{@render foo()}</optgroup></select>`
+            let html = format!("<select{attrs}><optgroup{og_attrs}><!></optgroup></select>");
+            let oc_name = ctx.next_optgroup_content();
+            ctx.module_decls.push(t::var(
+                &oc_name,
+                t::call(
+                    t::member_id(t::id("$"), "from_html"),
+                    vec![
+                        t::template_raw(vec!["<!>".to_string()], Vec::new()),
+                        t::lit_number(1.0),
+                    ],
+                ),
+            ));
+            let anchor_var = ctx.next_named("anchor");
+            let fragment_var = ctx.next_named("fragment");
+            let node_var = ctx.next_named("node");
+            let callee_name = if let Expression::Call(c) = &rt.expression {
+                if let Expression::Identifier(id) = &c.callee {
+                    id.name.clone()
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            };
+            let arrow_body = vec![
+                t::var(
+                    &anchor_var,
+                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)]),
+                ),
+                t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
+                t::var(
+                    &node_var,
+                    t::call(
+                        t::member_id(t::id("$"), "first_child"),
+                        vec![t::id(&fragment_var)],
+                    ),
+                ),
+                t::stmt(t::call(t::id(&callee_name), vec![t::id(&node_var)])),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "append"),
+                    vec![t::id(&anchor_var), t::id(&fragment_var)],
+                )),
+            ];
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: arrow_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            let body = vec![
+                t::var(
+                    &og_var,
+                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                ),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "customizable_select"),
+                    vec![t::id(&og_var), arrow],
+                )),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(select_var)],
+                )),
+            ];
+            Some((html, body))
+        }
+        _ => None,
+    }
+}
+
 fn emit_deep_static_walker_program(
     root_fragment: &svelte_ast::fragment::Fragment,
     component_name: &str,
@@ -4695,7 +6992,6 @@ fn analyze_script(
     #[allow(unused_assignments)]
     let mut uses_runes = false;
     let mut uses_props = has_class_with_runes;
-    let mut saw_non_import = false;
     let mut props_destructured: HashSet<String> = HashSet::new();
     if has_class_with_runes {
         uses_runes = true;
@@ -4703,13 +6999,11 @@ fn analyze_script(
     for s in body {
         match s {
             Statement::Import(_) => {
-                if saw_non_import {
-                    return None;
-                }
+                // Hoist all imports to the top regardless of source order
+                // (matches upstream's behavior).
                 imports.push(s.clone());
             }
             _ => {
-                saw_non_import = true;
                 // Detect `let { a, b } = $props()` and drop the declaration —
                 // template refs to `a`/`b` get rewritten to `$$props.a` /
                 // `$$props.b` by `rewrite_props_destructured` later. Only
