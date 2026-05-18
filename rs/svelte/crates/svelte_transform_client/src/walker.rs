@@ -1762,6 +1762,13 @@ struct ScriptInfo {
     /// - the set of bindings touched by those groups
     /// - the index of the last group (used in template_effect blockers)
     async_info: Option<AsyncInfo>,
+    /// Names of `let X = $state({...})` / `$state([...])` bindings —
+    /// lowered to `$.proxy(...)`. Reads stay as direct member access (no
+    /// `$.get` wrap); writes stay as direct property assignment.
+    proxy_bindings: HashSet<String>,
+    /// Names of `const X = $derived(...)` bindings — lowered to
+    /// `$.derived(() => ...)`. Reads of these get `$.get(X)` wrapping.
+    derived_bindings: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -1786,6 +1793,8 @@ fn analyze_script(
             has_class_with_runes: false,
             rest_props_bindings: HashSet::new(),
             async_info: None,
+            proxy_bindings: HashSet::new(),
+            derived_bindings: HashSet::new(),
         });
     };
 
@@ -1793,14 +1802,24 @@ fn analyze_script(
     let mut assigned: HashSet<String> = collect_assigned_targets(body);
     assigned.extend(template_assigned.iter().cloned());
 
-    // First pass: discover which $state bindings need lowering to $.state.
+    // First pass: discover which $state bindings need lowering to $.state /
+    // $.proxy, and which `const X = $derived(...)` bindings need $.derived.
     let mut state_bindings: HashSet<String> = HashSet::new();
+    let mut proxy_bindings: HashSet<String> = HashSet::new();
+    let mut derived_bindings: HashSet<String> = HashSet::new();
     for s in body {
         if let Statement::Variable(v) = s {
             for d in &v.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
-                    if is_state_call(init) && assigned.contains(&id.name) {
-                        state_bindings.insert(id.name.clone());
+                    if is_state_call(init) {
+                        // `$state({...})` / `$state([...])` lowers to `$.proxy(...)`.
+                        if state_call_inner_is_proxy_init(init) {
+                            proxy_bindings.insert(id.name.clone());
+                        } else if assigned.contains(&id.name) {
+                            state_bindings.insert(id.name.clone());
+                        }
+                    } else if is_derived_call(init) {
+                        derived_bindings.insert(id.name.clone());
                     }
                 }
             }
@@ -1927,6 +1946,8 @@ fn analyze_script(
         has_class_with_runes,
         rest_props_bindings,
         async_info,
+        proxy_bindings,
+        derived_bindings,
     })
 }
 
@@ -2479,6 +2500,16 @@ fn rewrite_top_stmt(
             let mut out = (**v).clone();
             for d in &mut out.declarations {
                 if let Some(init) = &mut d.init {
+                    // Proxy lowering: `$state({...})` / `$state([...])` →
+                    // `$.proxy(...)`. Must check before state-strip / state
+                    // lowering.
+                    if let Pattern::Identifier(_id) = &d.id {
+                        if is_state_call(init) && state_call_inner_is_proxy_init(init) {
+                            *uses_runes = true;
+                            lower_to_proxy_init(init);
+                            continue;
+                        }
+                    }
                     // First, try strip (binding never assigned).
                     let stripped = try_strip_state(init, &d.id, assigned, uses_runes);
                     if !stripped {
@@ -2488,6 +2519,12 @@ fn rewrite_top_stmt(
                             if state_bindings.contains(&id.name) && is_state_call(init) {
                                 *uses_runes = true;
                                 lower_state_init(init);
+                                continue;
+                            }
+                            // Derived: `$derived(EXPR)` → `$.derived(() => EXPR)`.
+                            if is_derived_call(init) {
+                                *uses_runes = true;
+                                lower_to_derived_init(init);
                                 continue;
                             }
                         }
@@ -2921,6 +2958,36 @@ fn lower_state_init(init: &mut Expression) {
     c.callee = t::member_id(t::id("$"), "state");
 }
 
+/// `$state({...})` / `$state([...])` → `$.proxy({...})` (in-place).
+fn lower_to_proxy_init(init: &mut Expression) {
+    let Expression::Call(c) = init else { return };
+    c.callee = t::member_id(t::id("$"), "proxy");
+}
+
+/// `$derived(EXPR)` → `$.derived(() => EXPR)`. `$derived.by(FN)` → `$.derived(FN)`.
+fn lower_to_derived_init(init: &mut Expression) {
+    let Expression::Call(c) = init else { return };
+    let kp = global_keypath(&c.callee).unwrap_or_default();
+    let by = kp == "$derived.by";
+    c.callee = t::member_id(t::id("$"), "derived");
+    if !by {
+        // Wrap the first arg in `() => arg`.
+        let arg = c.arguments.iter().find_map(|a| match a {
+            Argument::Expression(e) => Some(e.clone()),
+            _ => None,
+        });
+        if let Some(inner) = arg {
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(inner),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            c.arguments = vec![Argument::Expression(arrow)];
+        }
+    }
+}
+
 /// Walk a function body and rewrite state-binding references.
 fn rewrite_block_for_state(body: &mut Vec<Statement>, state: &HashSet<String>) {
     for s in body {
@@ -3263,6 +3330,24 @@ fn is_state_call(e: &Expression) -> bool {
     let Expression::Call(c) = e else { return false };
     let Some(kp) = global_keypath(&c.callee) else { return false };
     matches!(kp.as_str(), "$state" | "$state.raw" | "$state.eager")
+}
+
+/// True when `$state(...)` has an object-literal or array-literal arg —
+/// these lower to `$.proxy(...)` rather than `$.state(...)`.
+fn state_call_inner_is_proxy_init(e: &Expression) -> bool {
+    let Expression::Call(c) = e else { return false };
+    c.arguments.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e),
+        _ => None,
+    }).map_or(false, |inner| {
+        matches!(inner, Expression::Object(_) | Expression::Array(_))
+    })
+}
+
+fn is_derived_call(e: &Expression) -> bool {
+    let Expression::Call(c) = e else { return false };
+    let Some(kp) = global_keypath(&c.callee) else { return false };
+    matches!(kp.as_str(), "$derived" | "$derived.by")
 }
 
 fn expr_has_unsupported_rune(e: &Expression) -> bool {

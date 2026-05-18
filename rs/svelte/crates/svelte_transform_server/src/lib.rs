@@ -136,6 +136,15 @@ fn lower_fragment_server_async(
     async_bindings: &std::collections::HashSet<String>,
     last_group_idx: usize,
 ) -> Option<Vec<Statement>> {
+    lower_fragment_server_async_with(f, async_bindings, last_group_idx, "$$promises")
+}
+
+fn lower_fragment_server_async_with(
+    f: &svelte_ast::fragment::Fragment,
+    async_bindings: &std::collections::HashSet<String>,
+    last_group_idx: usize,
+    promises_var: &str,
+) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::new();
     let mut buf = TemplateBuf::new();
     let nodes = trim_boundary_whitespace(&f.nodes);
@@ -186,7 +195,11 @@ fn lower_fragment_server_async(
                         FragmentChild::ExpressionTag(t) => t,
                         _ => unreachable!(),
                     };
-                    out.push(emit_async_wrap(&et.expression, last_group_idx));
+                    out.push(emit_async_wrap_with(
+                        &et.expression,
+                        last_group_idx,
+                        promises_var,
+                    ));
                     // Close tag → buf
                     buf.push_str("</");
                     buf.push_str(&el.name);
@@ -204,7 +217,11 @@ fn lower_fragment_server_async(
                     if let Some(stmt) = buf.flush() {
                         out.push(stmt);
                     }
-                    out.push(emit_async_wrap(&t.expression, last_group_idx));
+                    out.push(emit_async_wrap_with(
+                        &t.expression,
+                        last_group_idx,
+                        promises_var,
+                    ));
                 } else if append_node_to_template(n, &mut buf).is_none() {
                     return None;
                 }
@@ -220,6 +237,173 @@ fn lower_fragment_server_async(
     if let Some(stmt) = buf.flush() {
         out.push(stmt);
     }
+    Some(out)
+}
+
+/// True when the fragment has a `{@const X = ...}` whose initializer
+/// contains a top-level `await`.
+fn fragment_has_const_with_await(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(|n| {
+        if let FragmentChild::ConstTag(ct) = n {
+            ct.declaration.declarations.iter().any(|d| {
+                d.init.as_ref().map_or(false, expr_has_await_top)
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// Lower a fragment that contains `{@const X = ...}` tags with await. The
+/// pattern:
+///   $$renderer.push('<!--[0-->');  // marker (caller emits)
+///   let a;
+///   let b;
+///   var promises = $$renderer.run([async () => a = (await $.save(...))(), () => b = a + 1]);
+///   ...rest of fragment lowered with $$renderer.async([promises[N]], ...)...
+fn lower_fragment_with_const_await(
+    f: &svelte_ast::fragment::Fragment,
+) -> Option<Vec<Statement>> {
+    let mut out: Vec<Statement> = Vec::new();
+    let mut const_names: Vec<String> = Vec::new();
+    let mut groups: Vec<Expression> = Vec::new();
+    let mut current_sync: Vec<Statement> = Vec::new();
+    let mut rest_nodes: Vec<FragmentChild> = Vec::new();
+    let mut last_was_async = false;
+
+    fn flush_sync(groups: &mut Vec<Expression>, current_sync: &mut Vec<Statement>) {
+        if current_sync.is_empty() {
+            return;
+        }
+        if current_sync.len() == 1 {
+            let s = current_sync.remove(0);
+            if let Statement::Expression(es) = s {
+                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(es.expression),
+                    r#async: false,
+                    span: Span::ZERO,
+                })));
+                return;
+            }
+            current_sync.push(s);
+        }
+        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: std::mem::take(current_sync),
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        })));
+    }
+
+    for n in &f.nodes {
+        if let FragmentChild::ConstTag(ct) = n {
+            for d in &ct.declaration.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    const_names.push(id.name.clone());
+                    if expr_has_await_top(init) {
+                        // Flush sync first
+                        if !current_sync.is_empty() {
+                            flush_sync(&mut groups, &mut current_sync);
+                        }
+                        // async () => X = (await $.save(INNER))()
+                        let inner = match init {
+                            Expression::Await(a) => a.argument.clone(),
+                            e => e.clone(),
+                        };
+                        let saved = t::call(
+                            t::member_id(t::id("$"), "save"),
+                            vec![inner],
+                        );
+                        let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
+                            expression: Expression::Await(Box::new(AwaitExpression {
+                                argument: saved,
+                                span: Span::ZERO,
+                            })),
+                            span: Span::ZERO,
+                        }));
+                        let called = t::call(awaited, Vec::new());
+                        let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                            left: AssignmentTarget::Expression(t::id(&id.name)),
+                            operator: AssignmentOperator::Assign,
+                            right: called,
+                            span: Span::ZERO,
+                        }));
+                        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                            params: Vec::new(),
+                            body: ArrowBody::Expression(assign),
+                            r#async: true,
+                            span: Span::ZERO,
+                        })));
+                        last_was_async = true;
+                    } else {
+                        // Sync: X = INIT
+                        let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                            left: AssignmentTarget::Expression(t::id(&id.name)),
+                            operator: AssignmentOperator::Assign,
+                            right: init.clone(),
+                            span: Span::ZERO,
+                        }));
+                        current_sync.push(t::stmt(assign));
+                        last_was_async = false;
+                    }
+                } else {
+                    return None;
+                }
+            }
+        } else {
+            rest_nodes.push(n.clone());
+        }
+    }
+    // Trailing sync group
+    if !current_sync.is_empty() || last_was_async {
+        if current_sync.is_empty() {
+            current_sync.push(t::stmt(Expression::Identifier(Identifier {
+                name: "undefined".to_string(),
+                span: Span::ZERO,
+            })));
+        }
+        flush_sync(&mut groups, &mut current_sync);
+    }
+
+    // Emit hoisted lets
+    for name in &const_names {
+        out.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Let,
+            declarations: vec![VariableDeclarator {
+                id: t::pat_id(name),
+                init: None,
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        })));
+    }
+    // var promises = $$renderer.run([...]);
+    out.push(t::var(
+        "promises",
+        t::call(
+            t::member_id(t::id("$$renderer"), "run"),
+            vec![Expression::Array(Box::new(ArrayExpression {
+                elements: groups.iter().cloned().map(ArrayElement::Expression).collect(),
+                span: Span::ZERO,
+            }))],
+        ),
+    ));
+
+    // Lower the rest of the fragment with the const names treated as
+    // async-tainted. `promises` is the local var name.
+    let last_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
+    let async_set: std::collections::HashSet<String> = const_names.into_iter().collect();
+    let stub_fragment = svelte_ast::fragment::Fragment { nodes: rest_nodes };
+    out.extend(lower_fragment_server_async_with(
+        &stub_fragment,
+        &async_set,
+        last_idx,
+        "promises",
+    )?);
     Some(out)
 }
 
@@ -335,8 +519,12 @@ fn expr_refs_any(e: &Expression, names: &std::collections::HashSet<String>) -> b
 /// `$$renderer.async([$$promises[idx]], ($$renderer) => $$renderer.push(
 /// () => $.escape(EXPR)));`
 fn emit_async_wrap(expr: &Expression, group_idx: usize) -> Statement {
+    emit_async_wrap_with(expr, group_idx, "$$promises")
+}
+
+fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str) -> Statement {
     let promises_slot = Expression::Member(Box::new(MemberExpression {
-        object: t::id("$$promises"),
+        object: t::id(promises_var),
         property: MemberProperty::Expression(t::lit_number(group_idx as f64)),
         computed: true,
         optional: false,
@@ -727,6 +915,10 @@ fn lower_if_block_server(
     });
     if test_is_async {
         consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
+    } else if fragment_has_const_with_await(&ib.consequent) {
+        // Non-async test but body has `{@const X = await ...}` — promote to
+        // nested-run pattern with a local `promises` var.
+        consequent_body.extend(lower_fragment_with_const_await(&ib.consequent)?);
     } else {
         consequent_body.extend(lower_fragment_with_marker(
             &ib.consequent,
