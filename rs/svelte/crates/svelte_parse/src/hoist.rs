@@ -41,7 +41,25 @@ pub fn hoist_scripts_and_styles(
                 _ => unreachable!(),
             };
             let is_module = is_module_script(&el.attributes);
-            let script = build_script(&el, source, line_map, ts)?;
+            let (script, comments) = build_script_with_comments(&el, source, line_map, ts)?;
+            // Append script comments to root.comments for downstream
+            // codegen (inter-declarator preservation).
+            for c in comments {
+                root.comments.push(svelte_ast::root::JsComment {
+                    kind: if c.line {
+                        svelte_ast::root::JsCommentKind::Line
+                    } else {
+                        svelte_ast::root::JsCommentKind::Block
+                    },
+                    value: c.value,
+                    start: c.start,
+                    end: c.end,
+                    loc: svelte_ast::SourceLocation {
+                        start: svelte_ast::Position { line: 0, column: 0, character: None },
+                        end: svelte_ast::Position { line: 0, column: 0, character: None },
+                    },
+                });
+            }
             if is_module {
                 if root.module.is_none() {
                     root.module = Some(script);
@@ -70,6 +88,44 @@ pub fn hoist_scripts_and_styles(
     Ok(())
 }
 
+fn build_script_with_comments(
+    el: &RegularElement,
+    source: &str,
+    line_map: &LineMap,
+    ts_default: bool,
+) -> Result<(Script, Vec<oxc_bridge::RawComment>), CompileDiagnostic> {
+    let (body_start, body_end) = body_bounds(el).unwrap_or((el.end as usize, el.end as usize));
+    let ts = ts_default
+        || attribute_string_value(&el.attributes, "lang")
+            .map(|s| s == "ts" || s == "typescript")
+            .unwrap_or(false);
+    let (content, comments) =
+        oxc_bridge::parse_program(source, line_map, body_start, body_end, ts)?;
+    let context = if is_module_script(&el.attributes) {
+        ScriptContext::Module
+    } else {
+        ScriptContext::Default
+    };
+    let attributes: Vec<Attribute> = el
+        .attributes
+        .iter()
+        .filter_map(|a| match a {
+            ElementAttribute::Attribute(attr) => Some(attr.clone()),
+            _ => None,
+        })
+        .collect();
+    Ok((
+        Script {
+            start: el.start,
+            end: el.end,
+            context,
+            content,
+            attributes,
+        },
+        comments,
+    ))
+}
+
 fn build_script(
     el: &RegularElement,
     source: &str,
@@ -87,6 +143,8 @@ fn build_script(
 
     let (content, _comments) =
         oxc_bridge::parse_program(source, line_map, body_start, body_end, ts)?;
+    // Note: comments are captured by `build_script_with_comments` below;
+    // callers using `build_script` (legacy entry) drop them.
 
     let context = if is_module_script(&el.attributes) {
         ScriptContext::Module

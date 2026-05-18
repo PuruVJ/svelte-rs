@@ -130,6 +130,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
 
     // Gather all let/const bindings to hoist + classify each statement.
     let mut hoisted_names: Vec<String> = Vec::new();
+    let mut hoisted_spans: Vec<Span> = Vec::new();
     enum Lowered {
         AsyncSet { name: String, init: Expression },
         Sync(Statement),
@@ -142,6 +143,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
                         hoisted_names.push(id.name.clone());
+                        hoisted_spans.push(id.span);
                         let init = d.init.clone().unwrap_or_else(undefined_expr);
                         // `$.derived(() => await E)` pattern (post rune-erase
                         // form of `let X = $derived(await E)`) → convert to
@@ -274,10 +276,14 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     if !hoisted_names.is_empty() {
         let decls: Vec<VariableDeclarator> = hoisted_names
             .iter()
-            .map(|n| VariableDeclarator {
-                id: t::pat_id(n),
+            .enumerate()
+            .map(|(i, n)| VariableDeclarator {
+                id: Pattern::Identifier(Identifier {
+                    name: n.clone(),
+                    span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
+                }),
                 init: None,
-                span: Span::ZERO,
+                span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
             })
             .collect();
         setup_stmts.push(Statement::Variable(Box::new(VariableDeclaration {

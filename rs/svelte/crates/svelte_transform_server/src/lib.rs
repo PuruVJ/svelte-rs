@@ -281,6 +281,40 @@ fn lower_fragment_server_async(
     lower_fragment_server_async_with(f, async_bindings, last_group_idx, "$$promises")
 }
 
+/// Wraps the given block-lowering output in
+/// `$$renderer.async_block([$$promises[0]], ($$renderer) => { ... });`,
+/// optionally marking the arrow async if the test contains await.
+fn wrap_async_block(
+    inner: Vec<Statement>,
+    promises_var: &str,
+    test_is_async: bool,
+) -> Statement {
+    let promises_slot = Expression::Member(Box::new(MemberExpression {
+        object: t::id(promises_var),
+        property: MemberProperty::Expression(t::lit_number(0.0)),
+        computed: true,
+        optional: false,
+        span: Span::ZERO,
+    }));
+    let blockers = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(promises_slot)],
+        span: Span::ZERO,
+    }));
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: inner,
+            span: Span::ZERO,
+        })),
+        r#async: test_is_async,
+        span: Span::ZERO,
+    }));
+    t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "async_block"),
+        vec![blockers, arrow],
+    ))
+}
+
 fn lower_fragment_server_async_with(
     f: &svelte_ast::fragment::Fragment,
     async_bindings: &std::collections::HashSet<String>,

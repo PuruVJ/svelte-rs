@@ -91,6 +91,24 @@ pub fn try_typed_client_walker_with(
         return None;
     }
 
+    // Special case: a single top-level ExpressionTag whose expression is
+    // async-tainted — emit a script-only body that creates a $.text() node
+    // and registers a template_effect with the appropriate blockers.
+    if nodes.len() == 1 {
+        if let FragmentChild::ExpressionTag(et) = nodes[0] {
+            if let Some(ai) = &script.async_info {
+                if expr_refs_any_client(&et.expression, &ai.async_bindings) {
+                    return emit_single_async_expr_program(
+                        &et.expression,
+                        component_name,
+                        &script,
+                        ai,
+                    );
+                }
+            }
+        }
+    }
+
     // Special case: a single top-level `{#each}` block uses a different
     // emission path (no `var root` at module scope; the function body
     // creates `$.comment()` and dispatches to `$.each(...)`). Done before
@@ -1035,6 +1053,72 @@ fn emit_single_component_program(
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Single top-level async-tainted ExpressionTag — emits a no-root
+/// template with `$.text()` + `$.template_effect` + `$.append`.
+fn emit_single_async_expr_program(
+    expr: &Expression,
+    component_name: &str,
+    script: &ScriptInfo,
+    ai: &AsyncInfo,
+) -> Option<Program> {
+    let mut body: Vec<Statement> = Vec::new();
+    body.extend(script.body.clone());
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "next"),
+        Vec::new(),
+    )));
+    body.push(t::var(
+        "text",
+        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+    ));
+    let set_call = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), expr.clone()],
+    );
+    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(set_call),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let blockers = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(Expression::Member(Box::new(
+            MemberExpression {
+                object: t::id("$$promises"),
+                property: MemberProperty::Expression(t::lit_number(
+                    ai.last_group_idx as f64,
+                )),
+                computed: true,
+                optional: false,
+                span: Span::ZERO,
+            },
+        )))],
+        span: Span::ZERO,
+    }));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![effect_fn, void_zero_client(), void_zero_client(), blockers],
+    )));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("text")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
     prog.push(export);
@@ -2236,6 +2320,7 @@ fn expr_top_await(e: &Expression) -> bool {
 
 fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
     let mut hoisted_names: Vec<String> = Vec::new();
+    let mut hoisted_spans: Vec<Span> = Vec::new();
     enum Lowered {
         AsyncSet { name: String, init: Expression },
         Sync(Statement),
@@ -2248,6 +2333,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
                         hoisted_names.push(id.name.clone());
+                        hoisted_spans.push(id.span);
                         let init = d
                             .init
                             .clone()
@@ -2371,10 +2457,14 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
     if !hoisted_names.is_empty() {
         let decls: Vec<VariableDeclarator> = hoisted_names
             .iter()
-            .map(|n| VariableDeclarator {
-                id: t::pat_id(n),
+            .enumerate()
+            .map(|(i, n)| VariableDeclarator {
+                id: Pattern::Identifier(Identifier {
+                    name: n.clone(),
+                    span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
+                }),
                 init: None,
-                span: Span::ZERO,
+                span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
             })
             .collect();
         setup_stmts.push(Statement::Variable(Box::new(VariableDeclaration {

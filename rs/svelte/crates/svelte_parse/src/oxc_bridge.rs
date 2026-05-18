@@ -41,7 +41,20 @@ fn collect_comments(
         .iter()
         .map(|c| {
             let span = c.span;
-            let value = slice[(span.start as usize)..(span.end as usize)].to_string();
+            let mut value = slice[(span.start as usize)..(span.end as usize)].to_string();
+            // OXC includes the comment markers in the slice; strip them for
+            // downstream `TypedComment.value` which already wraps with `//`
+            // or `/* ... */` at codegen time.
+            if matches!(c.kind, oxc_ast::CommentKind::Line) && value.starts_with("//") {
+                value = value[2..].to_string();
+            } else {
+                if value.starts_with("/*") {
+                    value = value[2..].to_string();
+                }
+                if value.ends_with("*/") {
+                    value.truncate(value.len() - 2);
+                }
+            }
             // OXC's Comment.span covers the comment's *body* (between the
             // `//` or `/*` markers and the terminator). Adjust to include
             // the markers when emitting a `RawComment` — acorn's onComment
