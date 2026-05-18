@@ -142,6 +142,34 @@ pub fn try_typed_client_walker_with(
         }
     }
 
+    // Deep-static-walker case: multi-root template made entirely of
+    // RegularElements (with whitespace text/comment between), no blocks /
+    // components / await. Reactive points are sparse inside subtrees and
+    // need navigation via `$.sibling(N)` / `$.child(...)` / `$.next(N)` /
+    // `$.reset(...)`. Matches the skip-static-subtree fixture.
+    if nodes.iter().all(|n| {
+        matches!(
+            n,
+            FragmentChild::RegularElement(_)
+                | FragmentChild::HtmlTag(_)
+                | FragmentChild::Comment(_)
+        )
+    }) && nodes.len() >= 2
+        && nodes
+            .iter()
+            .any(|n| matches!(n, FragmentChild::RegularElement(_)))
+        && script.async_info.is_none()
+        && fragment_has_deep_reactive(&root.fragment)
+    {
+        if let Some(p) = emit_deep_static_walker_program(
+            &root.fragment,
+            component_name,
+            &script,
+        ) {
+            return Some(p);
+        }
+    }
+
     // Multi-IfBlock async case: top-level non-trivial nodes are IfBlocks
     // (comments and whitespace text dropped) AND the script is in async
     // mode → route to the dedicated emitter (matches async-if-chain).
@@ -2092,6 +2120,853 @@ fn is_only_blocker_derived(
     false
 }
 
+/// Returns true iff the fragment contains a "deep reactive point": a
+/// nested ExpressionTag, HtmlTag, or an Element with reactive-trigger
+/// attribute (autofocus, muted, value-on-option, custom-element-data).
+fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(node_has_deep_reactive)
+}
+
+fn node_has_deep_reactive(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => true,
+        FragmentChild::RegularElement(el) => {
+            if element_has_reactive_attr(el) {
+                return true;
+            }
+            fragment_has_deep_reactive(&el.fragment)
+        }
+        _ => false,
+    }
+}
+
+fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool {
+    let is_custom = el.name.contains('-');
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            // Any attribute on a custom element triggers $.set_custom_element_data.
+            if is_custom {
+                return true;
+            }
+            match attr.name.as_str() {
+                "autofocus" => return true,
+                "muted" if el.name == "source" || el.name == "video" || el.name == "audio" => {
+                    return true
+                }
+                "value" if el.name == "option" => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Emit the deep-static-walker program. Builds the full HTML template by
+/// concatenating top-level elements with whitespace between them, then
+/// walks the elements emitting navigation + reactive handlers.
+fn emit_deep_static_walker_program(
+    root_fragment: &svelte_ast::fragment::Fragment,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Collect top-level element nodes (interleaved with text/comment).
+    let mut html = String::with_capacity(128);
+    let mut needs_import_node = false;
+    serialize_fragment_to_html(root_fragment, &mut html, &mut needs_import_node)?;
+
+    let mut counters = DeepCounters::default();
+    let mut var_names: HashMap<String, usize> = HashMap::new();
+    let mut body: Vec<Statement> = Vec::new();
+    let mut effects: Vec<(String, Expression)> = Vec::new(); // (text_var, getter_expr)
+
+    body.push(t::var(
+        "fragment",
+        t::call(t::id("root"), Vec::new()),
+    ));
+
+    // Walk top-level elements in order. Track previous element variable
+    // name + its index in top_elements for $.sibling navigation.
+    let mut prev_var: Option<String> = None;
+    let mut prev_top_idx: Option<usize> = None;
+    let mut first_emitted = false;
+    let top_elements: Vec<&svelte_ast::elements::RegularElement> = root_fragment
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            FragmentChild::RegularElement(el) => Some(el),
+            _ => None,
+        })
+        .collect();
+    let _top_count = top_elements.len();
+
+    for (i, el) in top_elements.iter().enumerate() {
+        let has_reactive_inside = fragment_has_deep_reactive(&el.fragment);
+        let has_reactive_attr = element_has_reactive_attr(el);
+        let needs_visit = has_reactive_inside || has_reactive_attr;
+        if !needs_visit {
+            // Skip purely static element. We don't emit anything for it.
+            continue;
+        }
+        // Allocate a variable name for this element. Each top element at
+        // index i corresponds to rendered sibling index i*2 (alternating
+        // element, text-space).
+        let var = allocate_named(&el.name, &mut var_names);
+        let init = if !first_emitted {
+            if i == 0 {
+                t::call(
+                    t::member_id(t::id("$"), "first_child"),
+                    vec![t::id("fragment")],
+                )
+            } else {
+                t::call(
+                    t::member_id(t::id("$"), "sibling"),
+                    vec![
+                        t::call(
+                            t::member_id(t::id("$"), "first_child"),
+                            vec![t::id("fragment")],
+                        ),
+                        t::lit_number((i * 2) as f64),
+                    ],
+                )
+            }
+        } else {
+            let prev = prev_var.as_ref().expect("prev_var set");
+            let prev_idx = prev_top_idx.expect("prev_top_idx set");
+            let offset = (i - prev_idx) * 2;
+            t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![t::id(prev), t::lit_number(offset as f64)],
+            )
+        };
+        body.push(t::var(&var, init));
+        prev_var = Some(var.clone());
+        prev_top_idx = Some(i);
+        first_emitted = true;
+
+        // Walk the element's interior — emit reactive handlers and
+        // navigation as needed.
+        walk_element_interior(
+            el,
+            &var,
+            &mut body,
+            &mut effects,
+            &mut var_names,
+            &mut counters,
+            script,
+        );
+        if has_reactive_inside {
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "reset"),
+                vec![t::id(&var)],
+            )));
+        }
+    }
+
+    // Trailing static top-elements: navigate to the first one + emit
+    // `$.next((trailing-1)*2)` for the rest. Matches skip-static-subtree's
+    // `var img = $.sibling(select, 2); $.next(2);` pattern.
+    if let Some(last_idx) = prev_top_idx {
+        let trailing = top_elements.len() - last_idx - 1;
+        if trailing > 0 {
+            let first_trailing = top_elements[last_idx + 1];
+            let var = allocate_named(&first_trailing.name, &mut var_names);
+            body.push(t::var(
+                &var,
+                t::call(
+                    t::member_id(t::id("$"), "sibling"),
+                    vec![
+                        t::id(prev_var.as_ref().expect("prev_var set")),
+                        t::lit_number(2.0),
+                    ],
+                ),
+            ));
+            if trailing > 1 {
+                body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "next"),
+                    vec![t::lit_number(((trailing - 1) * 2) as f64)],
+                )));
+            }
+        }
+    }
+
+    // Combined template_effect for text reactivity at the bottom.
+    if effects.len() == 1 {
+        let (text_var, expr) = effects.pop().unwrap();
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id(&text_var), expr],
+                )),
+                r#async: false,
+                span: Span::ZERO,
+            }))],
+        )));
+    } else if effects.len() >= 2 {
+        let mut block_body: Vec<Statement> = Vec::new();
+        for (text_var, expr) in effects {
+            block_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "set_text"),
+                vec![t::id(&text_var), expr],
+            )));
+        }
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: block_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }))],
+        )));
+    }
+
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    // `var root = $.from_html(\`HTML\`, FLAGS);` where FLAGS = 1 (multi-root)
+    // or 3 (multi-root + needs_import_node for video/custom-element).
+    let flags = if needs_import_node { 3.0 } else { 1.0 };
+    let root_decl = t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec![html], Vec::new()),
+                t::lit_number(flags),
+            ],
+        ),
+    );
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(root_decl);
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+#[derive(Default)]
+struct DeepCounters {
+    text: usize,
+    node: usize,
+}
+
+fn allocate_named(prefix: &str, names: &mut HashMap<String, usize>) -> String {
+    // Sanitize: replace `-` and other special chars with `_`.
+    let safe: String = prefix
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let cnt = names.entry(safe.clone()).or_insert(0);
+    let n = *cnt;
+    *cnt += 1;
+    if n == 0 {
+        safe
+    } else {
+        format!("{safe}_{n}")
+    }
+}
+
+fn prev_index_of<'a>(
+    name: &str,
+    top_elements: &[&'a svelte_ast::elements::RegularElement],
+) -> usize {
+    // Reverse-engineer: which top-element corresponds to `name`? Names like
+    // `main`, `div`, `div_1`, `cant_skip`, etc. are derived from el.name.
+    // For correct sibling offsets we need the position of the
+    // *previous-emitted* element in the top_elements array. The caller
+    // tracks this naturally by passing prev_var; we recover the index by
+    // scanning for the most recent element whose sanitized name matches.
+    // Approach: track via a separate counter — fall back to last index in
+    // the list with matching name.
+    let _ = name;
+    // Heuristic: callers track prev_var via mutable state. To avoid that
+    // complexity, this function is approximated by external bookkeeping —
+    // however the deep walker uses a different approach.
+    let _ = top_elements;
+    0
+}
+
+/// Walk the interior of `el` (which has known reactive content somewhere),
+/// emitting navigation + reactive handlers + $.reset calls.
+fn walk_element_interior(
+    el: &svelte_ast::elements::RegularElement,
+    parent_var: &str,
+    body: &mut Vec<Statement>,
+    effects: &mut Vec<(String, Expression)>,
+    var_names: &mut HashMap<String, usize>,
+    counters: &mut DeepCounters,
+    script: &ScriptInfo,
+) {
+    // First, handle direct attributes on `el` (autofocus, muted, value, custom-element-data).
+    apply_reactive_attrs(el, parent_var, body, script);
+
+    // Find the indices of reactive children in el's fragment, using the
+    // STRIPPED children (leading + trailing whitespace text nodes / comments
+    // removed) so indices match runtime siblings of the rendered template.
+    let raw: Vec<&FragmentChild> = el.fragment.nodes.iter().collect();
+    let is_boundary = |n: &&FragmentChild| match n {
+        FragmentChild::Text(t) => t.data.trim().is_empty(),
+        FragmentChild::Comment(_) => true,
+        _ => false,
+    };
+    let start = raw.iter().position(|n| !is_boundary(n)).unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|n| !is_boundary(n))
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let children: Vec<&FragmentChild> = raw[start..end].iter().copied().collect();
+    let mut reactive_idx: Vec<usize> = Vec::new();
+    for (i, c) in children.iter().enumerate() {
+        let r = match c {
+            FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => true,
+            FragmentChild::RegularElement(child_el) => {
+                element_has_reactive_attr(child_el) || fragment_has_deep_reactive(&child_el.fragment)
+            }
+            _ => false,
+        };
+        if r {
+            reactive_idx.push(i);
+        }
+    }
+    if reactive_idx.is_empty() {
+        return;
+    }
+
+    // For each reactive child, emit nav + handler. Static children get
+    // skipped via `$.sibling(prev, N)` offsets.
+    let mut prev_child_var: Option<String> = None;
+    let mut prev_child_idx: Option<usize> = None;
+    for (k, &i) in reactive_idx.iter().enumerate() {
+        let var: String;
+        let init: Expression;
+        if k == 0 {
+            // First reactive child — navigate via $.child(parent) or
+            // $.sibling($.first_child(parent), N) when not at trimmed
+            // index 0. The `true` arg of $.child is for TEXT-NODE
+            // navigation (e.g. inside `<h1>` for {title}), NOT for
+            // element-level navigation.
+            let prefix = match children[i] {
+                FragmentChild::RegularElement(child_el) => child_el.name.clone(),
+                FragmentChild::HtmlTag(_) => "node".to_string(),
+                FragmentChild::ExpressionTag(_) => "text".to_string(),
+                _ => "node".to_string(),
+            };
+            var = allocate_named(&prefix, var_names);
+            if i == 0 {
+                init = t::call(
+                    t::member_id(t::id("$"), "child"),
+                    vec![t::id(parent_var)],
+                );
+            } else {
+                init = t::call(
+                    t::member_id(t::id("$"), "sibling"),
+                    vec![
+                        t::call(
+                            t::member_id(t::id("$"), "first_child"),
+                            vec![t::id(parent_var)],
+                        ),
+                        t::lit_number(i as f64),
+                    ],
+                );
+            }
+        } else {
+            let prev = prev_child_var.as_ref().expect("prev_child_var set");
+            let prev_i = prev_child_idx.unwrap();
+            let offset = i - prev_i;
+            let prefix = match children[i] {
+                FragmentChild::RegularElement(child_el) => child_el.name.clone(),
+                FragmentChild::HtmlTag(_) => "node".to_string(),
+                FragmentChild::ExpressionTag(_) => "text".to_string(),
+                _ => "node".to_string(),
+            };
+            var = allocate_named(&prefix, var_names);
+            init = t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![t::id(prev), t::lit_number(offset as f64)],
+            );
+        }
+        body.push(t::var(&var, init));
+        // Emit the reactive handler for this child.
+        match children[i] {
+            FragmentChild::ExpressionTag(et) => {
+                let expr = rewrite_props_destructured(&et.expression, &script.props_destructured);
+                effects.push((var.clone(), expr));
+            }
+            FragmentChild::HtmlTag(ht) => {
+                let expr = rewrite_props_destructured(&ht.expression, &script.props_destructured);
+                let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(expr),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "html"),
+                    vec![t::id(&var), getter],
+                )));
+            }
+            FragmentChild::RegularElement(child_el) => {
+                if is_text_only_element(child_el) {
+                    let text_var = allocate_named("text", var_names);
+                    body.push(t::var(
+                        &text_var,
+                        t::call(
+                            t::member_id(t::id("$"), "child"),
+                            vec![
+                                t::id(&var),
+                                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                    value: true,
+                                    span: Span::ZERO,
+                                }))),
+                            ],
+                        ),
+                    ));
+                    if let Some(expr) = single_expression_in_element(child_el) {
+                        let rewritten = rewrite_props_destructured(expr, &script.props_destructured);
+                        effects.push((text_var, rewritten));
+                    }
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "reset"),
+                        vec![t::id(&var)],
+                    )));
+                } else {
+                    // Recurse into the child.
+                    walk_element_interior(child_el, &var, body, effects, var_names, counters, script);
+                    if fragment_has_deep_reactive(&child_el.fragment) {
+                        body.push(t::stmt(t::call(
+                            t::member_id(t::id("$"), "reset"),
+                            vec![t::id(&var)],
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+        prev_child_var = Some(var);
+        prev_child_idx = Some(i);
+    }
+
+    // Trailing static siblings after the last reactive child — emit $.next(N).
+    let last_reactive = *reactive_idx.last().unwrap();
+    let trailing_count = children.len() - 1 - last_reactive;
+    if trailing_count > 0 {
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            vec![t::lit_number(trailing_count as f64)],
+        )));
+    }
+}
+
+fn apply_reactive_attrs(
+    el: &svelte_ast::elements::RegularElement,
+    var: &str,
+    body: &mut Vec<Statement>,
+    _script: &ScriptInfo,
+) {
+    let is_custom = el.name.contains('-');
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            if is_custom {
+                // `$.set_custom_element_data(var, NAME, VALUE)`.
+                let value_expr = attr_value_as_string_expr(&attr.value);
+                body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "set_custom_element_data"),
+                    vec![
+                        t::id(var),
+                        Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: attr.name.clone(),
+                            raw: Some(format!("'{}'", attr.name)),
+                            span: Span::ZERO,
+                        }))),
+                        value_expr,
+                    ],
+                )));
+                continue;
+            }
+            match attr.name.as_str() {
+                "autofocus" => {
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "autofocus"),
+                        vec![
+                            t::id(var),
+                            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                value: true,
+                                span: Span::ZERO,
+                            }))),
+                        ],
+                    )));
+                }
+                "muted" if el.name == "source" || el.name == "video" || el.name == "audio" => {
+                    // `EL.muted = true;`
+                    body.push(t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(Expression::Member(Box::new(
+                            MemberExpression {
+                                object: t::id(var),
+                                property: MemberProperty::Identifier(Identifier {
+                                    name: "muted".to_string(),
+                                    span: Span::ZERO,
+                                }),
+                                computed: false,
+                                optional: false,
+                                span: Span::ZERO,
+                            },
+                        ))),
+                        operator: AssignmentOperator::Assign,
+                        right: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                            value: true,
+                            span: Span::ZERO,
+                        }))),
+                        span: Span::ZERO,
+                    }))));
+                }
+                "value" if el.name == "option" => {
+                    // `EL.value = EL.__value = 'X';`
+                    let value_expr = attr_value_as_string_expr(&attr.value);
+                    // Inner: EL.__value = 'X'
+                    let inner = Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(Expression::Member(Box::new(
+                            MemberExpression {
+                                object: t::id(var),
+                                property: MemberProperty::Identifier(Identifier {
+                                    name: "__value".to_string(),
+                                    span: Span::ZERO,
+                                }),
+                                computed: false,
+                                optional: false,
+                                span: Span::ZERO,
+                            },
+                        ))),
+                        operator: AssignmentOperator::Assign,
+                        right: value_expr,
+                        span: Span::ZERO,
+                    }));
+                    // Outer: EL.value = inner
+                    let outer = Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(Expression::Member(Box::new(
+                            MemberExpression {
+                                object: t::id(var),
+                                property: MemberProperty::Identifier(Identifier {
+                                    name: "value".to_string(),
+                                    span: Span::ZERO,
+                                }),
+                                computed: false,
+                                optional: false,
+                                span: Span::ZERO,
+                            },
+                        ))),
+                        operator: AssignmentOperator::Assign,
+                        right: inner,
+                        span: Span::ZERO,
+                    }));
+                    body.push(t::stmt(outer));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn attr_value_as_string_expr(v: &AttributeValue) -> Expression {
+    match v {
+        AttributeValue::Many(parts) if parts.len() == 1 => {
+            if let AttributeValuePart::Text(t) = &parts[0] {
+                return Expression::Literal(Box::new(Literal::String(StringLiteral {
+                    value: t.data.clone(),
+                    raw: Some(format!("'{}'", t.data)),
+                    span: Span::ZERO,
+                })));
+            }
+            t::id("undefined")
+        }
+        _ => t::id("undefined"),
+    }
+}
+
+fn is_text_only_element(el: &svelte_ast::elements::RegularElement) -> bool {
+    // Returns true iff the element has exactly one non-whitespace child that
+    // is an ExpressionTag (matches `<h1>{title}</h1>`-shape).
+    let non_ws: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        })
+        .collect();
+    non_ws.len() == 1 && matches!(non_ws[0], FragmentChild::ExpressionTag(_))
+}
+
+fn single_expression_in_element(
+    el: &svelte_ast::elements::RegularElement,
+) -> Option<&Expression> {
+    for n in &el.fragment.nodes {
+        if let FragmentChild::ExpressionTag(et) = n {
+            return Some(&et.expression);
+        }
+    }
+    None
+}
+
+fn serialize_fragment_to_html(
+    f: &svelte_ast::fragment::Fragment,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    let nodes = trim_boundary_text_client(&f.nodes);
+    let mut last_was_text_with_space = false;
+    for (i, n) in nodes.iter().enumerate() {
+        match n {
+            FragmentChild::Text(t) => {
+                let collapsed = collapse_ws_client(&t.data);
+                // Trim around block boundaries: leading whitespace of a
+                // multi-line text run after an element becomes a single
+                // space; same for trailing.
+                if collapsed.is_empty() {
+                    continue;
+                }
+                // Don't emit duplicate spaces.
+                if last_was_text_with_space && collapsed.starts_with(' ') {
+                    let rest = collapsed.trim_start_matches(' ');
+                    if !rest.is_empty() {
+                        out.push_str(rest);
+                    }
+                } else {
+                    out.push_str(&collapsed);
+                }
+                last_was_text_with_space = collapsed.ends_with(' ');
+            }
+            FragmentChild::Comment(_) => {
+                let _ = i;
+                // Drop comments (server-side behavior also).
+            }
+            FragmentChild::HtmlTag(_) => {
+                out.push_str("<!>");
+                last_was_text_with_space = false;
+            }
+            FragmentChild::ExpressionTag(_) => {
+                // Inside an element this is a placeholder. At fragment top
+                // level it would be a text anchor — not the case for deep-
+                // static-walker which only handles element top-levels.
+                out.push(' ');
+                last_was_text_with_space = true;
+            }
+            FragmentChild::RegularElement(el) => {
+                serialize_element_to_html(el, out, needs_import_node)?;
+                last_was_text_with_space = false;
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+fn serialize_element_to_html(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    let is_custom = el.name.contains('-');
+    if is_custom || el.name == "video" {
+        *needs_import_node = true;
+    }
+    out.push('<');
+    out.push_str(&el.name);
+    let is_text_only = is_text_only_element(el);
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            // Skip reactive attrs that the walker handles separately.
+            let skip = if is_custom {
+                true
+            } else {
+                matches!(attr.name.as_str(), "autofocus" | "muted")
+                    || (el.name == "option" && attr.name == "value")
+            };
+            if skip {
+                continue;
+            }
+            match &attr.value {
+                AttributeValue::Empty => {
+                    out.push(' ');
+                    out.push_str(&attr.name);
+                }
+                AttributeValue::Many(parts) => {
+                    let mut s = String::new();
+                    let mut all_text = true;
+                    for p in parts {
+                        if let AttributeValuePart::Text(t) = p {
+                            s.push_str(&t.data);
+                        } else {
+                            all_text = false;
+                            break;
+                        }
+                    }
+                    if !all_text {
+                        return None;
+                    }
+                    out.push(' ');
+                    out.push_str(&attr.name);
+                    out.push_str("=\"");
+                    out.push_str(&s);
+                    out.push('"');
+                }
+                _ => return None,
+            }
+        }
+    }
+    if is_void_client(&el.name) {
+        out.push_str("/>");
+        return Some(());
+    }
+    out.push('>');
+    if is_text_only {
+        // Placeholder space for the text anchor.
+        out.push(' ');
+    } else {
+        serialize_fragment_to_html(&el.fragment, out, needs_import_node)?;
+    }
+    out.push_str("</");
+    out.push_str(&el.name);
+    out.push('>');
+    Some(())
+}
+
+fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
+    // Drop leading/trailing whitespace-only text nodes for top-level
+    // fragment serialization. Returns a Vec of references.
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end {
+        match &nodes[start] {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => start += 1,
+            FragmentChild::Comment(_) => start += 1,
+            _ => break,
+        }
+    }
+    while end > start {
+        match &nodes[end - 1] {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => end -= 1,
+            FragmentChild::Comment(_) => end -= 1,
+            _ => break,
+        }
+    }
+    nodes[start..end].iter().collect()
+}
+
+fn collapse_ws_client(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out
+}
+
+fn is_void_client(name: &str) -> bool {
+    matches!(
+        name,
+        "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
+            | "param" | "source" | "track" | "wbr"
+    )
+}
+
+/// Rewrite every Identifier in `e` that's in `names` to `$$props.NAME`.
+/// Used for `let { title, content } = $props()`-style destructure: the
+/// declaration is dropped and references become direct member access.
+fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expression {
+    fn go(e: &Expression, names: &HashSet<String>) -> Expression {
+        match e {
+            Expression::Identifier(id) if names.contains(&id.name) => {
+                Expression::Member(Box::new(MemberExpression {
+                    object: t::id("$$props"),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: id.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))
+            }
+            Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+                callee: go(&c.callee, names),
+                arguments: c
+                    .arguments
+                    .iter()
+                    .map(|a| match a {
+                        Argument::Expression(e) => Argument::Expression(go(e, names)),
+                        other => other.clone(),
+                    })
+                    .collect(),
+                optional: c.optional,
+                span: c.span,
+            })),
+            Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
+                object: go(&m.object, names),
+                property: m.property.clone(),
+                computed: m.computed,
+                optional: m.optional,
+                span: m.span,
+            })),
+            Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+                operator: b.operator,
+                left: go(&b.left, names),
+                right: go(&b.right, names),
+                span: b.span,
+            })),
+            Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+                operator: l.operator,
+                left: go(&l.left, names),
+                right: go(&l.right, names),
+                span: l.span,
+            })),
+            Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+                operator: u.operator,
+                argument: go(&u.argument, names),
+                prefix: u.prefix,
+                span: u.span,
+            })),
+            Expression::Conditional(c) => Expression::Conditional(Box::new(ConditionalExpression {
+                test: go(&c.test, names),
+                consequent: go(&c.consequent, names),
+                alternate: go(&c.alternate, names),
+                span: c.span,
+            })),
+            Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+                expression: go(&p.expression, names),
+                span: p.span,
+            })),
+            e => e.clone(),
+        }
+    }
+    go(e, names)
+}
+
 /// Returns true iff `e` contains a CallExpression whose callee is a regular
 /// user-function reference (not a derived-binding read or other compiler-
 /// inserted call). Used to decide if an if-chain test should be hoisted to
@@ -3265,6 +4140,10 @@ struct ScriptInfo {
     /// Names of `const X = $derived(...)` bindings — lowered to
     /// `$.derived(() => ...)`. Reads of these get `$.get(X)` wrapping.
     derived_bindings: HashSet<String>,
+    /// Names destructured from `let { a, b, c } = $props()`. Template
+    /// reads of these names get rewritten to `$$props.NAME` and the
+    /// declaration itself is dropped from the script body.
+    props_destructured: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -3297,6 +4176,7 @@ fn analyze_script(
             async_info: None,
             proxy_bindings: HashSet::new(),
             derived_bindings: HashSet::new(),
+            props_destructured: HashSet::new(),
         });
     };
 
@@ -3354,6 +4234,7 @@ fn analyze_script(
     let mut uses_runes = false;
     let mut uses_props = has_class_with_runes;
     let mut saw_non_import = false;
+    let mut props_destructured: HashSet<String> = HashSet::new();
     if has_class_with_runes {
         uses_runes = true;
     }
@@ -3367,6 +4248,44 @@ fn analyze_script(
             }
             _ => {
                 saw_non_import = true;
+                // Detect `let { a, b } = $props()` and drop the declaration —
+                // template refs to `a`/`b` get rewritten to `$$props.a` /
+                // `$$props.b` by `rewrite_props_destructured` later. Only
+                // applies when every member is a plain identifier (no
+                // defaults, no aliasing) — anything else falls through to
+                // the regular `rewrite_top_stmt_multi` path.
+                let mut handled = false;
+                if let Statement::Variable(v) = s {
+                    if v.declarations.len() == 1 {
+                        let d = &v.declarations[0];
+                        if let (Pattern::Object(obj), Some(init)) = (&d.id, &d.init) {
+                            if is_props_call(init) {
+                                let all_simple = obj.properties.iter().all(|m| match m {
+                                    ObjectPatternMember::Property(p) => {
+                                        matches!(p.key, PropertyKey::Identifier(_))
+                                            && matches!(p.value, Pattern::Identifier(_))
+                                    }
+                                    _ => false,
+                                });
+                                if all_simple {
+                                    uses_runes = true;
+                                    uses_props = true;
+                                    for m in &obj.properties {
+                                        if let ObjectPatternMember::Property(p) = m {
+                                            if let PropertyKey::Identifier(id) = &p.key {
+                                                props_destructured.insert(id.name.clone());
+                                            }
+                                        }
+                                    }
+                                    handled = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if handled {
+                    continue;
+                }
                 let rewritten = rewrite_top_stmt_multi(
                     s,
                     &assigned,
@@ -3424,6 +4343,9 @@ fn analyze_script(
         }
     }
 
+    // (`props_destructured` is now populated during the top loop above —
+    // drops are done inline.)
+
     // Merge derived bindings into state_bindings so reads get $.get wrapping
     // (state_bindings is the read-rewrite set).
     let mut state_bindings = state_bindings;
@@ -3457,6 +4379,7 @@ fn analyze_script(
         async_info,
         proxy_bindings,
         derived_bindings,
+        props_destructured,
     })
 }
 
