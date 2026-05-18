@@ -22,12 +22,24 @@ import { spawnSync } from 'node:child_process';
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, '../../..');
 
-// Default fixtures — small, medium, large samples picked from snapshot/.
+// Default fixtures — currently-passing samples across client + server.
+// Override with one or more `--fixture PATH` flags to bench a different set.
 const DEFAULT_FIXTURES = [
 	'packages/svelte/tests/snapshot/samples/hello-world/index.svelte',
 	'packages/svelte/tests/snapshot/samples/imports-in-modules/index.svelte',
-	'packages/svelte/tests/snapshot/samples/svelte-element/index.svelte',
+	'packages/svelte/tests/snapshot/samples/bind-this/index.svelte',
+	'packages/svelte/tests/snapshot/samples/purity/index.svelte',
+	'packages/svelte/tests/snapshot/samples/text-nodes-deriveds/index.svelte',
+	'packages/svelte/tests/snapshot/samples/functional-templating/index.svelte',
+	'packages/svelte/tests/snapshot/samples/state-proxy-literal/index.svelte',
+	'packages/svelte/tests/snapshot/samples/nullish-coallescence-omittance/index.svelte',
+	'packages/svelte/tests/snapshot/samples/each-index-non-null/index.svelte',
 	'packages/svelte/tests/snapshot/samples/each-string-template/index.svelte',
+	'packages/svelte/tests/snapshot/samples/delegated-locally-declared-shadowed/index.svelte',
+	'packages/svelte/tests/snapshot/samples/svelte-element/index.svelte',
+	'packages/svelte/tests/snapshot/samples/class-state-field-constructor-assignment/index.svelte',
+	'packages/svelte/tests/snapshot/samples/function-prop-no-getter/index.svelte',
+	'packages/svelte/tests/snapshot/samples/props-identifier/index.svelte',
 	'packages/svelte/tests/snapshot/samples/skip-static-subtree/index.svelte',
 ];
 
