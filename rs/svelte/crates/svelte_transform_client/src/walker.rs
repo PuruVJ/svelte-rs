@@ -70,10 +70,11 @@ pub fn try_typed_client_walker_with(
         })
         .collect();
 
-    // Empty fragment but script has a class-with-runes — emit
-    // `$.push($$props, true); <class>; $.pop();` wrap with no template.
+    // Empty fragment but script has a class-with-runes OR a rest_props
+    // binding — emit `\$.push(\$\$props, true); ...; \$.pop();` wrap with no
+    // template.
     if nodes.is_empty() {
-        if script.has_class_with_runes {
+        if script.has_class_with_runes || !script.rest_props_bindings.is_empty() {
             return emit_class_only_program(component_name, &script);
         }
         return None;
@@ -1230,6 +1231,9 @@ struct ScriptInfo {
     /// Whether the script contains a class with rune fields. Triggers
     /// `$.push($$props, true); ...; $.pop();` wrap around the function body.
     has_class_with_runes: bool,
+    /// Names bound to `let X = $props()` (identifier destructure). Static-key
+    /// reads of these (e.g. `X.foo`) get rewritten to `$$props.foo`.
+    rest_props_bindings: HashSet<String>,
 }
 
 fn analyze_script(
@@ -1245,6 +1249,7 @@ fn analyze_script(
             constants: HashMap::new(),
             uses_props: false,
             has_class_with_runes: false,
+            rest_props_bindings: HashSet::new(),
         });
     };
 
@@ -1288,6 +1293,7 @@ fn analyze_script(
 
     let mut imports: Vec<Statement> = Vec::new();
     let mut rest: Vec<Statement> = Vec::new();
+    #[allow(unused_assignments)]
     let mut uses_runes = false;
     let mut uses_props = has_class_with_runes;
     let mut saw_non_import = false;
@@ -1334,6 +1340,33 @@ fn analyze_script(
         }
     }
 
+    // Detect `let X = $props()` (identifier destructure, not object) and
+    // rewrite to `let X = $.rest_props($$props, ['$$slots', '$$events',
+    // '$$legacy']);`. Also rewrite reads of `X.STATIC` to `$$props.STATIC`
+    // elsewhere in the script body.
+    let mut rest_props_bindings: HashSet<String> = HashSet::new();
+    for s in &rest {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    if is_props_call(init) {
+                        rest_props_bindings.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    if !rest_props_bindings.is_empty() {
+        uses_runes = true;
+        uses_props = true;
+        for s in &mut rest {
+            replace_props_init_with_rest_props(s, &rest_props_bindings);
+        }
+        for s in &mut rest {
+            rewrite_stmt_for_rest_props(s, &rest_props_bindings);
+        }
+    }
+
     Some(ScriptInfo {
         imports,
         body: rest,
@@ -1342,7 +1375,143 @@ fn analyze_script(
         constants,
         uses_props,
         has_class_with_runes,
+        rest_props_bindings,
     })
+}
+
+fn replace_props_init_with_rest_props(s: &mut Statement, names: &HashSet<String>) {
+    if let Statement::Variable(v) = s {
+        for d in &mut v.declarations {
+            if let (Pattern::Identifier(id), Some(init)) = (&d.id, &mut d.init) {
+                if names.contains(&id.name) && is_props_call(init) {
+                    let arr = Expression::Array(Box::new(ArrayExpression {
+                        elements: ["$$slots", "$$events", "$$legacy"]
+                            .iter()
+                            .map(|n| {
+                                ArrayElement::Expression(Expression::Literal(Box::new(
+                                    Literal::String(StringLiteral {
+                                        value: (*n).to_string(),
+                                        raw: None,
+                                        span: Span::ZERO,
+                                    }),
+                                )))
+                            })
+                            .collect(),
+                        span: Span::ZERO,
+                    }));
+                    *init = t::call(
+                        t::member_id(t::id("$"), "rest_props"),
+                        vec![t::id("$$props"), arr],
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn rewrite_stmt_for_rest_props(s: &mut Statement, names: &HashSet<String>) {
+    use Statement as S;
+    match s {
+        S::Variable(v) => {
+            for d in &mut v.declarations {
+                if let Some(init) = &mut d.init {
+                    rewrite_expr_for_rest_props(init, names, false);
+                }
+            }
+        }
+        S::Expression(e) => rewrite_expr_for_rest_props(&mut e.expression, names, false),
+        S::Block(b) => {
+            for s in &mut b.body {
+                rewrite_stmt_for_rest_props(s, names);
+            }
+        }
+        S::Return(r) => {
+            if let Some(a) = &mut r.argument {
+                rewrite_expr_for_rest_props(a, names, false);
+            }
+        }
+        S::If(i) => {
+            rewrite_expr_for_rest_props(&mut i.test, names, false);
+            rewrite_stmt_for_rest_props(&mut i.consequent, names);
+            if let Some(a) = &mut i.alternate {
+                rewrite_stmt_for_rest_props(a, names);
+            }
+        }
+        S::Function(f) => {
+            for s in &mut f.body.body {
+                rewrite_stmt_for_rest_props(s, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_expr_for_rest_props(
+    e: &mut Expression,
+    names: &HashSet<String>,
+    in_lhs_outermost: bool,
+) {
+    use Expression as E;
+    match e {
+        E::Member(m) => {
+            // If this Member's object is a known rest_props identifier AND
+            // we're NOT at the outermost LHS (write target), rewrite it.
+            if !in_lhs_outermost {
+                if let E::Identifier(id) = &m.object {
+                    if names.contains(&id.name) && !m.computed {
+                        if let MemberProperty::Identifier(_) = &m.property {
+                            m.object = t::id("$$props");
+                            return;
+                        }
+                    }
+                }
+            }
+            rewrite_expr_for_rest_props(&mut m.object, names, false);
+            if let MemberProperty::Expression(e) = &mut m.property {
+                rewrite_expr_for_rest_props(e, names, false);
+            }
+        }
+        E::Assignment(a) => {
+            // Outermost LHS doesn't get rewritten; inside it (sub-members)
+            // do. RHS is normal read context.
+            if let AssignmentTarget::Expression(t) = &mut a.left {
+                rewrite_expr_for_rest_props(t, names, true);
+            }
+            rewrite_expr_for_rest_props(&mut a.right, names, false);
+        }
+        E::Call(c) => {
+            rewrite_expr_for_rest_props(&mut c.callee, names, false);
+            for a in &mut c.arguments {
+                match a {
+                    Argument::Expression(e) => rewrite_expr_for_rest_props(e, names, false),
+                    Argument::Spread(s) => {
+                        rewrite_expr_for_rest_props(&mut s.argument, names, false)
+                    }
+                }
+            }
+        }
+        E::Binary(b) => {
+            rewrite_expr_for_rest_props(&mut b.left, names, false);
+            rewrite_expr_for_rest_props(&mut b.right, names, false);
+        }
+        E::Logical(l) => {
+            rewrite_expr_for_rest_props(&mut l.left, names, false);
+            rewrite_expr_for_rest_props(&mut l.right, names, false);
+        }
+        E::Conditional(c) => {
+            rewrite_expr_for_rest_props(&mut c.test, names, false);
+            rewrite_expr_for_rest_props(&mut c.consequent, names, false);
+            rewrite_expr_for_rest_props(&mut c.alternate, names, false);
+        }
+        E::Unary(u) => rewrite_expr_for_rest_props(&mut u.argument, names, false),
+        E::Sequence(s) => {
+            for e in &mut s.expressions {
+                rewrite_expr_for_rest_props(e, names, false);
+            }
+        }
+        E::Paren(p) => rewrite_expr_for_rest_props(&mut p.expression, names, false),
+        _ => {}
+    }
 }
 
 fn class_has_rune_fields(c: &ClassDeclaration) -> bool {
@@ -1487,6 +1656,12 @@ fn rewrite_top_stmt(
                                 lower_state_init(init);
                                 continue;
                             }
+                        }
+                        // $props() with identifier pattern is handled by the
+                        // post-pass (rest_props lowering). Anything else
+                        // starting with $ is unsupported.
+                        if is_props_call(init) {
+                            continue;
                         }
                         if expr_has_unsupported_rune(init) {
                             return None;
