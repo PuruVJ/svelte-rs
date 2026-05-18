@@ -625,25 +625,71 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
     }));
 
     if expr_is_async {
-        // Wrap each_array_decl + for-loop in
-        // `$$renderer.child_block(async ($$renderer) => { ... })`
+        // Build the inside-child_block body.
+        let mut inside_body: Vec<Statement> = vec![each_array_decl];
+        if let Some(fallback) = &eb.fallback {
+            // With a fallback: wrap the for-loop in
+            // `if (each_array.length !== 0) { ... } else { ... fallback ... }`
+            let length_member = Expression::Member(Box::new(MemberExpression {
+                object: t::id("each_array"),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "length".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            }));
+            let test_neq_zero = Expression::Binary(Box::new(BinaryExpression {
+                left: length_member,
+                operator: BinaryOperator::StrictNotEq,
+                right: t::lit_number(0.0),
+                span: Span::ZERO,
+            }));
+            let then_branch: Vec<Statement> = vec![push_string("<!--[-->"), for_stmt];
+            // Else branch: `<!--[!-->` marker + fallback body
+            let mut else_branch: Vec<Statement> = vec![push_string("<!--[!-->")];
+            if body_needs_marker(fallback) {
+                else_branch.push(push_template("<!---->"));
+            }
+            else_branch.extend(lower_fragment_for_async_block(fallback)?);
+            inside_body.push(Statement::If(Box::new(IfStatement {
+                test: test_neq_zero,
+                consequent: Statement::Block(Box::new(BlockStatement {
+                    body: then_branch,
+                    span: Span::ZERO,
+                })),
+                alternate: Some(Statement::Block(Box::new(BlockStatement {
+                    body: else_branch,
+                    span: Span::ZERO,
+                }))),
+                span: Span::ZERO,
+            })));
+        } else {
+            inside_body.push(for_stmt);
+        }
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
             body: ArrowBody::Block(Box::new(BlockStatement {
-                body: vec![each_array_decl, for_stmt],
+                body: inside_body,
                 span: Span::ZERO,
             })),
             r#async: true,
             span: Span::ZERO,
         }));
-        Some(vec![
-            push_template("<!--[-->"),
-            t::stmt(t::call(
-                t::member_id(t::id("$$renderer"), "child_block"),
-                vec![arrow],
-            )),
-            push_template("<!--]-->"),
-        ])
+        // When there's no fallback, the outer `<!--[-->` push stays outside
+        // (matches non-fallback expected). With a fallback, the marker is
+        // emitted from inside the conditional.
+        let mut out: Vec<Statement> = Vec::new();
+        if eb.fallback.is_none() {
+            out.push(push_template("<!--[-->"));
+        }
+        out.push(t::stmt(t::call(
+            t::member_id(t::id("$$renderer"), "child_block"),
+            vec![arrow],
+        )));
+        out.push(push_template("<!--]-->"));
+        Some(out)
     } else {
         Some(vec![
             push_template("<!--[-->"),
