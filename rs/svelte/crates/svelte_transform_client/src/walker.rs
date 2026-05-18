@@ -69,7 +69,13 @@ pub fn try_typed_client_walker_with(
             _ => true,
         })
         .collect();
+
+    // Empty fragment but script has a class-with-runes — emit
+    // `$.push($$props, true); <class>; $.pop();` wrap with no template.
     if nodes.is_empty() {
+        if script.has_class_with_runes {
+            return emit_class_only_program(component_name, &script);
+        }
         return None;
     }
 
@@ -494,6 +500,43 @@ fn collapse_ws(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Class-only (empty template + class with runes) emission
+// ---------------------------------------------------------------------------
+
+fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<Program> {
+    let mut body: Vec<Statement> = Vec::new();
+    // `$.push($$props, true);`
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "push"),
+        vec![
+            t::id("$$props"),
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            }))),
+        ],
+    )));
+    body.extend(script.body.clone());
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "pop"),
+        Vec::new(),
+    )));
+
+    let params = vec![t::pat_id("$$anchor"), t::pat_id("$$props")];
+    let export = t::export_default_function(component_name, params, body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -948,6 +991,9 @@ struct ScriptInfo {
     /// Whether `$props()` was destructured — the component function needs
     /// `$$props` as its second parameter.
     uses_props: bool,
+    /// Whether the script contains a class with rune fields. Triggers
+    /// `$.push($$props, true); ...; $.pop();` wrap around the function body.
+    has_class_with_runes: bool,
 }
 
 fn analyze_script(
@@ -962,6 +1008,7 @@ fn analyze_script(
             state_bindings: HashSet::new(),
             constants: HashMap::new(),
             uses_props: false,
+            has_class_with_runes: false,
         });
     };
 
@@ -983,11 +1030,34 @@ fn analyze_script(
         }
     }
 
+    // Detect any class declaration with rune-initialized fields.
+    let mut has_class_with_runes = false;
+    for s in body {
+        match s {
+            Statement::Class(c) => {
+                if class_has_rune_fields(c) {
+                    has_class_with_runes = true;
+                }
+            }
+            Statement::ExportDefault(e) => {
+                if let ExportDefault::Class(c) = &e.declaration {
+                    if class_has_rune_fields(c) {
+                        has_class_with_runes = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut imports: Vec<Statement> = Vec::new();
     let mut rest: Vec<Statement> = Vec::new();
     let mut uses_runes = false;
-    let mut uses_props = false;
+    let mut uses_props = has_class_with_runes;
     let mut saw_non_import = false;
+    if has_class_with_runes {
+        uses_runes = true;
+    }
     for s in body {
         match s {
             Statement::Import(_) => {
@@ -1035,7 +1105,31 @@ fn analyze_script(
         state_bindings,
         constants,
         uses_props,
+        has_class_with_runes,
     })
+}
+
+fn class_has_rune_fields(c: &ClassDeclaration) -> bool {
+    c.body.body.iter().any(|m| {
+        if let ClassMember::Property(p) = m {
+            if let Some(value) = &p.value {
+                return is_rune_call_in_class(value);
+            }
+        }
+        false
+    })
+}
+
+fn is_rune_call_in_class(e: &Expression) -> bool {
+    if let Expression::Call(c) = e {
+        if let Some(kp) = global_keypath(&c.callee) {
+            return matches!(
+                kp.as_str(),
+                "$state" | "$state.raw" | "$state.eager" | "$derived" | "$derived.by"
+            );
+        }
+    }
+    false
 }
 
 /// Wrapper that expands a single source statement into one-or-more output
@@ -1171,8 +1265,408 @@ fn rewrite_top_stmt(
             rewrite_block_for_state(&mut f2.body.body, state_bindings);
             Some(Statement::Function(Box::new(f2)))
         }
+        Statement::Class(c) => {
+            let mut c2 = (**c).clone();
+            rewrite_class_body_client(&mut c2);
+            Some(Statement::Class(Box::new(c2)))
+        }
         Statement::Expression(_) => Some(s.clone()),
         _ => None,
+    }
+}
+
+/// Client-side class body transform. Mirrors the server transform but with
+/// client-specific semantics:
+/// - Public `\$state(V)` field → private `#X = \$.state(V)` + getter
+///   `get X() { return \$.get(this.#X); }` + setter
+///   `set X(value) { \$.set(this.#X, value, true); }`
+/// - Private `\$state(V)` field → `#X = \$.state(V)` (no accessor pair).
+/// - Public `\$derived(E)` field → private `#X = \$.derived(() => E)` +
+///   getter `get X() { return \$.get(this.#X); }` + setter
+///   `set X(value) { \$.set(this.#X, value); }`
+/// - `\$derived.by(F)` → `\$.derived(F)`.
+/// - Method/constructor bodies: rewrite `this.#X = V` to `\$.set(this.#X, V)`
+///   for any field that lowered to a state binding.
+fn rewrite_class_body_client(c: &mut ClassDeclaration) {
+    // First pass: discover which private names will hold state (need the
+    // `$.set(this.#X, V)` rewrite in method bodies).
+    let mut state_privates: HashSet<String> = HashSet::new();
+    for m in &c.body.body {
+        if let ClassMember::Property(p) = m {
+            if let Some(value) = &p.value {
+                if let Expression::Call(call) = value {
+                    if let Some(kp) = global_keypath(&call.callee) {
+                        if matches!(kp.as_str(), "$state" | "$state.raw" | "$state.eager") {
+                            if let PropertyKey::Private(pi) = &p.key {
+                                state_privates.insert(pi.name.clone());
+                            } else if let PropertyKey::Identifier(id) = &p.key {
+                                state_privates.insert(id.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut new_members: Vec<ClassMember> = Vec::with_capacity(c.body.body.len());
+    for member in std::mem::take(&mut c.body.body) {
+        match member {
+            ClassMember::Property(mut p) => {
+                let kind = property_rune_kind_client(&p.value);
+                match kind {
+                    Some(ClassFieldRuneClient::State) => {
+                        let was_private = matches!(p.key, PropertyKey::Private(_));
+                        let public_name = match &p.key {
+                            PropertyKey::Identifier(i) => i.name.clone(),
+                            PropertyKey::Private(pi) => pi.name.clone(),
+                            _ => {
+                                new_members.push(ClassMember::Property(p));
+                                continue;
+                            }
+                        };
+                        // Inner $state arg (or no init).
+                        let arg = property_rune_inner_client(p.value.as_ref().unwrap());
+                        let state_call_args: Vec<Argument> = match arg {
+                            Some(e) => vec![Argument::Expression(e)],
+                            None => Vec::new(),
+                        };
+                        let state_expr = Expression::Call(Box::new(CallExpression {
+                            callee: t::member_id(t::id("$"), "state"),
+                            arguments: state_call_args,
+                            optional: false,
+                            span: Span::ZERO,
+                        }));
+                        p.key = PropertyKey::Private(PrivateIdentifier {
+                            name: public_name.clone(),
+                            span: Span::ZERO,
+                        });
+                        p.value = Some(state_expr);
+                        new_members.push(ClassMember::Property(p));
+                        if !was_private {
+                            new_members.push(make_state_getter(&public_name));
+                            new_members.push(make_state_setter(&public_name));
+                        }
+                    }
+                    Some(ClassFieldRuneClient::Derived(by)) => {
+                        let was_private = matches!(p.key, PropertyKey::Private(_));
+                        let public_name = match &p.key {
+                            PropertyKey::Identifier(i) => i.name.clone(),
+                            PropertyKey::Private(pi) => pi.name.clone(),
+                            _ => {
+                                new_members.push(ClassMember::Property(p));
+                                continue;
+                            }
+                        };
+                        let arg = property_rune_inner_client(p.value.as_ref().unwrap())
+                            .unwrap_or_else(|| Expression::Identifier(Identifier {
+                                name: "undefined".to_string(),
+                                span: Span::ZERO,
+                            }));
+                        let derived_expr = if by {
+                            t::call(t::member_id(t::id("$"), "derived"), vec![arg])
+                        } else {
+                            t::call(
+                                t::member_id(t::id("$"), "derived"),
+                                vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                                    params: Vec::new(),
+                                    body: ArrowBody::Expression(arg),
+                                    r#async: false,
+                                    span: Span::ZERO,
+                                }))],
+                            )
+                        };
+                        p.key = PropertyKey::Private(PrivateIdentifier {
+                            name: public_name.clone(),
+                            span: Span::ZERO,
+                        });
+                        p.value = Some(derived_expr);
+                        new_members.push(ClassMember::Property(p));
+                        if !was_private {
+                            new_members.push(make_derived_getter_client(&public_name));
+                            new_members.push(make_derived_setter_client(&public_name));
+                        }
+                    }
+                    None => {
+                        new_members.push(ClassMember::Property(p));
+                    }
+                }
+            }
+            ClassMember::Method(mut m) => {
+                rewrite_block_for_class_state(&mut m.value.body.body, &state_privates);
+                new_members.push(ClassMember::Method(m));
+            }
+            ClassMember::StaticBlock(mut sb) => {
+                rewrite_block_for_class_state(&mut sb.body, &state_privates);
+                new_members.push(ClassMember::StaticBlock(sb));
+            }
+        }
+    }
+    c.body.body = new_members;
+}
+
+enum ClassFieldRuneClient {
+    State,
+    Derived(bool),
+}
+
+fn property_rune_kind_client(value: &Option<Expression>) -> Option<ClassFieldRuneClient> {
+    let e = value.as_ref()?;
+    let Expression::Call(c) = e else { return None };
+    let kp = global_keypath(&c.callee)?;
+    match kp.as_str() {
+        "$state" | "$state.raw" | "$state.eager" => Some(ClassFieldRuneClient::State),
+        "$derived" => Some(ClassFieldRuneClient::Derived(false)),
+        "$derived.by" => Some(ClassFieldRuneClient::Derived(true)),
+        _ => None,
+    }
+}
+
+fn property_rune_inner_client(e: &Expression) -> Option<Expression> {
+    let Expression::Call(c) = e else { return None };
+    c.arguments.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e.clone()),
+        _ => None,
+    })
+}
+
+fn make_state_getter(public_name: &str) -> ClassMember {
+    // `get X() { return $.get(this.#X); }`
+    let body = vec![Statement::Return(Box::new(ReturnStatement {
+        argument: Some(t::call(
+            t::member_id(t::id("$"), "get"),
+            vec![this_private(public_name)],
+        )),
+        span: Span::ZERO,
+    }))];
+    ClassMember::Method(Box::new(MethodDefinition {
+        key: PropertyKey::Identifier(Identifier {
+            name: public_name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: FunctionExpression {
+            id: None,
+            params: Vec::new(),
+            body: BlockStatement { body, span: Span::ZERO },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        },
+        kind: MethodKind::Get,
+        computed: false,
+        r#static: false,
+        span: Span::ZERO,
+    }))
+}
+
+fn make_state_setter(public_name: &str) -> ClassMember {
+    // `set X(value) { $.set(this.#X, value, true); }`
+    let body = vec![t::stmt(t::call(
+        t::member_id(t::id("$"), "set"),
+        vec![
+            this_private(public_name),
+            t::id("value"),
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            }))),
+        ],
+    ))];
+    ClassMember::Method(Box::new(MethodDefinition {
+        key: PropertyKey::Identifier(Identifier {
+            name: public_name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: FunctionExpression {
+            id: None,
+            params: vec![t::pat_id("value")],
+            body: BlockStatement { body, span: Span::ZERO },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        },
+        kind: MethodKind::Set,
+        computed: false,
+        r#static: false,
+        span: Span::ZERO,
+    }))
+}
+
+fn make_derived_getter_client(public_name: &str) -> ClassMember {
+    let body = vec![Statement::Return(Box::new(ReturnStatement {
+        argument: Some(t::call(
+            t::member_id(t::id("$"), "get"),
+            vec![this_private(public_name)],
+        )),
+        span: Span::ZERO,
+    }))];
+    ClassMember::Method(Box::new(MethodDefinition {
+        key: PropertyKey::Identifier(Identifier {
+            name: public_name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: FunctionExpression {
+            id: None,
+            params: Vec::new(),
+            body: BlockStatement { body, span: Span::ZERO },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        },
+        kind: MethodKind::Get,
+        computed: false,
+        r#static: false,
+        span: Span::ZERO,
+    }))
+}
+
+fn make_derived_setter_client(public_name: &str) -> ClassMember {
+    // `set X(value) { $.set(this.#X, value); }`
+    let body = vec![t::stmt(t::call(
+        t::member_id(t::id("$"), "set"),
+        vec![this_private(public_name), t::id("value")],
+    ))];
+    ClassMember::Method(Box::new(MethodDefinition {
+        key: PropertyKey::Identifier(Identifier {
+            name: public_name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: FunctionExpression {
+            id: None,
+            params: vec![t::pat_id("value")],
+            body: BlockStatement { body, span: Span::ZERO },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        },
+        kind: MethodKind::Set,
+        computed: false,
+        r#static: false,
+        span: Span::ZERO,
+    }))
+}
+
+fn this_private(name: &str) -> Expression {
+    Expression::Member(Box::new(MemberExpression {
+        object: Expression::This(Span::ZERO),
+        property: MemberProperty::Private(PrivateIdentifier {
+            name: name.to_string(),
+            span: Span::ZERO,
+        }),
+        computed: false,
+        optional: false,
+        span: Span::ZERO,
+    }))
+}
+
+/// Walk a method body and rewrite `this.#X = V` to `$.set(this.#X, V)` when
+/// `#X` is a known state private field.
+fn rewrite_block_for_class_state(body: &mut Vec<Statement>, state_privates: &HashSet<String>) {
+    for s in body {
+        rewrite_stmt_for_class_state(s, state_privates);
+    }
+}
+
+fn rewrite_stmt_for_class_state(s: &mut Statement, state_privates: &HashSet<String>) {
+    use Statement as S;
+    match s {
+        S::Variable(v) => {
+            for d in &mut v.declarations {
+                if let Some(init) = &mut d.init {
+                    rewrite_expr_for_class_state(init, state_privates);
+                }
+            }
+        }
+        S::Expression(e) => rewrite_expr_for_class_state(&mut e.expression, state_privates),
+        S::Block(b) => rewrite_block_for_class_state(&mut b.body, state_privates),
+        S::Return(r) => {
+            if let Some(a) = &mut r.argument {
+                rewrite_expr_for_class_state(a, state_privates);
+            }
+        }
+        S::If(i) => {
+            rewrite_expr_for_class_state(&mut i.test, state_privates);
+            rewrite_stmt_for_class_state(&mut i.consequent, state_privates);
+            if let Some(a) = &mut i.alternate {
+                rewrite_stmt_for_class_state(a, state_privates);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_expr_for_class_state(e: &mut Expression, state_privates: &HashSet<String>) {
+    use Expression as E;
+    match e {
+        E::Assignment(a) => {
+            // Detect `this.#X = V` → `\$.set(this.#X, V)`.
+            let private_name = match &a.left {
+                AssignmentTarget::Expression(E::Member(m)) => {
+                    if matches!(&m.object, E::This(_)) {
+                        if let MemberProperty::Private(pi) = &m.property {
+                            Some(pi.name.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                AssignmentTarget::Pattern(Pattern::Member(m)) => {
+                    if matches!(&m.object, E::This(_)) {
+                        if let MemberProperty::Private(pi) = &m.property {
+                            Some(pi.name.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(name) = private_name {
+                if state_privates.contains(&name)
+                    && matches!(a.operator, AssignmentOperator::Assign)
+                {
+                    rewrite_expr_for_class_state(&mut a.right, state_privates);
+                    let rhs = std::mem::replace(
+                        &mut a.right,
+                        Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                    );
+                    *e = t::call(
+                        t::member_id(t::id("$"), "set"),
+                        vec![this_private(&name), rhs],
+                    );
+                    return;
+                }
+            }
+            if let AssignmentTarget::Expression(target) = &mut a.left {
+                rewrite_expr_for_class_state(target, state_privates);
+            }
+            rewrite_expr_for_class_state(&mut a.right, state_privates);
+        }
+        E::Call(c) => {
+            rewrite_expr_for_class_state(&mut c.callee, state_privates);
+            for a in &mut c.arguments {
+                match a {
+                    Argument::Expression(e) => rewrite_expr_for_class_state(e, state_privates),
+                    Argument::Spread(s) => rewrite_expr_for_class_state(&mut s.argument, state_privates),
+                }
+            }
+        }
+        E::Member(m) => {
+            rewrite_expr_for_class_state(&mut m.object, state_privates);
+        }
+        E::Binary(b) => {
+            rewrite_expr_for_class_state(&mut b.left, state_privates);
+            rewrite_expr_for_class_state(&mut b.right, state_privates);
+        }
+        E::Logical(l) => {
+            rewrite_expr_for_class_state(&mut l.left, state_privates);
+            rewrite_expr_for_class_state(&mut l.right, state_privates);
+        }
+        _ => {}
     }
 }
 
