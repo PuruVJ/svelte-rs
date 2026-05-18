@@ -86,7 +86,17 @@ pub fn try_typed_client_walker_with(
     // `classify` because classify doesn't yet know about EachBlock nodes.
     if nodes.len() == 1 {
         if let FragmentChild::EachBlock(eb) = nodes[0] {
+            if expr_top_await(&eb.expression) {
+                return emit_single_async_each_program(eb, component_name, &script);
+            }
             return emit_single_each_program(eb, component_name, &script);
+        }
+        if let FragmentChild::IfBlock(ib) = nodes[0] {
+            if expr_top_await(&ib.test) {
+                return emit_single_async_if_program(ib, component_name, &script);
+            }
+            // Non-async if-block not yet handled by walker.
+            return None;
         }
         if let FragmentChild::SvelteElement(se) = nodes[0] {
             return emit_single_svelte_element_program(se, component_name, &script);
@@ -792,6 +802,497 @@ fn emit_single_component_program(
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+// ---------------------------------------------------------------------------
+// Async if / each block emission (single top-level case)
+// ---------------------------------------------------------------------------
+
+/// Strip an outer `await EXPR` to its inner argument. Otherwise return clone.
+fn strip_outer_await(e: &Expression) -> Expression {
+    if let Expression::Await(a) = e {
+        a.argument.clone()
+    } else {
+        e.clone()
+    }
+}
+
+/// Lower a small async-block branch body. Currently only supports
+/// "single ExpressionTag (with await) child" — the upstream form for the
+/// async-if / async-each fixtures we target. Emits:
+///   var TEXT = $.text();
+///   $.template_effect(($0) => $.set_text(TEXT, $0), void 0, [() => INNER_EXPR]);
+///   $.append($$anchor, TEXT);
+fn emit_async_branch_body(
+    fragment: &svelte_ast::fragment::Fragment,
+    text_name: &str,
+) -> Option<Vec<Statement>> {
+    // Find the first non-whitespace child.
+    let non_ws: Vec<&FragmentChild> = fragment
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let expr = match non_ws[0] {
+        FragmentChild::ExpressionTag(et) => &et.expression,
+        _ => return None,
+    };
+
+    let mut body: Vec<Statement> = Vec::new();
+    body.push(t::var(
+        text_name,
+        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+    ));
+    // template_effect:
+    //   `($0) => $.set_text(TEXT, $0), void 0, [() => INNER_EXPR]`
+    let set_text_call = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id(text_name), t::id("$0")],
+    );
+    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$0")],
+        body: ArrowBody::Expression(set_text_call),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let inner = strip_outer_await(expr);
+    let dep_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(inner),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let deps_array = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(dep_arrow)],
+        span: Span::ZERO,
+    }));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![effect_fn, void_zero_client(), deps_array],
+    )));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(text_name)],
+    )));
+    Some(body)
+}
+
+/// `{#if await EXPR}then{:else}else{/if}` →
+/// `\$.async(node, [], [() => EXPR], (node, \$\$condition) => {
+///     var consequent = (\$\$anchor) => { ... };
+///     var alternate = (\$\$anchor) => { ... };
+///     \$.if(node, (\$\$render) => { if (\$.get(\$\$condition)) \$\$render(consequent);
+///         else \$\$render(alternate, -1); });
+/// });`
+fn emit_single_async_if_program(
+    ib: &svelte_ast::blocks::IfBlock,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    let test_inner = strip_outer_await(&ib.test);
+    let consequent_body = emit_async_branch_body(&ib.consequent, "text")?;
+    let alternate_body = if let Some(alt) = &ib.alternate {
+        Some(emit_async_branch_body(alt, "text_1")?)
+    } else {
+        None
+    };
+
+    // consequent arrow
+    let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: consequent_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let mut async_inner_body: Vec<Statement> = Vec::new();
+    async_inner_body.push(t::var("consequent", consequent_arrow));
+    if let Some(alt_body) = alternate_body {
+        let alt_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$anchor")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: alt_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        async_inner_body.push(t::var("alternate", alt_arrow));
+    }
+
+    // `$.if(node, ($$render) => { if ($.get($$condition)) $$render(consequent); else $$render(alternate, -1); })`
+    let condition_get = t::call(
+        t::member_id(t::id("$"), "get"),
+        vec![t::id("$$condition")],
+    );
+    let then_call = t::stmt(t::call(t::id("$$render"), vec![t::id("consequent")]));
+    let else_call = if ib.alternate.is_some() {
+        Some(t::stmt(t::call(
+            t::id("$$render"),
+            vec![t::id("alternate"), t::lit_number(-1.0)],
+        )))
+    } else {
+        None
+    };
+    let render_if = Statement::If(Box::new(IfStatement {
+        test: condition_get,
+        consequent: then_call,
+        alternate: else_call,
+        span: Span::ZERO,
+    }));
+    let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$render")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![render_if],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    async_inner_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "if"),
+        vec![t::id("node"), render_arrow],
+    )));
+
+    // `$.async(node, [], [() => TEST_INNER], (node, $$condition) => { ... })`
+    let promises_array = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(Expression::Arrow(Box::new(
+            ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(test_inner),
+                r#async: false,
+                span: Span::ZERO,
+            },
+        )))],
+        span: Span::ZERO,
+    }));
+    let blockers_array = Expression::Array(Box::new(ArrayExpression {
+        elements: Vec::new(),
+        span: Span::ZERO,
+    }));
+    let async_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("node"), t::pat_id("$$condition")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: async_inner_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let async_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "async"),
+        vec![
+            t::id("node"),
+            blockers_array,
+            promises_array,
+            async_callback,
+        ],
+    ));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+    func_body.push(async_call);
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/async"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// `{#each await EXPR as ITEM}body{/each}` →
+/// `\$.async(node, [], [() => EXPR], (node, \$\$collection) => {
+///     \$.each(node, 17, () => \$.get(\$\$collection), \$.index, (\$\$anchor, ITEM) => { ... });
+/// });`
+fn emit_single_async_each_program(
+    eb: &svelte_ast::blocks::EachBlock,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Body: only support text-only bodies (single ExpressionTag) for now.
+    let body_non_ws: Vec<&FragmentChild> = eb
+        .body
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        })
+        .collect();
+    if body_non_ws.len() != 1 {
+        return None;
+    }
+    let body_expr = match body_non_ws[0] {
+        FragmentChild::ExpressionTag(et) => &et.expression,
+        _ => return None,
+    };
+
+    let collection_inner = strip_outer_await(&eb.expression);
+
+    // Each body arrow: ($$anchor, ITEM) => {
+    //     $.next();
+    //     var text = $.text();
+    //     $.template_effect(($0) => $.set_text(text, $0), void 0, [() => $.get(ITEM) or RAW]);
+    //     $.append($$anchor, text);
+    // }
+    let item_name = match &eb.context {
+        Some(Pattern::Identifier(i)) => i.name.clone(),
+        _ => "$$item".to_string(),
+    };
+    let body_uses_item = expr_contains_ident(body_expr, &item_name);
+    let each_flag: f64 = if body_uses_item { 17.0 } else { 16.0 };
+    let mut each_body_stmts: Vec<Statement> = Vec::new();
+    each_body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "next"),
+        Vec::new(),
+    )));
+    each_body_stmts.push(t::var(
+        "text",
+        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+    ));
+    let set_text_call = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), t::id("$0")],
+    );
+    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$0")],
+        body: ArrowBody::Expression(set_text_call),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    // dep: `() => $.get(ITEM)` when body expr is `await ITEM` (or referenced via await)
+    // For the more general case, we want to extract: strip outer await, then
+    // wrap the remaining identifier with $.get if it's the iteration var.
+    let body_inner = strip_outer_await(body_expr);
+    let body_with_get = if let Expression::Identifier(i) = &body_inner {
+        if i.name == item_name {
+            t::call(t::member_id(t::id("$"), "get"), vec![t::id(&i.name)])
+        } else {
+            body_inner
+        }
+    } else {
+        body_inner
+    };
+    let dep_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(body_with_get),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    each_body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![
+            effect_fn,
+            void_zero_client(),
+            Expression::Array(Box::new(ArrayExpression {
+                elements: vec![ArrayElement::Expression(dep_arrow)],
+                span: Span::ZERO,
+            })),
+        ],
+    )));
+    each_body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("text")],
+    )));
+
+    let each_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: each_body_stmts,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // `$.each(node, FLAG, () => $.get($$collection), $.index, body_arrow[, fallback_arrow])`
+    let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(t::call(
+            t::member_id(t::id("$"), "get"),
+            vec![t::id("$$collection")],
+        )),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let mut each_args = vec![
+        t::id("node"),
+        t::lit_number(each_flag),
+        getter,
+        t::member_id(t::id("$"), "index"),
+        each_callback,
+    ];
+    if let Some(fallback) = &eb.fallback {
+        // Fallback arrow: `($$anchor) => { $.next(); var text_1 = $.text();
+        // $.template_effect(($0) => $.set_text(text_1, $0), void 0, [() => FALLBACK_EXPR]);
+        // $.append($$anchor, text_1); }`
+        let fb_non_ws: Vec<&FragmentChild> = fallback
+            .nodes
+            .iter()
+            .filter(|c| match c {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                _ => true,
+            })
+            .collect();
+        if fb_non_ws.len() == 1 {
+            if let FragmentChild::ExpressionTag(et) = fb_non_ws[0] {
+                let inner_fb = strip_outer_await(&et.expression);
+                let mut fb_body: Vec<Statement> = Vec::new();
+                fb_body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "next"),
+                    Vec::new(),
+                )));
+                fb_body.push(t::var(
+                    "text_1",
+                    t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+                ));
+                let fb_set = t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id("text_1"), t::id("$0")],
+                );
+                let fb_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$0")],
+                    body: ArrowBody::Expression(fb_set),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                let fb_dep = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(inner_fb),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                fb_body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "template_effect"),
+                    vec![
+                        fb_fn,
+                        void_zero_client(),
+                        Expression::Array(Box::new(ArrayExpression {
+                            elements: vec![ArrayElement::Expression(fb_dep)],
+                            span: Span::ZERO,
+                        })),
+                    ],
+                )));
+                fb_body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "append"),
+                    vec![t::id("$$anchor"), t::id("text_1")],
+                )));
+                each_args.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$anchor")],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: fb_body,
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                })));
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    let each_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "each"),
+        each_args,
+    ));
+
+    let async_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("node"), t::pat_id("$$collection")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![each_call],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let async_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "async"),
+        vec![
+            t::id("node"),
+            Expression::Array(Box::new(ArrayExpression {
+                elements: Vec::new(),
+                span: Span::ZERO,
+            })),
+            Expression::Array(Box::new(ArrayExpression {
+                elements: vec![ArrayElement::Expression(Expression::Arrow(Box::new(
+                    ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(collection_inner),
+                        r#async: false,
+                        span: Span::ZERO,
+                    },
+                )))],
+                span: Span::ZERO,
+            })),
+            async_callback,
+        ],
+    ));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+    func_body.push(async_call);
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
     prog.push(export);
@@ -1638,6 +2139,36 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
         async_bindings,
         last_group_idx,
     })
+}
+
+fn expr_contains_ident(e: &Expression, name: &str) -> bool {
+    match e {
+        Expression::Identifier(i) => i.name == name,
+        Expression::Member(m) => expr_contains_ident(&m.object, name),
+        Expression::Call(c) => {
+            expr_contains_ident(&c.callee, name)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_contains_ident(e, name),
+                    Argument::Spread(s) => expr_contains_ident(&s.argument, name),
+                })
+        }
+        Expression::Binary(b) => {
+            expr_contains_ident(&b.left, name) || expr_contains_ident(&b.right, name)
+        }
+        Expression::Logical(l) => {
+            expr_contains_ident(&l.left, name) || expr_contains_ident(&l.right, name)
+        }
+        Expression::Unary(u) => expr_contains_ident(&u.argument, name),
+        Expression::Conditional(c) => {
+            expr_contains_ident(&c.test, name)
+                || expr_contains_ident(&c.consequent, name)
+                || expr_contains_ident(&c.alternate, name)
+        }
+        Expression::Paren(p) => expr_contains_ident(&p.expression, name),
+        Expression::Template(t) => t.expressions.iter().any(|e| expr_contains_ident(e, name)),
+        Expression::Await(a) => expr_contains_ident(&a.argument, name),
+        _ => false,
+    }
 }
 
 fn expr_refs_any_client(e: &Expression, names: &HashSet<String>) -> bool {
