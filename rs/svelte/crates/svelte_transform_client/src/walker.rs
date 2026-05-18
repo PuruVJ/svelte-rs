@@ -73,6 +73,16 @@ pub fn try_typed_client_walker_with(
         return None;
     }
 
+    // Special case: a single top-level `{#each}` block uses a different
+    // emission path (no `var root` at module scope; the function body
+    // creates `$.comment()` and dispatches to `$.each(...)`). Done before
+    // `classify` because classify doesn't yet know about EachBlock nodes.
+    if nodes.len() == 1 {
+        if let FragmentChild::EachBlock(eb) = nodes[0] {
+            return emit_single_each_program(eb, component_name, &script);
+        }
+    }
+
     let classified: Vec<NodeKind> = nodes.iter().map(|n| classify(n)).collect::<Option<_>>()?;
 
     let is_multi_root = nodes.len() > 1;
@@ -481,6 +491,236 @@ fn collapse_ws(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Single top-level {#each} emission
+// ---------------------------------------------------------------------------
+
+fn emit_single_each_program(
+    eb: &svelte_ast::blocks::EachBlock,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Body classification: either a single wrapper element (e.g. `<p>{i}</p>`)
+    // or a text-only body (e.g. `{thing}, `). Anything else bails.
+    let body_nodes: Vec<&FragmentChild> = eb
+        .body
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        })
+        .collect();
+
+    let mut hoisted: Vec<Statement> = Vec::new();
+    let mut body_stmts: Vec<Statement> = Vec::new();
+
+    if body_nodes.len() == 1 {
+        if let FragmentChild::RegularElement(el) = body_nodes[0] {
+            // Wrapper element body. Hoist `var root_1 = $.from_html(\`<el></el>\`);`
+            // and inside the each callback: `var p = root_1(); p.textContent = ...; \$.append($$anchor, p)`.
+            // Only support the simple single-expression DirectText case here.
+            let mut html = String::new();
+            serialize_element(el, &mut html, /*body*/ false, /*reactive*/ false)?;
+            hoisted.push(t::var(
+                "root_1",
+                t::call(
+                    t::member_id(t::id("$"), "from_html"),
+                    vec![t::template_raw(vec![html], vec![])],
+                ),
+            ));
+            let var = el.name.clone();
+            body_stmts.push(t::var(&var, t::call(t::id("root_1"), vec![])));
+            // Inspect children: at most one ExpressionTag adjacent to optional
+            // static text. If purely static, leave the textContent in the
+            // template literal. If single expression that's a context/index
+            // identifier, emit `p.textContent = \`...${ident}\``.
+            let mut parts: Vec<TextPart> = Vec::new();
+            for c in &el.fragment.nodes {
+                match c {
+                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                    FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
+                    _ => return None,
+                }
+            }
+            while parts
+                .first()
+                .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+                .unwrap_or(false)
+            {
+                parts.remove(0);
+            }
+            while parts
+                .last()
+                .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+                .unwrap_or(false)
+            {
+                parts.pop();
+            }
+            // Build textContent template literal.
+            let mut quasis: Vec<String> = Vec::new();
+            let mut subs: Vec<Expression> = Vec::new();
+            let mut current = String::new();
+            for p in &parts {
+                match p {
+                    TextPart::Static(s) => current.push_str(s),
+                    TextPart::Expr(e) => {
+                        quasis.push(std::mem::take(&mut current));
+                        subs.push((*e).clone());
+                    }
+                }
+            }
+            quasis.push(current);
+            let tmpl = t::template_raw(quasis, subs);
+            let target = Expression::Member(Box::new(MemberExpression {
+                object: t::id(&var),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "textContent".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            }));
+            body_stmts.push(t::stmt(Expression::Assignment(Box::new(
+                AssignmentExpression {
+                    left: AssignmentTarget::Expression(target),
+                    operator: AssignmentOperator::Assign,
+                    right: tmpl,
+                    span: Span::ZERO,
+                },
+            ))));
+            body_stmts.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id(&var)],
+            )));
+        } else {
+            return None;
+        }
+    } else {
+        // Text-only body: `$.next(); var text = $.text(); $.template_effect(...); $.append($$anchor, text);`
+        let mut parts: Vec<TextPart> = Vec::new();
+        for c in &eb.body.nodes {
+            match c {
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
+                _ => return None,
+            }
+        }
+        while parts
+            .first()
+            .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+            .unwrap_or(false)
+        {
+            parts.remove(0);
+        }
+        while parts
+            .last()
+            .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+            .unwrap_or(false)
+        {
+            parts.pop();
+        }
+        body_stmts.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            Vec::new(),
+        )));
+        body_stmts.push(t::var(
+            "text",
+            t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        ));
+        let inline = build_inline_template(&parts, &script.state_bindings);
+        let fn_body = t::call(
+            t::member_id(t::id("$"), "set_text"),
+            vec![t::id("text"), inline],
+        );
+        let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(fn_body),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        body_stmts.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![fn_arrow],
+        )));
+        body_stmts.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id("$$anchor"), t::id("text")],
+        )));
+    }
+
+    // Build the each-call arrow params: `($$anchor, ITEM, INDEX?)` or
+    // `($$anchor, $$item, INDEX)` if no context.
+    let mut params = vec![t::pat_id("$$anchor")];
+    if let Some(ctx) = &eb.context {
+        params.push(ctx.clone());
+    } else {
+        params.push(t::pat_id("$$item"));
+    }
+    if let Some(idx) = &eb.index {
+        params.push(t::pat_id(idx));
+    }
+
+    let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params,
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: body_stmts,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // Build top-level function body.
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    func_body.push(t::var(
+        "node",
+        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+    ));
+
+    // `$.each(node, 0, () => EXPR, $.index, body_arrow)`
+    let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(eb.expression.clone()),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let key_fn = t::member_id(t::id("$"), "index");
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "each"),
+        vec![
+            t::id("node"),
+            t::lit_number(0.0),
+            getter,
+            key_fn,
+            body_arrow,
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let export = t::export_default_function(component_name, vec![t::pat_id("$$anchor")], func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len() + hoisted.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.extend(hoisted);
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 fn trim_boundary_ws(nodes: &[FragmentChild]) -> &[FragmentChild] {
@@ -1868,6 +2108,11 @@ fn build_inline_template(
         match p {
             TextPart::Static(s) => current.push_str(s),
             TextPart::Expr(e) => {
+                // Literal expressions fold into the surrounding static text.
+                if let Some(s) = literal_to_template_string(e) {
+                    current.push_str(&s);
+                    continue;
+                }
                 quasis.push(std::mem::take(&mut current));
                 let mut sub = (*e).clone();
                 rewrite_expr_for_state(&mut sub, state_bindings);
