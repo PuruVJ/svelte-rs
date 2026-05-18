@@ -62,13 +62,35 @@ pub fn try_typed_server(root: &Root, component_name: &str) -> Option<Program> {
 
 /// Walk a fragment and return its content as one HTML string if and only
 /// if every child is either static text or a void/simple element with no
-/// dynamic attributes. Returns `None` on the first dynamic node.
+/// dynamic attributes. Returns `None` on the first dynamic node OR on any
+/// `<option>` (which upstream lowers to a `$$renderer.option(...)` call even
+/// in static contexts — falls through to the dynamic path).
 fn static_html(fragment: &Fragment) -> Option<String> {
+    if fragment_contains_option_element(fragment) {
+        return None;
+    }
     let mut out = String::with_capacity(64);
     for c in &fragment.nodes {
         append_static(c, &mut out)?;
     }
     Some(out)
+}
+
+/// True if any descendant of `fragment` is a `<select>` or `<option>` element —
+/// those need the customizable-select-element call shape, not static HTML.
+fn fragment_contains_option_element(fragment: &Fragment) -> bool {
+    fragment.nodes.iter().any(node_contains_option_element)
+}
+
+fn node_contains_option_element(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::RegularElement(el) => {
+            el.name == "option"
+                || el.name == "select"
+                || fragment_contains_option_element(&el.fragment)
+        }
+        _ => false,
+    }
 }
 
 fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {

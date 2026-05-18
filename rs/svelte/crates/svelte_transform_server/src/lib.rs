@@ -33,6 +33,9 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
         return None;
     }
 
+    // Reset the per-component each-array counter for `<select>` lowering.
+    SELECT_EACH_COUNTER.with(|c| c.set(0));
+
     // Process the instance script: rewrite runes, split imports vs rest.
     let mut script_imports: Vec<Statement> = Vec::new();
     let mut script_rest: Vec<Statement> = Vec::new();
@@ -173,8 +176,24 @@ fn extract_and_lower_snippets(
     for n in std::mem::take(&mut fragment.nodes) {
         if let FragmentChild::SnippetBlock(sb) = &n {
             let name = sb.expression.name.clone();
+            // Snippet body needs a leading `<!---->` anchor UNLESS the first
+            // non-whitespace child is an `<option>` (which emits a self-anchored
+            // `$$renderer.option(...)` call) or a `<select>` etc.
+            let first = sb.body.nodes.iter().find(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            });
+            let needs_marker = match first {
+                Some(FragmentChild::RegularElement(el))
+                    if el.name == "option" || el.name == "select" =>
+                {
+                    false
+                }
+                _ => body_needs_marker(&sb.body),
+            };
             let body_stmts: Vec<Statement> =
-                lower_fragment_with_marker(&sb.body, true)?;
+                lower_fragment_with_marker(&sb.body, needs_marker)?;
             let mut params = vec![t::pat_id("$$renderer")];
             for p in &sb.parameters {
                 params.push(p.clone());
@@ -1179,6 +1198,12 @@ fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<State
     lower_fragment_with_marker(f, false)
 }
 
+thread_local! {
+    /// Shared each-array counter spanning every `<select>` in the current
+    /// component lowering. Reset at the top of `try_typed_server_component`.
+    static SELECT_EACH_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
 /// Lower a fragment with an optional leading `<!---->` marker (prepended
 /// to the first push if the first non-whitespace child needs it).
 fn lower_fragment_with_marker(
@@ -1204,8 +1229,22 @@ fn lower_fragment_with_marker(
                 last_was_component = false;
             }
         }
-        // RegularElement with <option> children: write open tag + interleave
-        // option calls + close tag inline (keeps the existing buf flowing).
+        // `<option>` ANYWHERE (even outside `<select>`) becomes
+        // `$$renderer.option(...)` — mirrors upstream's `is_option_special`
+        // rule which fires regardless of parent context.
+        if let FragmentChild::RegularElement(el) = n {
+            if el.name == "option" {
+                if let Some(stmt) = buf.flush() {
+                    emitted_static_push = true;
+                    out.push(stmt);
+                }
+                out.push(lower_option_server(el)?);
+                last_was_component = false;
+                continue;
+            }
+        }
+        // `<select>` (or other option-child container) routes to the inline
+        // emitter so blocks inside it can produce `$$renderer.option(...)` calls.
         if let FragmentChild::RegularElement(el) = n {
             if has_option_child(el) {
                 emit_select_inline(el, &mut buf, &mut out)?;
@@ -1280,6 +1319,15 @@ fn emit_select_inline(
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
 ) -> Option<()> {
+    SELECT_EACH_COUNTER.with(|c| emit_select_inline_with(el, buf, out, c))
+}
+
+fn emit_select_inline_with(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+    each_counter: &std::cell::Cell<usize>,
+) -> Option<()> {
     buf.push_str("<");
     buf.push_str(&el.name);
     for attr in &el.attributes {
@@ -1288,24 +1336,404 @@ fn emit_select_inline(
     buf.push_str(">");
     let children = trim_boundary_whitespace(&el.fragment.nodes);
     for c in children {
-        match c {
-            FragmentChild::RegularElement(child) if child.name == "option" => {
-                if let Some(stmt) = buf.flush() {
-                    out.push(stmt);
-                }
-                out.push(lower_option_server(child)?);
-            }
-            other => {
-                if append_node_to_template(other, buf).is_none() {
-                    return None;
-                }
-            }
-        }
+        lower_select_child(c, buf, out, each_counter)?;
     }
     buf.push_str("</");
     buf.push_str(&el.name);
     buf.push_str(">");
     Some(())
+}
+
+/// Lower a single child of a `<select>` / `<optgroup>` / `<svelte:boundary>`
+/// container. Knows that `<option>` becomes a `$$renderer.option(...)` call,
+/// blocks (`{#each}`, `{#if}`, `{#key}`) recursively lower their bodies
+/// "inside select context", Components / snippets / @html / @render get
+/// their out-of-band emission with anchor markers.
+fn lower_select_child(
+    c: &FragmentChild,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+    each_counter: &std::cell::Cell<usize>,
+) -> Option<()> {
+    match c {
+        FragmentChild::RegularElement(child) if child.name == "option" => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            out.push(lower_option_server(child)?);
+        }
+        FragmentChild::RegularElement(child) if child.name == "optgroup" => {
+            // Inline open tag + recursive lowering + close tag.
+            buf.push_str("<optgroup");
+            for attr in &child.attributes {
+                append_element_attribute_server(attr, buf)?;
+            }
+            buf.push_str(">");
+            let inner_children = trim_boundary_whitespace(&child.fragment.nodes);
+            for c2 in inner_children {
+                lower_select_child(c2, buf, out, each_counter)?;
+            }
+            buf.push_str("</optgroup>");
+        }
+        FragmentChild::EachBlock(eb) => {
+            // Fuse `<!--[-->` open marker with the preceding buf, then emit
+            // the for-loop, then push the close marker into buf so it fuses
+            // with the next chunk.
+            buf.push_str("<!--[-->");
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            let idx = each_counter.get();
+            each_counter.set(idx + 1);
+            out.extend(lower_each_for_select(eb, idx, each_counter)?);
+            buf.push_str("<!--]-->");
+            // Trailing `<!>` anchor when the body contains rich content
+            // (Component/RenderTag/HtmlTag).
+            if each_body_has_rich_content(&eb.body) {
+                buf.push_str("<!>");
+            }
+        }
+        FragmentChild::IfBlock(ib) => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            out.push(build_if_chain_for_select(ib, each_counter)?);
+            buf.push_str("<!--]-->");
+            // Trailing `<!>` anchor when any branch contains rich content.
+            let rich = each_body_has_rich_content(&ib.consequent)
+                || ib.alternate.as_ref().map_or(false, each_body_has_rich_content);
+            if rich {
+                buf.push_str("<!>");
+            }
+        }
+        FragmentChild::KeyBlock(kb) => {
+            // Fuse `<!---->` open marker with the preceding buf.
+            buf.push_str("<!---->");
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            let mut inner_body: Vec<Statement> = Vec::new();
+            let mut inner_buf = TemplateBuf::new();
+            let inner_children = trim_boundary_whitespace(&kb.fragment.nodes);
+            for c2 in inner_children {
+                lower_select_child(c2, &mut inner_buf, &mut inner_body, each_counter)?;
+            }
+            if let Some(stmt) = inner_buf.flush() {
+                inner_body.push(stmt);
+            }
+            out.push(Statement::Block(Box::new(BlockStatement {
+                body: inner_body,
+                span: Span::ZERO,
+            })));
+            buf.push_str("<!---->");
+        }
+        FragmentChild::SvelteBoundary(b) => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            out.push(push_template("<!--[-->"));
+            let mut inner_body: Vec<Statement> = Vec::new();
+            let mut inner_buf = TemplateBuf::new();
+            let inner_children = trim_boundary_whitespace(&b.fragment.nodes);
+            for c2 in inner_children {
+                lower_select_child(c2, &mut inner_buf, &mut inner_body, each_counter)?;
+            }
+            if let Some(stmt) = inner_buf.flush() {
+                inner_body.push(stmt);
+            }
+            out.push(Statement::Block(Box::new(BlockStatement {
+                body: inner_body,
+                span: Span::ZERO,
+            })));
+            out.push(push_template("<!--]-->"));
+        }
+        FragmentChild::Component(comp) => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            out.push(lower_component_server(comp)?);
+            // Anchor marker pair after Component: `<!---->` then `<!>` (hydration).
+            buf.push_str("<!---->");
+            buf.push_str("<!>");
+        }
+        FragmentChild::RenderTag(rt) => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            // `{@render snippet()}` → just call `snippet($$renderer)`.
+            out.push(lower_render_tag_for_select(rt)?);
+            buf.push_str("<!---->");
+            buf.push_str("<!>");
+        }
+        FragmentChild::HtmlTag(t) => {
+            // `{@html EXPR}` → `${$.html(EXPR)}` interpolation in buf.
+            buf.push_expr(t::call(
+                t::member_id(t::id("$"), "html"),
+                vec![t.expression.clone()],
+            ));
+            // `@html` inside a select also emits a hydration anchor.
+            buf.push_str("<!>");
+        }
+        FragmentChild::ConstTag(_) => {
+            // ConstTag inside select fragment is lowered by the enclosing
+            // each/if body, not here directly. Handled inside lower_each_for_select.
+        }
+        FragmentChild::Comment(_) | FragmentChild::SnippetBlock(_) => {
+            // Comments dropped server-side. Top-level snippet blocks were already
+            // extracted before this point.
+        }
+        other => {
+            if append_node_to_template(other, buf).is_none() {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
+/// Inside an each-block's for-loop body (within a `<select>`), Components and
+/// RenderTags don't emit per-iteration anchors — those go on the trailing
+/// `<!--]-->`/`<!>` push after the loop instead.
+fn lower_select_child_loop_body(
+    c: &FragmentChild,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+    each_counter: &std::cell::Cell<usize>,
+) -> Option<()> {
+    match c {
+        FragmentChild::Component(comp) => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            out.push(lower_component_server(comp)?);
+        }
+        FragmentChild::RenderTag(rt) => {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            out.push(lower_render_tag_for_select(rt)?);
+        }
+        FragmentChild::HtmlTag(t) => {
+            buf.push_expr(t::call(
+                t::member_id(t::id("$"), "html"),
+                vec![t.expression.clone()],
+            ));
+        }
+        _ => return lower_select_child(c, buf, out, each_counter),
+    }
+    Some(())
+}
+
+/// True if any descendant of the fragment is a Component, RenderTag, or
+/// HtmlTag — meaning the each/if-block's close marker needs a trailing `<!>`.
+fn each_body_has_rich_content(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(|n| match n {
+        FragmentChild::Component(_)
+        | FragmentChild::RenderTag(_)
+        | FragmentChild::HtmlTag(_) => true,
+        FragmentChild::IfBlock(ib) => {
+            each_body_has_rich_content(&ib.consequent)
+                || ib.alternate.as_ref().map_or(false, each_body_has_rich_content)
+        }
+        FragmentChild::EachBlock(eb) => each_body_has_rich_content(&eb.body),
+        FragmentChild::KeyBlock(kb) => each_body_has_rich_content(&kb.fragment),
+        FragmentChild::AwaitBlock(ab) => {
+            ab.pending.as_ref().map_or(false, each_body_has_rich_content)
+                || ab.then.as_ref().map_or(false, each_body_has_rich_content)
+                || ab.catch_.as_ref().map_or(false, each_body_has_rich_content)
+        }
+        FragmentChild::SvelteBoundary(b) => each_body_has_rich_content(&b.fragment),
+        _ => false,
+    })
+}
+
+/// `{@render fn(args)}` → `fn($$renderer, ...args)`.
+fn lower_render_tag_for_select(rt: &svelte_ast::tags::RenderTag) -> Option<Statement> {
+    let (callee, args) = match &rt.expression {
+        Expression::Call(c) => (c.callee.clone(), c.arguments.clone()),
+        _ => return None,
+    };
+    let mut arguments = vec![Argument::Expression(t::id("$$renderer"))];
+    arguments.extend(args);
+    Some(t::stmt(Expression::Call(Box::new(CallExpression {
+        callee,
+        arguments,
+        optional: false,
+        span: Span::ZERO,
+    }))))
+}
+
+/// Each-block whose body lowers to `lower_select_child` (for use inside `<select>`).
+/// `idx == 0` uses plain names (`each_array`, `$$index`, `$$length`); higher
+/// indices append `_N` to dedupe across sibling each-blocks.
+fn lower_each_for_select(
+    eb: &svelte_ast::blocks::EachBlock,
+    idx: usize,
+    each_counter: &std::cell::Cell<usize>,
+) -> Option<Vec<Statement>> {
+    let arr_name = if idx == 0 {
+        "each_array".to_string()
+    } else {
+        format!("each_array_{idx}")
+    };
+    let index_name = eb.index.clone().unwrap_or_else(|| {
+        if idx == 0 {
+            "$$index".to_string()
+        } else {
+            format!("$$index_{idx}")
+        }
+    });
+
+    let init = Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Let,
+        declarations: vec![
+            VariableDeclarator {
+                id: t::pat_id(&index_name),
+                init: Some(t::lit_number(0.0)),
+                span: Span::ZERO,
+            },
+            VariableDeclarator {
+                id: t::pat_id("$$length"),
+                init: Some(Expression::Member(Box::new(MemberExpression {
+                    object: t::id(&arr_name),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "length".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                span: Span::ZERO,
+            },
+        ],
+        span: Span::ZERO,
+    }));
+    let test = Expression::Binary(Box::new(BinaryExpression {
+        left: t::id(&index_name),
+        operator: BinaryOperator::Lt,
+        right: t::id("$$length"),
+        span: Span::ZERO,
+    }));
+    let update = Expression::Update(Box::new(UpdateExpression {
+        operator: UpdateOperator::Increment,
+        argument: t::id(&index_name),
+        prefix: false,
+        span: Span::ZERO,
+    }));
+    let mut body_stmts: Vec<Statement> = Vec::new();
+    if let Some(ctx) = &eb.context {
+        body_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Let,
+            declarations: vec![VariableDeclarator {
+                id: ctx.clone(),
+                init: Some(Expression::Member(Box::new(MemberExpression {
+                    object: t::id(&arr_name),
+                    property: MemberProperty::Expression(t::id(&index_name)),
+                    computed: true,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        })));
+    }
+    // Emit ConstTag declarations BEFORE the rest of the body (mirrors
+    // upstream's ConstTag visitor in non-async context: `const X = INIT;`).
+    for c in &eb.body.nodes {
+        if let FragmentChild::ConstTag(ct) = c {
+            body_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
+                kind: VariableKind::Const,
+                declarations: ct.declaration.declarations.clone(),
+                span: Span::ZERO,
+            })));
+        }
+    }
+    // Lower each-block body in select context. Components/RenderTags inside
+    // a for-loop body don't emit per-iteration `<!---->`/`<!>` anchors — the
+    // single trailing anchor goes AFTER the for-loop close marker (computed
+    // by the caller from `each_body_has_rich_content`).
+    let mut inner_buf = TemplateBuf::new();
+    for c in &eb.body.nodes {
+        if matches!(c, FragmentChild::ConstTag(_)) {
+            continue; // already emitted above
+        }
+        lower_select_child_loop_body(c, &mut inner_buf, &mut body_stmts, each_counter)?;
+    }
+    if let Some(stmt) = inner_buf.flush() {
+        body_stmts.push(stmt);
+    }
+
+    let for_stmt = Statement::For(Box::new(ForStatement {
+        init: Some(ForInit::Declaration(Box::new(
+            match init {
+                Statement::Variable(v) => *v,
+                _ => unreachable!(),
+            },
+        ))),
+        test: Some(test),
+        update: Some(update),
+        body: Statement::Block(Box::new(BlockStatement {
+            body: body_stmts,
+            span: Span::ZERO,
+        })),
+        span: Span::ZERO,
+    }));
+
+    let arr_decl = t::const_decl(
+        &arr_name,
+        t::call(
+            t::member_id(t::id("$"), "ensure_array_like"),
+            vec![eb.expression.clone()],
+        ),
+    );
+    Some(vec![arr_decl, for_stmt])
+}
+
+/// If-block whose branches lower via `lower_select_child` for the `<select>`
+/// context. Simpler than the async version — no blockers, no async wrap.
+fn build_if_chain_for_select(
+    ib: &svelte_ast::blocks::IfBlock,
+    each_counter: &std::cell::Cell<usize>,
+) -> Option<Statement> {
+    let consequent_marker = "<!--[0-->";
+    let mut consequent_body: Vec<Statement> = vec![push_string(consequent_marker)];
+    {
+        let mut inner_buf = TemplateBuf::new();
+        let children = trim_boundary_whitespace(&ib.consequent.nodes);
+        let children = trim_boundary_text(children);
+        for c in children.iter() {
+            lower_select_child(c, &mut inner_buf, &mut consequent_body, each_counter)?;
+        }
+        if let Some(stmt) = inner_buf.flush() {
+            consequent_body.push(stmt);
+        }
+    }
+    let mut alternate_body: Vec<Statement> = vec![push_string("<!--[-1-->")];
+    if let Some(alt) = &ib.alternate {
+        let mut inner_buf = TemplateBuf::new();
+        let children = trim_boundary_whitespace(&alt.nodes);
+        let children = trim_boundary_text(children);
+        for c in children.iter() {
+            lower_select_child(c, &mut inner_buf, &mut alternate_body, each_counter)?;
+        }
+        if let Some(stmt) = inner_buf.flush() {
+            alternate_body.push(stmt);
+        }
+    }
+    Some(Statement::If(Box::new(IfStatement {
+        test: ib.test.clone(),
+        consequent: Statement::Block(Box::new(BlockStatement {
+            body: consequent_body,
+            span: Span::ZERO,
+        })),
+        alternate: Some(Statement::Block(Box::new(BlockStatement {
+            body: alternate_body,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    })))
 }
 
 /// Returns true unless the first non-trivial child of the fragment is a
@@ -1959,12 +2387,13 @@ fn build_block_arrow(
 }
 
 /// True if the element has any `<option>` direct child. `<select>` /
-/// `<datalist>` etc. with rich-content options need special interleaved
-/// `$$renderer.option(...)` lowering.
+/// `<select>` containers (and `<optgroup>`/`<svelte:boundary>` inside one)
+/// need the customizable-select-element call shape. Currently this returns
+/// true for any `<select>` element (matching upstream's
+/// `is_option_special`-style decision applied per-`<option>`, but routed at
+/// the `<select>` level so the recursive lowering reaches every option).
 fn has_option_child(el: &svelte_ast::elements::RegularElement) -> bool {
-    el.fragment.nodes.iter().any(|n| {
-        matches!(n, FragmentChild::RegularElement(child) if child.name == "option")
-    })
+    el.name == "select"
 }
 
 /// `<select>` with `<option>` children: emit the open tag, each option as a
@@ -2017,29 +2446,125 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             props.push(attribute_to_object_member(a)?);
         }
     }
-    // <option> body doesn't need a hydration anchor — renderer.option handles positioning.
-    let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
-    let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
-        body: ArrowBody::Block(Box::new(BlockStatement {
-            body: body_stmts,
+    // Decide the body shape:
+    //  - If `<option>` has rich content (any RegularElement descendant), emit
+    //    the 7-arg form `option({attrs}, body_fn, void 0, void 0, void 0, void 0, true)`
+    //  - If `<option>` contains exactly one ExpressionTag and nothing else, emit
+    //    the 2-arg form `option({attrs}, EXPR)` — value passed directly.
+    //  - Else emit `option({attrs}, ($$renderer) => { ... body })` (2-arg arrow).
+    let is_rich = is_customizable_option(el);
+    let non_ws: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    let single_expr_value: Option<Expression> = if !is_rich
+        && non_ws.len() == 1
+    {
+        if let FragmentChild::ExpressionTag(t) = non_ws[0] {
+            Some(t.expression.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let body_arg = if let Some(expr) = single_expr_value {
+        expr
+    } else {
+        let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: body_stmts,
+                span: Span::ZERO,
+            })),
+            r#async: false,
             span: Span::ZERO,
-        })),
-        r#async: false,
-        span: Span::ZERO,
-    }));
+        }))
+    };
+    let mut arguments = vec![
+        Argument::Expression(Expression::Object(Box::new(ObjectExpression {
+            properties: props,
+            span: Span::ZERO,
+        }))),
+        Argument::Expression(body_arg),
+    ];
+    if is_rich {
+        // 7-arg form: pad slots 3-6 with `void 0` and pass `true` as the
+        // customizable-select-element flag (slot 7).
+        for _ in 0..4 {
+            arguments.push(Argument::Expression(void_zero_expr()));
+        }
+        arguments.push(Argument::Expression(Expression::Literal(Box::new(
+            Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            }),
+        ))));
+    }
     Some(t::stmt(Expression::Call(Box::new(CallExpression {
         callee: t::member_id(t::id("$$renderer"), "option"),
-        arguments: vec![
-            Argument::Expression(Expression::Object(Box::new(ObjectExpression {
-                properties: props,
-                span: Span::ZERO,
-            }))),
-            Argument::Expression(body_arrow),
-        ],
+        arguments,
         optional: false,
         span: Span::ZERO,
     }))))
+}
+
+fn void_zero_expr() -> Expression {
+    Expression::Unary(Box::new(UnaryExpression {
+        operator: UnaryOperator::Void,
+        argument: Expression::Literal(Box::new(Literal::Number(NumberLiteral {
+            value: 0.0,
+            raw: Some("0".to_string()),
+            span: Span::ZERO,
+        }))),
+        prefix: true,
+        span: Span::ZERO,
+    }))
+}
+
+/// Mirrors upstream's `is_customizable_select_element` for the `<option>` case:
+/// returns true if any descendant of the option's fragment is a RegularElement
+/// (rich content like `<span>`/`<em>`), an HtmlTag (`{@html ...}`), a
+/// Component, a RenderTag (`{@render ...}`), etc.
+fn is_customizable_option(el: &svelte_ast::elements::RegularElement) -> bool {
+    fn check(n: &FragmentChild) -> bool {
+        match n {
+            // Stop at: snippet/const/comment/expression/text/debug.
+            FragmentChild::Text(_)
+            | FragmentChild::Comment(_)
+            | FragmentChild::ExpressionTag(_)
+            | FragmentChild::ConstTag(_)
+            | FragmentChild::SnippetBlock(_)
+            | FragmentChild::DebugTag(_) => false,
+            FragmentChild::RegularElement(_) => true,
+            FragmentChild::IfBlock(ib) => {
+                ib.consequent.nodes.iter().any(check)
+                    || ib.alternate.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+            }
+            FragmentChild::EachBlock(eb) => {
+                eb.body.nodes.iter().any(check)
+                    || eb.fallback.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+            }
+            FragmentChild::KeyBlock(kb) => kb.fragment.nodes.iter().any(check),
+            FragmentChild::AwaitBlock(ab) => {
+                ab.pending.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+                    || ab.then.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+                    || ab.catch_.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+            }
+            FragmentChild::SvelteBoundary(b) => b.fragment.nodes.iter().any(check),
+            // Components, render tags, @html, svelte:element, svelte:component all count as rich.
+            _ => true,
+        }
+    }
+    el.fragment.nodes.iter().any(check)
 }
 
 /// `$$renderer.push(\`STR\`);`
@@ -2693,6 +3218,12 @@ fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment) -> bool {
         match n {
             FragmentChild::Text(_) | FragmentChild::Comment(_) => true,
             FragmentChild::RegularElement(el) => {
+                // `<option>` and `<select>` are NOT static even with no
+                // attributes — they need `$$renderer.option(...)` /
+                // customizable-select-element call lowering.
+                if el.name == "option" || el.name == "select" {
+                    return false;
+                }
                 el.attributes.is_empty() && el.fragment.nodes.iter().all(is_static)
             }
             _ => false,
@@ -2920,21 +3451,15 @@ fn fragment_is_empty(f: &svelte_ast::fragment::Fragment) -> bool {
 }
 
 fn partition_imports(body: &[Statement]) -> Option<(Vec<Statement>, Vec<Statement>)> {
+    // Hoist every ImportDeclaration to the top regardless of source order —
+    // upstream's `<script>` parser preserves user ordering but the server
+    // codegen always emits imports first (they're scoped at module level).
     let mut imports = Vec::new();
     let mut rest = Vec::new();
-    let mut saw_non_import = false;
     for s in body {
         match s {
-            Statement::Import(_) => {
-                if saw_non_import {
-                    return None;
-                }
-                imports.push(s.clone());
-            }
-            _ => {
-                saw_non_import = true;
-                rest.push(s.clone());
-            }
+            Statement::Import(_) => imports.push(s.clone()),
+            _ => rest.push(s.clone()),
         }
     }
     Some((imports, rest))

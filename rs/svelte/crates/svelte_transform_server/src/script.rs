@@ -981,10 +981,18 @@ pub fn collect_script_constants(
     p: &Program,
     skip: &HashSet<String>,
 ) -> HashMap<String, Expression> {
-    // First pass: collect candidates.
+    // First pass: collect candidates. In runes mode (any rune declaration
+    // present in `skip`), unbound `let`s with literal inits may be folded —
+    // upstream's `<h1>Hello, {name}</h1>` collapses `name='world'` into the
+    // text. In legacy / non-runes mode, `let`s stay LIVE because they're
+    // exported as props by default and may be set by the parent.
+    let runes_mode = !skip.is_empty();
     let mut candidates: HashMap<String, Expression> = HashMap::new();
     for s in &p.body {
         if let Statement::Variable(v) = s {
+            if !matches!(v.kind, VariableKind::Const) && !runes_mode {
+                continue;
+            }
             for d in &v.declarations {
                 if let Pattern::Identifier(id) = &d.id {
                     if skip.contains(&id.name) {
