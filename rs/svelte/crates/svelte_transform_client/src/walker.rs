@@ -46,6 +46,19 @@ pub fn try_typed_client_walker_with(
     let template_assigned = scan_fragment_assignments(&root.fragment);
     let script = analyze_script(root.instance.as_ref(), &template_assigned)?;
 
+    // Apply script-context fold to the fragment: inline plain `let X = LIT`
+    // bindings, fold nullish-coalesce, and any nested Math.X calls. Mutates
+    // a local clone of the fragment so we don't disturb the caller.
+    let mut fragment = root.fragment.clone();
+    if !script.constants.is_empty() {
+        fold_fragment_with_consts(&mut fragment, &script.constants);
+    }
+    let root_owned = svelte_ast::root::Root {
+        fragment,
+        ..root.clone()
+    };
+    let root = &root_owned;
+
     // Collect top-level non-ws nodes.
     let nodes: Vec<&FragmentChild> = root
         .fragment
@@ -505,6 +518,9 @@ struct ScriptInfo {
     /// contexts (template_effect deps, function bodies) need `$.get(X)` /
     /// `$.set(X, V)` wrapping.
     state_bindings: HashSet<String>,
+    /// Plain `let X = LITERAL` bindings that are never assigned. Template
+    /// references can be substituted with the literal value at compile time.
+    constants: HashMap<String, Expression>,
 }
 
 fn analyze_script(
@@ -517,6 +533,7 @@ fn analyze_script(
             body: Vec::new(),
             emit_legacy_flag: true,
             state_bindings: HashSet::new(),
+            constants: HashMap::new(),
         });
     };
 
@@ -559,12 +576,35 @@ fn analyze_script(
         }
     }
 
+    // Collect plain `let X = LITERAL` constants (X is never assigned and not
+    // a state binding) — usable for template-expression substitution.
+    let mut constants: HashMap<String, Expression> = HashMap::new();
+    for s in body {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    if assigned.contains(&id.name) || state_bindings.contains(&id.name) {
+                        continue;
+                    }
+                    if is_literal_expression(init) {
+                        constants.insert(id.name.clone(), init.clone());
+                    }
+                }
+            }
+        }
+    }
+
     Some(ScriptInfo {
         imports,
         body: rest,
         emit_legacy_flag: !uses_runes,
         state_bindings,
+        constants,
     })
+}
+
+fn is_literal_expression(e: &Expression) -> bool {
+    matches!(e, Expression::Literal(_))
 }
 
 /// Rewrite a top-level script statement for the client. Handles:
@@ -1327,6 +1367,10 @@ enum ElementContent<'a> {
     /// Element has children but they're all static text — serialize directly
     /// into the template literal.
     StaticOnly,
+    /// Element had expression children but they all folded to literal
+    /// strings; the combined result is assigned via
+    /// `el.textContent = 'combined'`.
+    FoldedText(String),
     /// `<el>{expr}</el>` — single expression child. Lowered to
     /// `el.textContent = EXPR` provided EXPR doesn't reference a state-tracked
     /// binding (we don't yet wrap such reads with `$.get`).
@@ -1437,8 +1481,6 @@ fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
                 if only_static_attrs {
                     return Some(NodeKind::StaticElement(el));
                 }
-                // Element with directives but no text content — use a
-                // synthetic "no content" interp marker.
                 return Some(NodeKind::InterpElement(
                     el,
                     ElementContent::NoContent,
@@ -1455,6 +1497,31 @@ fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
                 return Some(NodeKind::InterpElement(
                     el,
                     ElementContent::StaticOnly,
+                    directives,
+                ));
+            }
+
+            // Check whether every Expr part is a literal-stringifiable value
+            // (after fold). If so, combine all parts into a single string and
+            // lower to `el.textContent = '...';`.
+            if parts.iter().all(|p| match p {
+                TextPart::Static(_) => true,
+                TextPart::Expr(e) => literal_to_template_string(e).is_some(),
+            }) {
+                let mut combined = String::new();
+                for p in &parts {
+                    match p {
+                        TextPart::Static(s) => combined.push_str(s),
+                        TextPart::Expr(e) => {
+                            if let Some(s) = literal_to_template_string(e) {
+                                combined.push_str(&s);
+                            }
+                        }
+                    }
+                }
+                return Some(NodeKind::InterpElement(
+                    el,
+                    ElementContent::FoldedText(combined),
                     directives,
                 ));
             }
@@ -1673,6 +1740,30 @@ fn emit_element_content(
 ) {
     match content {
         ElementContent::NoContent | ElementContent::StaticOnly => {}
+        ElementContent::FoldedText(s) => {
+            let target = Expression::Member(Box::new(MemberExpression {
+                object: t::id(parent_var),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "textContent".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            }));
+            body_stmts.push(t::stmt(Expression::Assignment(Box::new(
+                AssignmentExpression {
+                    left: AssignmentTarget::Expression(target),
+                    operator: AssignmentOperator::Assign,
+                    right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                        value: s.clone(),
+                        raw: None,
+                        span: Span::ZERO,
+                    }))),
+                    span: Span::ZERO,
+                },
+            ))));
+        }
         ElementContent::DirectText(expr) => {
             let target = Expression::Member(Box::new(MemberExpression {
                 object: t::id(parent_var),
@@ -1705,34 +1796,56 @@ fn emit_element_content(
                 vec![t::id(parent_var)],
             )));
 
-            // Build template literal + dep functions.
-            let (template_expr, dep_fns) = build_template_effect(parts, state_bindings);
-            // `$.template_effect((args...) => $.set_text(text, TEMPLATE), [deps])`
-            // For 1+ exprs: pass deps as array; for 0 exprs we wouldn't be here.
-            let mut params: Vec<Pattern> = Vec::new();
-            for i in 0..dep_fns.len() {
-                params.push(t::pat_id(&format!("${i}")));
+            let expr_count = parts
+                .iter()
+                .filter(|p| matches!(p, TextPart::Expr(_)))
+                .count();
+            let fn_arrow: Expression;
+            let mut call_args = Vec::new();
+            if expr_count <= 1 {
+                // Inline form: `() => $.set_text(text, \`...${EXPR ?? ''}\`)`
+                let template_expr = build_inline_template(parts, state_bindings);
+                let fn_body = t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id(&text_var), template_expr],
+                );
+                fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(fn_body),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                call_args.push(fn_arrow);
+            } else {
+                // Deps-array form: `(args...) => $.set_text(text, TEMPLATE), [deps]`
+                let (template_expr, dep_fns) = build_template_effect(parts, state_bindings);
+                let mut params: Vec<Pattern> = Vec::new();
+                for i in 0..dep_fns.len() {
+                    params.push(t::pat_id(&format!("${i}")));
+                }
+                let fn_body = t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id(&text_var), template_expr],
+                );
+                fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params,
+                    body: ArrowBody::Expression(fn_body),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                let deps_array = Expression::Array(Box::new(ArrayExpression {
+                    elements: dep_fns
+                        .into_iter()
+                        .map(ArrayElement::Expression)
+                        .collect(),
+                    span: Span::ZERO,
+                }));
+                call_args.push(fn_arrow);
+                call_args.push(deps_array);
             }
-            let fn_body = t::call(
-                t::member_id(t::id("$"), "set_text"),
-                vec![t::id(&text_var), template_expr],
-            );
-            let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                params,
-                body: ArrowBody::Expression(fn_body),
-                r#async: false,
-                span: Span::ZERO,
-            }));
-            let deps_array = Expression::Array(Box::new(ArrayExpression {
-                elements: dep_fns
-                    .into_iter()
-                    .map(ArrayElement::Expression)
-                    .collect(),
-                span: Span::ZERO,
-            }));
             effects.push(t::stmt(t::call(
                 t::member_id(t::id("$"), "template_effect"),
-                vec![fn_arrow, deps_array],
+                call_args,
             )));
         }
     }
@@ -1742,6 +1855,41 @@ fn emit_element_content(
 /// - The template literal expression for `set_text` (e.g.
 ///   `` `Count is ${$0 ?? ''}` ``).
 /// - The deps array entries `() => exprN`.
+/// Inline form: emit a template literal containing each expression as
+/// `${EXPR ?? ''}` (with state reads rewritten to `$.get(...)`).
+fn build_inline_template(
+    parts: &[TextPart],
+    state_bindings: &HashSet<String>,
+) -> Expression {
+    let mut quasis: Vec<String> = Vec::new();
+    let mut subs: Vec<Expression> = Vec::new();
+    let mut current = String::new();
+    for p in parts {
+        match p {
+            TextPart::Static(s) => current.push_str(s),
+            TextPart::Expr(e) => {
+                quasis.push(std::mem::take(&mut current));
+                let mut sub = (*e).clone();
+                rewrite_expr_for_state(&mut sub, state_bindings);
+                // Wrap as `EXPR ?? ''`
+                let coalesced = Expression::Logical(Box::new(LogicalExpression {
+                    left: sub,
+                    operator: LogicalOperator::Coalesce,
+                    right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                        value: String::new(),
+                        raw: None,
+                        span: Span::ZERO,
+                    }))),
+                    span: Span::ZERO,
+                }));
+                subs.push(coalesced);
+            }
+        }
+    }
+    quasis.push(current);
+    t::template_raw(quasis, subs)
+}
+
 fn build_template_effect(
     parts: &[TextPart],
     state_bindings: &HashSet<String>,
@@ -1882,6 +2030,200 @@ fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
 pub fn fold_in_fragment(f: &mut Fragment) {
     for n in &mut f.nodes {
         fold_in_node(n);
+    }
+}
+
+/// Fold every expression in the fragment using script-discovered constants,
+/// Math.X, and nullish-coalesce rules. The fragment shape is preserved —
+/// expressions that fold to literals remain inside their ExpressionTag so
+/// `classify` can still distinguish "static body" from "had-expressions".
+fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expression>) {
+    for child in &mut f.nodes {
+        fold_node_with_consts(child, consts);
+    }
+}
+
+fn fold_node_with_consts(n: &mut FragmentChild, consts: &HashMap<String, Expression>) {
+    match n {
+        FragmentChild::ExpressionTag(t) => fold_expr_with_consts(&mut t.expression, consts),
+        FragmentChild::HtmlTag(t) => fold_expr_with_consts(&mut t.expression, consts),
+        FragmentChild::RegularElement(el) => {
+            for attr in &mut el.attributes {
+                fold_attr_with_consts(attr, consts);
+            }
+            fold_fragment_with_consts(&mut el.fragment, consts);
+        }
+        FragmentChild::Component(c) => {
+            for attr in &mut c.attributes {
+                fold_attr_with_consts(attr, consts);
+            }
+            fold_fragment_with_consts(&mut c.fragment, consts);
+        }
+        _ => {}
+    }
+}
+
+fn fold_attr_with_consts(attr: &mut ElementAttribute, consts: &HashMap<String, Expression>) {
+    match attr {
+        ElementAttribute::Attribute(a) => match &mut a.value {
+            AttributeValue::Single(tag) => fold_expr_with_consts(&mut tag.expression, consts),
+            AttributeValue::Many(parts) => {
+                for p in parts {
+                    if let AttributeValuePart::ExpressionTag(t) = p {
+                        fold_expr_with_consts(&mut t.expression, consts);
+                    }
+                }
+            }
+            _ => {}
+        },
+        ElementAttribute::SpreadAttribute(s) => fold_expr_with_consts(&mut s.expression, consts),
+        _ => {}
+    }
+}
+
+fn fold_expr_with_consts(e: &mut Expression, consts: &HashMap<String, Expression>) {
+    // First substitute identifiers.
+    substitute_consts(e, consts);
+    // Then fold via Math.X + nullish-coalesce + paren-unwrap.
+    fold_expr_full(e);
+}
+
+fn substitute_consts(e: &mut Expression, consts: &HashMap<String, Expression>) {
+    match e {
+        Expression::Identifier(i) => {
+            if let Some(lit) = consts.get(&i.name) {
+                *e = lit.clone();
+            }
+        }
+        Expression::Call(c) => {
+            substitute_consts(&mut c.callee, consts);
+            for a in &mut c.arguments {
+                match a {
+                    Argument::Expression(e) => substitute_consts(e, consts),
+                    Argument::Spread(s) => substitute_consts(&mut s.argument, consts),
+                }
+            }
+        }
+        Expression::Member(m) => substitute_consts(&mut m.object, consts),
+        Expression::Binary(b) => {
+            substitute_consts(&mut b.left, consts);
+            substitute_consts(&mut b.right, consts);
+        }
+        Expression::Logical(l) => {
+            substitute_consts(&mut l.left, consts);
+            substitute_consts(&mut l.right, consts);
+        }
+        Expression::Conditional(c) => {
+            substitute_consts(&mut c.test, consts);
+            substitute_consts(&mut c.consequent, consts);
+            substitute_consts(&mut c.alternate, consts);
+        }
+        Expression::Unary(u) => substitute_consts(&mut u.argument, consts),
+        Expression::Sequence(s) => {
+            for e in &mut s.expressions {
+                substitute_consts(e, consts);
+            }
+        }
+        Expression::Paren(p) => substitute_consts(&mut p.expression, consts),
+        Expression::Template(t) => {
+            for ex in &mut t.expressions {
+                substitute_consts(ex, consts);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Full fold: nullish coalescence + Math.X + paren unwrap.
+fn fold_expr_full(e: &mut Expression) {
+    match e {
+        Expression::Logical(l) => {
+            fold_expr_full(&mut l.left);
+            fold_expr_full(&mut l.right);
+            if matches!(l.operator, LogicalOperator::Coalesce) {
+                if let Some(true) = is_non_nullish_literal(&l.left) {
+                    let inner = std::mem::replace(
+                        &mut l.left,
+                        Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                    );
+                    *e = inner;
+                    return;
+                }
+                if let Some(false) = is_non_nullish_literal(&l.left) {
+                    let inner = std::mem::replace(
+                        &mut l.right,
+                        Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                    );
+                    *e = inner;
+                    return;
+                }
+            }
+        }
+        Expression::Call(c) => {
+            fold_expr_full(&mut c.callee);
+            for a in &mut c.arguments {
+                if let Argument::Expression(e) = a {
+                    fold_expr_full(e);
+                }
+            }
+            if let Some(folded) = try_fold_math_call(c) {
+                *e = folded;
+            }
+        }
+        Expression::Member(m) => fold_expr_full(&mut m.object),
+        Expression::Binary(b) => {
+            fold_expr_full(&mut b.left);
+            fold_expr_full(&mut b.right);
+        }
+        Expression::Conditional(c) => {
+            fold_expr_full(&mut c.test);
+            fold_expr_full(&mut c.consequent);
+            fold_expr_full(&mut c.alternate);
+        }
+        Expression::Unary(u) => fold_expr_full(&mut u.argument),
+        Expression::Sequence(s) => {
+            for e in &mut s.expressions {
+                fold_expr_full(e);
+            }
+        }
+        Expression::Paren(p) => {
+            fold_expr_full(&mut p.expression);
+            if matches!(p.expression, Expression::Literal(_)) {
+                let inner = std::mem::replace(
+                    &mut p.expression,
+                    Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                );
+                *e = inner;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_non_nullish_literal(e: &Expression) -> Option<bool> {
+    match e {
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::Null(_) => Some(false),
+            _ => Some(true),
+        },
+        Expression::Identifier(i) if i.name == "undefined" => Some(false),
+        _ => None,
+    }
+}
+
+/// If `e` is a literal that should render as a string in textContent,
+/// return that string. Null/undefined render as empty string.
+fn literal_to_template_string(e: &Expression) -> Option<String> {
+    match e {
+        Expression::Literal(lit) => match lit.as_ref() {
+            Literal::String(s) => Some(s.value.clone()),
+            Literal::Number(n) => Some(format_num(n.value)),
+            Literal::Boolean(b) => Some(b.value.to_string()),
+            Literal::Null(_) => Some(String::new()),
+            _ => None,
+        },
+        Expression::Identifier(i) if i.name == "undefined" => Some(String::new()),
+        _ => None,
     }
 }
 
