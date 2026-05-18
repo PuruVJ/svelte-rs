@@ -43,11 +43,19 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     let mut derived_bindings: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut async_info: Option<script::AsyncInfo> = None;
+    // Inspect the template + script for any "non-safe identifier" callee
+    // (IIFE, member-method on a complex expression, NewExpression). Upstream
+    // sets `needs_context = true` in those cases (CallExpression.js line 31,
+    // MemberExpression.js line 23), and the server emits `$$renderer.component`
+    // wrap when `needs_context` is true.
+    if fragment_has_unsafe_call(&root.fragment) {
+        needs_component_wrap = true;
+    }
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
         uses_props = info.uses_props;
-        needs_component_wrap = info.needs_component_wrap();
+        needs_component_wrap |= info.needs_component_wrap();
         derived_bindings = info.derived_bindings;
         if let Some(name) = &info.single_id_props {
             script::rewrite_props_destructure(&mut content, name);
@@ -128,9 +136,12 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
         })))];
     }
 
-    // Build the parameter list. Runes-mode uses_props adds $$props.
+    // Build the parameter list. Runes-mode uses_props adds $$props. When the
+    // body needs the `$$renderer.component(...)` wrap, upstream always passes
+    // `$$props` through to the outer function (so the wrap can forward props
+    // into the inner closure even when the script doesn't read them directly).
     let mut params = vec![t::pat_id("$$renderer")];
-    if uses_props {
+    if uses_props || needs_component_wrap {
         params.push(t::pat_id("$$props"));
     }
 
@@ -293,6 +304,134 @@ fn lower_fragment_server_async(
     )
 }
 
+/// Returns true if any CallExpression in the fragment has a non-safe-identifier
+/// callee (an arrow/function IIFE, a complex MemberExpression base, etc).
+/// Mirrors upstream's `is_safe_identifier` check inside CallExpression visitor.
+fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(node_has_unsafe_call)
+}
+
+fn node_has_unsafe_call(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::ExpressionTag(t) => expr_has_unsafe_call(&t.expression),
+        FragmentChild::HtmlTag(t) => expr_has_unsafe_call(&t.expression),
+        FragmentChild::ConstTag(ct) => ct
+            .declaration
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, expr_has_unsafe_call)),
+        FragmentChild::RegularElement(el) => {
+            el.attributes.iter().any(attr_has_unsafe_call)
+                || fragment_has_unsafe_call(&el.fragment)
+        }
+        FragmentChild::Component(c) => {
+            c.attributes.iter().any(attr_has_unsafe_call)
+                || fragment_has_unsafe_call(&c.fragment)
+        }
+        FragmentChild::SvelteElement(el) => {
+            expr_has_unsafe_call(&el.tag)
+                || el.attributes.iter().any(attr_has_unsafe_call)
+                || fragment_has_unsafe_call(&el.fragment)
+        }
+        FragmentChild::EachBlock(eb) => {
+            expr_has_unsafe_call(&eb.expression)
+                || fragment_has_unsafe_call(&eb.body)
+                || eb.fallback.as_ref().map_or(false, fragment_has_unsafe_call)
+        }
+        FragmentChild::IfBlock(ib) => {
+            expr_has_unsafe_call(&ib.test)
+                || fragment_has_unsafe_call(&ib.consequent)
+                || ib.alternate.as_ref().map_or(false, fragment_has_unsafe_call)
+        }
+        FragmentChild::AwaitBlock(ab) => {
+            expr_has_unsafe_call(&ab.expression)
+                || ab.pending.as_ref().map_or(false, fragment_has_unsafe_call)
+                || ab.then.as_ref().map_or(false, fragment_has_unsafe_call)
+                || ab.catch_.as_ref().map_or(false, fragment_has_unsafe_call)
+        }
+        FragmentChild::KeyBlock(kb) => {
+            expr_has_unsafe_call(&kb.expression) || fragment_has_unsafe_call(&kb.fragment)
+        }
+        _ => false,
+    }
+}
+
+fn attr_has_unsafe_call(a: &ElementAttribute) -> bool {
+    match a {
+        ElementAttribute::Attribute(attr) => match &attr.value {
+            AttributeValue::Many(parts) => parts.iter().any(|p| match p {
+                AttributeValuePart::ExpressionTag(e) => expr_has_unsafe_call(&e.expression),
+                _ => false,
+            }),
+            _ => false,
+        },
+        ElementAttribute::SpreadAttribute(s) => expr_has_unsafe_call(&s.expression),
+        _ => false,
+    }
+}
+
+fn expr_has_unsafe_call(e: &Expression) -> bool {
+    match e {
+        Expression::Call(c) => {
+            if !is_safe_callee(&c.callee) {
+                return true;
+            }
+            expr_has_unsafe_call(&c.callee)
+                || c.arguments.iter().any(|a| match a {
+                    svelte_js_ast::Argument::Expression(e) => expr_has_unsafe_call(e),
+                    svelte_js_ast::Argument::Spread(s) => expr_has_unsafe_call(&s.argument),
+                })
+        }
+        Expression::New(_) => true,
+        Expression::Member(m) => expr_has_unsafe_call(&m.object),
+        Expression::Binary(b) => {
+            expr_has_unsafe_call(&b.left) || expr_has_unsafe_call(&b.right)
+        }
+        Expression::Logical(l) => {
+            expr_has_unsafe_call(&l.left) || expr_has_unsafe_call(&l.right)
+        }
+        Expression::Unary(u) => expr_has_unsafe_call(&u.argument),
+        Expression::Update(u) => expr_has_unsafe_call(&u.argument),
+        Expression::Assignment(a) => {
+            (match &a.left {
+                AssignmentTarget::Expression(e) => expr_has_unsafe_call(e),
+                _ => false,
+            }) || expr_has_unsafe_call(&a.right)
+        }
+        Expression::Conditional(c) => {
+            expr_has_unsafe_call(&c.test)
+                || expr_has_unsafe_call(&c.consequent)
+                || expr_has_unsafe_call(&c.alternate)
+        }
+        Expression::Paren(p) => expr_has_unsafe_call(&p.expression),
+        Expression::Sequence(s) => s.expressions.iter().any(expr_has_unsafe_call),
+        Expression::Spread(s) => expr_has_unsafe_call(&s.argument),
+        Expression::Await(a) => expr_has_unsafe_call(&a.argument),
+        Expression::Array(a) => a.elements.iter().any(|el| match el {
+            ArrayElement::Expression(e) => expr_has_unsafe_call(e),
+            _ => false,
+        }),
+        Expression::Template(t) => t.expressions.iter().any(expr_has_unsafe_call),
+        // Don't descend into function bodies — only eager evaluation.
+        _ => false,
+    }
+}
+
+/// A callee is "safe" if, after walking through MemberExpressions, we end at
+/// a plain Identifier. Arrow/function IIFEs, parenthesized expressions over
+/// non-identifiers, and other complex callees count as unsafe.
+fn is_safe_callee(e: &Expression) -> bool {
+    let mut node = e;
+    loop {
+        match node {
+            Expression::Member(m) => node = &m.object,
+            Expression::Paren(p) => node = &p.expression,
+            Expression::Identifier(_) => return true,
+            _ => return false,
+        }
+    }
+}
+
 /// Builds the final IfStatement once consequent + alternate are known.
 fn finalize_if(
     test_is_async: bool,
@@ -325,6 +464,10 @@ struct AsyncCtx<'a> {
     /// The set of blockers from the parent if/elseif chain so far. When an
     /// elseif introduces blockers not in this set, the chain breaks.
     parent_blockers: std::collections::BTreeSet<usize>,
+    /// Sibling-unique counter for `promises`/`promises_1`/... local vars when
+    /// a consequent fragment uses `lower_fragment_with_const_await_with`. Each
+    /// time the consequent grabs a name it bumps this counter.
+    const_await_counter: std::cell::Cell<usize>,
 }
 
 /// Wraps the given block-lowering output in
@@ -517,6 +660,11 @@ fn lower_fragment_server_async_with(
     let mut buf = TemplateBuf::new();
     let nodes = trim_boundary_whitespace(&f.nodes);
     let nodes = trim_boundary_text(nodes);
+    // Sibling-shared counter for `promises`/`promises_1`/... names when
+    // sibling if-blocks each emit their own `lower_fragment_with_const_await`
+    // local. Initial value 0 → first allocation gets `promises`, next
+    // `promises_1`, etc.
+    let mut const_await_counter: usize = 0;
 
     // If the first non-whitespace top-level node is an async-tainted
     // ExpressionTag, prepend `<!---->` marker.
@@ -609,6 +757,7 @@ fn lower_fragment_server_async_with(
                     promises_var,
                     blocker_bindings,
                     parent_blockers,
+                    const_await_counter: std::cell::Cell::new(const_await_counter),
                 };
                 if !indices_vec.is_empty() {
                     // Build the if-chain without the outer child_block — wrap
@@ -632,6 +781,7 @@ fn lower_fragment_server_async_with(
                     let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
                     out.push(if_stmt);
                 }
+                const_await_counter = ctx.const_await_counter.get();
                 buf.push_str("<!--]-->");
             }
             FragmentChild::EachBlock(eb) => {
@@ -661,8 +811,35 @@ fn lower_fragment_server_async_with(
     Some(out)
 }
 
-/// True when the fragment has a `{@const X = ...}` whose initializer
-/// contains a top-level `await`.
+/// True when the fragment has a `{@const X = ...}` that needs the async run-
+/// array emission shape: either the initializer has top-level `await`, OR it
+/// references a script binding that has its own `$$promises[idx]` blocker
+/// (mirrors upstream's `2-analyze/visitors/ConstTag.js` decision).
+fn fragment_has_const_with_await_or_blocker(
+    f: &svelte_ast::fragment::Fragment,
+    blocker_bindings: &std::collections::HashMap<String, usize>,
+) -> bool {
+    f.nodes.iter().any(|n| {
+        if let FragmentChild::ConstTag(ct) = n {
+            ct.declaration.declarations.iter().any(|d| {
+                d.init.as_ref().map_or(false, |i| {
+                    if expr_has_await_top(i) {
+                        return true;
+                    }
+                    let mut indices = std::collections::BTreeSet::new();
+                    collect_block_indices_in_expr(i, blocker_bindings, &mut indices);
+                    !indices.is_empty()
+                })
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// Legacy await-only check kept for callers that don't have access to
+/// `blocker_bindings`. Returns true ONLY when at least one const has top-level
+/// await.
 fn fragment_has_const_with_await(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(|n| {
         if let FragmentChild::ConstTag(ct) = n {
@@ -685,92 +862,98 @@ fn fragment_has_const_with_await(f: &svelte_ast::fragment::Fragment) -> bool {
 fn lower_fragment_with_const_await(
     f: &svelte_ast::fragment::Fragment,
 ) -> Option<Vec<Statement>> {
+    let empty: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    lower_fragment_with_const_await_with(f, &empty, "promises")
+}
+
+/// Lower a fragment that contains `{@const X = ...}` tags needing the run-
+/// array emission. Each const is its own thunk (or pair of thunks when
+/// blockers are present):
+///   - `await E`             → `async () => X = REWRITE(E)` (one thunk)
+///   - blocker-bound, no await→ `() => $$promises[idx]` then `() => X = INIT` (two thunks)
+///   - plain                  → `() => X = INIT` (one thunk)
+/// `promises_var` controls the local var name (default `promises`, but
+/// caller may pass `promises_1` etc to dedupe across sibling fragments).
+fn lower_fragment_with_const_await_with(
+    f: &svelte_ast::fragment::Fragment,
+    blocker_bindings: &std::collections::HashMap<String, usize>,
+    promises_var: &str,
+) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::new();
     let mut const_names: Vec<String> = Vec::new();
     let mut groups: Vec<Expression> = Vec::new();
-    let mut current_sync: Vec<Statement> = Vec::new();
     let mut rest_nodes: Vec<FragmentChild> = Vec::new();
     let mut last_was_async = false;
-
-    fn flush_sync(groups: &mut Vec<Expression>, current_sync: &mut Vec<Statement>) {
-        if current_sync.is_empty() {
-            return;
-        }
-        if current_sync.len() == 1 {
-            let s = current_sync.remove(0);
-            if let Statement::Expression(es) = s {
-                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: Vec::new(),
-                    body: ArrowBody::Expression(es.expression),
-                    r#async: false,
-                    span: Span::ZERO,
-                })));
-                return;
-            }
-            current_sync.push(s);
-        }
-        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: Vec::new(),
-            body: ArrowBody::Block(Box::new(BlockStatement {
-                body: std::mem::take(current_sync),
-                span: Span::ZERO,
-            })),
-            r#async: false,
-            span: Span::ZERO,
-        })));
-    }
 
     for n in &f.nodes {
         if let FragmentChild::ConstTag(ct) = n {
             for d in &ct.declaration.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
                     const_names.push(id.name.clone());
-                    if expr_has_await_top(init) {
-                        // Flush sync first
-                        if !current_sync.is_empty() {
-                            flush_sync(&mut groups, &mut current_sync);
-                        }
-                        // async () => X = (await $.save(INNER))()
-                        let inner = match init {
-                            Expression::Await(a) => a.argument.clone(),
-                            e => e.clone(),
-                        };
-                        let saved = t::call(
-                            t::member_id(t::id("$"), "save"),
-                            vec![inner],
-                        );
-                        let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
-                            expression: Expression::Await(Box::new(AwaitExpression {
-                                argument: saved,
+
+                    // Collect blockers from init (eager identifier references
+                    // to script bindings that have `$$promises[idx]`).
+                    let mut blocker_set: std::collections::BTreeSet<usize> =
+                        std::collections::BTreeSet::new();
+                    collect_block_indices_in_expr(init, blocker_bindings, &mut blocker_set);
+
+                    let has_await = expr_has_await_top(init);
+
+                    // Blocker thunks: emit `() => $$promises[idx]` for each
+                    // blocker the init depends on. With multiple blockers
+                    // upstream wraps in `Promise.all([...])`.
+                    if !blocker_set.is_empty() {
+                        let elems: Vec<Expression> = blocker_set
+                            .iter()
+                            .map(|i| Expression::Member(Box::new(MemberExpression {
+                                object: t::id("$$promises"),
+                                property: MemberProperty::Expression(t::lit_number(*i as f64)),
+                                computed: true,
+                                optional: false,
                                 span: Span::ZERO,
-                            })),
-                            span: Span::ZERO,
-                        }));
-                        let called = t::call(awaited, Vec::new());
-                        let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                            left: AssignmentTarget::Expression(t::id(&id.name)),
-                            operator: AssignmentOperator::Assign,
-                            right: called,
-                            span: Span::ZERO,
-                        }));
+                            })))
+                            .collect();
+                        let body = if elems.len() == 1 {
+                            elems[0].clone()
+                        } else {
+                            t::call(
+                                t::member_id(t::id("Promise"), "all"),
+                                vec![Expression::Array(Box::new(ArrayExpression {
+                                    elements: elems
+                                        .into_iter()
+                                        .map(ArrayElement::Expression)
+                                        .collect(),
+                                    span: Span::ZERO,
+                                }))],
+                            )
+                        };
                         groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: Vec::new(),
-                            body: ArrowBody::Expression(assign),
-                            r#async: true,
+                            body: ArrowBody::Expression(body),
+                            r#async: false,
                             span: Span::ZERO,
                         })));
-                        last_was_async = true;
-                    } else {
-                        // Sync: X = INIT
-                        let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                            left: AssignmentTarget::Expression(t::id(&id.name)),
-                            operator: AssignmentOperator::Assign,
-                            right: init.clone(),
-                            span: Span::ZERO,
-                        }));
-                        current_sync.push(t::stmt(assign));
-                        last_was_async = false;
                     }
+
+                    // Setter thunk.
+                    let setter_init = if has_await {
+                        wrap_async_test(init)
+                    } else {
+                        init.clone()
+                    };
+                    let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(t::id(&id.name)),
+                        operator: AssignmentOperator::Assign,
+                        right: setter_init,
+                        span: Span::ZERO,
+                    }));
+                    groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(assign),
+                        r#async: has_await,
+                        span: Span::ZERO,
+                    })));
+                    last_was_async = has_await;
                 } else {
                     return None;
                 }
@@ -779,15 +962,20 @@ fn lower_fragment_with_const_await(
             rest_nodes.push(n.clone());
         }
     }
-    // Trailing sync group
-    if !current_sync.is_empty() || last_was_async {
-        if current_sync.is_empty() {
-            current_sync.push(t::stmt(Expression::Identifier(Identifier {
+
+    // Trailing `() => undefined` only when the last group is async. Mirrors
+    // upstream's `b.thunk(...)` pattern: an async-trailing run-array needs a
+    // sync fallback so `last_group_idx` lands on something awaitable.
+    if last_was_async {
+        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(Expression::Identifier(Identifier {
                 name: "undefined".to_string(),
                 span: Span::ZERO,
-            })));
-        }
-        flush_sync(&mut groups, &mut current_sync);
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        })));
     }
 
     // Emit hoisted lets
@@ -802,9 +990,9 @@ fn lower_fragment_with_const_await(
             span: Span::ZERO,
         })));
     }
-    // var promises = $$renderer.run([...]);
+    // var <promises_var> = $$renderer.run([...]);
     out.push(t::var(
-        "promises",
+        promises_var,
         t::call(
             t::member_id(t::id("$$renderer"), "run"),
             vec![Expression::Array(Box::new(ArrayExpression {
@@ -815,7 +1003,7 @@ fn lower_fragment_with_const_await(
     ));
 
     // Lower the rest of the fragment with the const names treated as
-    // async-tainted. `promises` is the local var name.
+    // async-tainted. `<promises_var>` is the local var name.
     let last_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
     let async_set: std::collections::HashSet<String> = const_names.into_iter().collect();
     let stub_fragment = svelte_ast::fragment::Fragment { nodes: rest_nodes };
@@ -825,7 +1013,7 @@ fn lower_fragment_with_const_await(
         &stub_fragment,
         &async_set,
         last_idx,
-        "promises",
+        promises_var,
         &empty_blockers,
     )?);
     Some(out)
@@ -1401,7 +1589,13 @@ fn build_if_chain_server_ex(
     async_ctx: Option<&AsyncCtx>,
 ) -> Option<Statement> {
     let test_is_async = expr_has_await_top(&ib.test);
-    let consequent_has_const_await = fragment_has_const_with_await(&ib.consequent);
+    let empty_blockers: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let blocker_bindings = async_ctx
+        .map(|c| c.blocker_bindings)
+        .unwrap_or(&empty_blockers);
+    let consequent_has_const_await =
+        fragment_has_const_with_await_or_blocker(&ib.consequent, blocker_bindings);
     let use_async_marker = use_async_marker || consequent_has_const_await;
 
     let consequent_marker = format!("<!--[{branch_idx}-->");
@@ -1414,7 +1608,25 @@ fn build_if_chain_server_ex(
     if test_is_async {
         consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
     } else if consequent_has_const_await {
-        consequent_body.extend(lower_fragment_with_const_await(&ib.consequent)?);
+        // Pick a unique `promises`/`promises_1`/... name from the sibling
+        // counter on AsyncCtx (or default to "promises" when there's no ctx).
+        let idx = async_ctx
+            .map(|c| {
+                let i = c.const_await_counter.get();
+                c.const_await_counter.set(i + 1);
+                i
+            })
+            .unwrap_or(0);
+        let promises_var = if idx == 0 {
+            "promises".to_string()
+        } else {
+            format!("promises_{idx}")
+        };
+        consequent_body.extend(lower_fragment_with_const_await_with(
+            &ib.consequent,
+            blocker_bindings,
+            &promises_var,
+        )?);
     } else {
         // Inside an async_block / child_block (use_async_marker=true), the
         // wrap's string-literal `<!--[N-->` push already anchors the scope —
@@ -1486,6 +1698,7 @@ fn build_if_chain_server_ex(
                 promises_var: ctx.promises_var,
                 blocker_bindings: ctx.blocker_bindings,
                 parent_blockers: inner_blockers.clone(),
+                const_await_counter: std::cell::Cell::new(ctx.const_await_counter.get()),
             });
             let inner_chain =
                 build_if_chain_server_ex(inner, 0, true, inner_async_ctx.as_ref())?;
@@ -1567,7 +1780,8 @@ fn wrap_async_test(test: &Expression) -> Expression {
     // Recursively replace each `await X` sub-expression with `(await $.save(X))()`.
     // This mirrors upstream's PromiseOptimiser which only rewrites the
     // AwaitExpression itself, leaving surrounding binary/logical/etc. structure
-    // intact (e.g. `await foo > 10` → `(await $.save(foo))() > 10`).
+    // intact (e.g. `await foo > 10` → `(await $.save(foo))() > 10`, and
+    // `foo(await 1)` → `foo((await $.save(1))())`).
     fn rewrite(e: &Expression) -> Expression {
         match e {
             Expression::Await(a) => {
@@ -1613,6 +1827,33 @@ fn wrap_async_test(test: &Expression) -> Expression {
             Expression::Sequence(s) => Expression::Sequence(Box::new(SequenceExpression {
                 expressions: s.expressions.iter().map(rewrite).collect(),
                 span: s.span,
+            })),
+            Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+                callee: rewrite(&c.callee),
+                arguments: c
+                    .arguments
+                    .iter()
+                    .map(|a| match a {
+                        svelte_js_ast::Argument::Expression(e) => {
+                            svelte_js_ast::Argument::Expression(rewrite(e))
+                        }
+                        svelte_js_ast::Argument::Spread(s) => {
+                            svelte_js_ast::Argument::Spread(Box::new(SpreadElement {
+                                argument: rewrite(&s.argument),
+                                span: s.span,
+                            }))
+                        }
+                    })
+                    .collect(),
+                optional: c.optional,
+                span: c.span,
+            })),
+            Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
+                object: rewrite(&m.object),
+                property: m.property.clone(),
+                computed: m.computed,
+                optional: m.optional,
+                span: m.span,
             })),
             e => e.clone(),
         }
@@ -2529,6 +2770,13 @@ fn call_derived_in_node(
         FragmentChild::KeyBlock(kb) => {
             script::call_derived_refs(&mut kb.expression, derived);
             call_derived_in_fragment(&mut kb.fragment, derived);
+        }
+        FragmentChild::ConstTag(ct) => {
+            for d in &mut ct.declaration.declarations {
+                if let Some(init) = &mut d.init {
+                    script::call_derived_refs(init, derived);
+                }
+            }
         }
         _ => {}
     }

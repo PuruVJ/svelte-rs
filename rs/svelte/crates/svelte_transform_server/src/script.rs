@@ -326,13 +326,20 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             }
         }
     }
-    // Compute blocker_bindings: simulate the group counting and, for each
-    // async declarator, attach `group_idx` to its declared name and to every
-    // identifier "touched" by a CallExpression in the init.
+    // Compute blocker_bindings: simulate the group counting and assign
+    // `group_idx` per binding. Mirrors upstream's
+    // `2-analyze/index.js::calculate_blockers`:
+    //   - async declarators flush any pending sync group, then occupy their
+    //     own async group index. Touched identifiers (writes via the
+    //     CallExpression rule) ALSO get this index.
+    //   - sync declarators that come AFTER the first async one accumulate
+    //     into the upcoming sync group; their blocker is the index THAT sync
+    //     group will land on once flushed.
     let mut blocker_bindings: HashMap<String, usize> = HashMap::new();
     {
         let mut groups_count: usize = 0;
         let mut sync_pending: bool = false;
+        let mut awaited_seen: bool = false;
         for s in body.iter() {
             if let Statement::Variable(v) = s {
                 for d in &v.declarations {
@@ -360,7 +367,16 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                                 }
                             }
                             groups_count += 1;
+                            awaited_seen = true;
                         } else {
+                            // After any await, sync declarators also get a
+                            // blocker — the index of the pending sync group
+                            // they'll be flushed into.
+                            if awaited_seen {
+                                blocker_bindings
+                                    .entry(id.name.clone())
+                                    .or_insert(groups_count);
+                            }
                             sync_pending = true;
                         }
                     }
