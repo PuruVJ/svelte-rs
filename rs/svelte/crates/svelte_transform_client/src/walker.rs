@@ -81,6 +81,9 @@ pub fn try_typed_client_walker_with(
         if let FragmentChild::EachBlock(eb) = nodes[0] {
             return emit_single_each_program(eb, component_name, &script);
         }
+        if let FragmentChild::SvelteElement(se) = nodes[0] {
+            return emit_single_svelte_element_program(se, component_name, &script);
+        }
     }
 
     let classified: Vec<NodeKind> = nodes.iter().map(|n| classify(n)).collect::<Option<_>>()?;
@@ -198,11 +201,11 @@ pub fn try_typed_client_walker_with(
         t::call(t::member_id(t::id("$"), "from_html"), from_html_args),
     );
 
-    let export = t::export_default_function(
-        component_name,
-        vec![t::pat_id("$$anchor")],
-        body_stmts,
-    );
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, body_stmts);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(6 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
@@ -491,6 +494,66 @@ fn collapse_ws(s: &str) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Single top-level <svelte:element> emission
+// ---------------------------------------------------------------------------
+
+fn emit_single_svelte_element_program(
+    se: &svelte_ast::elements::SvelteElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Only handles `<svelte:element this={EXPR} />` with no children + no
+    // other attributes for now.
+    if !se.attributes.is_empty() || !se.fragment.nodes.is_empty() {
+        return None;
+    }
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "element"),
+        vec![
+            t::id("node"),
+            se.tag.clone(),
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: false,
+                span: Span::ZERO,
+            }))),
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +866,11 @@ fn emit_single_each_program(
         vec![t::id("$$anchor"), t::id("fragment")],
     )));
 
-    let export = t::export_default_function(component_name, vec![t::pat_id("$$anchor")], func_body);
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len() + hoisted.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
@@ -878,6 +945,9 @@ struct ScriptInfo {
     /// Plain `let X = LITERAL` bindings that are never assigned. Template
     /// references can be substituted with the literal value at compile time.
     constants: HashMap<String, Expression>,
+    /// Whether `$props()` was destructured — the component function needs
+    /// `$$props` as its second parameter.
+    uses_props: bool,
 }
 
 fn analyze_script(
@@ -891,6 +961,7 @@ fn analyze_script(
             emit_legacy_flag: true,
             state_bindings: HashSet::new(),
             constants: HashMap::new(),
+            uses_props: false,
         });
     };
 
@@ -915,6 +986,7 @@ fn analyze_script(
     let mut imports: Vec<Statement> = Vec::new();
     let mut rest: Vec<Statement> = Vec::new();
     let mut uses_runes = false;
+    let mut uses_props = false;
     let mut saw_non_import = false;
     for s in body {
         match s {
@@ -926,9 +998,14 @@ fn analyze_script(
             }
             _ => {
                 saw_non_import = true;
-                let rewritten =
-                    rewrite_top_stmt(s, &assigned, &state_bindings, &mut uses_runes)?;
-                rest.push(rewritten);
+                let rewritten = rewrite_top_stmt_multi(
+                    s,
+                    &assigned,
+                    &state_bindings,
+                    &mut uses_runes,
+                    &mut uses_props,
+                )?;
+                rest.extend(rewritten);
             }
         }
     }
@@ -957,7 +1034,92 @@ fn analyze_script(
         emit_legacy_flag: !uses_runes,
         state_bindings,
         constants,
+        uses_props,
     })
+}
+
+/// Wrapper that expands a single source statement into one-or-more output
+/// statements (needed for `let { a, b = D } = $props()` which becomes a
+/// flat list of `let a = $.prop(...); let b = $.prop(...);`).
+fn rewrite_top_stmt_multi(
+    s: &Statement,
+    assigned: &HashSet<String>,
+    state_bindings: &HashSet<String>,
+    uses_runes: &mut bool,
+    uses_props: &mut bool,
+) -> Option<Vec<Statement>> {
+    // Detect `let { ... } = $props()` and expand to one $.prop per member.
+    if let Statement::Variable(v) = s {
+        if v.declarations.len() == 1 {
+            let d = &v.declarations[0];
+            if let (Pattern::Object(obj), Some(init)) = (&d.id, &d.init) {
+                if is_props_call(init) {
+                    *uses_runes = true;
+                    *uses_props = true;
+                    let mut out = Vec::new();
+                    for m in &obj.properties {
+                        match m {
+                            ObjectPatternMember::Property(p) => {
+                                let key_name = match &p.key {
+                                    PropertyKey::Identifier(i) => i.name.clone(),
+                                    _ => return None,
+                                };
+                                let (local_name, default) = match &p.value {
+                                    Pattern::Identifier(i) => (i.name.clone(), None),
+                                    Pattern::Assignment(a) => {
+                                        let local = match &a.left {
+                                            Pattern::Identifier(i) => i.name.clone(),
+                                            _ => return None,
+                                        };
+                                        (local, Some(a.right.clone()))
+                                    }
+                                    _ => return None,
+                                };
+                                let mut args = vec![
+                                    t::id("$$props"),
+                                    Expression::Literal(Box::new(Literal::String(
+                                        StringLiteral {
+                                            value: key_name,
+                                            raw: None,
+                                            span: Span::ZERO,
+                                        },
+                                    ))),
+                                ];
+                                if let Some(def) = default {
+                                    // Flag `3` = "has default + assignable" per upstream.
+                                    args.push(t::lit_number(3.0));
+                                    args.push(def);
+                                } else {
+                                    args.push(t::lit_number(1.0));
+                                }
+                                out.push(t::let_decl(
+                                    &local_name,
+                                    Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                                ));
+                            }
+                            _ => return None,
+                        }
+                    }
+                    return Some(out);
+                }
+            }
+        }
+    }
+    Some(vec![rewrite_top_stmt(
+        s,
+        assigned,
+        state_bindings,
+        uses_runes,
+    )?])
+}
+
+fn is_props_call(e: &Expression) -> bool {
+    if let Expression::Call(c) = e {
+        if let Some(kp) = global_keypath(&c.callee) {
+            return kp == "$props";
+        }
+    }
+    false
 }
 
 fn is_literal_expression(e: &Expression) -> bool {
