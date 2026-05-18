@@ -89,7 +89,12 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     let needs_bind_wrap = fragment_has_component_bind(&fragment);
 
     let template_body = if let Some(ai) = &async_info {
-        lower_fragment_server_async(&fragment, &ai.async_bindings, ai.last_group_idx)?
+        lower_fragment_server_async(
+            &fragment,
+            &ai.async_bindings,
+            ai.last_group_idx,
+            &ai.blocker_bindings,
+        )?
     } else {
         lower_fragment_server(&fragment)?
     };
@@ -277,27 +282,73 @@ fn lower_fragment_server_async(
     f: &svelte_ast::fragment::Fragment,
     async_bindings: &std::collections::HashSet<String>,
     last_group_idx: usize,
+    blocker_bindings: &std::collections::HashMap<String, usize>,
 ) -> Option<Vec<Statement>> {
-    lower_fragment_server_async_with(f, async_bindings, last_group_idx, "$$promises")
+    lower_fragment_server_async_with(
+        f,
+        async_bindings,
+        last_group_idx,
+        "$$promises",
+        blocker_bindings,
+    )
+}
+
+/// Builds the final IfStatement once consequent + alternate are known.
+fn finalize_if(
+    test_is_async: bool,
+    raw_test: &Expression,
+    consequent_body: Vec<Statement>,
+    alternate: Option<Statement>,
+) -> Statement {
+    let test = if test_is_async {
+        wrap_async_test(raw_test)
+    } else {
+        raw_test.clone()
+    };
+    Statement::If(Box::new(IfStatement {
+        test,
+        consequent: Statement::Block(Box::new(BlockStatement {
+            body: consequent_body,
+            span: Span::ZERO,
+        })),
+        alternate,
+        span: Span::ZERO,
+    }))
+}
+
+/// Context threaded through if-chain building inside an async fragment.
+/// Lets `build_if_chain_server_ex` decide whether to flatten an elseif into
+/// the chain or BREAK OUT into a `child_block` / `async_block`.
+struct AsyncCtx<'a> {
+    promises_var: &'a str,
+    blocker_bindings: &'a std::collections::HashMap<String, usize>,
+    /// The set of blockers from the parent if/elseif chain so far. When an
+    /// elseif introduces blockers not in this set, the chain breaks.
+    parent_blockers: std::collections::BTreeSet<usize>,
 }
 
 /// Wraps the given block-lowering output in
-/// `$$renderer.async_block([$$promises[0]], ($$renderer) => { ... });`,
+/// `$$renderer.async_block([$$promises[idx0], ...], (async)? ($$renderer) => { ... });`,
 /// optionally marking the arrow async if the test contains await.
 fn wrap_async_block(
     inner: Vec<Statement>,
     promises_var: &str,
-    test_is_async: bool,
+    blocker_indices: &[usize],
+    arrow_is_async: bool,
 ) -> Statement {
-    let promises_slot = Expression::Member(Box::new(MemberExpression {
-        object: t::id(promises_var),
-        property: MemberProperty::Expression(t::lit_number(0.0)),
-        computed: true,
-        optional: false,
-        span: Span::ZERO,
-    }));
     let blockers = Expression::Array(Box::new(ArrayExpression {
-        elements: vec![ArrayElement::Expression(promises_slot)],
+        elements: blocker_indices
+            .iter()
+            .map(|i| {
+                ArrayElement::Expression(Expression::Member(Box::new(MemberExpression {
+                    object: t::id(promises_var),
+                    property: MemberProperty::Expression(t::lit_number(*i as f64)),
+                    computed: true,
+                    optional: false,
+                    span: Span::ZERO,
+                })))
+            })
+            .collect(),
         span: Span::ZERO,
     }));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -306,7 +357,7 @@ fn wrap_async_block(
             body: inner,
             span: Span::ZERO,
         })),
-        r#async: test_is_async,
+        r#async: arrow_is_async,
         span: Span::ZERO,
     }));
     t::stmt(t::call(
@@ -315,11 +366,152 @@ fn wrap_async_block(
     ))
 }
 
+/// Wraps the given inner statements in `$$renderer.child_block(async ($$renderer) => { ... });`.
+fn wrap_child_block(inner: Vec<Statement>) -> Statement {
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: inner,
+            span: Span::ZERO,
+        })),
+        r#async: true,
+        span: Span::ZERO,
+    }));
+    t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "child_block"),
+        vec![arrow],
+    ))
+}
+
+/// Collects the unique sorted set of blocker indices for any binding referenced
+/// (eagerly, not inside nested functions) in `e`. The result is used to build
+/// the `[$$promises[i], ...]` array for `async_block`.
+fn collect_block_indices_in_expr(
+    e: &Expression,
+    blocker_bindings: &std::collections::HashMap<String, usize>,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    match e {
+        Expression::Identifier(id) => {
+            if let Some(idx) = blocker_bindings.get(&id.name) {
+                out.insert(*idx);
+            }
+        }
+        Expression::Call(c) => {
+            collect_block_indices_in_expr(&c.callee, blocker_bindings, out);
+            for a in &c.arguments {
+                match a {
+                    svelte_js_ast::Argument::Expression(e) => {
+                        collect_block_indices_in_expr(e, blocker_bindings, out)
+                    }
+                    svelte_js_ast::Argument::Spread(s) => {
+                        collect_block_indices_in_expr(&s.argument, blocker_bindings, out)
+                    }
+                }
+            }
+        }
+        Expression::Member(m) => {
+            collect_block_indices_in_expr(&m.object, blocker_bindings, out);
+            if m.computed {
+                if let MemberProperty::Expression(e) = &m.property {
+                    collect_block_indices_in_expr(e, blocker_bindings, out);
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            collect_block_indices_in_expr(&b.left, blocker_bindings, out);
+            collect_block_indices_in_expr(&b.right, blocker_bindings, out);
+        }
+        Expression::Logical(l) => {
+            collect_block_indices_in_expr(&l.left, blocker_bindings, out);
+            collect_block_indices_in_expr(&l.right, blocker_bindings, out);
+        }
+        Expression::Unary(u) => collect_block_indices_in_expr(&u.argument, blocker_bindings, out),
+        Expression::Update(u) => collect_block_indices_in_expr(&u.argument, blocker_bindings, out),
+        Expression::Assignment(a) => {
+            if let AssignmentTarget::Expression(e) = &a.left {
+                collect_block_indices_in_expr(e, blocker_bindings, out);
+            }
+            collect_block_indices_in_expr(&a.right, blocker_bindings, out);
+        }
+        Expression::Conditional(c) => {
+            collect_block_indices_in_expr(&c.test, blocker_bindings, out);
+            collect_block_indices_in_expr(&c.consequent, blocker_bindings, out);
+            collect_block_indices_in_expr(&c.alternate, blocker_bindings, out);
+        }
+        Expression::Paren(p) => collect_block_indices_in_expr(&p.expression, blocker_bindings, out),
+        Expression::Sequence(s) => {
+            for e in &s.expressions {
+                collect_block_indices_in_expr(e, blocker_bindings, out);
+            }
+        }
+        Expression::Spread(s) => collect_block_indices_in_expr(&s.argument, blocker_bindings, out),
+        Expression::Await(a) => collect_block_indices_in_expr(&a.argument, blocker_bindings, out),
+        Expression::Array(a) => {
+            for el in &a.elements {
+                if let ArrayElement::Expression(e) = el {
+                    collect_block_indices_in_expr(e, blocker_bindings, out);
+                }
+            }
+        }
+        Expression::Template(tpl) => {
+            for e in &tpl.expressions {
+                collect_block_indices_in_expr(e, blocker_bindings, out);
+            }
+        }
+        Expression::New(n) => {
+            collect_block_indices_in_expr(&n.callee, blocker_bindings, out);
+            for a in &n.arguments {
+                match a {
+                    svelte_js_ast::Argument::Expression(e) => {
+                        collect_block_indices_in_expr(e, blocker_bindings, out)
+                    }
+                    svelte_js_ast::Argument::Spread(s) => {
+                        collect_block_indices_in_expr(&s.argument, blocker_bindings, out)
+                    }
+                }
+            }
+        }
+        // Stop at function boundaries (template expressions are eager).
+        Expression::Function(_) | Expression::Arrow(_) => {}
+        _ => {}
+    }
+}
+
+/// Collects all blocker indices from an IfBlock test plus any nested
+/// flattened elseif tests (those without their own await/break-out).
+fn collect_if_block_indices(
+    ib: &svelte_ast::blocks::IfBlock,
+    blocker_bindings: &std::collections::HashMap<String, usize>,
+    out: &mut std::collections::BTreeSet<usize>,
+) {
+    collect_block_indices_in_expr(&ib.test, blocker_bindings, out);
+    // Walk down the flattened else-if chain.
+    if let Some(alt) = &ib.alternate {
+        let non_ws: Vec<&FragmentChild> = alt
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                _ => true,
+            })
+            .collect();
+        if non_ws.len() == 1 {
+            if let FragmentChild::IfBlock(inner) = non_ws[0] {
+                if inner.elseif && !expr_has_await_top(&inner.test) {
+                    collect_if_block_indices(inner, blocker_bindings, out);
+                }
+            }
+        }
+    }
+}
+
 fn lower_fragment_server_async_with(
     f: &svelte_ast::fragment::Fragment,
     async_bindings: &std::collections::HashSet<String>,
     last_group_idx: usize,
     promises_var: &str,
+    blocker_bindings: &std::collections::HashMap<String, usize>,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::new();
     let mut buf = TemplateBuf::new();
@@ -406,7 +598,40 @@ fn lower_fragment_server_async_with(
                 if let Some(stmt) = buf.flush() {
                     out.push(stmt);
                 }
-                out.extend(lower_if_block_server(ib)?);
+                let test_is_async = expr_has_await_top(&ib.test);
+                let mut indices: std::collections::BTreeSet<usize> =
+                    std::collections::BTreeSet::new();
+                collect_if_block_indices(ib, blocker_bindings, &mut indices);
+                let indices_vec: Vec<usize> = indices.into_iter().collect();
+                let parent_blockers: std::collections::BTreeSet<usize> =
+                    indices_vec.iter().copied().collect();
+                let ctx = AsyncCtx {
+                    promises_var,
+                    blocker_bindings,
+                    parent_blockers,
+                };
+                if !indices_vec.is_empty() {
+                    // Build the if-chain without the outer child_block — wrap
+                    // ourselves with async_block(blockers, ...). Markers always
+                    // use string literals (not template literals) inside an
+                    // async_block / child_block body.
+                    let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
+                    out.push(wrap_async_block(
+                        vec![if_stmt],
+                        promises_var,
+                        &indices_vec,
+                        test_is_async,
+                    ));
+                } else if test_is_async {
+                    // No blockers but await in test → child_block wrap.
+                    let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
+                    out.push(wrap_child_block(vec![if_stmt]));
+                } else {
+                    // No blockers, no await — plain if-statement, but in
+                    // async-mode markers are still single-quoted strings.
+                    let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
+                    out.push(if_stmt);
+                }
                 buf.push_str("<!--]-->");
             }
             FragmentChild::EachBlock(eb) => {
@@ -594,11 +819,14 @@ fn lower_fragment_with_const_await(
     let last_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
     let async_set: std::collections::HashSet<String> = const_names.into_iter().collect();
     let stub_fragment = svelte_ast::fragment::Fragment { nodes: rest_nodes };
+    let empty_blockers: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     out.extend(lower_fragment_server_async_with(
         &stub_fragment,
         &async_set,
         last_idx,
         "promises",
+        &empty_blockers,
     )?);
     Some(out)
 }
@@ -825,6 +1053,19 @@ fn lower_fragment_with_marker(
                     out.extend(lower_if_block_server(ib)?);
                     // BLOCK_CLOSE `<!--]-->` fuses with the next text push.
                     buf.push_str("<!--]-->");
+                    last_was_component = false;
+                }
+                FragmentChild::ConstTag(ct) => {
+                    // Regular `{@const X = INIT}` without await — emit as a
+                    // plain `let X = INIT;` declaration. The async-aware shape
+                    // (deferred `$$renderer.run([…])`) is handled separately by
+                    // `lower_fragment_with_const_await` when an await is in
+                    // play.
+                    out.push(Statement::Variable(Box::new(VariableDeclaration {
+                        kind: VariableKind::Let,
+                        declarations: ct.declaration.declarations.clone(),
+                        span: Span::ZERO,
+                    })));
                     last_was_component = false;
                 }
                 _ => return None,
@@ -1139,10 +1380,25 @@ fn lower_if_block_server(
 
 /// Recursively build an if/else-if chain. `branch_idx` is the current
 /// branch number, used in the `<!--[N-->` marker; final else uses `-1`.
+///
+/// When `async_ctx` is provided, elseifs whose test has `await` (or that
+/// would introduce a new blocker not in this block's set) BREAK OUT of the
+/// chain — the final `else` body emits a `child_block` / `async_block`
+/// wrapping a fresh if-chain starting at the broken-out elseif. Mirrors
+/// upstream's IfBlock.js + analyze visitor's flattened/non-flattened split.
 fn build_if_chain_server(
     ib: &svelte_ast::blocks::IfBlock,
     branch_idx: i32,
     use_async_marker: bool,
+) -> Option<Statement> {
+    build_if_chain_server_ex(ib, branch_idx, use_async_marker, None)
+}
+
+fn build_if_chain_server_ex(
+    ib: &svelte_ast::blocks::IfBlock,
+    branch_idx: i32,
+    use_async_marker: bool,
+    async_ctx: Option<&AsyncCtx>,
 ) -> Option<Statement> {
     let test_is_async = expr_has_await_top(&ib.test);
     let consequent_has_const_await = fragment_has_const_with_await(&ib.consequent);
@@ -1160,10 +1416,11 @@ fn build_if_chain_server(
     } else if consequent_has_const_await {
         consequent_body.extend(lower_fragment_with_const_await(&ib.consequent)?);
     } else {
-        consequent_body.extend(lower_fragment_with_marker(
-            &ib.consequent,
-            body_needs_marker(&ib.consequent),
-        )?);
+        // Inside an async_block / child_block (use_async_marker=true), the
+        // wrap's string-literal `<!--[N-->` push already anchors the scope —
+        // do NOT prepend `<!---->` to the body push template.
+        let needs_marker = !use_async_marker && body_needs_marker(&ib.consequent);
+        consequent_body.extend(lower_fragment_with_marker(&ib.consequent, needs_marker)?);
     }
 
     // Determine alternate: if alternate fragment is exactly `[IfBlock with
@@ -1177,21 +1434,81 @@ fn build_if_chain_server(
                 _ => true,
             })
             .collect();
-        let chain = if non_ws.len() == 1 {
+        // Detect a break-out: an elseif whose test has `await`, or whose own
+        // blocker set introduces an index not in `parent_blockers`. In both
+        // cases the chain stops here and a nested wrap takes over.
+        let mut break_out_target: Option<&svelte_ast::blocks::IfBlock> = None;
+        if non_ws.len() == 1 {
             if let FragmentChild::IfBlock(inner) = non_ws[0] {
                 if inner.elseif {
-                    Some(build_if_chain_server(inner, branch_idx + 1, use_async_marker)?)
+                    let inner_test_async = expr_has_await_top(&inner.test);
+                    let mut needs_break = inner_test_async;
+                    if let Some(ctx) = &async_ctx {
+                        let mut inner_blockers = std::collections::BTreeSet::new();
+                        collect_block_indices_in_expr(
+                            &inner.test,
+                            ctx.blocker_bindings,
+                            &mut inner_blockers,
+                        );
+                        if inner_blockers.iter().any(|i| !ctx.parent_blockers.contains(i)) {
+                            needs_break = true;
+                        }
+                    }
+                    if !needs_break {
+                        // Flatten — recurse to extend the chain.
+                        let chain = build_if_chain_server_ex(
+                            inner,
+                            branch_idx + 1,
+                            use_async_marker,
+                            async_ctx,
+                        )?;
+                        return Some(finalize_if(test_is_async, &ib.test, consequent_body, Some(chain)));
+                    }
+                    break_out_target = Some(inner);
+                }
+            }
+        }
+
+        if let Some(inner) = break_out_target {
+            // Build the final-else body with the broken-out wrap.
+            let final_marker = "<!--[-1-->";
+            let mut alternate_body: Vec<Statement> = Vec::new();
+            alternate_body.push(push_string(final_marker));
+            // Compute inner blockers (the new chain's blocker set).
+            let mut inner_blockers: std::collections::BTreeSet<usize> =
+                std::collections::BTreeSet::new();
+            if let Some(ctx) = &async_ctx {
+                collect_if_block_indices(inner, ctx.blocker_bindings, &mut inner_blockers);
+            }
+            let inner_test_async = expr_has_await_top(&inner.test);
+            // Build the inner if-chain with fresh branch index starting at 0.
+            let inner_async_ctx = async_ctx.map(|ctx| AsyncCtx {
+                promises_var: ctx.promises_var,
+                blocker_bindings: ctx.blocker_bindings,
+                parent_blockers: inner_blockers.clone(),
+            });
+            let inner_chain =
+                build_if_chain_server_ex(inner, 0, true, inner_async_ctx.as_ref())?;
+            let indices_vec: Vec<usize> = inner_blockers.into_iter().collect();
+            if !indices_vec.is_empty() {
+                if let Some(ctx) = &async_ctx {
+                    alternate_body.push(wrap_async_block(
+                        vec![inner_chain],
+                        ctx.promises_var,
+                        &indices_vec,
+                        inner_test_async,
+                    ));
                 } else {
-                    None
+                    alternate_body.push(wrap_child_block(vec![inner_chain]));
                 }
             } else {
-                None
+                alternate_body.push(wrap_child_block(vec![inner_chain]));
             }
-        } else {
-            None
-        };
-        if let Some(chain) = chain {
-            Some(chain)
+            alternate_body.push(push_template("<!--]-->"));
+            Some(Statement::Block(Box::new(BlockStatement {
+                body: alternate_body,
+                span: Span::ZERO,
+            })))
         } else {
             // Final `else` branch.
             let final_marker = "<!--[-1-->";
@@ -1204,7 +1521,8 @@ fn build_if_chain_server(
             if test_is_async {
                 alternate_body.extend(lower_fragment_for_async_block(alt)?);
             } else {
-                alternate_body.extend(lower_fragment_with_marker(alt, body_needs_marker(alt))?);
+                let needs_marker = !use_async_marker && body_needs_marker(alt);
+                alternate_body.extend(lower_fragment_with_marker(alt, needs_marker)?);
             }
             Some(Statement::Block(Box::new(BlockStatement {
                 body: alternate_body,
@@ -1246,20 +1564,60 @@ fn build_if_chain_server(
 /// `EXPR` → `(await $.save(EXPR))()`. Used when an async block's test
 /// needs blocker tracking.
 fn wrap_async_test(test: &Expression) -> Expression {
-    // Strip the outer await if present so we wrap the underlying value.
-    let inner = match test {
-        Expression::Await(a) => a.argument.clone(),
-        e => e.clone(),
-    };
-    let save_call = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
-    let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
-        expression: Expression::Await(Box::new(AwaitExpression {
-            argument: save_call,
-            span: Span::ZERO,
-        })),
-        span: Span::ZERO,
-    }));
-    t::call(awaited, Vec::new())
+    // Recursively replace each `await X` sub-expression with `(await $.save(X))()`.
+    // This mirrors upstream's PromiseOptimiser which only rewrites the
+    // AwaitExpression itself, leaving surrounding binary/logical/etc. structure
+    // intact (e.g. `await foo > 10` → `(await $.save(foo))() > 10`).
+    fn rewrite(e: &Expression) -> Expression {
+        match e {
+            Expression::Await(a) => {
+                let inner = rewrite(&a.argument);
+                let save_call = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+                let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
+                    expression: Expression::Await(Box::new(AwaitExpression {
+                        argument: save_call,
+                        span: Span::ZERO,
+                    })),
+                    span: Span::ZERO,
+                }));
+                t::call(awaited, Vec::new())
+            }
+            Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+                operator: b.operator,
+                left: rewrite(&b.left),
+                right: rewrite(&b.right),
+                span: b.span,
+            })),
+            Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+                operator: l.operator,
+                left: rewrite(&l.left),
+                right: rewrite(&l.right),
+                span: l.span,
+            })),
+            Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+                operator: u.operator,
+                argument: rewrite(&u.argument),
+                prefix: u.prefix,
+                span: u.span,
+            })),
+            Expression::Conditional(c) => Expression::Conditional(Box::new(ConditionalExpression {
+                test: rewrite(&c.test),
+                consequent: rewrite(&c.consequent),
+                alternate: rewrite(&c.alternate),
+                span: c.span,
+            })),
+            Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+                expression: rewrite(&p.expression),
+                span: p.span,
+            })),
+            Expression::Sequence(s) => Expression::Sequence(Box::new(SequenceExpression {
+                expressions: s.expressions.iter().map(rewrite).collect(),
+                span: s.span,
+            })),
+            e => e.clone(),
+        }
+    }
+    rewrite(test)
 }
 
 /// Lower a fragment inside an async block body. ExpressionTags with await
@@ -1779,7 +2137,17 @@ impl TemplateBuf {
     }
 
     fn push_str(&mut self, s: &str) {
-        self.parts.last_mut().unwrap().push_str(s);
+        let last = self.parts.last_mut().unwrap();
+        // Collapse runs of whitespace across pushes: if the last char of the
+        // buffer is space and the incoming text starts with whitespace, drop
+        // the leading whitespace. This matches upstream's behavior of treating
+        // `text\nwhitespace<!--comment-->\nmore_text` as a single space.
+        if last.ends_with(' ') {
+            let trimmed = s.trim_start_matches(|c: char| c.is_whitespace());
+            last.push_str(trimmed);
+        } else {
+            last.push_str(s);
+        }
     }
 
     fn push_expr(&mut self, e: Expression) {

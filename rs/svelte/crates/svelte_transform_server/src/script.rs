@@ -40,6 +40,15 @@ pub struct AsyncInfo {
     pub setup_stmts: Vec<Statement>,
     pub async_bindings: HashSet<String>,
     pub last_group_idx: usize,
+    /// All `let` / `const` bindings declared in the script (excluding
+    /// function declarations). Used to decide whether a top-level block
+    /// needs the `$$renderer.async_block([...], ...)` wrap.
+    pub script_let_bindings: HashSet<String>,
+    /// Per-binding-name, the group index of the async statement that touched
+    /// it (writes OR reads inside the async init's call expressions). The
+    /// template uses these as `$$promises[idx]` blockers. Mirrors upstream's
+    /// `binding.blocker` mechanism in `2-analyze/index.js::calculate_blockers`.
+    pub blocker_bindings: HashMap<String, usize>,
 }
 
 /// Returns true if the program contains top-level `await` (an Await
@@ -272,7 +281,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     let mut setup_stmts: Vec<Statement> = Vec::new();
     // Pre-async statements (functions + plain sync bindings before the first
     // await) come first, untouched.
-    setup_stmts.extend(pre_async);
+    setup_stmts.extend(pre_async.clone());
     if !hoisted_names.is_empty() {
         let decls: Vec<VariableDeclarator> = hoisted_names
             .iter()
@@ -305,10 +314,71 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     ));
 
     let async_bindings: HashSet<String> = hoisted_names.into_iter().collect();
+    // Collect all script let/const bindings (pre-async + hoisted), excluding
+    // function declarations.
+    let mut script_let_bindings: HashSet<String> = async_bindings.clone();
+    for s in pre_async.iter().chain(body.iter()) {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let Pattern::Identifier(id) = &d.id {
+                    script_let_bindings.insert(id.name.clone());
+                }
+            }
+        }
+    }
+    // Compute blocker_bindings: simulate the group counting and, for each
+    // async declarator, attach `group_idx` to its declared name and to every
+    // identifier "touched" by a CallExpression in the init.
+    let mut blocker_bindings: HashMap<String, usize> = HashMap::new();
+    {
+        let mut groups_count: usize = 0;
+        let mut sync_pending: bool = false;
+        for s in body.iter() {
+            if let Statement::Variable(v) = s {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        let init = d.init.as_ref();
+                        let is_async = init.map_or(false, |i| {
+                            expr_has_top_level_await(i) || rewrite_async_derived(i).is_some()
+                        });
+                        if is_async {
+                            if sync_pending {
+                                groups_count += 1;
+                                sync_pending = false;
+                            }
+                            let idx = groups_count;
+                            blocker_bindings
+                                .entry(id.name.clone())
+                                .or_insert(idx);
+                            if let Some(init) = init {
+                                let mut touched: HashSet<String> = HashSet::new();
+                                collect_touched_in_expr(init, &mut touched);
+                                for name in touched {
+                                    if script_let_bindings.contains(&name) {
+                                        blocker_bindings.entry(name).or_insert(idx);
+                                    }
+                                }
+                            }
+                            groups_count += 1;
+                        } else {
+                            sync_pending = true;
+                        }
+                    }
+                }
+            } else if matches!(s, Statement::Function(_)) {
+                // Function declarations are sync; they go to setup, not groups.
+                // Don't count them.
+            } else {
+                sync_pending = true;
+            }
+        }
+    }
     Some(AsyncInfo {
         setup_stmts,
         async_bindings,
         last_group_idx,
+        script_let_bindings,
+        blocker_bindings,
     })
 }
 
@@ -359,22 +429,31 @@ fn rewrite_async_derived(e: &Expression) -> Option<Expression> {
         Expression::Arrow(a) => a,
         _ => return None,
     };
-    // Inspect ARROW.body — must contain a top-level await.
-    let inner = match &arrow.body {
-        ArrowBody::Expression(e) => {
-            if let Expression::Await(a) = e {
-                Some(a.argument.clone())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }?;
-    // Build `await $.async_derived(() => INNER)`.
+    // The wrapping arrow from `$derived(EXPR)` rune-erase is never async; if
+    // the user used `$derived.by(async () => …)` (no1's case in
+    // async-in-derived) the arrow IS async and we leave it untouched.
+    if arrow.r#async {
+        return None;
+    }
+    // Inspect ARROW.body for top-level await. Two shapes:
+    //   - body is exactly `await X`   → `await $.async_derived(() => X)`
+    //   - body has nested top-level
+    //     awaits (e.g. `foo(await 1)`)→ `await $.async_derived(async () => BODY)`
+    let body = match &arrow.body {
+        ArrowBody::Expression(e) => e,
+        _ => return None,
+    };
+    let (new_body, new_async) = if let Expression::Await(a) = body {
+        (ArrowBody::Expression(a.argument.clone()), false)
+    } else if expr_has_top_level_await(body) {
+        (ArrowBody::Expression(body.clone()), true)
+    } else {
+        return None;
+    };
     let new_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
-        body: ArrowBody::Expression(inner),
-        r#async: false,
+        body: new_body,
+        r#async: new_async,
         span: Span::ZERO,
     }));
     let async_derived_call = t::call(
@@ -385,6 +464,183 @@ fn rewrite_async_derived(e: &Expression) -> Option<Expression> {
         argument: async_derived_call,
         span: Span::ZERO,
     })))
+}
+
+/// Walks `e` and collects every identifier reference into `out`, but does
+/// NOT descend into nested function/arrow bodies (mirrors upstream's `touch`
+/// which stops at function boundaries). This is the same set of bindings
+/// upstream marks as "touched" by an async declarator's init for blocker
+/// computation.
+fn collect_touched_in_expr(e: &Expression, out: &mut HashSet<String>) {
+    match e {
+        Expression::Identifier(id) => {
+            // Skip `undefined` etc. — these aren't real bindings.
+            if id.name != "undefined" {
+                out.insert(id.name.clone());
+            }
+        }
+        Expression::Call(c) => {
+            collect_touched_in_expr(&c.callee, out);
+            for a in &c.arguments {
+                match a {
+                    Argument::Expression(e) => collect_touched_in_expr(e, out),
+                    Argument::Spread(s) => collect_touched_in_expr(&s.argument, out),
+                }
+            }
+        }
+        Expression::Member(m) => {
+            collect_touched_in_expr(&m.object, out);
+            if let MemberProperty::Expression(e) = &m.property {
+                if m.computed {
+                    collect_touched_in_expr(e, out);
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            collect_touched_in_expr(&b.left, out);
+            collect_touched_in_expr(&b.right, out);
+        }
+        Expression::Logical(l) => {
+            collect_touched_in_expr(&l.left, out);
+            collect_touched_in_expr(&l.right, out);
+        }
+        Expression::Unary(u) => collect_touched_in_expr(&u.argument, out),
+        Expression::Update(u) => collect_touched_in_expr(&u.argument, out),
+        Expression::Assignment(a) => {
+            if let AssignmentTarget::Expression(e) = &a.left {
+                collect_touched_in_expr(e, out);
+            }
+            collect_touched_in_expr(&a.right, out);
+        }
+        Expression::Conditional(c) => {
+            collect_touched_in_expr(&c.test, out);
+            collect_touched_in_expr(&c.consequent, out);
+            collect_touched_in_expr(&c.alternate, out);
+        }
+        Expression::Paren(p) => collect_touched_in_expr(&p.expression, out),
+        Expression::Sequence(s) => {
+            for e in &s.expressions {
+                collect_touched_in_expr(e, out);
+            }
+        }
+        Expression::Spread(s) => collect_touched_in_expr(&s.argument, out),
+        Expression::Await(a) => collect_touched_in_expr(&a.argument, out),
+        Expression::Array(a) => {
+            for el in &a.elements {
+                if let ArrayElement::Expression(e) = el {
+                    collect_touched_in_expr(e, out);
+                }
+            }
+        }
+        Expression::Object(o) => {
+            for p in &o.properties {
+                match p {
+                    ObjectMember::Property(prop) => {
+                        if prop.computed {
+                            if let PropertyKey::Expression(e) = &prop.key {
+                                collect_touched_in_expr(e, out);
+                            }
+                        }
+                        collect_touched_in_expr(&prop.value, out);
+                    }
+                    ObjectMember::Spread(s) => {
+                        collect_touched_in_expr(&s.argument, out);
+                    }
+                }
+            }
+        }
+        Expression::Template(t) => {
+            for e in &t.expressions {
+                collect_touched_in_expr(e, out);
+            }
+        }
+        Expression::Tagged(t) => {
+            collect_touched_in_expr(&t.tag, out);
+            for e in &t.quasi.expressions {
+                collect_touched_in_expr(e, out);
+            }
+        }
+        Expression::New(n) => {
+            collect_touched_in_expr(&n.callee, out);
+            for a in &n.arguments {
+                match a {
+                    Argument::Expression(e) => collect_touched_in_expr(e, out),
+                    Argument::Spread(s) => collect_touched_in_expr(&s.argument, out),
+                }
+            }
+        }
+        // Descend into function/arrow bodies. Upstream's `touch` does this
+        // because the async statement could call the function eagerly, and
+        // any binding read inside it counts as touched.
+        Expression::Arrow(a) => {
+            match &a.body {
+                ArrowBody::Expression(e) => collect_touched_in_expr(e, out),
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        collect_touched_in_stmt(s, out);
+                    }
+                }
+            }
+        }
+        Expression::Function(f) => {
+            for s in &f.body.body {
+                collect_touched_in_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_touched_in_stmt(s: &Statement, out: &mut HashSet<String>) {
+    match s {
+        Statement::Expression(e) => collect_touched_in_expr(&e.expression, out),
+        Statement::Return(r) => {
+            if let Some(a) = &r.argument {
+                collect_touched_in_expr(a, out);
+            }
+        }
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    collect_touched_in_expr(init, out);
+                }
+            }
+        }
+        Statement::If(i) => {
+            collect_touched_in_expr(&i.test, out);
+            collect_touched_in_stmt(&i.consequent, out);
+            if let Some(a) = &i.alternate {
+                collect_touched_in_stmt(a, out);
+            }
+        }
+        Statement::Block(b) => {
+            for s in &b.body {
+                collect_touched_in_stmt(s, out);
+            }
+        }
+        Statement::For(f) => {
+            if let Some(init) = &f.init {
+                match init {
+                    ForInit::Declaration(v) => {
+                        for d in &v.declarations {
+                            if let Some(i) = &d.init {
+                                collect_touched_in_expr(i, out);
+                            }
+                        }
+                    }
+                    ForInit::Expression(e) => collect_touched_in_expr(e, out),
+                }
+            }
+            if let Some(t) = &f.test {
+                collect_touched_in_expr(t, out);
+            }
+            if let Some(u) = &f.update {
+                collect_touched_in_expr(u, out);
+            }
+            collect_touched_in_stmt(&f.body, out);
+        }
+        _ => {}
+    }
 }
 
 fn assignment_stmt(name: &str, value: Expression) -> Statement {
