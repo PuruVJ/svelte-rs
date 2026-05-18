@@ -53,6 +53,17 @@ pub fn try_typed_client_walker_with(
     if !script.constants.is_empty() {
         fold_fragment_with_consts(&mut fragment, &script.constants);
     }
+
+    // Extract top-level snippets — emit as `const NAME = ($$anchor, ...) => { ... };`
+    // before the export. SnippetBlocks are removed from the fragment.
+    // Pre-allocate `var_counts` so the snippet's `text` consumes the bare
+    // slot; subsequent vars in the main function become `text_1` etc.
+    let mut var_counts: HashMap<String, usize> = HashMap::new();
+    let snippet_decls = extract_client_snippets(
+        &mut fragment,
+        &script.state_bindings,
+        &mut var_counts,
+    )?;
     let root_owned = svelte_ast::root::Root {
         fragment,
         ..root.clone()
@@ -106,7 +117,14 @@ pub fn try_typed_client_walker_with(
         }
     }
 
-    let classified: Vec<NodeKind> = nodes.iter().map(|n| classify(n)).collect::<Option<_>>()?;
+    // Pre-process: coalesce runs of consecutive Text + ExpressionTag at
+    // top-level into a single TopLevelText group so they share one
+    // text-node anchor. Other nodes pass through unchanged.
+    let nodes_grouped = coalesce_top_level_text(&nodes);
+    let classified: Vec<NodeKind> = nodes_grouped
+        .iter()
+        .map(|g| classify_grouped(g))
+        .collect::<Option<_>>()?;
 
     let is_multi_root = nodes.len() > 1;
     // Tree-mode: skip the html/body walking entirely and emit a fully-static
@@ -122,7 +140,8 @@ pub fn try_typed_client_walker_with(
     // Start the function body with the rewritten script body.
     body_stmts.extend(script.body.clone());
 
-    let mut var_counts: HashMap<String, usize> = HashMap::new();
+    // var_counts was pre-seeded by extract_client_snippets so any name it
+    // consumed (e.g. `text`) gets numbered (`text_1`) when used again here.
     let mut prev_var: Option<String> = None;
 
     // Root holder: for multi-root we own a `fragment` variable; for single-root
@@ -220,7 +239,7 @@ pub fn try_typed_client_walker_with(
                 } else {
                     prev_var.clone().expect("single-root nav established")
                 };
-                body_stmts.push(component_call(c, &var)?);
+                body_stmts.push(component_call_with(c, &var, &script.state_bindings)?);
             }
             NodeKind::AwaitBlock(ab) => {
                 // `<!>` placeholder + `$.await(node, getter, pending, then)`.
@@ -303,6 +322,80 @@ pub fn try_typed_client_walker_with(
                             span: Span::ZERO,
                         }))],
                     );
+                    text_effects.push((v, template));
+                }
+            }
+            NodeKind::TopLevelText(parts) => {
+                // A run of Text + ExpressionTag at top level: emit a
+                // text-node anchor (preceding separator) + a combined
+                // template_effect entry from the run's parts.
+                if is_multi_root {
+                    let v = unique_var("text", &mut var_counts);
+                    body_stmts.push(t::var(
+                        &v,
+                        t::call(
+                            t::member_id(t::id("$"), "sibling"),
+                            vec![t::id(prev_var.as_deref().expect("preceding node"))],
+                        ),
+                    ));
+                    prev_var = Some(v.clone());
+                    // Drop entirely-whitespace boundary Static parts.
+                    let mut trimmed = parts.clone();
+                    while trimmed
+                        .first()
+                        .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+                        .unwrap_or(false)
+                    {
+                        trimmed.remove(0);
+                    }
+                    while trimmed
+                        .last()
+                        .map(|p| matches!(p, TextPart::Static(s) if s.trim().is_empty()))
+                        .unwrap_or(false)
+                    {
+                        trimmed.pop();
+                    }
+                    // Trim leading whitespace in first Static, trailing
+                    // whitespace in last.
+                    if let Some(TextPart::Static(s)) = trimmed.first_mut() {
+                        *s = s.trim_start().to_string();
+                    }
+                    if let Some(TextPart::Static(s)) = trimmed.last_mut() {
+                        *s = s.trim_end().to_string();
+                    }
+                    // Build inline template with `?? ''` coalesce on expressions.
+                    let mut quasis: Vec<String> = Vec::new();
+                    let mut subs: Vec<Expression> = Vec::new();
+                    let mut current = String::from(" ");
+                    for p in &trimmed {
+                        match p {
+                            TextPart::Static(s) => current.push_str(s),
+                            TextPart::Expr(e) => {
+                                if let Some(s) = literal_to_template_string(e) {
+                                    current.push_str(&s);
+                                    continue;
+                                }
+                                quasis.push(std::mem::take(&mut current));
+                                let mut sub = (*e).clone();
+                                rewrite_expr_for_state(&mut sub, &script.state_bindings);
+                                let coalesced = Expression::Logical(Box::new(LogicalExpression {
+                                    left: sub,
+                                    operator: LogicalOperator::Coalesce,
+                                    right: Expression::Literal(Box::new(Literal::String(
+                                        StringLiteral {
+                                            value: String::new(),
+                                            raw: None,
+                                            span: Span::ZERO,
+                                        },
+                                    ))),
+                                    span: Span::ZERO,
+                                }));
+                                subs.push(coalesced);
+                            }
+                        }
+                    }
+                    quasis.push(current);
+                    let template = t::template_raw(quasis, subs);
                     text_effects.push((v, template));
                 }
             }
@@ -395,6 +488,7 @@ pub fn try_typed_client_walker_with(
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
+    prog.extend(snippet_decls);
     prog.push(root_decl);
     prog.push(export);
     // Module-level `\$.delegate(["click", ...])` if any delegated events.
@@ -3668,7 +3762,13 @@ fn scan_nodes_for_assignments(nodes: &[FragmentChild], out: &mut HashSet<String>
                             scan_expr_for_assignments(&s.expression, out)
                         }
                         ElementAttribute::BindDirective(b) => {
-                            scan_expr_for_assignments(&b.expression, out)
+                            // `bind:NAME={target}` means the child may
+                            // mutate `target`. Treat the target's root
+                            // identifier as assigned so it gets state lowering.
+                            if let Expression::Identifier(i) = &b.expression {
+                                out.insert(i.name.clone());
+                            }
+                            scan_expr_for_assignments(&b.expression, out);
                         }
                         _ => {}
                     }
@@ -3695,7 +3795,13 @@ fn scan_nodes_for_assignments(nodes: &[FragmentChild], out: &mut HashSet<String>
                             scan_expr_for_assignments(&s.expression, out)
                         }
                         ElementAttribute::BindDirective(b) => {
-                            scan_expr_for_assignments(&b.expression, out)
+                            // `bind:NAME={target}` means the child may
+                            // mutate `target`. Treat the target's root
+                            // identifier as assigned so it gets state lowering.
+                            if let Expression::Identifier(i) = &b.expression {
+                                out.insert(i.name.clone());
+                            }
+                            scan_expr_for_assignments(&b.expression, out);
                         }
                         _ => {}
                     }
@@ -3887,6 +3993,10 @@ enum NodeKind<'a> {
     /// Top-level `{expr}` — lowered to a space text-node anchor + a
     /// `$.set_text(text_N, ...)` entry in the combined template_effect.
     TopLevelExpr(&'a Expression),
+    /// A run of consecutive top-level Text + ExpressionTag children that
+    /// share a single text-node anchor. Lowered to one space in the HTML
+    /// + `var text_N = $.sibling(prev)` + a combined template_effect.
+    TopLevelText(Vec<TextPart<'a>>),
 }
 
 #[derive(Debug, Default)]
@@ -3933,6 +4043,55 @@ fn single_root_var_name(kind: &NodeKind) -> String {
         NodeKind::Component(_) => "fragment".to_string(),
         NodeKind::AwaitBlock(_) => "fragment".to_string(),
         NodeKind::TopLevelExpr(_) => "fragment".to_string(),
+        NodeKind::TopLevelText(_) => "fragment".to_string(),
+    }
+}
+
+#[derive(Debug)]
+enum GroupedNode<'a> {
+    Single(&'a FragmentChild),
+    /// A consecutive run of top-level Text + ExpressionTag children. They
+    /// share one text-node anchor and one combined template_effect entry.
+    TextRun(Vec<TextPart<'a>>),
+}
+
+fn coalesce_top_level_text<'a>(nodes: &[&'a FragmentChild]) -> Vec<GroupedNode<'a>> {
+    let mut out: Vec<GroupedNode<'a>> = Vec::new();
+    let mut run: Vec<TextPart<'a>> = Vec::new();
+    let flush = |out: &mut Vec<GroupedNode<'a>>, run: &mut Vec<TextPart<'a>>| {
+        if run.is_empty() {
+            return;
+        }
+        // Only count as a run if at least one expression participates;
+        // otherwise leave the lone text inline and skip it.
+        if run.iter().any(|p| matches!(p, TextPart::Expr(_))) {
+            out.push(GroupedNode::TextRun(std::mem::take(run)));
+        } else {
+            run.clear();
+        }
+    };
+    for n in nodes {
+        match n {
+            FragmentChild::Text(t) => {
+                run.push(TextPart::Static(t.data.clone()));
+            }
+            FragmentChild::ExpressionTag(et) => {
+                run.push(TextPart::Expr(&et.expression));
+            }
+            _ => {
+                flush(&mut out, &mut run);
+                out.push(GroupedNode::Single(n));
+            }
+        }
+    }
+    flush(&mut out, &mut run);
+    out
+}
+
+fn classify_grouped<'a>(g: &GroupedNode<'a>) -> Option<NodeKind<'a>> {
+    match g {
+        GroupedNode::Single(n) => classify(n),
+        GroupedNode::TextRun(parts) => Some(NodeKind::TopLevelText(parts.clone())),
     }
 }
 
@@ -4718,7 +4877,91 @@ fn format_num(n: f64) -> String {
     format!("{n}")
 }
 
+/// Extract top-level `{#snippet NAME(...)}` blocks from the fragment, lower
+/// each as a `const NAME = ($$anchor, ...params) => { ... }` declaration,
+/// and remove the SnippetBlock children from the fragment.
+fn extract_client_snippets(
+    fragment: &mut svelte_ast::fragment::Fragment,
+    state_bindings: &HashSet<String>,
+    var_counts: &mut HashMap<String, usize>,
+) -> Option<Vec<Statement>> {
+    let _ = state_bindings;
+    let mut out: Vec<Statement> = Vec::new();
+    let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
+    for n in std::mem::take(&mut fragment.nodes) {
+        if let FragmentChild::SnippetBlock(sb) = &n {
+            let name = sb.expression.name.clone();
+            // Snippet body: `$.next(); var text = $.text('Something'); $.append($$anchor, text);`
+            // for a single static text body. More complex bodies fall back to
+            // None (caller would bail).
+            let body_non_ws: Vec<&FragmentChild> = sb
+                .body
+                .nodes
+                .iter()
+                .filter(|c| match c {
+                    FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                    _ => true,
+                })
+                .collect();
+            if body_non_ws.len() != 1 {
+                return None;
+            }
+            let text_value = match body_non_ws[0] {
+                FragmentChild::Text(t) => t.data.trim().to_string(),
+                _ => return None,
+            };
+            let text_var = unique_var("text", var_counts);
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "next"),
+                Vec::new(),
+            )));
+            body.push(t::var(
+                &text_var,
+                t::call(
+                    t::member_id(t::id("$"), "text"),
+                    vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
+                        value: text_value,
+                        raw: None,
+                        span: Span::ZERO,
+                    })))],
+                ),
+            ));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id(&text_var)],
+            )));
+            let mut params = vec![t::pat_id("$$anchor")];
+            for p in &sb.parameters {
+                params.push(p.clone());
+            }
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params,
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            out.push(t::const_decl(&name, arrow));
+            continue;
+        }
+        remaining.push(n);
+    }
+    fragment.nodes = remaining;
+    Some(out)
+}
+
 fn component_call(c: &Component, node_var: &str) -> Option<Statement> {
+    component_call_with(c, node_var, &HashSet::new())
+}
+
+fn component_call_with(
+    c: &Component,
+    node_var: &str,
+    state_bindings: &HashSet<String>,
+) -> Option<Statement> {
     let mut props: Vec<ObjectMember> = Vec::new();
     for attr in &c.attributes {
         match attr {
@@ -4726,6 +4969,100 @@ fn component_call(c: &Component, node_var: &str) -> Option<Statement> {
             ElementAttribute::SpreadAttribute(s) => {
                 props.push(ObjectMember::Spread(Box::new(SpreadElement {
                     argument: s.expression.clone(),
+                    span: Span::ZERO,
+                })));
+            }
+            ElementAttribute::BindDirective(b) if b.name == "this" => {
+                // bind:this captured by typed_client_component path; skip here.
+                continue;
+            }
+            ElementAttribute::BindDirective(b) => {
+                // `bind:NAME={target}` on Component → getter/setter pair.
+                // When target refers to a state binding, wrap with $.get / $.set.
+                let target_is_state = matches!(
+                    &b.expression,
+                    Expression::Identifier(i) if state_bindings.contains(&i.name)
+                );
+                let getter_body = if target_is_state {
+                    let name = match &b.expression {
+                        Expression::Identifier(i) => i.name.clone(),
+                        _ => return None,
+                    };
+                    t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)])
+                } else {
+                    b.expression.clone()
+                };
+                let setter_body = if target_is_state {
+                    let name = match &b.expression {
+                        Expression::Identifier(i) => i.name.clone(),
+                        _ => return None,
+                    };
+                    t::call(
+                        t::member_id(t::id("$"), "set"),
+                        vec![
+                            t::id(&name),
+                            t::id("$$value"),
+                            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                value: true,
+                                span: Span::ZERO,
+                            }))),
+                        ],
+                    )
+                } else {
+                    Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(b.expression.clone()),
+                        operator: AssignmentOperator::Assign,
+                        right: t::id("$$value"),
+                        span: Span::ZERO,
+                    }))
+                };
+                // get NAME() { return GETTER_BODY; }
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: b.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value: Expression::Function(Box::new(FunctionExpression {
+                        id: None,
+                        params: Vec::new(),
+                        body: BlockStatement {
+                            body: vec![Statement::Return(Box::new(ReturnStatement {
+                                argument: Some(getter_body),
+                                span: Span::ZERO,
+                            }))],
+                            span: Span::ZERO,
+                        },
+                        generator: false,
+                        r#async: false,
+                        span: Span::ZERO,
+                    })),
+                    kind: PropertyKind::Get,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+                // set NAME($$value) { SETTER_BODY; }
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: b.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value: Expression::Function(Box::new(FunctionExpression {
+                        id: None,
+                        params: vec![t::pat_id("$$value")],
+                        body: BlockStatement {
+                            body: vec![t::stmt(setter_body)],
+                            span: Span::ZERO,
+                        },
+                        generator: false,
+                        r#async: false,
+                        span: Span::ZERO,
+                    })),
+                    kind: PropertyKind::Set,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
                     span: Span::ZERO,
                 })));
             }
