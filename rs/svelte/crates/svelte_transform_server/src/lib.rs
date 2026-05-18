@@ -226,6 +226,26 @@ fn lower_fragment_server_async_with(
                     return None;
                 }
             }
+            FragmentChild::IfBlock(ib) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.extend(lower_if_block_server(ib)?);
+                buf.push_str("<!--]-->");
+            }
+            FragmentChild::EachBlock(eb) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.extend(lower_each_block_server(eb)?);
+            }
+            FragmentChild::AwaitBlock(ab) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.extend(lower_await_block_server(ab)?);
+                buf.push_str("<!--]-->");
+            }
             FragmentChild::Text(_) | FragmentChild::Comment(_) => {
                 if append_node_to_template(n, &mut buf).is_none() {
                     return None;

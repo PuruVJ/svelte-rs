@@ -105,9 +105,28 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
         body: body.to_vec(),
         span: Span::ZERO,
     };
-    if !has_top_level_await(&p) {
+    if !has_top_level_await(&p) && !has_async_derived_init(&p) {
         return None;
     }
+
+    // Statements before the first async stay as-is in the function body
+    // (they execute synchronously before the run-array fires). Statements
+    // from the first async onwards go through the hoist + run mechanism.
+    let first_async_idx = body.iter().position(|s| {
+        if let Statement::Variable(v) = s {
+            v.declarations.iter().any(|d| {
+                d.init.as_ref().map_or(false, |i| {
+                    expr_has_top_level_await(i) || rewrite_async_derived(i).is_some()
+                })
+            })
+        } else if let Statement::Expression(e) = s {
+            expr_has_top_level_await(&e.expression)
+        } else {
+            false
+        }
+    })?;
+    let pre_async: Vec<Statement> = body[..first_async_idx].to_vec();
+    let body = &body[first_async_idx..];
 
     // Gather all let/const bindings to hoist + classify each statement.
     let mut hoisted_names: Vec<String> = Vec::new();
@@ -124,6 +143,17 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                     if let Pattern::Identifier(id) = &d.id {
                         hoisted_names.push(id.name.clone());
                         let init = d.init.clone().unwrap_or_else(undefined_expr);
+                        // `$.derived(() => await E)` pattern (post rune-erase
+                        // form of `let X = $derived(await E)`) → convert to
+                        // `await $.async_derived(() => E)` for the async-set
+                        // arrow.
+                        if let Some(rewritten) = rewrite_async_derived(&init) {
+                            lowered.push(Lowered::AsyncSet {
+                                name: id.name.clone(),
+                                init: rewritten,
+                            });
+                            continue;
+                        }
                         if expr_has_top_level_await(&init) {
                             lowered.push(Lowered::AsyncSet {
                                 name: id.name.clone(),
@@ -155,6 +185,11 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                         continue;
                     }
                 }
+                lowered.push(Lowered::Sync(s.clone()));
+            }
+            // Function declarations pass through untouched (they don't
+            // participate in the async hoisting).
+            Statement::Function(_) => {
                 lowered.push(Lowered::Sync(s.clone()));
             }
             _ => return None,
@@ -222,11 +257,10 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             }
         }
     }
-    // Ensure there's a trailing sync group so $$promises[1] etc. has a slot.
-    if !current_sync.is_empty() || last_was_async {
-        if current_sync.is_empty() {
-            current_sync.push(t::stmt(void_zero()));
-        }
+    // Trailing sync group: only when there are actual sync statements after
+    // the last async. Empty trailing groups are not emitted.
+    let _ = last_was_async;
+    if !current_sync.is_empty() {
         flush_sync(&mut groups, &mut current_sync);
     }
 
@@ -234,6 +268,9 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
 
     // var X, Y, Z;
     let mut setup_stmts: Vec<Statement> = Vec::new();
+    // Pre-async statements (functions + plain sync bindings before the first
+    // await) come first, untouched.
+    setup_stmts.extend(pre_async);
     if !hoisted_names.is_empty() {
         let decls: Vec<VariableDeclarator> = hoisted_names
             .iter()
@@ -282,6 +319,66 @@ fn void_zero() -> Expression {
         prefix: true,
         span: Span::ZERO,
     }))
+}
+
+/// Detect any `$.derived(ARROW)` where ARROW's body contains await — the
+/// post rune-erase form of `let X = $derived(await E)`. Used to trigger the
+/// async transform even when the script has no other top-level await.
+fn has_async_derived_init(p: &Program) -> bool {
+    p.body.iter().any(|s| {
+        if let Statement::Variable(v) = s {
+            v.declarations.iter().any(|d| {
+                d.init.as_ref().map_or(false, |i| rewrite_async_derived(i).is_some())
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// If `e` is `$.derived(ARROW)` with `ARROW.body` containing top-level await,
+/// return `await $.async_derived(NEW_ARROW)` where NEW_ARROW strips the outer
+/// await from the body. Otherwise None.
+fn rewrite_async_derived(e: &Expression) -> Option<Expression> {
+    let Expression::Call(c) = e else { return None };
+    // Must be `$.derived(...)` (rune-erase output).
+    if global_keypath(&c.callee).as_deref() != Some("$.derived") {
+        return None;
+    }
+    let arg = c.arguments.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e),
+        _ => None,
+    })?;
+    let arrow = match arg {
+        Expression::Arrow(a) => a,
+        _ => return None,
+    };
+    // Inspect ARROW.body — must contain a top-level await.
+    let inner = match &arrow.body {
+        ArrowBody::Expression(e) => {
+            if let Expression::Await(a) = e {
+                Some(a.argument.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }?;
+    // Build `await $.async_derived(() => INNER)`.
+    let new_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(inner),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let async_derived_call = t::call(
+        t::member_id(t::id("$"), "async_derived"),
+        vec![new_arrow],
+    );
+    Some(Expression::Await(Box::new(AwaitExpression {
+        argument: async_derived_call,
+        span: Span::ZERO,
+    })))
 }
 
 fn assignment_stmt(name: &str, value: Expression) -> Statement {
