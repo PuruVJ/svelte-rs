@@ -124,6 +124,13 @@ pub fn try_typed_client_walker_with(
             if expr_top_await(&ib.test) {
                 return emit_single_async_if_program(ib, component_name, &script);
             }
+            // `{#if LITERAL}{@const X = await E}...{/if}` — literal-test if
+            // with async-const inside body. Route to dedicated emitter.
+            if !expr_top_await(&ib.test)
+                && fragment_has_const_await_client(&ib.consequent)
+            {
+                return emit_const_async_if_program(ib, component_name, &script);
+            }
             // Non-async if-block not yet handled by walker.
             return None;
         }
@@ -1350,6 +1357,386 @@ fn emit_single_async_if_program(
     prog.extend(script.imports.clone());
     prog.push(export);
     Some(t::program(prog))
+}
+
+/// True iff the fragment contains a `{@const X = ...}` whose initializer has
+/// a top-level `await`.
+fn fragment_has_const_await_client(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(|n| {
+        if let FragmentChild::ConstTag(ct) = n {
+            ct.declaration
+                .declarations
+                .iter()
+                .any(|d| d.init.as_ref().map_or(false, expr_top_await))
+        } else {
+            false
+        }
+    })
+}
+
+/// Compile a `{#if LITERAL}` whose body holds `{@const ... await ...}`
+/// declarations and a single `<element>{TEXT_EXPR}</element>` child. Produces
+/// the async-const client shape (see async-const fixture).
+fn emit_const_async_if_program(
+    ib: &svelte_ast::blocks::IfBlock,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Extract const tags + the single child element.
+    let mut consts: Vec<&svelte_ast::tags::ConstTag> = Vec::new();
+    let mut element_node: Option<&svelte_ast::elements::RegularElement> = None;
+    for n in &ib.consequent.nodes {
+        match n {
+            FragmentChild::ConstTag(ct) => consts.push(ct),
+            FragmentChild::RegularElement(el) => {
+                if element_node.is_some() {
+                    return None; // only one element supported
+                }
+                element_node = Some(el);
+            }
+            FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            _ => return None,
+        }
+    }
+    let element = element_node?;
+
+    // Element must be `<TAG>{EXPR}</TAG>` — a single ExpressionTag child.
+    let el_non_ws: Vec<&FragmentChild> = element
+        .fragment
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => true,
+        })
+        .collect();
+    if el_non_ws.len() != 1 {
+        return None;
+    }
+    let text_expr = match el_non_ws[0] {
+        FragmentChild::ExpressionTag(et) => et.expression.clone(),
+        _ => return None,
+    };
+
+    // Collect const names + classify each as async (has await) or sync.
+    let mut const_names: Vec<String> = Vec::new();
+    let mut thunks: Vec<Expression> = Vec::new();
+    let mut const_blocker_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for ct in &consts {
+        for d in &ct.declaration.declarations {
+            let Pattern::Identifier(id) = &d.id else { return None };
+            let Some(init) = &d.init else { return None };
+            let has_await = expr_top_await(init);
+            const_names.push(id.name.clone());
+            let idx = thunks.len();
+            const_blocker_idx.insert(id.name.clone(), idx);
+            if has_await {
+                // `async () => X = (await $.save($.async_derived(async () =>
+                // (await $.save(INNER))())))()`
+                let inner = match init {
+                    Expression::Await(a) => a.argument.clone(),
+                    e => e.clone(),
+                };
+                let inner_save_await =
+                    save_await_call_client(inner);
+                let async_derived_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(inner_save_await),
+                    r#async: true,
+                    span: Span::ZERO,
+                }));
+                let async_derived_call = t::call(
+                    t::member_id(t::id("$"), "async_derived"),
+                    vec![async_derived_arrow],
+                );
+                let outer = save_await_call_client(async_derived_call);
+                let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                    left: AssignmentTarget::Expression(t::id(&id.name)),
+                    operator: AssignmentOperator::Assign,
+                    right: outer,
+                    span: Span::ZERO,
+                }));
+                thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(assign),
+                    r#async: true,
+                    span: Span::ZERO,
+                })));
+            } else {
+                // `() => X = $.derived(() => INIT_WITH_GET_REFS)`
+                let rewritten = rewrite_const_refs_with_get(init, &const_names);
+                let derived_call = t::call(
+                    t::member_id(t::id("$"), "derived"),
+                    vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(rewritten),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }))],
+                );
+                let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                    left: AssignmentTarget::Expression(t::id(&id.name)),
+                    operator: AssignmentOperator::Assign,
+                    right: derived_call,
+                    span: Span::ZERO,
+                }));
+                thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(assign),
+                    r#async: false,
+                    span: Span::ZERO,
+                })));
+            }
+        }
+    }
+
+    // Identify the text expression's blocker (which promises slot to wait on).
+    let text_ref_name = match &text_expr {
+        Expression::Identifier(id) => id.name.clone(),
+        _ => return None,
+    };
+    let text_blocker_idx = *const_blocker_idx.get(&text_ref_name)?;
+
+    // Build the consequent body.
+    let mut consequent: Vec<Statement> = Vec::new();
+    for name in &const_names {
+        consequent.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Let,
+            declarations: vec![VariableDeclarator {
+                id: t::pat_id(name),
+                init: None,
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        })));
+    }
+    // var promises = $.run([...thunks])
+    consequent.push(t::var(
+        "promises",
+        t::call(
+            t::member_id(t::id("$"), "run"),
+            vec![Expression::Array(Box::new(array_expression_from_exprs(thunks)))],
+        ),
+    ));
+    // var p = root_1();
+    consequent.push(t::var(
+        "p",
+        t::call(t::id("root_1"), Vec::new()),
+    ));
+    // var text = $.child(p, true);
+    consequent.push(t::var(
+        "text",
+        t::call(
+            t::member_id(t::id("$"), "child"),
+            vec![
+                t::id("p"),
+                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                    value: true,
+                    span: Span::ZERO,
+                }))),
+            ],
+        ),
+    ));
+    // $.reset(p);
+    consequent.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id("p")],
+    )));
+    // $.template_effect(() => $.set_text(text, $.get(TEXT_REF)), void 0, void 0, [promises[N]])
+    let get_text_ref = t::call(
+        t::member_id(t::id("$"), "get"),
+        vec![t::id(&text_ref_name)],
+    );
+    let set_text_call = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), get_text_ref],
+    );
+    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(set_text_call),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let blocker_member = Expression::Member(Box::new(MemberExpression {
+        object: t::id("promises"),
+        property: MemberProperty::Expression(t::lit_number(text_blocker_idx as f64)),
+        computed: true,
+        optional: false,
+        span: Span::ZERO,
+    }));
+    let blockers_array = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(blocker_member)],
+        span: Span::ZERO,
+    }));
+    consequent.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![
+            effect_fn,
+            void_zero_client(),
+            void_zero_client(),
+            blockers_array,
+        ],
+    )));
+    // $.append($$anchor, p);
+    consequent.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("p")],
+    )));
+
+    let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: consequent,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // Build the wrap block: { var consequent = ...; $.if(node, ($$render) => { if (TEST) $$render(consequent); }); }
+    let render_if = Statement::If(Box::new(IfStatement {
+        test: ib.test.clone(),
+        consequent: t::stmt(t::call(
+            t::id("$$render"),
+            vec![t::id("consequent")],
+        )),
+        alternate: None,
+        span: Span::ZERO,
+    }));
+    let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$render")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![render_if],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let if_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "if"),
+        vec![t::id("node"), render_arrow],
+    ));
+    let wrap_block = Statement::Block(Box::new(BlockStatement {
+        body: vec![t::var("consequent", consequent_arrow), if_call],
+        span: Span::ZERO,
+    }));
+
+    // Build the function body.
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+    func_body.push(wrap_block);
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    // root_1 template at module scope. Element with single ExpressionTag
+    // text child → `<TAG> </TAG>` (single space placeholder).
+    let template_html = format!("<{0}> </{0}>", element.name);
+    let root_decl = t::var(
+        "root_1",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![template_html], Vec::new())],
+        ),
+    );
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/async"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(root_decl);
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Helper: build an ArrayExpression from a Vec of Expressions.
+fn array_expression_from_exprs(exprs: Vec<Expression>) -> ArrayExpression {
+    ArrayExpression {
+        elements: exprs.into_iter().map(ArrayElement::Expression).collect(),
+        span: Span::ZERO,
+    }
+}
+
+/// `(await $.save(X))()` — wrap an expression for the async-const setter form.
+fn save_await_call_client(inner: Expression) -> Expression {
+    let saved = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+    let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
+        expression: Expression::Await(Box::new(AwaitExpression {
+            argument: saved,
+            span: Span::ZERO,
+        })),
+        span: Span::ZERO,
+    }));
+    t::call(awaited, Vec::new())
+}
+
+/// Walk an expression and replace any `Identifier` in `consts` with
+/// `$.get(IDENT)` — used to wrap reads of const-bound names in the derived
+/// thunk.
+fn rewrite_const_refs_with_get(e: &Expression, consts: &[String]) -> Expression {
+    match e {
+        Expression::Identifier(id) if consts.iter().any(|n| n == &id.name) => {
+            t::call(t::member_id(t::id("$"), "get"), vec![Expression::Identifier(id.clone())])
+        }
+        Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+            operator: b.operator,
+            left: rewrite_const_refs_with_get(&b.left, consts),
+            right: rewrite_const_refs_with_get(&b.right, consts),
+            span: b.span,
+        })),
+        Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+            operator: l.operator,
+            left: rewrite_const_refs_with_get(&l.left, consts),
+            right: rewrite_const_refs_with_get(&l.right, consts),
+            span: l.span,
+        })),
+        Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+            operator: u.operator,
+            argument: rewrite_const_refs_with_get(&u.argument, consts),
+            prefix: u.prefix,
+            span: u.span,
+        })),
+        Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+            callee: rewrite_const_refs_with_get(&c.callee, consts),
+            arguments: c
+                .arguments
+                .iter()
+                .map(|a| match a {
+                    Argument::Expression(e) => {
+                        Argument::Expression(rewrite_const_refs_with_get(e, consts))
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+            optional: c.optional,
+            span: c.span,
+        })),
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: rewrite_const_refs_with_get(&p.expression, consts),
+            span: p.span,
+        })),
+        e => e.clone(),
+    }
 }
 
 /// `{#each await EXPR as ITEM}body{/each}` →
