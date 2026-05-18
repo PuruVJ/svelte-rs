@@ -78,12 +78,30 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     if !derived.is_empty() {
         call_derived_in_fragment(&mut fragment, derived);
     }
+
+    // Extract top-level SnippetBlocks to hoist as separate `function` decls
+    // outside the export. Removed from fragment so they don't flow through
+    // the template lowering.
+    let snippet_decls = extract_and_lower_snippets(&mut fragment)?;
+
+    // Detect Component-with-bind:value at top level — triggers the
+    // do-while `$$settled` wrap pattern.
+    let needs_bind_wrap = fragment_has_component_bind(&fragment);
+
     let template_body = if let Some(ai) = &async_info {
         lower_fragment_server_async(&fragment, &ai.async_bindings, ai.last_group_idx)?
     } else {
         lower_fragment_server(&fragment)?
     };
-    func_body.extend(template_body);
+
+    if needs_bind_wrap {
+        // Script bindings stay at the outer function-body level; only the
+        // template-rendering statements move into `$$render_inner`.
+        let outer_settled = wrap_for_bind_settled(template_body);
+        func_body.extend(outer_settled);
+    } else {
+        func_body.extend(template_body);
+    }
 
     // When script triggers component-context: wrap the whole body in
     // `$$renderer.component(($$renderer) => { ... });`.
@@ -122,8 +140,132 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     }
     top.push(t::import_namespace("$", "svelte/internal/server"));
     top.extend(script_imports);
+    // Hoisted snippet function declarations come before the default export.
+    top.extend(snippet_decls);
     top.push(t::export_default_function(component_name, params, func_body));
     Some(t::program(top))
+}
+
+/// Extract top-level `{#snippet NAME(...)}` blocks from the fragment, lower
+/// each as a `function NAME($$renderer) { body }` declaration, and remove
+/// the SnippetBlock children from the fragment.
+fn extract_and_lower_snippets(
+    fragment: &mut svelte_ast::fragment::Fragment,
+) -> Option<Vec<Statement>> {
+    let mut out: Vec<Statement> = Vec::new();
+    let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
+    for n in std::mem::take(&mut fragment.nodes) {
+        if let FragmentChild::SnippetBlock(sb) = &n {
+            let name = sb.expression.name.clone();
+            let body_stmts: Vec<Statement> =
+                lower_fragment_with_marker(&sb.body, true)?;
+            let mut params = vec![t::pat_id("$$renderer")];
+            for p in &sb.parameters {
+                params.push(p.clone());
+            }
+            out.push(t::function_decl(&name, params, body_stmts));
+            continue;
+        }
+        remaining.push(n);
+    }
+    fragment.nodes = remaining;
+    Some(out)
+}
+
+/// Does the fragment contain a top-level `<Component bind:X={...} />` where
+/// X is not `this`? (bind:this just captures the component instance and
+/// doesn't need the $$settled re-render dance.)
+fn fragment_has_component_bind(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(|n| {
+        if let FragmentChild::Component(c) = n {
+            c.attributes.iter().any(|a| {
+                if let svelte_ast::attributes::ElementAttribute::BindDirective(b) = a {
+                    b.name != "this"
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// Wrap the function body for `bind:` on Components: declare \$\$settled +
+/// \$\$inner_renderer + \$\$render_inner, then loop do/while + subsume.
+fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
+    let mut out: Vec<Statement> = Vec::new();
+    // `let $$settled = true;`
+    out.push(Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Let,
+        declarations: vec![VariableDeclarator {
+            id: t::pat_id("$$settled"),
+            init: Some(Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            })))),
+            span: Span::ZERO,
+        }],
+        span: Span::ZERO,
+    })));
+    // `let $$inner_renderer;`
+    out.push(Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Let,
+        declarations: vec![VariableDeclarator {
+            id: t::pat_id("$$inner_renderer"),
+            init: None,
+            span: Span::ZERO,
+        }],
+        span: Span::ZERO,
+    })));
+    // `function $$render_inner($$renderer) { ...inner... }`
+    out.push(t::function_decl(
+        "$$render_inner",
+        vec![t::pat_id("$$renderer")],
+        inner,
+    ));
+    // `do { $$settled = true; $$inner_renderer = $$renderer.copy();
+    //      $$render_inner($$inner_renderer); } while (!$$settled);`
+    let mut do_body: Vec<Statement> = Vec::new();
+    do_body.push(t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(t::id("$$settled")),
+        operator: AssignmentOperator::Assign,
+        right: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+            value: true,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }))));
+    do_body.push(t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(t::id("$$inner_renderer")),
+        operator: AssignmentOperator::Assign,
+        right: t::call(t::member_id(t::id("$$renderer"), "copy"), Vec::new()),
+        span: Span::ZERO,
+    }))));
+    do_body.push(t::stmt(t::call(
+        t::id("$$render_inner"),
+        vec![t::id("$$inner_renderer")],
+    )));
+    let not_settled = Expression::Unary(Box::new(UnaryExpression {
+        operator: UnaryOperator::Not,
+        argument: t::id("$$settled"),
+        prefix: true,
+        span: Span::ZERO,
+    }));
+    out.push(Statement::DoWhile(Box::new(DoWhileStatement {
+        body: Statement::Block(Box::new(BlockStatement {
+            body: do_body,
+            span: Span::ZERO,
+        })),
+        test: not_settled,
+        span: Span::ZERO,
+    })));
+    // `$$renderer.subsume($$inner_renderer);`
+    out.push(t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "subsume"),
+        vec![t::id("$$inner_renderer")],
+    )));
+    out
 }
 
 /// Lower a fragment under top-level-await semantics. Expressions that
@@ -603,6 +745,15 @@ fn lower_fragment_with_marker(
     let mut emitted_static_push = false;
     let mut last_was_component = false;
     for n in nodes.iter() {
+        // Before processing this node, if the previous node was a Component
+        // and we're now about to emit non-Component content, push `<!---->`
+        // to buf so it anchors the hydration scope.
+        if last_was_component {
+            if !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()) {
+                buf.push_str("<!---->");
+                last_was_component = false;
+            }
+        }
         // RegularElement with <option> children: write open tag + interleave
         // option calls + close tag inline (keeps the existing buf flowing).
         if let FragmentChild::RegularElement(el) = n {
@@ -651,8 +802,8 @@ fn lower_fragment_with_marker(
     if let Some(stmt) = buf.flush() {
         out.push(stmt);
     } else if last_was_component && emitted_static_push {
-        // Mid-fragment Component followed by no more static content needs
-        // a closing `<!---->` marker to anchor the end of the hydration scope.
+        // Mid-fragment Component with no trailing content: emit an anchor
+        // `<!---->` to close the hydration scope.
         out.push(push_template("<!---->"));
     }
     Some(out)
@@ -1670,6 +1821,20 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
                     span: Span::ZERO,
                 })));
             }
+            ElementAttribute::BindDirective(b) => {
+                if b.name == "this" {
+                    // bind:this is handled by typed_fast/typed_client_component
+                    // for the simple case. Server doesn't emit a getter/setter
+                    // pair for it.
+                    continue;
+                }
+                // `bind:NAME={target}` on a Component lowers to a getter/
+                // setter pair so the parent observes mutations from the
+                // child. The setter also flips `$$settled = false` to
+                // re-render under the do-while wrap.
+                props.push(make_bind_getter(&b.name, &b.expression));
+                props.push(make_bind_setter(&b.name, &b.expression));
+            }
             _ => {}
         }
     }
@@ -1748,6 +1913,78 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         optional: false,
         span: Span::ZERO,
     }))))
+}
+
+/// `bind:NAME={target}` → `get NAME() { return target; }` accessor pair.
+fn make_bind_getter(name: &str, target: &Expression) -> ObjectMember {
+    let body = vec![Statement::Return(Box::new(ReturnStatement {
+        argument: Some(target.clone()),
+        span: Span::ZERO,
+    }))];
+    ObjectMember::Property(Box::new(Property {
+        key: PropertyKey::Identifier(Identifier {
+            name: name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: Expression::Function(Box::new(FunctionExpression {
+            id: None,
+            params: Vec::new(),
+            body: BlockStatement {
+                body,
+                span: Span::ZERO,
+            },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        })),
+        kind: PropertyKind::Get,
+        computed: false,
+        shorthand: false,
+        method: false,
+        span: Span::ZERO,
+    }))
+}
+
+/// `bind:NAME={target}` → `set NAME($$value) { target = $$value; $$settled = false; }`.
+fn make_bind_setter(name: &str, target: &Expression) -> ObjectMember {
+    let assign_target = Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(target.clone()),
+        operator: AssignmentOperator::Assign,
+        right: t::id("$$value"),
+        span: Span::ZERO,
+    }));
+    let assign_settled = Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(t::id("$$settled")),
+        operator: AssignmentOperator::Assign,
+        right: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+            value: false,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }));
+    let body = vec![t::stmt(assign_target), t::stmt(assign_settled)];
+    ObjectMember::Property(Box::new(Property {
+        key: PropertyKey::Identifier(Identifier {
+            name: name.to_string(),
+            span: Span::ZERO,
+        }),
+        value: Expression::Function(Box::new(FunctionExpression {
+            id: None,
+            params: vec![t::pat_id("$$value")],
+            body: BlockStatement {
+                body,
+                span: Span::ZERO,
+            },
+            generator: false,
+            r#async: false,
+            span: Span::ZERO,
+        })),
+        kind: PropertyKind::Set,
+        computed: false,
+        shorthand: false,
+        method: false,
+        span: Span::ZERO,
+    }))
 }
 
 /// `name={expr}` → `{ name: expr }`. `name="literal"` → `{ name: 'literal' }`.
