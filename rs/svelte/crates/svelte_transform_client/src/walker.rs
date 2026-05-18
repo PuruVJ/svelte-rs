@@ -40,8 +40,11 @@ pub fn try_typed_client_walker_with(
     }
 
     // Script analysis: collect statements to emit, plus any erased rune
-    // bindings.
-    let script = analyze_script(root.instance.as_ref())?;
+    // bindings. The assignment scan also considers template expressions so
+    // `onclick={()=>count++}` registers `count` as assigned even when the
+    // script has no direct mutation.
+    let template_assigned = scan_fragment_assignments(&root.fragment);
+    let script = analyze_script(root.instance.as_ref(), &template_assigned)?;
 
     // Collect top-level non-ws nodes.
     let nodes: Vec<&FragmentChild> = root
@@ -92,21 +95,24 @@ pub fn try_typed_client_walker_with(
         root_holder = var;
     }
 
+    // Track event types that need module-level `\$.delegate([...])`.
+    let mut delegated_events: HashSet<String> = HashSet::new();
+
     let last_idx = classified.len() - 1;
     for (i, kind) in classified.iter().enumerate() {
         match kind {
             NodeKind::StaticElement(el) => {
                 serialize_element(el, &mut html, /*body*/ true, /*reactive*/ false)?;
-                // First-nav only needed in multi-root; single-root already has root_holder.
                 if is_multi_root {
                     let var = unique_var(&el.name, &mut var_counts);
                     emit_nav(&mut body_stmts, &var, prev_var.as_deref());
                     prev_var = Some(var);
                 }
             }
-            NodeKind::InterpElement(el, content) => {
+            NodeKind::InterpElement(el, content, dirs) => {
+                let include_body = matches!(content, ElementContent::StaticOnly);
                 let needs_reactive_body = matches!(content, ElementContent::Reactive(_));
-                serialize_element(el, &mut html, /*body*/ false, needs_reactive_body)?;
+                serialize_element(el, &mut html, include_body, needs_reactive_body)?;
                 let var = if is_multi_root {
                     let v = unique_var(&el.name, &mut var_counts);
                     emit_nav(&mut body_stmts, &v, prev_var.as_deref());
@@ -115,6 +121,14 @@ pub fn try_typed_client_walker_with(
                 } else {
                     prev_var.clone().expect("single-root nav established")
                 };
+                // For `<input>` with any directive — emit
+                // `\$.remove_input_defaults(var);` immediately after nav.
+                if el.name == "input" && (dirs.bind_value.is_some() || !dirs.events.is_empty()) {
+                    body_stmts.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "remove_input_defaults"),
+                        vec![t::id(&var)],
+                    )));
+                }
                 emit_element_content(
                     content,
                     &var,
@@ -122,6 +136,7 @@ pub fn try_typed_client_walker_with(
                     &mut effects,
                     &script.state_bindings,
                 );
+                emit_directives(dirs, &var, &mut effects, &script.state_bindings, &mut delegated_events);
             }
             NodeKind::Component(c) => {
                 html.push_str("<!>");
@@ -166,7 +181,7 @@ pub fn try_typed_client_walker_with(
         body_stmts,
     );
 
-    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
+    let mut prog: Vec<Statement> = Vec::with_capacity(6 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
@@ -175,7 +190,105 @@ pub fn try_typed_client_walker_with(
     prog.extend(script.imports.clone());
     prog.push(root_decl);
     prog.push(export);
+    // Module-level `\$.delegate(["click", ...])` if any delegated events.
+    if !delegated_events.is_empty() {
+        let mut names: Vec<String> = delegated_events.into_iter().collect();
+        names.sort();
+        let arr = Expression::Array(Box::new(ArrayExpression {
+            elements: names
+                .into_iter()
+                .map(|n| {
+                    ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
+                        StringLiteral {
+                            value: n,
+                            raw: None,
+                            span: Span::ZERO,
+                        },
+                    ))))
+                })
+                .collect(),
+            span: Span::ZERO,
+        }));
+        prog.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "delegate"),
+            vec![arr],
+        )));
+    }
     Some(t::program(prog))
+}
+
+fn emit_directives(
+    dirs: &Directives,
+    var: &str,
+    effects: &mut Vec<Statement>,
+    state_bindings: &HashSet<String>,
+    delegated_events: &mut HashSet<String>,
+) {
+    // bind:value first (matches upstream ordering — bind_value before events).
+    if let Some(target) = dirs.bind_value {
+        // `\$.bind_value(var, () => \$.get(target), (\$\$value) => \$.set(target, \$\$value))`
+        let target_name = match target {
+            Expression::Identifier(i) => i.name.clone(),
+            _ => return,
+        };
+        let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression({
+                if state_bindings.contains(&target_name) {
+                    t::call(
+                        t::member_id(t::id("$"), "get"),
+                        vec![t::id(&target_name)],
+                    )
+                } else {
+                    t::id(&target_name)
+                }
+            }),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let setter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$value")],
+            body: ArrowBody::Expression({
+                if state_bindings.contains(&target_name) {
+                    t::call(
+                        t::member_id(t::id("$"), "set"),
+                        vec![t::id(&target_name), t::id("$$value")],
+                    )
+                } else {
+                    Expression::Assignment(Box::new(AssignmentExpression {
+                        left: AssignmentTarget::Expression(t::id(&target_name)),
+                        operator: AssignmentOperator::Assign,
+                        right: t::id("$$value"),
+                        span: Span::ZERO,
+                    }))
+                }
+            }),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        effects.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "bind_value"),
+            vec![t::id(var), getter, setter],
+        )));
+    }
+    // Event handlers: `\$.delegated("click", var, handler)`.
+    for (event, handler) in &dirs.events {
+        delegated_events.insert(event.clone());
+        let mut handler_expr = (*handler).clone();
+        rewrite_expr_for_state(&mut handler_expr, state_bindings);
+        effects.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "delegated"),
+            vec![
+                Expression::Literal(Box::new(Literal::String(StringLiteral {
+                    value: event.clone(),
+                    raw: None,
+                    span: Span::ZERO,
+                }))),
+                t::id(var),
+                handler_expr,
+            ],
+        )));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,7 +507,10 @@ struct ScriptInfo {
     state_bindings: HashSet<String>,
 }
 
-fn analyze_script(instance: opt_ref::Ref<svelte_ast::root::Script>) -> Option<ScriptInfo> {
+fn analyze_script(
+    instance: opt_ref::Ref<svelte_ast::root::Script>,
+    template_assigned: &HashSet<String>,
+) -> Option<ScriptInfo> {
     let Some(script) = instance else {
         return Some(ScriptInfo {
             imports: Vec::new(),
@@ -405,7 +521,8 @@ fn analyze_script(instance: opt_ref::Ref<svelte_ast::root::Script>) -> Option<Sc
     };
 
     let body = &script.content.body;
-    let assigned: HashSet<String> = collect_assigned_targets(body);
+    let mut assigned: HashSet<String> = collect_assigned_targets(body);
+    assigned.extend(template_assigned.iter().cloned());
 
     // First pass: discover which $state bindings need lowering to $.state.
     let mut state_bindings: HashSet<String> = HashSet::new();
@@ -594,10 +711,16 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
         }
         E::Assignment(a) => {
             // Try to detect `X = ...` or `X OP= ...` where X is a state binding.
-            if let AssignmentTarget::Expression(target) = &a.left {
-                if let E::Identifier(id) = target {
-                    if state.contains(&id.name) {
-                        let name = id.name.clone();
+            // The LHS may be either Expression(Identifier) or Pattern(Identifier)
+            // depending on the parser path.
+            let lhs_name: Option<String> = match &a.left {
+                AssignmentTarget::Expression(E::Identifier(id)) => Some(id.name.clone()),
+                AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(id.name.clone()),
+                _ => None,
+            };
+            if let Some(name) = lhs_name {
+                if state.contains(&name) {
+                    {
                         // Recurse into RHS first (its own reads become $.get).
                         rewrite_expr_for_state(&mut a.right, state);
                         let rhs = std::mem::replace(
@@ -940,6 +1063,106 @@ fn scan_stmt_for_assignments(s: &Statement, out: &mut HashSet<String>) {
     }
 }
 
+fn scan_fragment_assignments(f: &Fragment) -> HashSet<String> {
+    let mut out = HashSet::new();
+    scan_nodes_for_assignments(&f.nodes, &mut out);
+    out
+}
+
+fn scan_nodes_for_assignments(nodes: &[FragmentChild], out: &mut HashSet<String>) {
+    for n in nodes {
+        match n {
+            FragmentChild::ExpressionTag(t) => scan_expr_for_assignments(&t.expression, out),
+            FragmentChild::HtmlTag(t) => scan_expr_for_assignments(&t.expression, out),
+            FragmentChild::RegularElement(el) => {
+                for attr in &el.attributes {
+                    match attr {
+                        ElementAttribute::Attribute(a) => match &a.value {
+                            AttributeValue::Single(tag) => {
+                                scan_expr_for_assignments(&tag.expression, out)
+                            }
+                            AttributeValue::Many(parts) => {
+                                for p in parts {
+                                    if let AttributeValuePart::ExpressionTag(t) = p {
+                                        scan_expr_for_assignments(&t.expression, out);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        ElementAttribute::SpreadAttribute(s) => {
+                            scan_expr_for_assignments(&s.expression, out)
+                        }
+                        ElementAttribute::BindDirective(b) => {
+                            scan_expr_for_assignments(&b.expression, out)
+                        }
+                        _ => {}
+                    }
+                }
+                scan_nodes_for_assignments(&el.fragment.nodes, out);
+            }
+            FragmentChild::Component(c) => {
+                for attr in &c.attributes {
+                    match attr {
+                        ElementAttribute::Attribute(a) => match &a.value {
+                            AttributeValue::Single(tag) => {
+                                scan_expr_for_assignments(&tag.expression, out)
+                            }
+                            AttributeValue::Many(parts) => {
+                                for p in parts {
+                                    if let AttributeValuePart::ExpressionTag(t) = p {
+                                        scan_expr_for_assignments(&t.expression, out);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        ElementAttribute::SpreadAttribute(s) => {
+                            scan_expr_for_assignments(&s.expression, out)
+                        }
+                        ElementAttribute::BindDirective(b) => {
+                            scan_expr_for_assignments(&b.expression, out)
+                        }
+                        _ => {}
+                    }
+                }
+                scan_nodes_for_assignments(&c.fragment.nodes, out);
+            }
+            FragmentChild::IfBlock(ib) => {
+                scan_expr_for_assignments(&ib.test, out);
+                scan_nodes_for_assignments(&ib.consequent.nodes, out);
+                if let Some(a) = &ib.alternate {
+                    scan_nodes_for_assignments(&a.nodes, out);
+                }
+            }
+            FragmentChild::EachBlock(eb) => {
+                scan_expr_for_assignments(&eb.expression, out);
+                scan_nodes_for_assignments(&eb.body.nodes, out);
+                if let Some(f) = &eb.fallback {
+                    scan_nodes_for_assignments(&f.nodes, out);
+                }
+            }
+            FragmentChild::AwaitBlock(ab) => {
+                scan_expr_for_assignments(&ab.expression, out);
+                if let Some(p) = &ab.pending {
+                    scan_nodes_for_assignments(&p.nodes, out);
+                }
+                if let Some(t) = &ab.then {
+                    scan_nodes_for_assignments(&t.nodes, out);
+                }
+                if let Some(c) = &ab.catch_ {
+                    scan_nodes_for_assignments(&c.nodes, out);
+                }
+            }
+            FragmentChild::KeyBlock(kb) => {
+                scan_expr_for_assignments(&kb.expression, out);
+                scan_nodes_for_assignments(&kb.fragment.nodes, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn scan_expr_for_assignments(e: &Expression, out: &mut HashSet<String>) {
     use Expression as E;
     match e {
@@ -1076,13 +1299,34 @@ fn collect_pattern_idents(p: &Pattern, out: &mut HashSet<String>) {
 
 #[derive(Debug)]
 enum NodeKind<'a> {
+    /// Element with no expression children, only static attributes, no
+    /// directives — serializes wholly into the template literal.
     StaticElement(&'a RegularElement),
-    InterpElement(&'a RegularElement, ElementContent<'a>),
+    /// Element with at least one expression child OR an event handler /
+    /// bind directive. Static attrs serialize into HTML; everything else
+    /// is captured in `Directives` and emitted as body statements.
+    InterpElement(&'a RegularElement, ElementContent<'a>, Directives<'a>),
     Component(&'a Component),
+}
+
+#[derive(Debug, Default)]
+struct Directives<'a> {
+    /// `onclick={handler}` → `("click", handler)`. Lowered to
+    /// `\$.delegated("click", var, handler)`.
+    events: Vec<(String, &'a Expression)>,
+    /// `bind:value={target}` → target expression that becomes the
+    /// state-getter/setter wrap. Lowered to `\$.bind_value(...)`.
+    bind_value: Option<&'a Expression>,
 }
 
 #[derive(Debug)]
 enum ElementContent<'a> {
+    /// `<el></el>` with no child content — element exists only for its
+    /// directives (e.g. `<input bind:value={x}>`).
+    NoContent,
+    /// Element has children but they're all static text — serialize directly
+    /// into the template literal.
+    StaticOnly,
     /// `<el>{expr}</el>` — single expression child. Lowered to
     /// `el.textContent = EXPR` provided EXPR doesn't reference a state-tracked
     /// binding (we don't yet wrap such reads with `$.get`).
@@ -1101,7 +1345,7 @@ enum TextPart<'a> {
 fn single_root_var_name(kind: &NodeKind) -> String {
     match kind {
         NodeKind::StaticElement(el) => el.name.clone(),
-        NodeKind::InterpElement(el, _) => el.name.clone(),
+        NodeKind::InterpElement(el, _, _) => el.name.clone(),
         NodeKind::Component(_) => "fragment".to_string(),
     }
 }
@@ -1109,8 +1353,42 @@ fn single_root_var_name(kind: &NodeKind) -> String {
 fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
     match n {
         FragmentChild::RegularElement(el) => {
-            if !all_static_attrs(&el.attributes) {
-                return None;
+            // Sort attributes: static / event / bind:value / unsupported.
+            let mut directives = Directives::default();
+            let mut only_static_attrs = true;
+            for attr in &el.attributes {
+                match attr {
+                    ElementAttribute::Attribute(a) => {
+                        if is_event_name(&a.name) {
+                            // `onclick={handler}` → delegated event.
+                            if let AttributeValue::Single(tag) = &a.value {
+                                let event = a.name[2..].to_string();
+                                directives.events.push((event, &tag.expression));
+                                only_static_attrs = false;
+                                continue;
+                            }
+                            return None;
+                        }
+                        // Static-text-value attributes only.
+                        match &a.value {
+                            AttributeValue::Empty => {}
+                            AttributeValue::Many(parts) => {
+                                if !parts
+                                    .iter()
+                                    .all(|p| matches!(p, AttributeValuePart::Text(_)))
+                                {
+                                    return None;
+                                }
+                            }
+                            AttributeValue::Single(_) => return None,
+                        }
+                    }
+                    ElementAttribute::BindDirective(b) if b.name == "value" => {
+                        directives.bind_value = Some(&b.expression);
+                        only_static_attrs = false;
+                    }
+                    _ => return None,
+                }
             }
             // Walk children: collect text + expression fragments.
             let mut parts: Vec<TextPart> = Vec::new();
@@ -1154,45 +1432,67 @@ fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
                 parts.pop();
             }
 
-            // No content → static element.
+            // No content + no directives → static element.
             if parts.is_empty() {
-                return Some(NodeKind::StaticElement(el));
+                if only_static_attrs {
+                    return Some(NodeKind::StaticElement(el));
+                }
+                // Element with directives but no text content — use a
+                // synthetic "no content" interp marker.
+                return Some(NodeKind::InterpElement(
+                    el,
+                    ElementContent::NoContent,
+                    directives,
+                ));
             }
 
-            // Only static text → static element.
+            // Only static text → static body. If no directives → fully static
+            // element. Otherwise InterpElement with StaticOnly content.
             if parts.iter().all(|p| matches!(p, TextPart::Static(_))) {
-                return Some(NodeKind::StaticElement(el));
+                if only_static_attrs {
+                    return Some(NodeKind::StaticElement(el));
+                }
+                return Some(NodeKind::InterpElement(
+                    el,
+                    ElementContent::StaticOnly,
+                    directives,
+                ));
             }
 
             // Single expression, no static parts → direct textContent.
             if parts.len() == 1 {
                 if let TextPart::Expr(e) = &parts[0] {
                     if expr_is_safe_for_textcontent(e) {
-                        return Some(NodeKind::InterpElement(el, ElementContent::DirectText(*e)));
+                        return Some(NodeKind::InterpElement(
+                            el,
+                            ElementContent::DirectText(*e),
+                            directives,
+                        ));
                     }
                     // Fall through to reactive path.
                 }
             }
 
             // Reactive: one+ expressions, possibly with text.
-            Some(NodeKind::InterpElement(el, ElementContent::Reactive(parts)))
+            Some(NodeKind::InterpElement(
+                el,
+                ElementContent::Reactive(parts),
+                directives,
+            ))
         }
         FragmentChild::Component(c) => Some(NodeKind::Component(c)),
         _ => None,
     }
 }
 
-fn all_static_attrs(attrs: &[ElementAttribute]) -> bool {
-    attrs.iter().all(|a| match a {
-        ElementAttribute::Attribute(a) => match &a.value {
-            AttributeValue::Empty => true,
-            AttributeValue::Many(parts) => parts
-                .iter()
-                .all(|p| matches!(p, AttributeValuePart::Text(_))),
-            AttributeValue::Single(_) => false,
-        },
-        _ => false,
-    })
+fn is_event_name(name: &str) -> bool {
+    name.starts_with("on")
+        && name.len() > 2
+        && name
+            .as_bytes()
+            .get(2)
+            .map(|b| b.is_ascii_lowercase())
+            .unwrap_or(false)
 }
 
 fn write_static_attr(a: &Attribute, out: &mut String) -> Option<()> {
@@ -1279,10 +1579,17 @@ fn serialize_element(
     out.push('<');
     out.push_str(&el.name);
     for attr in &el.attributes {
-        if let ElementAttribute::Attribute(a) = attr {
-            write_static_attr(a, out)?;
-        } else {
-            return None;
+        match attr {
+            ElementAttribute::Attribute(a) => {
+                if is_event_name(&a.name) {
+                    // Event handlers are emitted as runtime calls — not in HTML.
+                    continue;
+                }
+                write_static_attr(a, out)?;
+            }
+            // bind:* and on:* directives are handled in the body, not the HTML.
+            ElementAttribute::BindDirective(_) | ElementAttribute::OnDirective(_) => continue,
+            _ => return None,
         }
     }
     if is_void(&el.name) {
@@ -1365,6 +1672,7 @@ fn emit_element_content(
     state_bindings: &HashSet<String>,
 ) {
     match content {
+        ElementContent::NoContent | ElementContent::StaticOnly => {}
         ElementContent::DirectText(expr) => {
             let target = Expression::Member(Box::new(MemberExpression {
                 object: t::id(parent_var),
