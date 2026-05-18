@@ -911,61 +911,7 @@ fn lower_if_block_server(
     ib: &svelte_ast::blocks::IfBlock,
 ) -> Option<Vec<Statement>> {
     let test_is_async = expr_has_await_top(&ib.test);
-    let consequent_has_const_await = fragment_has_const_with_await(&ib.consequent);
-    let use_async_marker = test_is_async || consequent_has_const_await;
-
-    let mut consequent_body: Vec<Statement> = Vec::new();
-    consequent_body.push(if use_async_marker {
-        push_string("<!--[0-->")
-    } else {
-        push_template("<!--[0-->")
-    });
-    if test_is_async {
-        consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
-    } else if consequent_has_const_await {
-        // Non-async test but body has `{@const X = await ...}` — promote to
-        // nested-run pattern with a local `promises` var.
-        consequent_body.extend(lower_fragment_with_const_await(&ib.consequent)?);
-    } else {
-        consequent_body.extend(lower_fragment_with_marker(
-            &ib.consequent,
-            body_needs_marker(&ib.consequent),
-        )?);
-    }
-
-    let mut alternate_body: Vec<Statement> = Vec::new();
-    alternate_body.push(if use_async_marker {
-        push_string("<!--[-1-->")
-    } else {
-        push_template("<!--[-1-->")
-    });
-    if let Some(alt) = &ib.alternate {
-        if test_is_async {
-            alternate_body.extend(lower_fragment_for_async_block(alt)?);
-        } else {
-            alternate_body.extend(lower_fragment_with_marker(alt, body_needs_marker(alt))?);
-        }
-    }
-
-    let test = if test_is_async {
-        wrap_async_test(&ib.test)
-    } else {
-        ib.test.clone()
-    };
-
-    let if_stmt = Statement::If(Box::new(IfStatement {
-        test,
-        consequent: Statement::Block(Box::new(BlockStatement {
-            body: consequent_body,
-            span: Span::ZERO,
-        })),
-        alternate: Some(Statement::Block(Box::new(BlockStatement {
-            body: alternate_body,
-            span: Span::ZERO,
-        }))),
-        span: Span::ZERO,
-    }));
-
+    let if_stmt = build_if_chain_server(ib, 0, test_is_async)?;
     if test_is_async {
         // Wrap in `$$renderer.child_block(async ($$renderer) => { if(...) {...} else {...} })`
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -984,6 +930,112 @@ fn lower_if_block_server(
     } else {
         Some(vec![if_stmt])
     }
+}
+
+/// Recursively build an if/else-if chain. `branch_idx` is the current
+/// branch number, used in the `<!--[N-->` marker; final else uses `-1`.
+fn build_if_chain_server(
+    ib: &svelte_ast::blocks::IfBlock,
+    branch_idx: i32,
+    use_async_marker: bool,
+) -> Option<Statement> {
+    let test_is_async = expr_has_await_top(&ib.test);
+    let consequent_has_const_await = fragment_has_const_with_await(&ib.consequent);
+    let use_async_marker = use_async_marker || consequent_has_const_await;
+
+    let consequent_marker = format!("<!--[{branch_idx}-->");
+    let mut consequent_body: Vec<Statement> = Vec::new();
+    consequent_body.push(if use_async_marker {
+        push_string(&consequent_marker)
+    } else {
+        push_template(&consequent_marker)
+    });
+    if test_is_async {
+        consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
+    } else if consequent_has_const_await {
+        consequent_body.extend(lower_fragment_with_const_await(&ib.consequent)?);
+    } else {
+        consequent_body.extend(lower_fragment_with_marker(
+            &ib.consequent,
+            body_needs_marker(&ib.consequent),
+        )?);
+    }
+
+    // Determine alternate: if alternate fragment is exactly `[IfBlock with
+    // elseif=true]`, recurse to build `else if (...)` chain directly.
+    let alternate_stmt: Option<Statement> = if let Some(alt) = &ib.alternate {
+        let non_ws: Vec<&FragmentChild> = alt
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                _ => true,
+            })
+            .collect();
+        let chain = if non_ws.len() == 1 {
+            if let FragmentChild::IfBlock(inner) = non_ws[0] {
+                if inner.elseif {
+                    Some(build_if_chain_server(inner, branch_idx + 1, use_async_marker)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(chain) = chain {
+            Some(chain)
+        } else {
+            // Final `else` branch.
+            let final_marker = "<!--[-1-->";
+            let mut alternate_body: Vec<Statement> = Vec::new();
+            alternate_body.push(if use_async_marker {
+                push_string(final_marker)
+            } else {
+                push_template(final_marker)
+            });
+            if test_is_async {
+                alternate_body.extend(lower_fragment_for_async_block(alt)?);
+            } else {
+                alternate_body.extend(lower_fragment_with_marker(alt, body_needs_marker(alt))?);
+            }
+            Some(Statement::Block(Box::new(BlockStatement {
+                body: alternate_body,
+                span: Span::ZERO,
+            })))
+        }
+    } else {
+        // No alternate at all. Still emit the final-else block with just the
+        // `<!--[-1-->` marker so the close marker has a partner.
+        let final_marker = "<!--[-1-->";
+        let alternate_body = vec![if use_async_marker {
+            push_string(final_marker)
+        } else {
+            push_template(final_marker)
+        }];
+        Some(Statement::Block(Box::new(BlockStatement {
+            body: alternate_body,
+            span: Span::ZERO,
+        })))
+    };
+
+    let test = if test_is_async {
+        wrap_async_test(&ib.test)
+    } else {
+        ib.test.clone()
+    };
+
+    Some(Statement::If(Box::new(IfStatement {
+        test,
+        consequent: Statement::Block(Box::new(BlockStatement {
+            body: consequent_body,
+            span: Span::ZERO,
+        })),
+        alternate: alternate_stmt,
+        span: Span::ZERO,
+    })))
 }
 
 /// `EXPR` → `(await $.save(EXPR))()`. Used when an async block's test
