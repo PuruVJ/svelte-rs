@@ -31,6 +31,270 @@ pub struct RewriteInfo {
     pub has_class_with_runes: bool,
 }
 
+/// Result of `transform_async_script_server` — non-None when the script
+/// contains top-level `await`. Carries the rewritten statements (hoisted
+/// `var` decls + `var $$promises = $$renderer.run([...])`) plus a set of
+/// bindings whose template references should be wrapped with
+/// `$$renderer.async([$$promises[idx]], ...)`.
+pub struct AsyncInfo {
+    pub setup_stmts: Vec<Statement>,
+    pub async_bindings: HashSet<String>,
+    pub last_group_idx: usize,
+}
+
+/// Returns true if the program contains top-level `await` (an Await
+/// expression not inside an async function / async arrow).
+pub fn has_top_level_await(p: &Program) -> bool {
+    p.body.iter().any(stmt_has_top_level_await)
+}
+
+fn stmt_has_top_level_await(s: &Statement) -> bool {
+    match s {
+        Statement::Variable(v) => v
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, expr_has_top_level_await)),
+        Statement::Expression(e) => expr_has_top_level_await(&e.expression),
+        _ => false,
+    }
+}
+
+fn expr_has_top_level_await(e: &Expression) -> bool {
+    match e {
+        Expression::Await(_) => true,
+        // Async function/arrow boundaries stop the search.
+        Expression::Function(f) if f.r#async => false,
+        Expression::Arrow(a) if a.r#async => false,
+        Expression::Call(c) => {
+            expr_has_top_level_await(&c.callee)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_has_top_level_await(e),
+                    Argument::Spread(s) => expr_has_top_level_await(&s.argument),
+                })
+        }
+        Expression::Binary(b) => {
+            expr_has_top_level_await(&b.left) || expr_has_top_level_await(&b.right)
+        }
+        Expression::Logical(l) => {
+            expr_has_top_level_await(&l.left) || expr_has_top_level_await(&l.right)
+        }
+        Expression::Unary(u) => expr_has_top_level_await(&u.argument),
+        Expression::Member(m) => expr_has_top_level_await(&m.object),
+        Expression::Conditional(c) => {
+            expr_has_top_level_await(&c.test)
+                || expr_has_top_level_await(&c.consequent)
+                || expr_has_top_level_await(&c.alternate)
+        }
+        Expression::Paren(p) => expr_has_top_level_await(&p.expression),
+        Expression::Sequence(s) => s.expressions.iter().any(expr_has_top_level_await),
+        Expression::Spread(s) => expr_has_top_level_await(&s.argument),
+        _ => false,
+    }
+}
+
+/// Transform a server-side script with top-level await into:
+/// 1. Hoisted `var X, Y, Z;` declaration of every top-level `let`/`const`.
+/// 2. `var $$promises = $$renderer.run([async () => ..., () => { ... }]);`
+///    where each await statement starts a new async arrow, and contiguous
+///    runs of sync statements collapse into a single sync arrow.
+///
+/// Returns None if no top-level await is present.
+pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
+    let p = Program {
+        source_type: SourceType::Module,
+        body: body.to_vec(),
+        span: Span::ZERO,
+    };
+    if !has_top_level_await(&p) {
+        return None;
+    }
+
+    // Gather all let/const bindings to hoist + classify each statement.
+    let mut hoisted_names: Vec<String> = Vec::new();
+    enum Lowered {
+        AsyncSet { name: String, init: Expression },
+        Sync(Statement),
+    }
+    let mut lowered: Vec<Lowered> = Vec::new();
+
+    for s in body {
+        match s {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        hoisted_names.push(id.name.clone());
+                        let init = d.init.clone().unwrap_or_else(undefined_expr);
+                        if expr_has_top_level_await(&init) {
+                            lowered.push(Lowered::AsyncSet {
+                                name: id.name.clone(),
+                                init,
+                            });
+                        } else {
+                            lowered.push(Lowered::Sync(assignment_stmt(&id.name, init)));
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+            }
+            Statement::Expression(e) => {
+                // Erase server-side $inspect/$inspect.trace calls.
+                if let Expression::Call(c) = &e.expression {
+                    if let Some(kp) = global_keypath(&c.callee) {
+                        if matches!(kp.as_str(), "$inspect" | "$inspect.trace") {
+                            lowered.push(Lowered::Sync(t::stmt(void_zero())));
+                            continue;
+                        }
+                    }
+                }
+                // Plain `undefined` identifier statement (post-rune-erasure
+                // form of `$inspect(...)` etc.) → emit as `void 0`.
+                if let Expression::Identifier(id) = &e.expression {
+                    if id.name == "undefined" {
+                        lowered.push(Lowered::Sync(t::stmt(void_zero())));
+                        continue;
+                    }
+                }
+                lowered.push(Lowered::Sync(s.clone()));
+            }
+            _ => return None,
+        }
+    }
+
+    // Build arrow groups: async statements get their own async arrow; sync
+    // statements collapse into the immediately-following sync arrow.
+    let mut groups: Vec<Expression> = Vec::new();
+    let mut current_sync: Vec<Statement> = Vec::new();
+    let mut last_was_async = false;
+
+    let flush_sync = |groups: &mut Vec<Expression>, current_sync: &mut Vec<Statement>| {
+        if current_sync.len() == 1 {
+            // Single-statement sync arrow: emit `() => EXPR` if the stmt is
+            // a single expression. Otherwise block.
+            let s = current_sync.remove(0);
+            if let Statement::Expression(es) = s {
+                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(es.expression),
+                    r#async: false,
+                    span: Span::ZERO,
+                })));
+                return;
+            }
+            current_sync.push(s);
+        }
+        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: std::mem::take(current_sync),
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        })));
+    };
+
+    for l in lowered {
+        match l {
+            Lowered::AsyncSet { name, init } => {
+                // Flush any pending sync into its own group.
+                if !current_sync.is_empty() {
+                    flush_sync(&mut groups, &mut current_sync);
+                }
+                // `async () => X = INIT`
+                let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                    left: AssignmentTarget::Expression(t::id(&name)),
+                    operator: AssignmentOperator::Assign,
+                    right: init,
+                    span: Span::ZERO,
+                }));
+                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(assign),
+                    r#async: true,
+                    span: Span::ZERO,
+                })));
+                last_was_async = true;
+            }
+            Lowered::Sync(stmt) => {
+                current_sync.push(stmt);
+                last_was_async = false;
+            }
+        }
+    }
+    // Ensure there's a trailing sync group so $$promises[1] etc. has a slot.
+    if !current_sync.is_empty() || last_was_async {
+        if current_sync.is_empty() {
+            current_sync.push(t::stmt(void_zero()));
+        }
+        flush_sync(&mut groups, &mut current_sync);
+    }
+
+    let last_group_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
+
+    // var X, Y, Z;
+    let mut setup_stmts: Vec<Statement> = Vec::new();
+    if !hoisted_names.is_empty() {
+        let decls: Vec<VariableDeclarator> = hoisted_names
+            .iter()
+            .map(|n| VariableDeclarator {
+                id: t::pat_id(n),
+                init: None,
+                span: Span::ZERO,
+            })
+            .collect();
+        setup_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Var,
+            declarations: decls,
+            span: Span::ZERO,
+        })));
+    }
+    // var $$promises = $$renderer.run([...groups...]);
+    setup_stmts.push(t::var(
+        "$$promises",
+        t::call(
+            t::member_id(t::id("$$renderer"), "run"),
+            vec![Expression::Array(Box::new(ArrayExpression {
+                elements: groups.into_iter().map(ArrayElement::Expression).collect(),
+                span: Span::ZERO,
+            }))],
+        ),
+    ));
+
+    let async_bindings: HashSet<String> = hoisted_names.into_iter().collect();
+    Some(AsyncInfo {
+        setup_stmts,
+        async_bindings,
+        last_group_idx,
+    })
+}
+
+/// `void 0` — a UnaryExpression that evaluates to `undefined` and is the
+/// idiomatic JS-output form for "no value".
+fn void_zero() -> Expression {
+    Expression::Unary(Box::new(UnaryExpression {
+        operator: UnaryOperator::Void,
+        argument: Expression::Literal(Box::new(Literal::Number(NumberLiteral {
+            value: 0.0,
+            raw: Some("0".to_string()),
+            span: Span::ZERO,
+        }))),
+        prefix: true,
+        span: Span::ZERO,
+    }))
+}
+
+fn assignment_stmt(name: &str, value: Expression) -> Statement {
+    t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(t::id(name)),
+        operator: AssignmentOperator::Assign,
+        right: value,
+        span: Span::ZERO,
+    })))
+}
+
+use svelte_transform_shared::builders_typed as t;
+
 impl RewriteInfo {
     pub fn needs_component_wrap(&self) -> bool {
         self.single_id_props.is_some() || self.has_class_with_runes

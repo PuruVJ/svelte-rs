@@ -44,8 +44,13 @@ fn server_compile_matches_all_fixtures() {
         }
         let source = fs::read_to_string(&svelte).unwrap_or_default();
         let expected = fs::read_to_string(&expected_path).unwrap_or_default();
+        let config_path = entry.path().join("_config.js");
+        let cfg = fs::read_to_string(&config_path).unwrap_or_default();
         let mut opts = CompileOptions::default();
         opts.module.generate = Some(Generate::Server);
+        if cfg.contains("async: true") {
+            opts.module.experimental.async_ = true;
+        }
         let result = compile(&source, &snake_to_pascal(&name), opts);
         match result {
             Ok(r) if r.js.trim() == expected.trim() => {

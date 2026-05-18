@@ -42,6 +42,7 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
         std::collections::HashMap::new();
     let mut derived_bindings: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut async_info: Option<script::AsyncInfo> = None;
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
@@ -54,11 +55,19 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
         consts = script::collect_script_constants(&content, &info.rune_bindings);
         let (imports, rest) = partition_imports(&content.body)?;
         script_imports = imports;
-        script_rest = rest;
+        if let Some(ai) = script::transform_async_script_server(&rest) {
+            async_info = Some(ai);
+        } else {
+            script_rest = rest;
+        }
     }
 
     // Build the function body: rune-rewritten script statements first, then template.
-    let mut func_body: Vec<Statement> = script_rest;
+    let mut func_body: Vec<Statement> = if let Some(ai) = &async_info {
+        ai.setup_stmts.clone()
+    } else {
+        script_rest
+    };
     // Apply template-only transforms: substitute script constants AND
     // call-wrap every Identifier that refers to a $derived binding.
     let mut fragment = root.fragment.clone();
@@ -69,7 +78,11 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     if !derived.is_empty() {
         call_derived_in_fragment(&mut fragment, derived);
     }
-    let template_body = lower_fragment_server(&fragment)?;
+    let template_body = if let Some(ai) = &async_info {
+        lower_fragment_server_async(&fragment, &ai.async_bindings, ai.last_group_idx)?
+    } else {
+        lower_fragment_server(&fragment)?
+    };
     func_body.extend(template_body);
 
     // When script triggers component-context: wrap the whole body in
@@ -98,11 +111,173 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
         params.push(t::pat_id("$$props"));
     }
 
-    let mut top: Vec<Statement> = Vec::with_capacity(2 + script_imports.len());
+    let mut top: Vec<Statement> = Vec::with_capacity(3 + script_imports.len());
+    if async_info.is_some() {
+        top.push(t::import_side_effect("svelte/internal/flags/async"));
+    }
     top.push(t::import_namespace("$", "svelte/internal/server"));
     top.extend(script_imports);
     top.push(t::export_default_function(component_name, params, func_body));
     Some(t::program(top))
+}
+
+/// Lower a fragment under top-level-await semantics. Expressions that
+/// reference any binding in `async_bindings` get wrapped with
+/// `$$renderer.async([$$promises[idx]], ($$renderer) => $$renderer.push(
+/// () => $.escape(EXPR)));`. Surrounding text/static-elements split into
+/// their own push statements.
+fn lower_fragment_server_async(
+    f: &svelte_ast::fragment::Fragment,
+    async_bindings: &std::collections::HashSet<String>,
+    last_group_idx: usize,
+) -> Option<Vec<Statement>> {
+    let mut out: Vec<Statement> = Vec::new();
+    let mut buf = TemplateBuf::new();
+    let nodes = trim_boundary_whitespace(&f.nodes);
+    let nodes = trim_boundary_text(nodes);
+
+    // If the first non-whitespace top-level node is an async-tainted
+    // ExpressionTag, prepend `<!---->` marker.
+    let needs_anchor = matches!(
+        nodes.first(),
+        Some(FragmentChild::ExpressionTag(t)) if expr_refs_any(&t.expression, async_bindings)
+    );
+    if needs_anchor {
+        buf.push_str("<!---->");
+    }
+
+    for n in nodes.iter() {
+        match n {
+            FragmentChild::RegularElement(el) => {
+                // Detect: element whose only non-ws child is an
+                // async-tainted ExpressionTag.
+                let body_non_ws: Vec<&FragmentChild> = el
+                    .fragment
+                    .nodes
+                    .iter()
+                    .filter(|c| match c {
+                        FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                        _ => true,
+                    })
+                    .collect();
+                let split_async = body_non_ws.len() == 1
+                    && matches!(
+                        body_non_ws[0],
+                        FragmentChild::ExpressionTag(t) if expr_refs_any(&t.expression, async_bindings)
+                    );
+                if split_async {
+                    // Open tag → buf
+                    buf.push_str("<");
+                    buf.push_str(&el.name);
+                    for attr in &el.attributes {
+                        append_element_attribute_server(attr, &mut buf)?;
+                    }
+                    buf.push_str(">");
+                    if let Some(stmt) = buf.flush() {
+                        out.push(stmt);
+                    }
+                    // Async-wrap the expression
+                    let et = match body_non_ws[0] {
+                        FragmentChild::ExpressionTag(t) => t,
+                        _ => unreachable!(),
+                    };
+                    out.push(emit_async_wrap(&et.expression, last_group_idx));
+                    // Close tag → buf
+                    buf.push_str("</");
+                    buf.push_str(&el.name);
+                    buf.push_str(">");
+                    continue;
+                }
+                // Fallback: treat as a static-only element.
+                if append_node_to_template(n, &mut buf).is_none() {
+                    return None;
+                }
+            }
+            FragmentChild::ExpressionTag(t) => {
+                if expr_refs_any(&t.expression, async_bindings) {
+                    // Flush any pending buffer, then emit async wrap.
+                    if let Some(stmt) = buf.flush() {
+                        out.push(stmt);
+                    }
+                    out.push(emit_async_wrap(&t.expression, last_group_idx));
+                } else if append_node_to_template(n, &mut buf).is_none() {
+                    return None;
+                }
+            }
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {
+                if append_node_to_template(n, &mut buf).is_none() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if let Some(stmt) = buf.flush() {
+        out.push(stmt);
+    }
+    Some(out)
+}
+
+fn expr_refs_any(e: &Expression, names: &std::collections::HashSet<String>) -> bool {
+    match e {
+        Expression::Identifier(i) => names.contains(&i.name),
+        Expression::Member(m) => expr_refs_any(&m.object, names),
+        Expression::Call(c) => {
+            expr_refs_any(&c.callee, names)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_refs_any(e, names),
+                    Argument::Spread(s) => expr_refs_any(&s.argument, names),
+                })
+        }
+        Expression::Binary(b) => expr_refs_any(&b.left, names) || expr_refs_any(&b.right, names),
+        Expression::Logical(l) => expr_refs_any(&l.left, names) || expr_refs_any(&l.right, names),
+        Expression::Unary(u) => expr_refs_any(&u.argument, names),
+        Expression::Conditional(c) => {
+            expr_refs_any(&c.test, names)
+                || expr_refs_any(&c.consequent, names)
+                || expr_refs_any(&c.alternate, names)
+        }
+        Expression::Paren(p) => expr_refs_any(&p.expression, names),
+        Expression::Template(t) => t.expressions.iter().any(|e| expr_refs_any(e, names)),
+        _ => false,
+    }
+}
+
+/// `$$renderer.async([$$promises[idx]], ($$renderer) => $$renderer.push(
+/// () => $.escape(EXPR)));`
+fn emit_async_wrap(expr: &Expression, group_idx: usize) -> Statement {
+    let promises_slot = Expression::Member(Box::new(MemberExpression {
+        object: t::id("$$promises"),
+        property: MemberProperty::Expression(t::lit_number(group_idx as f64)),
+        computed: true,
+        optional: false,
+        span: Span::ZERO,
+    }));
+    let blockers = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(promises_slot)],
+        span: Span::ZERO,
+    }));
+    let escape_call = t::call(t::member_id(t::id("$"), "escape"), vec![expr.clone()]);
+    let push_thunk = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(escape_call),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let inner_push = t::call(
+        t::member_id(t::id("$$renderer"), "push"),
+        vec![push_thunk],
+    );
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Expression(inner_push),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "async"),
+        vec![blockers, arrow],
+    ))
 }
 
 /// Lower an entire root-level fragment to a sequence of server statements.
