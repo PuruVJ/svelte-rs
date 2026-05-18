@@ -143,6 +143,10 @@ pub fn try_typed_client_walker_with(
 
     // Track event types that need module-level `\$.delegate([...])`.
     let mut delegated_events: HashSet<String> = HashSet::new();
+    // Collect (text_var, template_expr) for combined template_effect when
+    // more than one element has reactive text content. For 0 or 1 entries
+    // we fall back to per-element single template_effect emission.
+    let mut text_effects: Vec<(String, Expression)> = Vec::new();
 
     let last_idx = classified.len() - 1;
     for (i, kind) in classified.iter().enumerate() {
@@ -194,11 +198,13 @@ pub fn try_typed_client_walker_with(
                         vec![t::id(&var)],
                     )));
                 }
-                emit_element_content(
+                emit_element_content_combined(
                     content_ref,
                     &var,
                     &mut body_stmts,
                     &mut effects,
+                    &mut text_effects,
+                    &mut var_counts,
                     &script.state_bindings,
                     script.async_info.as_ref(),
                 );
@@ -216,13 +222,146 @@ pub fn try_typed_client_walker_with(
                 };
                 body_stmts.push(component_call(c, &var)?);
             }
+            NodeKind::AwaitBlock(ab) => {
+                // `<!>` placeholder + `$.await(node, getter, pending, then)`.
+                html.push_str("<!>");
+                let var = if is_multi_root {
+                    let v = unique_var("node", &mut var_counts);
+                    emit_nav(&mut body_stmts, &v, prev_var.as_deref());
+                    prev_var = Some(v.clone());
+                    v
+                } else {
+                    prev_var.clone().expect("single-root nav established")
+                };
+                // Getter: `() => $.get(EXPR)` if EXPR is a derived/state ref,
+                // otherwise `() => EXPR`. We rewrite via rewrite_expr_for_state
+                // which handles state+derived in the merged set.
+                let mut getter_body = ab.expression.clone();
+                rewrite_expr_for_state(&mut getter_body, &script.state_bindings);
+                let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(getter_body),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                // Pending: `null` if no pending body. (Non-empty pending
+                // bodies aren't yet supported.)
+                let pending = Expression::Literal(Box::new(Literal::Null(Span::ZERO)));
+                let _ = &ab.pending;
+                // Then: `($$anchor, PAT) => { body }`.
+                let mut then_params = vec![t::pat_id("$$anchor")];
+                if let Some(pat) = &ab.value {
+                    then_params.push(pat.clone());
+                }
+                let then = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: then_params,
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: Vec::new(),
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                body_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "await"),
+                    vec![t::id(&var), getter, pending, then],
+                )));
+            }
+            NodeKind::TopLevelExpr(e) => {
+                // The preceding separator space serves as the text-node
+                // anchor; no extra HTML emitted here. Navigate via
+                // `$.sibling(prev)` (1 step, no second arg).
+                if is_multi_root {
+                    let v = unique_var("text", &mut var_counts);
+                    body_stmts.push(t::var(
+                        &v,
+                        t::call(
+                            t::member_id(t::id("$"), "sibling"),
+                            vec![t::id(
+                                prev_var.as_deref().expect("preceding node"),
+                            )],
+                        ),
+                    ));
+                    prev_var = Some(v.clone());
+                    // Collect the text-effect entry. We include a leading
+                    // space because the preceding separator's whitespace is
+                    // part of the trailing text content.
+                    let mut expr = (*e).clone();
+                    rewrite_expr_for_state(&mut expr, &script.state_bindings);
+                    let template = t::template_raw(
+                        vec![" ".to_string(), String::new()],
+                        vec![Expression::Logical(Box::new(LogicalExpression {
+                            left: expr,
+                            operator: LogicalOperator::Coalesce,
+                            right: Expression::Literal(Box::new(Literal::String(
+                                StringLiteral {
+                                    value: String::new(),
+                                    raw: None,
+                                    span: Span::ZERO,
+                                },
+                            ))),
+                            span: Span::ZERO,
+                        }))],
+                    );
+                    text_effects.push((v, template));
+                }
+            }
         }
         if is_multi_root && i < last_idx {
             html.push(' ');
         }
     }
+    // (The trailing space for a final TopLevelExpr is already covered by the
+    // preceding separator emitted in the loop.)
 
-    // Append effects (template_effect calls etc.) after all navigation.
+    // Emit the combined (or single) template_effect from collected
+    // text_effects entries.
+    match text_effects.len() {
+        0 => {}
+        1 => {
+            // Inline form: `() => $.set_text(text, TEMPLATE)`.
+            let (text_var, template_expr) = text_effects.pop().unwrap();
+            let set_call = t::call(
+                t::member_id(t::id("$"), "set_text"),
+                vec![t::id(&text_var), template_expr],
+            );
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(set_call),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            body_stmts.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "template_effect"),
+                vec![arrow],
+            )));
+        }
+        _ => {
+            // Combined form: `() => { $.set_text(t1, e1); $.set_text(t2, e2); ... }`.
+            let mut block_body: Vec<Statement> = Vec::new();
+            for (text_var, template_expr) in text_effects {
+                block_body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id(&text_var), template_expr],
+                )));
+            }
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: block_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            body_stmts.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "template_effect"),
+                vec![arrow],
+            )));
+        }
+    }
+    // Append other effects (delegated, bind_value etc.) after the
+    // template_effect.
     body_stmts.extend(effects);
 
     // Final append.
@@ -1920,6 +2059,13 @@ fn analyze_script(
         for s in &mut rest {
             rewrite_stmt_for_rest_props(s, &rest_props_bindings);
         }
+    }
+
+    // Merge derived bindings into state_bindings so reads get $.get wrapping
+    // (state_bindings is the read-rewrite set).
+    let mut state_bindings = state_bindings;
+    for n in &derived_bindings {
+        state_bindings.insert(n.clone());
     }
 
     // Top-level await detection + transform.
@@ -3735,6 +3881,12 @@ enum NodeKind<'a> {
     /// is captured in `Directives` and emitted as body statements.
     InterpElement(&'a RegularElement, ElementContent<'a>, Directives<'a>),
     Component(&'a Component),
+    /// `{#await EXPR [then PAT]}{:catch PAT}{/await}` — lowered to a `<!>`
+    /// placeholder + `$.await(node, getter, pending_arrow, then_arrow)`.
+    AwaitBlock(&'a svelte_ast::blocks::AwaitBlock),
+    /// Top-level `{expr}` — lowered to a space text-node anchor + a
+    /// `$.set_text(text_N, ...)` entry in the combined template_effect.
+    TopLevelExpr(&'a Expression),
 }
 
 #[derive(Debug, Default)]
@@ -3779,11 +3931,15 @@ fn single_root_var_name(kind: &NodeKind) -> String {
         NodeKind::StaticElement(el) => el.name.clone(),
         NodeKind::InterpElement(el, _, _) => el.name.clone(),
         NodeKind::Component(_) => "fragment".to_string(),
+        NodeKind::AwaitBlock(_) => "fragment".to_string(),
+        NodeKind::TopLevelExpr(_) => "fragment".to_string(),
     }
 }
 
 fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
     match n {
+        FragmentChild::AwaitBlock(ab) => Some(NodeKind::AwaitBlock(ab)),
+        FragmentChild::ExpressionTag(et) => Some(NodeKind::TopLevelExpr(&et.expression)),
         FragmentChild::RegularElement(el) => {
             // Sort attributes: static / event / bind:value / unsupported.
             let mut directives = Directives::default();
@@ -3862,6 +4018,14 @@ fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
                 .unwrap_or(false)
             {
                 parts.pop();
+            }
+            // Trim leading whitespace inside the FIRST Static part and
+            // trailing whitespace inside the LAST.
+            if let Some(TextPart::Static(s)) = parts.first_mut() {
+                *s = s.trim_start().to_string();
+            }
+            if let Some(TextPart::Static(s)) = parts.last_mut() {
+                *s = s.trim_end().to_string();
             }
 
             // No content + no directives → static element.
@@ -4117,6 +4281,85 @@ fn unique_var(base: &str, counts: &mut HashMap<String, usize>) -> String {
     };
     *n += 1;
     name
+}
+
+/// Variant of emit_element_content that pushes inline-form Reactive entries
+/// to `text_effects` (so they can be combined into one template_effect later)
+/// while falling back to the original `emit_element_content` for everything
+/// else.
+fn emit_element_content_combined(
+    content: &ElementContent,
+    parent_var: &str,
+    body_stmts: &mut Vec<Statement>,
+    effects: &mut Vec<Statement>,
+    text_effects: &mut Vec<(String, Expression)>,
+    var_counts: &mut HashMap<String, usize>,
+    state_bindings: &HashSet<String>,
+    async_info: Option<&AsyncInfo>,
+) {
+    if let ElementContent::Reactive(parts) = content {
+        // If async-tainted, fall through to the original handler (4-arg
+        // template_effect form).
+        let async_tainted = match async_info {
+            Some(ai) => parts.iter().any(|p| match p {
+                TextPart::Static(_) => false,
+                TextPart::Expr(e) => expr_refs_any_client(e, &ai.async_bindings),
+            }),
+            None => false,
+        };
+        if async_tainted {
+            emit_element_content(
+                content,
+                parent_var,
+                body_stmts,
+                effects,
+                state_bindings,
+                async_info,
+            );
+            return;
+        }
+        // For Reactive content with 2+ expression parts, the per-element
+        // deps-array form is needed (`($0, $1) => $.set_text(...)`, [() =>
+        // expr0, () => expr1]). That doesn't combine with sibling reactive
+        // elements, so route to the original per-element emitter.
+        let expr_count = parts
+            .iter()
+            .filter(|p| matches!(p, TextPart::Expr(_)))
+            .count();
+        if expr_count > 1 {
+            emit_element_content(
+                content,
+                parent_var,
+                body_stmts,
+                effects,
+                state_bindings,
+                async_info,
+            );
+            return;
+        }
+        // Non-async Reactive with 0/1 expr: pick a unique text var name,
+        // emit nav, collect the template_expr for combined emission later.
+        let text_var = unique_var("text", var_counts);
+        body_stmts.push(t::var(
+            &text_var,
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id(parent_var)]),
+        ));
+        body_stmts.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "reset"),
+            vec![t::id(parent_var)],
+        )));
+        let template_expr = build_inline_template(parts, state_bindings);
+        text_effects.push((text_var, template_expr));
+        return;
+    }
+    emit_element_content(
+        content,
+        parent_var,
+        body_stmts,
+        effects,
+        state_bindings,
+        async_info,
+    );
 }
 
 fn emit_element_content(
