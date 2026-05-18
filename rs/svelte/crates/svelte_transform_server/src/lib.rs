@@ -111,8 +111,13 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
         params.push(t::pat_id("$$props"));
     }
 
+    // Detect async in the template (each-block/if-block test, or top-level
+    // await expression tags). If found, emit the `flags/async` import even
+    // when the script itself doesn't have top-level await.
+    let template_has_async = fragment_has_async(&root.fragment);
+
     let mut top: Vec<Statement> = Vec::with_capacity(3 + script_imports.len());
-    if async_info.is_some() {
+    if async_info.is_some() || template_has_async {
         top.push(t::import_side_effect("svelte/internal/flags/async"));
     }
     top.push(t::import_namespace("$", "svelte/internal/server"));
@@ -216,6 +221,90 @@ fn lower_fragment_server_async(
         out.push(stmt);
     }
     Some(out)
+}
+
+fn fragment_has_async(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(node_has_async)
+}
+
+fn node_has_async(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::ExpressionTag(t) => expr_has_await_top(&t.expression),
+        FragmentChild::HtmlTag(t) => expr_has_await_top(&t.expression),
+        FragmentChild::RegularElement(el) => {
+            el.attributes.iter().any(attr_has_async) || fragment_has_async(&el.fragment)
+        }
+        FragmentChild::Component(c) => {
+            c.attributes.iter().any(attr_has_async) || fragment_has_async(&c.fragment)
+        }
+        FragmentChild::SvelteElement(el) => {
+            expr_has_await_top(&el.tag)
+                || el.attributes.iter().any(attr_has_async)
+                || fragment_has_async(&el.fragment)
+        }
+        FragmentChild::EachBlock(eb) => {
+            expr_has_await_top(&eb.expression)
+                || fragment_has_async(&eb.body)
+                || eb.fallback.as_ref().map_or(false, fragment_has_async)
+        }
+        FragmentChild::IfBlock(ib) => {
+            expr_has_await_top(&ib.test)
+                || fragment_has_async(&ib.consequent)
+                || ib.alternate.as_ref().map_or(false, fragment_has_async)
+        }
+        FragmentChild::AwaitBlock(ab) => {
+            expr_has_await_top(&ab.expression)
+                || ab.pending.as_ref().map_or(false, fragment_has_async)
+                || ab.then.as_ref().map_or(false, fragment_has_async)
+                || ab.catch_.as_ref().map_or(false, fragment_has_async)
+        }
+        FragmentChild::KeyBlock(kb) => {
+            expr_has_await_top(&kb.expression) || fragment_has_async(&kb.fragment)
+        }
+        _ => false,
+    }
+}
+
+fn attr_has_async(a: &svelte_ast::attributes::ElementAttribute) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    match a {
+        ElementAttribute::Attribute(a) => match &a.value {
+            AttributeValue::Single(tag) => expr_has_await_top(&tag.expression),
+            AttributeValue::Many(parts) => parts.iter().any(|p| {
+                matches!(p, AttributeValuePart::ExpressionTag(t) if expr_has_await_top(&t.expression))
+            }),
+            _ => false,
+        },
+        ElementAttribute::SpreadAttribute(s) => expr_has_await_top(&s.expression),
+        ElementAttribute::BindDirective(b) => expr_has_await_top(&b.expression),
+        _ => false,
+    }
+}
+
+fn expr_has_await_top(e: &Expression) -> bool {
+    match e {
+        Expression::Await(_) => true,
+        Expression::Function(f) if f.r#async => false,
+        Expression::Arrow(a) if a.r#async => false,
+        Expression::Call(c) => {
+            expr_has_await_top(&c.callee)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_has_await_top(e),
+                    Argument::Spread(s) => expr_has_await_top(&s.argument),
+                })
+        }
+        Expression::Binary(b) => expr_has_await_top(&b.left) || expr_has_await_top(&b.right),
+        Expression::Logical(l) => expr_has_await_top(&l.left) || expr_has_await_top(&l.right),
+        Expression::Unary(u) => expr_has_await_top(&u.argument),
+        Expression::Member(m) => expr_has_await_top(&m.object),
+        Expression::Conditional(c) => {
+            expr_has_await_top(&c.test)
+                || expr_has_await_top(&c.consequent)
+                || expr_has_await_top(&c.alternate)
+        }
+        Expression::Paren(p) => expr_has_await_top(&p.expression),
+        _ => false,
+    }
 }
 
 fn expr_refs_any(e: &Expression, names: &std::collections::HashSet<String>) -> bool {
@@ -485,40 +574,84 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         })));
     }
 
-    let needs_marker = body_needs_marker(&eb.body);
-    body_stmts.extend(lower_fragment_with_marker(&eb.body, needs_marker)?);
+    let expr_is_async = expr_has_await_top(&eb.expression);
+    if expr_is_async {
+        // Body uses async-block lowering: ExpressionTags with await become
+        // separate `$$renderer.push(async () => ...)` statements. Prepend
+        // a `<!---->` per-iteration anchor when the body's first child
+        // would normally need one.
+        if body_needs_marker(&eb.body) {
+            body_stmts.push(push_template("<!---->"));
+        }
+        body_stmts.extend(lower_fragment_for_async_block(&eb.body)?);
+    } else {
+        let needs_marker = body_needs_marker(&eb.body);
+        body_stmts.extend(lower_fragment_with_marker(&eb.body, needs_marker)?);
+    }
 
-    Some(vec![
-        push_template("<!--[-->"),
-        Statement::Variable(Box::new(VariableDeclaration {
-            kind: VariableKind::Const,
-            declarations: vec![VariableDeclarator {
-                id: t::pat_id("each_array"),
-                init: Some(Expression::Call(Box::new(CallExpression {
-                    callee: t::member_id(t::id("$"), "ensure_array_like"),
-                    arguments: vec![Argument::Expression(eb.expression.clone())],
-                    optional: false,
-                    span: Span::ZERO,
-                }))),
+    let each_array_init = if expr_is_async {
+        wrap_async_test(&eb.expression)
+    } else {
+        eb.expression.clone()
+    };
+
+    let each_array_decl = Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Const,
+        declarations: vec![VariableDeclarator {
+            id: t::pat_id("each_array"),
+            init: Some(Expression::Call(Box::new(CallExpression {
+                callee: t::member_id(t::id("$"), "ensure_array_like"),
+                arguments: vec![Argument::Expression(each_array_init)],
+                optional: false,
                 span: Span::ZERO,
-            }],
+            }))),
+            span: Span::ZERO,
+        }],
+        span: Span::ZERO,
+    }));
+
+    let for_stmt = Statement::For(Box::new(ForStatement {
+        init: Some(ForInit::Declaration(Box::new(match init {
+            Statement::Variable(v) => *v,
+            _ => unreachable!(),
+        }))),
+        test: Some(test),
+        update: Some(update),
+        body: Statement::Block(Box::new(BlockStatement {
+            body: body_stmts,
             span: Span::ZERO,
         })),
-        Statement::For(Box::new(ForStatement {
-            init: Some(ForInit::Declaration(Box::new(match init {
-                Statement::Variable(v) => *v,
-                _ => unreachable!(),
-            }))),
-            test: Some(test),
-            update: Some(update),
-            body: Statement::Block(Box::new(BlockStatement {
-                body: body_stmts,
+        span: Span::ZERO,
+    }));
+
+    if expr_is_async {
+        // Wrap each_array_decl + for-loop in
+        // `$$renderer.child_block(async ($$renderer) => { ... })`
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![each_array_decl, for_stmt],
                 span: Span::ZERO,
             })),
+            r#async: true,
             span: Span::ZERO,
-        })),
-        push_template("<!--]-->"),
-    ])
+        }));
+        Some(vec![
+            push_template("<!--[-->"),
+            t::stmt(t::call(
+                t::member_id(t::id("$$renderer"), "child_block"),
+                vec![arrow],
+            )),
+            push_template("<!--]-->"),
+        ])
+    } else {
+        Some(vec![
+            push_template("<!--[-->"),
+            each_array_decl,
+            for_stmt,
+            push_template("<!--]-->"),
+        ])
+    }
 }
 
 /// `{#if TEST}consequent{:else if X}...{:else}alternate{/if}` →
@@ -538,21 +671,45 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
 fn lower_if_block_server(
     ib: &svelte_ast::blocks::IfBlock,
 ) -> Option<Vec<Statement>> {
-    let mut consequent_body: Vec<Statement> = Vec::new();
-    consequent_body.push(push_template("<!--[0-->"));
-    consequent_body.extend(lower_fragment_with_marker(
-        &ib.consequent,
-        body_needs_marker(&ib.consequent),
-    )?);
+    let test_is_async = expr_has_await_top(&ib.test);
 
-    let mut alternate_body: Vec<Statement> = Vec::new();
-    alternate_body.push(push_template("<!--[-1-->"));
-    if let Some(alt) = &ib.alternate {
-        alternate_body.extend(lower_fragment_with_marker(alt, body_needs_marker(alt))?);
+    let mut consequent_body: Vec<Statement> = Vec::new();
+    consequent_body.push(if test_is_async {
+        push_string("<!--[0-->")
+    } else {
+        push_template("<!--[0-->")
+    });
+    if test_is_async {
+        consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
+    } else {
+        consequent_body.extend(lower_fragment_with_marker(
+            &ib.consequent,
+            body_needs_marker(&ib.consequent),
+        )?);
     }
 
-    Some(vec![Statement::If(Box::new(IfStatement {
-        test: ib.test.clone(),
+    let mut alternate_body: Vec<Statement> = Vec::new();
+    alternate_body.push(if test_is_async {
+        push_string("<!--[-1-->")
+    } else {
+        push_template("<!--[-1-->")
+    });
+    if let Some(alt) = &ib.alternate {
+        if test_is_async {
+            alternate_body.extend(lower_fragment_for_async_block(alt)?);
+        } else {
+            alternate_body.extend(lower_fragment_with_marker(alt, body_needs_marker(alt))?);
+        }
+    }
+
+    let test = if test_is_async {
+        wrap_async_test(&ib.test)
+    } else {
+        ib.test.clone()
+    };
+
+    let if_stmt = Statement::If(Box::new(IfStatement {
+        test,
         consequent: Statement::Block(Box::new(BlockStatement {
             body: consequent_body,
             span: Span::ZERO,
@@ -562,7 +719,89 @@ fn lower_if_block_server(
             span: Span::ZERO,
         }))),
         span: Span::ZERO,
-    }))])
+    }));
+
+    if test_is_async {
+        // Wrap in `$$renderer.child_block(async ($$renderer) => { if(...) {...} else {...} })`
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![if_stmt],
+                span: Span::ZERO,
+            })),
+            r#async: true,
+            span: Span::ZERO,
+        }));
+        Some(vec![t::stmt(t::call(
+            t::member_id(t::id("$$renderer"), "child_block"),
+            vec![arrow],
+        ))])
+    } else {
+        Some(vec![if_stmt])
+    }
+}
+
+/// `EXPR` → `(await $.save(EXPR))()`. Used when an async block's test
+/// needs blocker tracking.
+fn wrap_async_test(test: &Expression) -> Expression {
+    // Strip the outer await if present so we wrap the underlying value.
+    let inner = match test {
+        Expression::Await(a) => a.argument.clone(),
+        e => e.clone(),
+    };
+    let save_call = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+    let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
+        expression: Expression::Await(Box::new(AwaitExpression {
+            argument: save_call,
+            span: Span::ZERO,
+        })),
+        span: Span::ZERO,
+    }));
+    t::call(awaited, Vec::new())
+}
+
+/// Lower a fragment inside an async block body. ExpressionTags with await
+/// in their expression become separate `$$renderer.push(async () =>
+/// $.escape(await EXPR))` statements; other content uses normal lowering.
+fn lower_fragment_for_async_block(
+    f: &svelte_ast::fragment::Fragment,
+) -> Option<Vec<Statement>> {
+    let mut out: Vec<Statement> = Vec::new();
+    let mut buf = TemplateBuf::new();
+    let nodes = trim_boundary_whitespace(&f.nodes);
+    let nodes = trim_boundary_text(nodes);
+    for n in nodes.iter() {
+        if let FragmentChild::ExpressionTag(t) = n {
+            if expr_has_await_top(&t.expression) {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                // `$$renderer.push(async () => $.escape(await EXPR))`
+                let escape_call = t::call(
+                    t::member_id(t::id("$"), "escape"),
+                    vec![t.expression.clone()],
+                );
+                let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(escape_call),
+                    r#async: true,
+                    span: Span::ZERO,
+                }));
+                out.push(t::stmt(t::call(
+                    t::member_id(t::id("$$renderer"), "push"),
+                    vec![arrow],
+                )));
+                continue;
+            }
+        }
+        if append_node_to_template(n, &mut buf).is_none() {
+            return None;
+        }
+    }
+    if let Some(stmt) = buf.flush() {
+        out.push(stmt);
+    }
+    Some(out)
 }
 
 /// `{#await EXPR [as PAT][:then PAT][:catch PAT]}...{/await}` →
@@ -710,6 +949,23 @@ fn push_template(s: &str) -> Statement {
             vec![s.to_string()],
             Vec::new(),
         ))],
+        optional: false,
+        span: Span::ZERO,
+    })))
+}
+
+/// `$$renderer.push('STR');` — single-quoted string literal form used inside
+/// async child_block bodies for the `<!--[0-->`/`<!--[-1-->` markers.
+fn push_string(s: &str) -> Statement {
+    t::stmt(Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$$renderer"), "push"),
+        arguments: vec![Argument::Expression(Expression::Literal(Box::new(
+            Literal::String(StringLiteral {
+                value: s.to_string(),
+                raw: Some(format!("'{}'", s.replace('\'', "\\'"))),
+                span: Span::ZERO,
+            }),
+        )))],
         optional: false,
         span: Span::ZERO,
     })))
