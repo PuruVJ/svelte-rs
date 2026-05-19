@@ -164,6 +164,15 @@ pub fn try_typed_client_walker_with(
                 return Some(p);
             }
         }
+        if let FragmentChild::Text(t) = nodes[0] {
+            if !t.data.trim().is_empty() {
+                if let Some(p) =
+                    emit_top_level_single_text_program(&t.data, component_name, &script)
+                {
+                    return Some(p);
+                }
+            }
+        }
     }
 
     // Special case: a single top-level `{#each}` block uses a different
@@ -215,6 +224,29 @@ pub fn try_typed_client_walker_with(
             if let Some(p) =
                 emit_single_element_wrapping_ifs_program(el, component_name, &script)
             {
+                return Some(p);
+            }
+        }
+    }
+
+    // Multi-IfBlock non-async case: top-level non-trivial nodes are all
+    // IfBlocks (whitespace text + comments + svelte:options dropped).
+    // Matches if-block-update.
+    if script.async_info.is_none() {
+        let non_ws: Vec<&FragmentChild> = nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                FragmentChild::SvelteOptions(_) => false,
+                _ => true,
+            })
+            .copied()
+            .collect();
+        if non_ws.len() >= 2
+            && non_ws.iter().all(|n| matches!(n, FragmentChild::IfBlock(_)))
+        {
+            if let Some(p) = emit_top_level_multi_if_program(&nodes, component_name, &script) {
                 return Some(p);
             }
         }
@@ -1798,6 +1830,67 @@ fn emit_top_level_html_tag_program(
 }
 
 /// Emit the upstream shape for a top-level fragment that is exactly one
+/// non-empty static Text node — e.g.
+///
+///   Text
+///
+/// →
+///
+///   export default function Main($$anchor) {
+///       $.next();
+///       var text = $.text('Text');
+///       $.append($$anchor, text);
+///   }
+fn emit_top_level_single_text_program(
+    text: &str,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+        || !script.legacy_export_props.is_empty()
+    {
+        return None;
+    }
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "next"),
+        Vec::new(),
+    )));
+    func_body.push(t::var(
+        "text",
+        t::call(
+            t::member_id(t::id("$"), "text"),
+            vec![t::literal_str(text)],
+        ),
+    ));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("text")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit the upstream shape for a top-level fragment that is exactly one
 /// non-async ExpressionTag — e.g.
 ///
 ///   {x}
@@ -2355,6 +2448,242 @@ fn emit_single_element_wrapping_ifs_program(
         t::call(
             t::member_id(t::id("$"), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit a non-async program for a top-level fragment that is exactly
+/// N>=2 if-blocks (no `else`, single-element fully-static consequent)
+/// separated by whitespace text / comments only — e.g. `if-block-update`.
+///
+///   {#if foo}<p>foo!</p>{/if} {#if bar}<p>bar!</p>{/if}
+///
+/// →
+///
+///   var root_1 = $.from_html(`<p>foo!</p>`);
+///   var root_2 = $.from_html(`<p>bar!</p>`);
+///   var root = $.from_html(`<!> <!>`, 1);
+///
+///   export default function Main($$anchor, $$props) {
+///     ...
+///     var fragment = root();
+///     var node = $.first_child(fragment);
+///     { consequent + $.if(node, ...) }
+///     var node_1 = $.sibling(node, 2);
+///     { consequent_1 + $.if(node_1, ...) }
+///     $.append($$anchor, fragment);
+///     ...
+///   }
+fn emit_top_level_multi_if_program(
+    nodes: &[&FragmentChild],
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    let non_ws: Vec<&FragmentChild> = nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            FragmentChild::SvelteOptions(_) => false,
+            _ => true,
+        })
+        .copied()
+        .collect();
+    if non_ws.len() < 2 {
+        return None;
+    }
+    let ifs: Vec<&svelte_ast::blocks::IfBlock> = non_ws
+        .iter()
+        .filter_map(|n| match n {
+            FragmentChild::IfBlock(ib) => Some(ib),
+            _ => None,
+        })
+        .collect();
+    if ifs.len() != non_ws.len() {
+        return None;
+    }
+    if ifs.iter().any(|ib| ib.alternate.is_some() || expr_top_await(&ib.test)) {
+        return None;
+    }
+
+    let mut root_decls: Vec<Statement> = Vec::new();
+    let mut root_idx: usize = 0;
+    let mut elem_var_idx: usize = 0;
+
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut block_stmts: Vec<Statement> = Vec::new();
+    for (i, ib) in ifs.iter().enumerate() {
+        let consequent_text_name = if i == 0 {
+            "text".to_string()
+        } else {
+            format!("text_{}", i)
+        };
+        let consequent_body = emit_vanilla_branch_body(
+            &ib.consequent,
+            &consequent_text_name,
+            &mut root_decls,
+            &mut root_idx,
+            &mut elem_var_idx,
+        )?;
+        let consequent_var = if i == 0 {
+            "consequent".to_string()
+        } else {
+            format!("consequent_{}", i)
+        };
+        let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$anchor")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: consequent_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let mut inner_block: Vec<Statement> = Vec::new();
+        inner_block.push(t::var(&consequent_var, consequent_arrow));
+        let test = rewrite_props_destructured(&ib.test, &script.props_destructured);
+        let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
+        let render_if = Statement::If(Box::new(IfStatement {
+            test,
+            consequent: t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)])),
+            alternate: None,
+            span: Span::ZERO,
+        }));
+        let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$render")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![render_if],
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let node_var = if i == 0 {
+            "node".to_string()
+        } else {
+            format!("node_{}", i)
+        };
+        inner_block.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "if"),
+            vec![t::id(&node_var), render_arrow],
+        )));
+        if i > 0 {
+            let prev_node = if i - 1 == 0 {
+                "node".to_string()
+            } else {
+                format!("node_{}", i - 1)
+            };
+            block_stmts.push(t::var(
+                &node_var,
+                t::call(
+                    t::member_id(t::id("$"), "sibling"),
+                    vec![t::id(&prev_node), t::lit_number(2.0)],
+                ),
+            ));
+        }
+        block_stmts.push(Statement::Block(Box::new(BlockStatement {
+            body: inner_block,
+            span: Span::ZERO,
+        })));
+    }
+
+    // Top-level function body.
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+    func_body.extend(block_stmts);
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props || !script.legacy_export_props.is_empty() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    // Build the wrapper template: `<!> <!>` (anchors separated by single space).
+    let mut html = String::with_capacity(8);
+    for (i, _) in ifs.iter().enumerate() {
+        if i > 0 {
+            html.push(' ');
+        }
+        html.push_str("<!>");
+    }
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.extend(root_decls);
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![]), t::lit_number(1.0)],
         ),
     ));
     prog.push(export);
