@@ -226,6 +226,11 @@ pub fn try_typed_client_walker_with(
             {
                 return Some(p);
             }
+            if let Some(p) =
+                emit_single_element_wrapping_each_program(el, component_name, &script)
+            {
+                return Some(p);
+            }
         }
     }
 
@@ -2788,6 +2793,427 @@ fn emit_top_level_multi_if_program(
     ));
     prog.push(export);
     Some(t::program(prog))
+}
+
+/// Emit a runes/legacy-mode program for the shape:
+///
+///   <TAG>{#each EXPR as VAR}<INNER>{VAR (or VAR.field)}</INNER>{/each}</TAG>
+///
+/// Constrained to: no key, no `:else`, single-element fully-static inner
+/// with text-only body (text or `{VAR}`). Mirrors the `each-block` fixture.
+fn emit_single_element_wrapping_each_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    // Wrapper must have no dynamic attrs/spread/directives.
+    let mut static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => static_attrs.push(attr),
+                AttributeValue::Many(parts) => {
+                    if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        static_attrs.push(attr);
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    // Body: exactly one EachBlock (whitespace + comments allowed).
+    let non_ws: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let eb = match non_ws[0] {
+        FragmentChild::EachBlock(e) => e,
+        _ => return None,
+    };
+    // Constraint: no `:else`, no key, simple item identifier.
+    if eb.fallback.is_some() || eb.key.is_some() {
+        return None;
+    }
+    if expr_top_await(&eb.expression) {
+        return None;
+    }
+    let item_name = match eb.context.as_ref() {
+        Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
+        _ => return None,
+    };
+
+    // Inner body: must be a single fully-static element with text-only body
+    // (text or `{VAR.field}` interpolation).
+    let inner_non_ws: Vec<&FragmentChild> = eb
+        .body
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if inner_non_ws.len() != 1 {
+        return None;
+    }
+    let inner_el = match inner_non_ws[0] {
+        FragmentChild::RegularElement(e) => e,
+        _ => return None,
+    };
+    // Inner element must have no dynamic attrs/directives.
+    let mut inner_static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    for a in &inner_el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => inner_static_attrs.push(attr),
+                AttributeValue::Many(parts) => {
+                    if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        inner_static_attrs.push(attr);
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    // Inner body must be text-with-single-expression (e.g. `{thing}` or
+    // `{item.name}`).
+    let inner_body_non_ws: Vec<&FragmentChild> = inner_el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if inner_body_non_ws.len() != 1 {
+        return None;
+    }
+    let inner_expr = match inner_body_non_ws[0] {
+        FragmentChild::ExpressionTag(et) => et.expression.clone(),
+        _ => return None,
+    };
+
+    // Build outer template HTML: `<TAG STATIC_ATTRS></TAG>`.
+    let mut outer_html = String::with_capacity(32);
+    outer_html.push('<');
+    outer_html.push_str(&el.name);
+    for attr in &static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                outer_html.push(' ');
+                outer_html.push_str(&attr.name);
+                outer_html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                outer_html.push(' ');
+                outer_html.push_str(&attr.name);
+                outer_html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => outer_html.push_str("&quot;"),
+                                '&' => outer_html.push_str("&amp;"),
+                                _ => outer_html.push(c),
+                            }
+                        }
+                    }
+                }
+                outer_html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    outer_html.push_str("></");
+    outer_html.push_str(&el.name);
+    outer_html.push('>');
+
+    // Inner template HTML: `<INNER STATIC_ATTRS> </INNER>` (single space anchor).
+    let mut inner_html = String::with_capacity(32);
+    inner_html.push('<');
+    inner_html.push_str(&inner_el.name);
+    for attr in &inner_static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                inner_html.push(' ');
+                inner_html.push_str(&attr.name);
+                inner_html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                inner_html.push(' ');
+                inner_html.push_str(&attr.name);
+                inner_html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => inner_html.push_str("&quot;"),
+                                '&' => inner_html.push_str("&amp;"),
+                                _ => inner_html.push(c),
+                            }
+                        }
+                    }
+                }
+                inner_html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    inner_html.push_str("> </");
+    inner_html.push_str(&inner_el.name);
+    inner_html.push('>');
+
+    // Each callback: ($$anchor, item) => { var li = root_1(); var text = $.child(li, true); $.reset(li); $.template_effect(() => $.set_text(text, $.get(item).field)); $.append($$anchor, li); }
+    let inner_var = inner_el.name.clone();
+    let mut item_body: Vec<Statement> = Vec::new();
+    item_body.push(t::var(&inner_var, t::call(t::id("root_1"), Vec::new())));
+    item_body.push(t::var(
+        "text",
+        t::call(
+            t::member_id(t::id("$"), "child"),
+            vec![
+                t::id(&inner_var),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: true, span: Span::ZERO },
+                ))),
+            ],
+        ),
+    ));
+    item_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&inner_var)],
+    )));
+    // Rewrite inner_expr: replace bare `item_name` references with `$.get(item_name)`.
+    let rewritten_inner = rewrite_get_for_each_var(&inner_expr, &item_name);
+    let set_text = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), rewritten_inner],
+    );
+    item_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(set_text),
+            r#async: false,
+            span: Span::ZERO,
+        }))],
+    )));
+    item_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&inner_var)],
+    )));
+    let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: item_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // Each expression: bare legacy prop accessor passes as-is, otherwise wrap.
+    // For now, only handle bare-identifier expression matching a legacy prop;
+    // for `$$props.field` shape (runes), pass it unchanged but wrapped.
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let is_bare_legacy = matches!(
+        &eb.expression,
+        Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+    );
+    let each_collection: Expression = if is_bare_legacy {
+        eb.expression.clone()
+    } else {
+        // Wrap in arrow returning the rewritten expression.
+        let rewritten = rewrite_props_destructured(&eb.expression, &script.props_destructured);
+        let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(rewritten),
+            r#async: false,
+            span: Span::ZERO,
+        }))
+    };
+    // Flags = 5 (unkeyed + mutable_source bound to item).
+    let each_call = t::stmt(t::call(
+        t::member_id(t::id("$"), "each"),
+        vec![
+            t::id(&el.name),
+            t::lit_number(5.0),
+            each_collection,
+            t::member_id(t::id("$"), "index"),
+            item_arrow,
+        ],
+    ));
+
+    let outer_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
+    func_body.push(each_call);
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&outer_var)],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&outer_var)],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props || !script.legacy_export_props.is_empty() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root_1",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![inner_html], vec![])],
+        ),
+    ));
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![outer_html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Walk an expression and replace any bare reference to `var_name` with
+/// `$.get(var_name)`. Used to wrap each-block iterators with mutable_source
+/// accessors.
+fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
+    match e {
+        Expression::Identifier(id) if id.name == var_name => t::call(
+            t::member_id(t::id("$"), "get"),
+            vec![Expression::Identifier(id.clone())],
+        ),
+        Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
+            object: rewrite_get_for_each_var(&m.object, var_name),
+            property: m.property.clone(),
+            computed: m.computed,
+            optional: m.optional,
+            span: m.span,
+        })),
+        Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+            callee: rewrite_get_for_each_var(&c.callee, var_name),
+            arguments: c
+                .arguments
+                .iter()
+                .map(|a| match a {
+                    Argument::Expression(e) => {
+                        Argument::Expression(rewrite_get_for_each_var(e, var_name))
+                    }
+                    other => other.clone(),
+                })
+                .collect(),
+            optional: c.optional,
+            span: c.span,
+        })),
+        Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+            operator: b.operator,
+            left: rewrite_get_for_each_var(&b.left, var_name),
+            right: rewrite_get_for_each_var(&b.right, var_name),
+            span: b.span,
+        })),
+        Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+            operator: l.operator,
+            left: rewrite_get_for_each_var(&l.left, var_name),
+            right: rewrite_get_for_each_var(&l.right, var_name),
+            span: l.span,
+        })),
+        Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+            operator: u.operator,
+            argument: rewrite_get_for_each_var(&u.argument, var_name),
+            prefix: u.prefix,
+            span: u.span,
+        })),
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: rewrite_get_for_each_var(&p.expression, var_name),
+            span: p.span,
+        })),
+        e => e.clone(),
+    }
 }
 
 fn emit_single_dynamic_element_program(
