@@ -255,10 +255,14 @@ pub fn try_typed_client_walker_with(
             .copied()
             .collect();
         if non_ws.len() >= 2
-            && non_ws.iter().any(|n| matches!(n, FragmentChild::IfBlock(_)))
+            && non_ws.iter().any(|n| matches!(
+                n,
+                FragmentChild::IfBlock(_) | FragmentChild::EachBlock(_)
+            ))
             && non_ws.iter().all(|n| matches!(
                 n,
                 FragmentChild::IfBlock(_)
+                    | FragmentChild::EachBlock(_)
                     | FragmentChild::RegularElement(_)
                     | FragmentChild::Text(_)
             ))
@@ -1617,6 +1621,24 @@ fn emit_vanilla_branch_body(
             )));
             Some(body)
         }
+        FragmentChild::Component(c) => {
+            // No-props bare Component: `Child($$anchor, {});`
+            if !c.attributes.is_empty() || !c.fragment.nodes.is_empty() {
+                return None;
+            }
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::stmt(t::call(
+                t::id(&c.name),
+                vec![
+                    t::id("$$anchor"),
+                    Expression::Object(Box::new(ObjectExpression {
+                        properties: Vec::new(),
+                        span: Span::ZERO,
+                    })),
+                ],
+            )));
+            Some(body)
+        }
         _ => None,
     }
 }
@@ -2940,6 +2962,7 @@ fn emit_top_level_multi_if_program(
         StaticEl(&'a svelte_ast::elements::RegularElement),
         StaticText(String),
         If(&'a svelte_ast::blocks::IfBlock),
+        Each(&'a svelte_ast::blocks::EachBlock),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -2981,6 +3004,20 @@ fn emit_top_level_multi_if_program(
                 pending_gap = false;
                 slots.push(Slot::If(ib));
             }
+            FragmentChild::EachBlock(eb) => {
+                // No key, no else, no async, simple identifier context.
+                if eb.key.is_some()
+                    || eb.fallback.is_some()
+                    || expr_top_await(&eb.expression)
+                {
+                    return None;
+                }
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
+                slots.push(Slot::Each(eb));
+            }
             FragmentChild::RegularElement(el) => {
                 if !is_element_fully_static(el) {
                     return None;
@@ -2998,16 +3035,10 @@ fn emit_top_level_multi_if_program(
         return None;
     }
     // Must contain at least one IfBlock.
-    if !slots.iter().any(|s| matches!(s, Slot::If(_))) {
+    let is_anchor_slot = |s: &Slot| matches!(s, Slot::If(_) | Slot::Each(_));
+    if !slots.iter().any(is_anchor_slot) {
         return None;
     }
-    let ifs: Vec<&svelte_ast::blocks::IfBlock> = slots
-        .iter()
-        .filter_map(|s| match s {
-            Slot::If(ib) => Some(*ib),
-            _ => None,
-        })
-        .collect();
 
     let mut root_decls: Vec<Statement> = Vec::new();
     let mut root_idx: usize = 0;
@@ -3018,8 +3049,8 @@ fn emit_top_level_multi_if_program(
         .iter()
         .map(|(n, _)| n.clone())
         .collect();
-    // Compute the DOM sibling position of each slot. Each StaticEl / If
-    // occupies its own position; runs of StaticText (with or without
+    // Compute the DOM sibling position of each slot. Each StaticEl / If /
+    // Each occupies its own position; runs of StaticText (with or without
     // surrounding whitespace gaps) merge into a single text-node position.
     // A whitespace gap between two non-text slots creates an intermediate
     // text node.
@@ -3027,11 +3058,9 @@ fn emit_top_level_multi_if_program(
     let mut pos: usize = 0;
     let mut pending_text = false;
     for (i, slot) in slots.iter().enumerate() {
-        // The gap before slot[i] (if i > 0) is gap_after[i-1]. If true,
-        // a text node forms (unless this slot itself is StaticText).
         let preceding_gap = i > 0 && gap_after[i - 1];
         match slot {
-            Slot::StaticEl(_) | Slot::If(_) => {
+            Slot::StaticEl(_) | Slot::If(_) | Slot::Each(_) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -3040,100 +3069,41 @@ fn emit_top_level_multi_if_program(
                 pos += 1;
             }
             Slot::StaticText(_) => {
-                if !pending_text {
-                    positions[i] = pos;
-                    pending_text = true;
-                } else {
-                    positions[i] = pos;
-                }
+                positions[i] = pos;
+                pending_text = true;
                 let _ = preceding_gap;
             }
         }
     }
-    // Find the first and last if slot indices for navigation / next() computation.
-    let first_if_slot = slots
-        .iter()
-        .position(|s| matches!(s, Slot::If(_)))
-        .unwrap();
-    let last_if_slot = slots
-        .iter()
-        .rposition(|s| matches!(s, Slot::If(_)))
-        .unwrap();
-    let first_if_pos = positions[first_if_slot];
-    let last_if_pos = positions[last_if_slot];
-    let final_pos = pos; // total sibling count
+    // Find first/last anchor slot for navigation / next() computation.
+    let first_anchor_slot = slots.iter().position(is_anchor_slot).unwrap();
+    let last_anchor_slot = slots.iter().rposition(is_anchor_slot).unwrap();
+    let first_if_pos = positions[first_anchor_slot];
+    let last_if_pos = positions[last_anchor_slot];
+    let final_pos = pos;
     let trailing_advance = final_pos - last_if_pos - 1;
     let mut block_stmts: Vec<Statement> = Vec::new();
-    let mut if_count = 0usize;
-    let mut prev_if_slot: Option<usize> = None;
+    let mut anchor_count = 0usize;
+    let mut prev_anchor_slot: Option<usize> = None;
     for (slot_i, slot) in slots.iter().enumerate() {
-        let ib = match slot {
-            Slot::If(ib) => *ib,
-            Slot::StaticEl(_) | Slot::StaticText(_) => continue,
-        };
-        let i = if_count;
-        if_count += 1;
-        let consequent_text_name = if i == 0 {
-            "text".to_string()
-        } else {
-            format!("text_{}", i)
-        };
-        let consequent_body = emit_vanilla_branch_body(
-            &ib.consequent,
-            &consequent_text_name,
-            &mut root_decls,
-            &mut root_idx,
-            &mut elem_var_idx,
-        )?;
-        let consequent_var = if i == 0 {
-            "consequent".to_string()
-        } else {
-            format!("consequent_{}", i)
-        };
-        let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
-            body: ArrowBody::Block(Box::new(BlockStatement {
-                body: consequent_body,
-                span: Span::ZERO,
-            })),
-            r#async: false,
-            span: Span::ZERO,
-        }));
-        let mut inner_block: Vec<Statement> = Vec::new();
-        inner_block.push(t::var(&consequent_var, consequent_arrow));
-        let test = rewrite_props_destructured(&ib.test, &script.props_destructured);
-        let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
-        let render_if = Statement::If(Box::new(IfStatement {
-            test,
-            consequent: t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)])),
-            alternate: None,
-            span: Span::ZERO,
-        }));
-        let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$render")],
-            body: ArrowBody::Block(Box::new(BlockStatement {
-                body: vec![render_if],
-                span: Span::ZERO,
-            })),
-            r#async: false,
-            span: Span::ZERO,
-        }));
+        if !is_anchor_slot(slot) {
+            continue;
+        }
+        let i = anchor_count;
+        anchor_count += 1;
         let node_var = if i == 0 {
             "node".to_string()
         } else {
             format!("node_{}", i)
         };
-        inner_block.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "if"),
-            vec![t::id(&node_var), render_arrow],
-        )));
+        // Emit sibling navigation between anchor slots before this one.
         if i > 0 {
             let prev_node = if i - 1 == 0 {
                 "node".to_string()
             } else {
                 format!("node_{}", i - 1)
             };
-            let prev_slot_i = prev_if_slot.unwrap();
+            let prev_slot_i = prev_anchor_slot.unwrap();
             let prev_pos = positions[prev_slot_i];
             let this_pos = positions[slot_i];
             let offset = this_pos - prev_pos;
@@ -3145,11 +3115,123 @@ fn emit_top_level_multi_if_program(
                 ),
             ));
         }
-        block_stmts.push(Statement::Block(Box::new(BlockStatement {
-            body: inner_block,
-            span: Span::ZERO,
-        })));
-        prev_if_slot = Some(slot_i);
+        match slot {
+            Slot::If(ib) => {
+                let consequent_text_name = if i == 0 {
+                    "text".to_string()
+                } else {
+                    format!("text_{}", i)
+                };
+                let consequent_body = emit_vanilla_branch_body(
+                    &ib.consequent,
+                    &consequent_text_name,
+                    &mut root_decls,
+                    &mut root_idx,
+                    &mut elem_var_idx,
+                )?;
+                let consequent_var = if i == 0 {
+                    "consequent".to_string()
+                } else {
+                    format!("consequent_{}", i)
+                };
+                let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$anchor")],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: consequent_body,
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                let mut inner_block: Vec<Statement> = Vec::new();
+                inner_block.push(t::var(&consequent_var, consequent_arrow));
+                let test = rewrite_props_destructured(&ib.test, &script.props_destructured);
+                let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
+                let render_if = Statement::If(Box::new(IfStatement {
+                    test,
+                    consequent: t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)])),
+                    alternate: None,
+                    span: Span::ZERO,
+                }));
+                let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$render")],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: vec![render_if],
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                inner_block.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "if"),
+                    vec![t::id(&node_var), render_arrow],
+                )));
+                block_stmts.push(Statement::Block(Box::new(BlockStatement {
+                    body: inner_block,
+                    span: Span::ZERO,
+                })));
+            }
+            Slot::Each(eb) => {
+                let item_name = match eb.context.as_ref() {
+                    Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
+                    _ => return None,
+                };
+                // Inner body via the same branch helper. Each iter var
+                // not wrapped in $.get since flag 0 doesn't use mutable_source.
+                let body_text_name = if i == 0 {
+                    "text".to_string()
+                } else {
+                    format!("text_{}", i)
+                };
+                let inner_body = emit_vanilla_branch_body(
+                    &eb.body,
+                    &body_text_name,
+                    &mut root_decls,
+                    &mut root_idx,
+                    &mut elem_var_idx,
+                )?;
+                let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: inner_body,
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                let is_bare_legacy = matches!(
+                    &eb.expression,
+                    Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+                );
+                let each_collection: Expression = if is_bare_legacy {
+                    eb.expression.clone()
+                } else {
+                    let rewritten = rewrite_props_destructured(
+                        &eb.expression,
+                        &script.props_destructured,
+                    );
+                    let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
+                    Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(rewritten),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }))
+                };
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "each"),
+                    vec![
+                        t::id(&node_var),
+                        t::lit_number(0.0),
+                        each_collection,
+                        t::member_id(t::id("$"), "index"),
+                        item_arrow,
+                    ],
+                )));
+            }
+            _ => unreachable!(),
+        }
+        prev_anchor_slot = Some(slot_i);
     }
 
     // Top-level function body.
@@ -3242,16 +3324,16 @@ fn emit_top_level_multi_if_program(
     let export = t::export_default_function(component_name, params, func_body);
 
     // Build the wrapper template: each slot becomes itself (static element
-    // serialized to HTML, `<!>` for if-block, or literal text). A space
-    // is inserted between consecutive slots iff the source had whitespace
-    // text between them (so the DOM sibling count matches upstream).
+    // serialized to HTML, `<!>` for if-block / each-block, or literal text).
+    // A space is inserted between consecutive slots iff the source had
+    // whitespace text between them (so the DOM sibling count matches upstream).
     let mut html = String::with_capacity(16);
     for (i, slot) in slots.iter().enumerate() {
         if i > 0 && gap_after[i - 1] {
             html.push(' ');
         }
         match slot {
-            Slot::If(_) => html.push_str("<!>"),
+            Slot::If(_) | Slot::Each(_) => html.push_str("<!>"),
             Slot::StaticEl(el) => {
                 let mut needs = false;
                 serialize_element_to_html(el, &mut html, &mut needs)?;
