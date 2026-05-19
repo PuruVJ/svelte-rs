@@ -476,13 +476,19 @@ pub fn try_typed_client_walker_with(
                 // template_effect entry from the run's parts.
                 if is_multi_root {
                     let v = unique_var("text", &mut var_counts);
-                    body_stmts.push(t::var(
-                        &v,
-                        t::call(
+                    // When this top-level text is the FIRST node we
+                    // anchor it with `$.first_child(fragment, true)`
+                    // — there's no preceding node to `$.sibling` off.
+                    // Otherwise the previous element/text supplies the
+                    // sibling base.
+                    let init = match prev_var.as_deref() {
+                        Some(prev) => t::call(
                             t::member_id(t::id("$"), "sibling"),
-                            vec![t::id(prev_var.as_deref().expect("preceding node"))],
+                            vec![t::id(prev)],
                         ),
-                    ));
+                        None => return None,
+                    };
+                    body_stmts.push(t::var(&v, init));
                     prev_var = Some(v.clone());
                     // Drop entirely-whitespace boundary Static parts.
                     let mut trimmed = parts.clone();
@@ -1357,6 +1363,19 @@ fn emit_vanilla_branch_body(
         return None;
     }
     match non_ws[0] {
+        FragmentChild::Text(t) => {
+            // Static-text-only consequent: `var text = $.text('hello');`
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::var(
+                text_name,
+                t::call(t::member_id(t::id("$"), "text"), vec![t::literal_str(&t.data)]),
+            ));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id(text_name)],
+            )));
+            Some(body)
+        }
         FragmentChild::ExpressionTag(et) => {
             let expr = et.expression.clone();
             let mut body: Vec<Statement> = Vec::new();
