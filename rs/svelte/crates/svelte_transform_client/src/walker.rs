@@ -1485,7 +1485,13 @@ fn emit_single_vanilla_if_program(
     } else {
         None
     };
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     let test = rewrite_props_destructured(&ib.test, &script.props_destructured);
+    let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
     let render_if = Statement::If(Box::new(IfStatement {
         test,
         consequent: then_call,
@@ -1508,6 +1514,36 @@ fn emit_single_vanilla_if_program(
 
     // Top-level function body.
     let mut func_body: Vec<Statement> = Vec::new();
+    // Legacy props prelude.
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
@@ -1528,6 +1564,15 @@ fn emit_single_vanilla_if_program(
         t::member_id(t::id("$"), "append"),
         vec![t::id("$$anchor"), t::id("fragment")],
     )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
 
     let mut params = vec![t::pat_id("$$anchor")];
     if script.uses_props {
@@ -1679,15 +1724,57 @@ fn emit_single_dynamic_element_program(
         html.push('>');
     }
 
-    // Rewrite dyn-attr expressions through props_destructured.
+    // Rewrite dyn-attr expressions through props_destructured AND
+    // legacy_export_props (legacy refs become calls — `name` → `name()`).
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
     let dyn_attrs: Vec<(String, Expression)> = dyn_attrs
         .into_iter()
-        .map(|(name, e)| (name.to_string(), rewrite_props_destructured(&e, &script.props_destructured)))
+        .map(|(name, e)| {
+            let e = rewrite_props_destructured(&e, &script.props_destructured);
+            let e = rewrite_legacy_prop_reads(&e, &legacy_prop_names);
+            (name.to_string(), e)
+        })
         .collect();
 
     // Build function body.
     let tag_var = el.name.clone();
     let mut func_body: Vec<Statement> = Vec::new();
+    // Legacy props prelude: `$.push($$props, false); let X = $.prop($$props, 'X', N [, INIT]);`
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            // Flag value `12` = `PROPS_IS_BINDABLE | PROPS_IS_UPDATED` per
+            // upstream's flag conventions; matches every legacy-mode
+            // snapshot we've inspected.
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        // $$exports accessor object.
+        let exports_obj = build_legacy_exports_object(&script.legacy_export_props);
+        func_body.push(t::var("$$exports", exports_obj));
+    }
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
 
@@ -1715,6 +1802,18 @@ fn emit_single_dynamic_element_program(
             return t::call(
                 t::member_id(t::id("$"), "set_checked"),
                 vec![t::id(&tag_var), e],
+            );
+        }
+        // `class={expr}` → `$.set_class(TAG, 1, $.clsx(expr))`. The `1`
+        // flag marks the value as dynamic (matches upstream).
+        if name == "class" {
+            return t::call(
+                t::member_id(t::id("$"), "set_class"),
+                vec![
+                    t::id(&tag_var),
+                    t::lit_number(1.0),
+                    t::call(t::member_id(t::id("$"), "clsx"), vec![e]),
+                ],
             );
         }
         t::call(
@@ -1750,6 +1849,15 @@ fn emit_single_dynamic_element_program(
         t::member_id(t::id("$"), "append"),
         vec![t::id("$$anchor"), t::id(&tag_var)],
     )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
 
     let mut params = vec![t::pat_id("$$anchor")];
     if script.uses_props {
@@ -6233,6 +6341,129 @@ fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expres
     go(e, names)
 }
 
+/// Rewrite each free `X` identifier in `e` to a call `X()` when `X` is in
+/// `names` — used for legacy-mode `export let X` reads since those resolve
+/// to a `$.prop($$props, 'X', N)` accessor that must be invoked.
+fn rewrite_legacy_prop_reads(e: &Expression, names: &HashSet<String>) -> Expression {
+    fn go(e: &Expression, names: &HashSet<String>) -> Expression {
+        match e {
+            Expression::Identifier(id) if names.contains(&id.name) => {
+                Expression::Call(Box::new(CallExpression {
+                    callee: Expression::Identifier(id.clone()),
+                    arguments: Vec::new(),
+                    optional: false,
+                    span: Span::ZERO,
+                }))
+            }
+            Expression::Call(c) => Expression::Call(Box::new(CallExpression {
+                callee: go(&c.callee, names),
+                arguments: c
+                    .arguments
+                    .iter()
+                    .map(|a| match a {
+                        Argument::Expression(e) => Argument::Expression(go(e, names)),
+                        other => other.clone(),
+                    })
+                    .collect(),
+                optional: c.optional,
+                span: c.span,
+            })),
+            Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
+                object: go(&m.object, names),
+                property: m.property.clone(),
+                computed: m.computed,
+                optional: m.optional,
+                span: m.span,
+            })),
+            Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
+                operator: b.operator,
+                left: go(&b.left, names),
+                right: go(&b.right, names),
+                span: b.span,
+            })),
+            Expression::Logical(l) => Expression::Logical(Box::new(LogicalExpression {
+                operator: l.operator,
+                left: go(&l.left, names),
+                right: go(&l.right, names),
+                span: l.span,
+            })),
+            Expression::Unary(u) => Expression::Unary(Box::new(UnaryExpression {
+                operator: u.operator,
+                argument: go(&u.argument, names),
+                prefix: u.prefix,
+                span: u.span,
+            })),
+            Expression::Conditional(c) => Expression::Conditional(Box::new(ConditionalExpression {
+                test: go(&c.test, names),
+                consequent: go(&c.consequent, names),
+                alternate: go(&c.alternate, names),
+                span: c.span,
+            })),
+            Expression::Paren(p) => Expression::Paren(Box::new(svelte_js_ast::ParenthesizedExpression {
+                expression: go(&p.expression, names),
+                span: p.span,
+            })),
+            Expression::Template(t) => Expression::Template(Box::new(TemplateLiteral {
+                quasis: t.quasis.clone(),
+                expressions: t.expressions.iter().map(|ex| go(ex, names)).collect(),
+                span: t.span,
+            })),
+            _ => e.clone(),
+        }
+    }
+    go(e, names)
+}
+
+/// Build the `var $$exports = { get NAME() {...}, set NAME($$value) {...} };`
+/// object that legacy components return through `$.pop($$exports)`. Per
+/// upstream's accessor shape for `$.prop`-wrapped props.
+fn build_legacy_exports_object(props: &[(String, Option<Expression>)]) -> Expression {
+    let mut members: Vec<ObjectMember> = Vec::new();
+    for (name, _) in props {
+        let getter_body = vec![Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(t::id(name), Vec::new())),
+            span: Span::ZERO,
+        }))];
+        members.push(ObjectMember::Property(Box::new(svelte_js_ast::Property {
+            key: PropertyKey::Identifier(Identifier { name: name.clone(), span: Span::ZERO }),
+            value: Expression::Function(Box::new(FunctionExpression {
+                id: None,
+                params: Vec::new(),
+                body: BlockStatement { body: getter_body, span: Span::ZERO },
+                generator: false,
+                r#async: false,
+                span: Span::ZERO,
+            })),
+            kind: PropertyKind::Get,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
+        let setter_body = vec![
+            t::stmt(t::call(t::id(name), vec![t::id("$$value")])),
+            t::stmt(t::call(t::member_id(t::id("$"), "flush"), Vec::new())),
+        ];
+        members.push(ObjectMember::Property(Box::new(svelte_js_ast::Property {
+            key: PropertyKey::Identifier(Identifier { name: name.clone(), span: Span::ZERO }),
+            value: Expression::Function(Box::new(FunctionExpression {
+                id: None,
+                params: vec![t::pat_id("$$value")],
+                body: BlockStatement { body: setter_body, span: Span::ZERO },
+                generator: false,
+                r#async: false,
+                span: Span::ZERO,
+            })),
+            kind: PropertyKind::Set,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
+    }
+    Expression::Object(Box::new(ObjectExpression { properties: members, span: Span::ZERO }))
+}
+
 /// Returns true iff `e` contains a CallExpression whose callee is a regular
 /// user-function reference (not a derived-binding read or other compiler-
 /// inserted call). Used to decide if an if-chain test should be hoisted to
@@ -7416,6 +7647,12 @@ struct ScriptInfo {
     /// reads of these names get rewritten to `$$props.NAME` and the
     /// declaration itself is dropped from the script body.
     props_destructured: HashSet<String>,
+    /// Legacy-mode `export let X [= INIT]` declarations. Each entry is
+    /// `(name, default_init)`. Stripped from `body` in `analyze_script`;
+    /// emitters that support legacy props rebuild the
+    /// `let X = $.prop($$props, 'X', N [, INIT])` + `$$exports` accessor
+    /// shape themselves.
+    legacy_export_props: Vec<(String, Option<Expression>)>,
 }
 
 #[derive(Clone)]
@@ -7449,6 +7686,7 @@ fn analyze_script(
             proxy_bindings: HashSet::new(),
             derived_bindings: HashSet::new(),
             props_destructured: HashSet::new(),
+            legacy_export_props: Vec::new(),
         });
     };
 
@@ -7506,6 +7744,7 @@ fn analyze_script(
     let mut uses_runes = false;
     let mut uses_props = has_class_with_runes;
     let mut props_destructured: HashSet<String> = HashSet::new();
+    let mut legacy_export_props: Vec<(String, Option<Expression>)> = Vec::new();
     if has_class_with_runes {
         uses_runes = true;
     }
@@ -7515,6 +7754,38 @@ fn analyze_script(
                 // Hoist all imports to the top regardless of source order
                 // (matches upstream's behavior).
                 imports.push(s.clone());
+            }
+            // Legacy-mode `export let X [= INIT]`: capture as a prop
+            // descriptor and DROP from the body. Emitters that support
+            // legacy props rebuild the prop declaration with $.prop().
+            Statement::ExportNamed(ex)
+                if ex.source.is_none() && ex.specifiers.is_empty() => {
+                let mut handled = false;
+                if let Some(Statement::Variable(v)) = &ex.declaration {
+                    if matches!(v.kind, VariableKind::Let)
+                        && v.declarations.iter().all(|d| matches!(d.id, Pattern::Identifier(_)))
+                    {
+                        for d in &v.declarations {
+                            if let Pattern::Identifier(id) = &d.id {
+                                legacy_export_props
+                                    .push((id.name.clone(), d.init.clone()));
+                                uses_props = true;
+                            }
+                        }
+                        handled = true;
+                    }
+                }
+                if handled {
+                    continue;
+                }
+                let rewritten = rewrite_top_stmt_multi(
+                    s,
+                    &assigned,
+                    &state_bindings,
+                    &mut uses_runes,
+                    &mut uses_props,
+                )?;
+                rest.extend(rewritten);
             }
             _ => {
                 // Detect `let { a, b } = $props()` and drop the declaration —
@@ -7649,6 +7920,7 @@ fn analyze_script(
         proxy_bindings,
         derived_bindings,
         props_destructured,
+        legacy_export_props,
     })
 }
 
