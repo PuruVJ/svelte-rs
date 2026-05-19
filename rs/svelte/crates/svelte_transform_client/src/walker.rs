@@ -3790,8 +3790,30 @@ fn emit_top_level_multi_if_program(
             let prev_pos = positions[prev_slot_i];
             let this_pos = positions[slot_i];
             let offset = this_pos - prev_pos;
-            let nav_args: Vec<Expression> = if offset == 1 {
+            // For LiteralAnchor with empty text content, append `, true` as
+            // an is_text hint (mirrors `$.sibling(prev, N, true)`).
+            let is_empty_literal = matches!(slot, Slot::LiteralAnchor(s) if {
+                let mut full = String::new();
+                if slot_i > 0 && gap_after[slot_i - 1] {
+                    full.push(' ');
+                }
+                full.push_str(s);
+                if slot_i + 1 < slots.len() && gap_after[slot_i] {
+                    full.push(' ');
+                }
+                full.is_empty()
+            });
+            let nav_args: Vec<Expression> = if offset == 1 && !is_empty_literal {
                 vec![t::id(&prev_node)]
+            } else if is_empty_literal {
+                vec![
+                    t::id(&prev_node),
+                    t::lit_number(offset as f64),
+                    Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                        value: true,
+                        span: Span::ZERO,
+                    }))),
+                ]
             } else {
                 vec![t::id(&prev_node), t::lit_number(offset as f64)]
             };
@@ -4011,10 +4033,32 @@ fn emit_top_level_multi_if_program(
         ));
     }
     func_body.extend(script.body.clone());
+    // Helper: full text content for a LiteralAnchor slot (literal + leading/
+    // trailing whitespace gaps that contribute to the same text run).
+    let literal_full_text = |slot_i: usize| -> String {
+        let lit = match &slots[slot_i] {
+            Slot::LiteralAnchor(s) => s.clone(),
+            _ => return String::new(),
+        };
+        let mut full = String::new();
+        if slot_i > 0 && gap_after[slot_i - 1] {
+            full.push(' ');
+        }
+        full.push_str(&lit);
+        if slot_i + 1 < slots.len() && gap_after[slot_i] {
+            full.push(' ');
+        }
+        full
+    };
     // When the first anchor is a LiteralAnchor at position 0, emit
     // `$.next();` to position the hydration cursor at the leading text
     // node. Mirrors `html-tag-hydration` / `dynamic-text-nil`.
     let first_anchor_is_text = matches!(slots[first_anchor_slot], Slot::LiteralAnchor(_));
+    // `is_text=true` flag on first_child/sibling for LiteralAnchor whose
+    // full text content is empty (server may have stripped the text node;
+    // runtime needs to create one).
+    let first_anchor_text_empty =
+        first_anchor_is_text && literal_full_text(first_anchor_slot).is_empty();
     if first_if_pos == 0 && first_anchor_is_text {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id("$"), "next"),
@@ -4023,12 +4067,23 @@ fn emit_top_level_multi_if_program(
     }
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
     // Navigate to first anchor. If first_if_pos==0, that's
-    // `$.first_child(fragment)`. If first_if_pos==1, omit the second arg
-    // (uses default `$.sibling(NODE)` which advances by 1). Otherwise
-    // emit `$.sibling($.first_child(fragment), N)`.
+    // `$.first_child(fragment)` (with `, true` when first anchor is a
+    // LiteralAnchor with empty content). If first_if_pos==1, omit the
+    // second arg (uses default `$.sibling(NODE)`).
+    let first_child_args: Vec<Expression> = if first_anchor_text_empty && first_if_pos == 0 {
+        vec![
+            t::id("fragment"),
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            }))),
+        ]
+    } else {
+        vec![t::id("fragment")]
+    };
     let first_child_call = t::call(
         t::member_id(t::id("$"), "first_child"),
-        vec![t::id("fragment")],
+        first_child_args,
     );
     let first_node_init = if first_if_pos == 0 {
         first_child_call
@@ -4095,22 +4150,14 @@ fn emit_top_level_multi_if_program(
                 serialize_element_to_html(el, &mut html, &mut needs)?;
             }
             Slot::StaticText(s) => html.push_str(s.trim()),
-            // LiteralAnchor contributes nothing to template HTML — its
-            // value is set at runtime via `text.nodeValue = ...`. The
-            // surrounding gaps remain (text node forms naturally).
+            // LiteralAnchor contributes a single space so a text node
+            // exists at its DOM position. Runtime sets nodeValue.
+            // Surrounding gaps collapse with this space.
             Slot::LiteralAnchor(_) => {
-                let _ = i;
+                html.push(' ');
             }
         }
-    }
-    // If the FIRST slot is a LiteralAnchor and has no leading gap, the
-    // template needs a leading space so a text node exists at sibling 0.
-    if matches!(slots.first(), Some(Slot::LiteralAnchor(_))) && !html.starts_with(' ') {
-        html.insert(0, ' ');
-    }
-    // Same for trailing.
-    if matches!(slots.last(), Some(Slot::LiteralAnchor(_))) && !html.ends_with(' ') {
-        html.push(' ');
+        let _ = i;
     }
     // Note: the loop above intentionally over-emits a space when both
     // sides of a LiteralAnchor have gaps. Fix by collapsing runs of
@@ -6463,6 +6510,13 @@ fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
     for n in &el.fragment.nodes {
         match n {
             FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            FragmentChild::ExpressionTag(et) => {
+                // Allow ExpressionTag if the expression is literal-foldable
+                // (post-fold step replaces script consts with literals).
+                if literal_to_template_string(&et.expression).is_none() {
+                    return false;
+                }
+            }
             FragmentChild::RegularElement(child) => {
                 if !is_element_fully_static(child) {
                     return false;
@@ -9313,18 +9367,23 @@ fn attr_value_as_string_expr(v: &AttributeValue) -> Expression {
 
 fn is_text_only_element(el: &svelte_ast::elements::RegularElement) -> bool {
     // Returns true iff the element body is exclusively Text + ExpressionTag
-    // (i.e. text-with-interpolation), with at least one ExpressionTag.
-    // Mirrors upstream which collapses such bodies to a single space anchor
-    // in the template and rebuilds the content via $.set_text + template_effect.
-    let mut has_expr = false;
+    // (i.e. text-with-interpolation), with at least one NON-LITERAL
+    // ExpressionTag. Literal-foldable ExpressionTags get serialized
+    // directly (their value is statically known), so the element is
+    // either fully static (no text anchor) or text-only (anchor needed).
+    let mut has_non_literal_expr = false;
     for n in &el.fragment.nodes {
         match n {
             FragmentChild::Text(_) => {}
-            FragmentChild::ExpressionTag(_) => has_expr = true,
+            FragmentChild::ExpressionTag(et) => {
+                if literal_to_template_string(&et.expression).is_none() {
+                    has_non_literal_expr = true;
+                }
+            }
             _ => return false,
         }
     }
-    has_expr
+    has_non_literal_expr
 }
 
 fn single_expression_in_element(
@@ -9395,12 +9454,21 @@ fn serialize_fragment_to_html(
                 out.push_str("<!>");
                 last_was_text_with_space = false;
             }
-            FragmentChild::ExpressionTag(_) => {
-                // Inside an element this is a placeholder. At fragment top
-                // level it would be a text anchor — not the case for deep-
-                // static-walker which only handles element top-levels.
-                out.push(' ');
-                last_was_text_with_space = true;
+            FragmentChild::ExpressionTag(et) => {
+                // If the expression is literal-foldable, emit the literal
+                // value as text. Otherwise treat as placeholder anchor.
+                if let Some(lit) = literal_to_template_string(&et.expression) {
+                    if !lit.is_empty() {
+                        out.push_str(&lit);
+                        last_was_text_with_space = lit.ends_with(' ');
+                    }
+                    // Empty literal → emit nothing.
+                } else {
+                    // Inside an element this is a placeholder. At fragment top
+                    // level it would be a text anchor.
+                    out.push(' ');
+                    last_was_text_with_space = true;
+                }
             }
             FragmentChild::RegularElement(el) => {
                 serialize_element_to_html(el, out, needs_import_node)?;
@@ -11986,6 +12054,8 @@ fn is_literal_expression(e: &Expression) -> bool {
         // Plain template literal with no substitutions — equivalent to a
         // string literal for constant-fold purposes.
         Expression::Template(t) => t.expressions.is_empty(),
+        // `undefined` global identifier — treat as literal for fold purposes.
+        Expression::Identifier(i) if i.name == "undefined" => true,
         _ => false,
     }
 }
