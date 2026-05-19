@@ -185,11 +185,17 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
             _ => return None,
         }
     }
-    // Count top-level element/text-with-content roots (matches what
-    // upstream considers "siblings" for $.next stride).
+    // Count top-level element/text/expression roots that produce a node
+    // — these define the sibling stride for `$.next(2*(N-1))`. We exclude
+    // whitespace-only text since `trim_boundary_whitespace` collapses
+    // those into separators, not standalone roots.
     let top_count = trimmed
         .iter()
-        .filter(|n| matches!(n, FragmentChild::RegularElement(_)))
+        .filter(|n| match n {
+            FragmentChild::RegularElement(_) => true,
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            _ => false,
+        })
         .count();
     Some(("fragment".to_string(), html, top_count))
 }
