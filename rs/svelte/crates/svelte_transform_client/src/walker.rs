@@ -144,6 +144,16 @@ pub fn try_typed_client_walker_with(
                     );
                 }
             }
+            // Non-async single expression — emit the vanilla top-level
+            // text-anchor shape (`$.next(); var text = $.text();
+            // $.template_effect(...); $.append($$anchor, text);`).
+            if let Some(p) = emit_top_level_single_expression_program(
+                &et.expression,
+                component_name,
+                &script,
+            ) {
+                return Some(p);
+            }
         }
     }
 
@@ -1640,6 +1650,124 @@ fn emit_single_vanilla_if_program(
 /// directives/events, no spread, no async. Returns `None` for anything
 /// outside the supported shape so the caller falls through to the
 /// general walker.
+/// Emit the upstream shape for a top-level fragment that is exactly one
+/// non-async ExpressionTag — e.g.
+///
+///   {x}
+///
+/// →
+///
+///   export default function Main($$anchor, $$props) {
+///       $.next();
+///       var text = $.text();
+///       $.template_effect(() => $.set_text(text, $$props.x));
+///       $.append($$anchor, text);
+///   }
+fn emit_top_level_single_expression_program(
+    expr: &Expression,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let inner = rewrite_props_destructured(expr, &script.props_destructured);
+    let inner = rewrite_legacy_prop_reads(&inner, &legacy_prop_names);
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "next"),
+        Vec::new(),
+    )));
+    func_body.push(t::var(
+        "text",
+        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+    ));
+    let set_text = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), inner],
+    );
+    let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(set_text),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![effect_fn],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("text")],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Emit the upstream shape for a single wrapper element containing
 /// exactly one Component child — e.g.
 ///
