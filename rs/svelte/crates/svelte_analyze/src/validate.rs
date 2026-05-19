@@ -82,6 +82,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
     validate_const_assignments(&root.fragment, &[], &mut state);
     validate_each_and_snippet_assignments(&root.fragment, &mut state);
     validate_slot_attributes(&root.fragment, /*is_component_child=*/ false, &mut state);
+    validate_snippet_conflict(&root.fragment, &mut state);
     visit_fragment(&root.fragment, &mut state);
     if let Some(s) = root.instance.as_ref() {
         validate_script_attributes(&s.attributes, &mut state);
@@ -2128,6 +2129,87 @@ fn validate_runes(
                 .push(errors::props_duplicate(Some(*span), "$props"));
         }
     }
+
+    // `props.$$slots` / `props.$$props` access on a `$props()`-bound
+    // identifier — `$$`-prefixed property names are reserved. Find all
+    // identifier-bound `let X = $props()` first, then walk for X.$$Y refs.
+    let mut props_identifier_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for stmt in &program.body {
+        if let Statement::Variable(v) = stmt {
+            for d in &v.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    if matches!(init, Expression::Call(c) if matches!(
+                        &c.callee,
+                        Expression::Identifier(callee) if callee.name == "$props"
+                    )) {
+                        props_identifier_names.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    if !props_identifier_names.is_empty() {
+        check_props_member_access(program, &props_identifier_names, state);
+    }
+}
+
+fn check_props_member_access(
+    program: &svelte_js_ast::Program,
+    props_names: &std::collections::HashSet<String>,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(
+        e: &Expression,
+        props_names: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        if let Expression::Member(m) = e {
+            if let (Expression::Identifier(obj), MemberProperty::Identifier(prop)) =
+                (&m.object, &m.property)
+            {
+                if props_names.contains(&obj.name) && prop.name.starts_with("$$") {
+                    state.errors.push(errors::props_illegal_name(Some((
+                        prop.span.start,
+                        prop.span.end,
+                    ))));
+                }
+            }
+            walk_expr(&m.object, props_names, state);
+        }
+        match e {
+            Expression::Call(c) => {
+                walk_expr(&c.callee, props_names, state);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, props_names, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        s: &Statement,
+        props_names: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, props_names, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, props_names, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt(stmt, props_names, state);
+    }
 }
 
 /// Walk the script for `let $`, `const $`, `import { $ }`, `function $`
@@ -2425,6 +2507,53 @@ fn check_props_destructure(pat: &svelte_js_ast::Pattern, state: &mut ValidateSta
         }
     }
     walk(pat, state);
+}
+
+/// Inside a Component, `{#snippet children()}` cannot coexist with other
+/// non-whitespace content (which would also become the default `children`
+/// slot). Mirrors `snippet_conflict`.
+fn validate_snippet_conflict(fragment: &Fragment, state: &mut ValidateState) {
+    for n in &fragment.nodes {
+        let inner = match n {
+            FragmentChild::Component(c) => &c.fragment,
+            FragmentChild::SvelteComponent(c) => &c.fragment,
+            FragmentChild::SvelteSelf(el) => &el.fragment,
+            FragmentChild::RegularElement(el) => {
+                validate_snippet_conflict(&el.fragment, state);
+                continue;
+            }
+            FragmentChild::IfBlock(b) => {
+                validate_snippet_conflict(&b.consequent, state);
+                if let Some(alt) = &b.alternate {
+                    validate_snippet_conflict(alt, state);
+                }
+                continue;
+            }
+            FragmentChild::EachBlock(b) => {
+                validate_snippet_conflict(&b.body, state);
+                continue;
+            }
+            _ => continue,
+        };
+        let mut has_children_snippet: Option<(u32, u32)> = None;
+        let mut has_other_content = false;
+        for child in &inner.nodes {
+            match child {
+                FragmentChild::SnippetBlock(s) if s.expression.name == "children" => {
+                    has_children_snippet = Some((s.start, s.end));
+                }
+                FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+                FragmentChild::Comment(_) => {}
+                _ => {
+                    has_other_content = true;
+                }
+            }
+        }
+        if let (Some(span), true) = (has_children_snippet, has_other_content) {
+            state.errors.push(errors::snippet_conflict(Some(span)));
+        }
+        validate_snippet_conflict(inner, state);
+    }
 }
 
 /// Walk the template tracking `{#each ... as PATTERN}` context bindings
@@ -4372,6 +4501,27 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
         FragmentChild::HtmlTag(t) => visit_html_tag(t, state),
         FragmentChild::DebugTag(t) => visit_debug_tag(t, state),
         FragmentChild::ConstTag(t) => visit_const_tag(t, state),
+        FragmentChild::RenderTag(t) => {
+            // `{@render expr}` must be a simple CallExpression. Specifically
+            // `.apply(...)` / `.call(...)` style chains are rejected. Mirrors
+            // upstream's render_tag_invalid_call_expression.
+            let invalid = matches!(&t.expression, svelte_js_ast::Expression::Call(c)
+                if matches!(
+                    &c.callee,
+                    svelte_js_ast::Expression::Member(m)
+                        if matches!(
+                            &m.property,
+                            svelte_js_ast::MemberProperty::Identifier(id)
+                                if matches!(id.name.as_str(), "apply" | "call" | "bind")
+                        )
+                )
+            );
+            if invalid {
+                state.errors.push(errors::render_tag_invalid_call_expression(
+                    Some((t.start, t.end)),
+                ));
+            }
+        }
         FragmentChild::RegularElement(el) => {
             // Unknown `<svelte:foo>` tag — parser lets it through as a
             // RegularElement; emit `svelte_meta_invalid_tag` here.

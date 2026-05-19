@@ -188,6 +188,20 @@ fn read_at_tag(
     let name = parser.read_while(|b| b.is_ascii_alphanumeric() || b == b'_');
     let name = name.to_string();
     let name_end = parser.index;
+    // `@htmlfoo` / `@constfoo` etc. — the keyword run includes trailing
+    // identifier chars; detect known-prefix case and surface
+    // `expected_whitespace` after the prefix.
+    for known_kw in ["html", "attach", "render", "const", "debug"] {
+        if name.len() > known_kw.len()
+            && name.starts_with(known_kw)
+            && name.as_bytes()[known_kw.len()].is_ascii_alphabetic()
+        {
+            return Err(svelte_diagnostics::errors::expected_whitespace(Some((
+                (name_start + known_kw.len()) as u32,
+                (name_start + known_kw.len()) as u32,
+            ))));
+        }
+    }
 
     match name.as_str() {
         "html" | "attach" => {

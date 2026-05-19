@@ -62,9 +62,22 @@ pub fn read_element_or_comment(
     parser.index += 1;
 
     if parser.match_str("/") {
-        return Err(errors::expected_token(
-            Some((start as u32, start as u32)),
-            "element name",
+        // `</foo>` at fragment top level with no matching open. Read the
+        // tag name to surface the upstream error code.
+        parser.index += 1; // consume `/`
+        let _close_name_start = parser.index;
+        let close_name = parser.read_while(|b| {
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b':' || b == b'!'
+        });
+        let close_name = close_name.to_string();
+        if is_void(&close_name) {
+            return Err(svelte_diagnostics::errors::void_element_invalid_content(
+                Some((start as u32, start as u32)),
+            ));
+        }
+        return Err(svelte_diagnostics::errors::element_invalid_closing_tag(
+            Some((start as u32, parser.index as u32)),
+            &close_name,
         ));
     }
 
@@ -97,6 +110,12 @@ pub fn read_element_or_comment(
     if !self_closing {
         // Otherwise `>` is required.
         if !parser.eat(">") {
+            if parser.index >= parser.template.len() {
+                return Err(svelte_diagnostics::errors::unexpected_eof(Some((
+                    parser.index as u32,
+                    parser.index as u32,
+                ))));
+            }
             return Err(errors::expected_token(
                 Some((parser.index as u32, parser.index as u32)),
                 ">",
@@ -229,6 +248,28 @@ pub fn read_element_or_comment(
 
     // Consume `</name>`.
     if !parser.eat("</") {
+        // For `<script>` whose body is empty AND we hit EOF, upstream
+        // emits `unexpected_eof` instead of `element_unclosed`.
+        if name == "script" && fragment.nodes.iter().all(|n| match n {
+            FragmentChild::Text(t) => t.data.is_empty(),
+            _ => false,
+        }) {
+            return Err(svelte_diagnostics::errors::unexpected_eof(Some((
+                parser.index as u32,
+                parser.index as u32,
+            ))));
+        }
+        // `<style>` empty body EOF: upstream emits `expected_token`
+        // ("Expected token </style"). Match that.
+        if name == "style" && fragment.nodes.iter().all(|n| match n {
+            FragmentChild::Text(t) => t.data.is_empty(),
+            _ => false,
+        }) {
+            return Err(errors::expected_token(
+                Some((parser.index as u32, parser.index as u32)),
+                "</style",
+            ));
+        }
         return Err(errors::element_unclosed(
             Some((start as u32, (start + 1) as u32)),
             &name,
@@ -526,6 +567,12 @@ fn is_svg_foreign(name: &str) -> bool {
 
 fn read_tag_name<'src>(parser: &mut Parser<'src>) -> Result<std::borrow::Cow<'src, str>, CompileDiagnostic> {
     let start = parser.index;
+    if parser.index >= parser.template.len() {
+        return Err(svelte_diagnostics::errors::unexpected_eof(Some((
+            parser.index as u32,
+            parser.index as u32,
+        ))));
+    }
     // Tag-name characters: alphanumerics, `-`, `.`, `_`, `:` (for svelte:foo).
     let name = parser.read_while(|b| {
         b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b':' || b == b'!'

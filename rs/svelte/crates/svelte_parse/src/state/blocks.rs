@@ -398,6 +398,16 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::P
                 &name,
             ));
         }
+        // `{#each X as $state(...)}` — rune-name pattern is invalid; emit
+        // `state_invalid_placement` for the specific case where the
+        // identifier is a `$state` / `$derived` / `$props` rune name.
+        if matches!(name.as_str(), "$state" | "$derived" | "$props" | "$effect" | "$bindable" | "$inspect" | "$host") {
+            let rune = name.clone();
+            return Err(svelte_diagnostics::errors::state_invalid_placement(
+                Some((pat_start as u32, pat_end as u32)),
+                &rune,
+            ));
+        }
         parser.index = pat_end;
         return Ok(svelte_js_ast::Pattern::Identifier(svelte_js_ast::Identifier {
             name,
@@ -812,10 +822,13 @@ fn parse_fragment_until_block_boundary(
     let mut nodes: Vec<FragmentChild> = Vec::new();
     loop {
         if parser.index >= parser.template.len() {
-            return Err(errors::expected_token(
-                Some((parser.index as u32, parser.index as u32)),
-                "block boundary or close tag",
-            ));
+            // Find the position of the enclosing block-open `{#...`. The
+            // outer caller passes us boundaries containing the close-tag
+            // keyword like `/if`; emit `block_unclosed` with the start of
+            // the open tag as a guess (we don't track it here, so use 0).
+            return Err(svelte_diagnostics::errors::block_unclosed(Some((
+                0, 1,
+            ))));
         }
 
         if parser.match_str("{") && peek_is_boundary(parser, boundaries) {
