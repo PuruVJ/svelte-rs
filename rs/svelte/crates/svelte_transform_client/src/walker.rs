@@ -5518,9 +5518,20 @@ fn serialize_fragment_to_html(
                 }
                 last_was_text_with_space = collapsed.ends_with(' ');
             }
-            FragmentChild::Comment(_) => {
+            FragmentChild::Comment(c) => {
+                // Strip `<!-- svelte-ignore ... -->` directives — they're
+                // analyzer hints, not real comments. Keep everything else
+                // (e.g. `<!-- test -->` inside elements is meaningful for
+                // hydration claim).
                 let _ = i;
-                // Drop comments (server-side behavior also).
+                let trimmed = c.data.trim();
+                if trimmed.starts_with("svelte-ignore") {
+                    continue;
+                }
+                out.push_str("<!--");
+                out.push_str(&c.data);
+                out.push_str("-->");
+                last_was_text_with_space = false;
             }
             FragmentChild::HtmlTag(_) => {
                 out.push_str("<!>");
@@ -5640,33 +5651,30 @@ fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
 }
 
 /// Mirrors upstream `clean_nodes` (3-transform/utils.js:126-251) for the
-/// template-text serializer: drops comments and trims leading/trailing
-/// pure-whitespace text from a fragment's children.
+/// template-text serializer: trims leading/trailing pure-whitespace text
+/// and drops `svelte-ignore` directive comments. Real comments (e.g.
+/// `<!-- test -->` inside an element) are preserved.
 fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
-    // Drop comments first (upstream does `continue` for them).
     let mut filtered: Vec<&FragmentChild> = nodes
         .iter()
-        .filter(|n| !matches!(n, FragmentChild::Comment(_)))
+        .filter(|n| match n {
+            FragmentChild::Comment(c) => !c.data.trim().starts_with("svelte-ignore"),
+            _ => true,
+        })
         .collect();
     let mut start = 0;
     let mut end = filtered.len();
     while start < end {
-        if let FragmentChild::Text(t) = filtered[start] {
-            if t.data.trim().is_empty() {
-                start += 1;
-                continue;
-            }
+        match filtered[start] {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => start += 1,
+            _ => break,
         }
-        break;
     }
     while end > start {
-        if let FragmentChild::Text(t) = filtered[end - 1] {
-            if t.data.trim().is_empty() {
-                end -= 1;
-                continue;
-            }
+        match filtered[end - 1] {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => end -= 1,
+            _ => break,
         }
-        break;
     }
     filtered.drain(end..);
     filtered.drain(..start);
