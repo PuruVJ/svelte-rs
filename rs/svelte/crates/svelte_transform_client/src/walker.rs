@@ -1107,6 +1107,106 @@ fn emit_single_component_program(
         })
         .collect();
     if !body_non_ws.is_empty() {
+        // Slot child case 1: body is exactly one Component (no props, no
+        // body), surrounded by whitespace text and comments only. Emit
+        // `children: ($$anchor, $$slotProps) => { Component($$anchor, {}); }`.
+        if body_non_ws.len() == 1 {
+            if let FragmentChild::Component(inner) = body_non_ws[0] {
+                if inner.attributes.is_empty() && inner.fragment.nodes.is_empty() {
+                    let inner_call = t::stmt(t::call(
+                        t::id(&inner.name),
+                        vec![
+                            t::id("$$anchor"),
+                            Expression::Object(Box::new(ObjectExpression {
+                                properties: Vec::new(),
+                                span: Span::ZERO,
+                            })),
+                        ],
+                    ));
+                    let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                        body: ArrowBody::Block(Box::new(BlockStatement {
+                            body: vec![inner_call],
+                            span: Span::ZERO,
+                        })),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }));
+                    props.push(ObjectMember::Property(Box::new(Property {
+                        key: PropertyKey::Identifier(Identifier {
+                            name: "children".to_string(),
+                            span: Span::ZERO,
+                        }),
+                        value: children_arrow,
+                        kind: PropertyKind::Init,
+                        computed: false,
+                        shorthand: false,
+                        method: false,
+                        span: Span::ZERO,
+                    })));
+                    props.push(ObjectMember::Property(Box::new(Property {
+                        key: PropertyKey::Identifier(Identifier {
+                            name: "$$slots".to_string(),
+                            span: Span::ZERO,
+                        }),
+                        value: Expression::Object(Box::new(ObjectExpression {
+                            properties: vec![ObjectMember::Property(Box::new(Property {
+                                key: PropertyKey::Identifier(Identifier {
+                                    name: "default".to_string(),
+                                    span: Span::ZERO,
+                                }),
+                                value: Expression::Literal(Box::new(Literal::Boolean(
+                                    BooleanLiteral { value: true, span: Span::ZERO },
+                                ))),
+                                kind: PropertyKind::Init,
+                                computed: false,
+                                shorthand: false,
+                                method: false,
+                                span: Span::ZERO,
+                            }))],
+                            span: Span::ZERO,
+                        })),
+                        kind: PropertyKind::Init,
+                        computed: false,
+                        shorthand: false,
+                        method: false,
+                        span: Span::ZERO,
+                    })));
+                    // Skip the text-build pathway below.
+                    let component_call = Expression::Call(Box::new(CallExpression {
+                        callee: t::id(&c.name),
+                        arguments: vec![
+                            Argument::Expression(t::id("$$anchor")),
+                            Argument::Expression(Expression::Object(Box::new(ObjectExpression {
+                                properties: props,
+                                span: Span::ZERO,
+                            }))),
+                        ],
+                        optional: false,
+                        span: Span::ZERO,
+                    }));
+                    let mut func_body: Vec<Statement> = Vec::new();
+                    func_body.extend(script.body.clone());
+                    func_body.push(t::stmt(component_call));
+                    let mut params = vec![t::pat_id("$$anchor")];
+                    if script.uses_props {
+                        params.push(t::pat_id("$$props"));
+                    }
+                    let export =
+                        t::export_default_function(component_name, params, func_body);
+                    let mut prog: Vec<Statement> =
+                        Vec::with_capacity(3 + script.imports.len());
+                    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+                    if script.emit_legacy_flag {
+                        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+                    }
+                    prog.push(t::import_namespace("$", "svelte/internal/client"));
+                    prog.extend(script.imports.clone());
+                    prog.push(export);
+                    return Some(t::program(prog));
+                }
+            }
+        }
         // Build a children arrow: `($$anchor, $$slotProps) => { ... }`
         // Currently only handle text-only body (mix of text + expressions).
         let mut parts: Vec<TextPart> = Vec::new();
@@ -7194,18 +7294,19 @@ fn attr_value_as_string_expr(v: &AttributeValue) -> Expression {
 }
 
 fn is_text_only_element(el: &svelte_ast::elements::RegularElement) -> bool {
-    // Returns true iff the element has exactly one non-whitespace child that
-    // is an ExpressionTag (matches `<h1>{title}</h1>`-shape).
-    let non_ws: Vec<&FragmentChild> = el
-        .fragment
-        .nodes
-        .iter()
-        .filter(|n| match n {
-            FragmentChild::Text(t) => !t.data.trim().is_empty(),
-            _ => true,
-        })
-        .collect();
-    non_ws.len() == 1 && matches!(non_ws[0], FragmentChild::ExpressionTag(_))
+    // Returns true iff the element body is exclusively Text + ExpressionTag
+    // (i.e. text-with-interpolation), with at least one ExpressionTag.
+    // Mirrors upstream which collapses such bodies to a single space anchor
+    // in the template and rebuilds the content via $.set_text + template_effect.
+    let mut has_expr = false;
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) => {}
+            FragmentChild::ExpressionTag(_) => has_expr = true,
+            _ => return false,
+        }
+    }
+    has_expr
 }
 
 fn single_expression_in_element(
