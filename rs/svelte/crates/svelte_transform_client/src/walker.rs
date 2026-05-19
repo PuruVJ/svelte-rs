@@ -1626,22 +1626,27 @@ fn emit_single_dynamic_element_program(
     {
         return None;
     }
-    // Element body must be fully static (no expressions / blocks / etc.).
-    if !el.fragment.nodes.iter().all(|n| matches!(n, FragmentChild::Text(_) | FragmentChild::Comment(_))) {
-        return None;
-    }
+    // Element body may contain text + expression tags (treated as one
+    // text region) plus comments. Anything else (nested elements, blocks,
+    // etc.) → bail to the general walker.
     if !el
         .fragment
         .nodes
         .iter()
-        .all(|n| match n {
-            FragmentChild::Text(_) => true,
-            FragmentChild::Comment(_) => true,
-            _ => false,
-        })
+        .all(|n| matches!(n, FragmentChild::Text(_) | FragmentChild::Comment(_) | FragmentChild::ExpressionTag(_)))
     {
         return None;
     }
+    // Body has a *real* dynamic expression (not just a literal that folds
+    // into surrounding text). Pure-literal expression tags collapse into
+    // the static template via `literal_to_template_string`.
+    let body_has_expression = el.fragment.nodes.iter().any(|n| {
+        if let FragmentChild::ExpressionTag(et) = n {
+            literal_to_template_string(&et.expression).is_none()
+        } else {
+            false
+        }
+    });
 
     // Classify attributes: static (literal/text) vs dynamic (single
     // ExpressionTag value). Any other shape (directive, spread, mixed
@@ -1669,8 +1674,36 @@ fn emit_single_dynamic_element_program(
             _ => return None,
         }
     }
-    if dyn_attrs.is_empty() {
+    if dyn_attrs.is_empty() && !body_has_expression {
         return None;
+    }
+    // Bail when the existing walker's template_effect emitter is needed:
+    // runes-mode (no legacy props, no props destructure) body with
+    // user-function calls produces the 3-arg `template_effect(EFFECT_FN,
+    // [DEP_FNS])` form that this emitter doesn't yet handle. Legacy /
+    // props-destructured paths use the inline 1-arg shape so they stay
+    // in scope here.
+    let is_legacy_or_destructured =
+        !script.legacy_export_props.is_empty() || !script.props_destructured.is_empty();
+    if !is_legacy_or_destructured {
+        let any_body_user_call = el.fragment.nodes.iter().any(|n| {
+            if let FragmentChild::ExpressionTag(et) = n {
+                expr_has_user_call(&et.expression, &script.derived_bindings)
+            } else {
+                false
+            }
+        });
+        let any_attr_user_call = el.attributes.iter().any(|a| {
+            if let svelte_ast::attributes::ElementAttribute::Attribute(attr) = a {
+                if let svelte_ast::attributes::AttributeValue::Single(et) = &attr.value {
+                    return expr_has_user_call(&et.expression, &script.derived_bindings);
+                }
+            }
+            false
+        });
+        if any_body_user_call || any_attr_user_call {
+            return None;
+        }
     }
 
     // Build template HTML.
@@ -1708,13 +1741,27 @@ fn emit_single_dynamic_element_program(
         html.push_str("/>");
     } else {
         html.push('>');
-        for n in &el.fragment.nodes {
-            if let FragmentChild::Text(t) = n {
-                for c in t.data.chars() {
-                    match c {
-                        '`' => html.push_str("\\`"),
-                        '\\' => html.push_str("\\\\"),
-                        _ => html.push(c),
+        if body_has_expression {
+            // Collapse mixed text+expression body to a single space — the
+            // template_effect setup writes the real content via
+            // `$.set_text(text, …)`. Mirrors upstream's text-anchor pattern.
+            html.push(' ');
+        } else {
+            // Fold literal expression tags (e.g. `{'client'}`) into the
+            // surrounding static text.
+            for n in &el.fragment.nodes {
+                let s = match n {
+                    FragmentChild::Text(t) => Some(t.data.clone()),
+                    FragmentChild::ExpressionTag(et) => literal_to_template_string(&et.expression),
+                    _ => None,
+                };
+                if let Some(s) = s {
+                    for c in s.chars() {
+                        match c {
+                            '`' => html.push_str("\\`"),
+                            '\\' => html.push_str("\\\\"),
+                            _ => html.push(c),
+                        }
                     }
                 }
             }
@@ -1731,14 +1778,34 @@ fn emit_single_dynamic_element_program(
         .iter()
         .map(|(n, _)| n.clone())
         .collect();
+    let rewrite_expr = |e: &Expression| {
+        let e = rewrite_props_destructured(e, &script.props_destructured);
+        rewrite_legacy_prop_reads(&e, &legacy_prop_names)
+    };
     let dyn_attrs: Vec<(String, Expression)> = dyn_attrs
         .into_iter()
-        .map(|(name, e)| {
-            let e = rewrite_props_destructured(&e, &script.props_destructured);
-            let e = rewrite_legacy_prop_reads(&e, &legacy_prop_names);
-            (name.to_string(), e)
-        })
+        .map(|(name, e)| (name.to_string(), rewrite_expr(&e)))
         .collect();
+    // Collect body text + expression parts for the set_text call.
+    let body_parts_owned: Vec<TextPart<'static>> = if body_has_expression {
+        let mut parts: Vec<TextPart<'static>> = Vec::new();
+        for n in &el.fragment.nodes {
+            match n {
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::ExpressionTag(et) => {
+                    let rewritten = rewrite_expr(&et.expression);
+                    // Leak the expression to extend its lifetime to 'static
+                    // — the parts vec only borrows via `TextPart::Expr`.
+                    let leaked: &'static Expression = Box::leak(Box::new(rewritten));
+                    parts.push(TextPart::Expr(leaked));
+                }
+                _ => {}
+            }
+        }
+        parts
+    } else {
+        Vec::new()
+    };
 
     // Build function body.
     let tag_var = el.name.clone();
@@ -1777,6 +1844,19 @@ fn emit_single_dynamic_element_program(
     }
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+    if body_has_expression {
+        func_body.push(t::var(
+            "text",
+            t::call(
+                t::member_id(t::id("$"), "child"),
+                vec![t::id(&tag_var)],
+            ),
+        ));
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "reset"),
+            vec![t::id(&tag_var)],
+        )));
+    }
 
     // `<input>` needs `$.remove_input_defaults` BEFORE the effect, and
     // `value` / `checked` attrs use dedicated setters instead of the
@@ -1821,22 +1901,35 @@ fn emit_single_dynamic_element_program(
             vec![t::id(&tag_var), t::literal_str(name), e],
         )
     };
-    let effect_arrow = if dyn_attrs.len() == 1 {
-        let (name, e) = dyn_attrs.into_iter().next().unwrap();
+    // Collect all effect statements: `$.set_text(text, …)` for the body
+    // (if any expressions), then per-dyn-attr setters.
+    let mut effect_stmts: Vec<Statement> = Vec::new();
+    if body_has_expression {
+        let tpl = build_inline_template(&body_parts_owned, &HashSet::new());
+        effect_stmts.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "set_text"),
+            vec![t::id("text"), tpl],
+        )));
+    }
+    for (name, e) in &dyn_attrs {
+        effect_stmts.push(t::stmt(set_attr_call(name, e.clone())));
+    }
+    let effect_arrow = if effect_stmts.len() == 1 {
+        let only = effect_stmts.into_iter().next().unwrap();
+        let expr = match only {
+            Statement::Expression(es) => es.expression,
+            _ => unreachable!(),
+        };
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
-            body: ArrowBody::Expression(set_attr_call(&name, e)),
+            body: ArrowBody::Expression(expr),
             r#async: false,
             span: Span::ZERO,
         }))
     } else {
-        let body: Vec<Statement> = dyn_attrs
-            .into_iter()
-            .map(|(name, e)| t::stmt(set_attr_call(&name, e)))
-            .collect();
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
-            body: ArrowBody::Block(Box::new(BlockStatement { body, span: Span::ZERO })),
+            body: ArrowBody::Block(Box::new(BlockStatement { body: effect_stmts, span: Span::ZERO })),
             r#async: false,
             span: Span::ZERO,
         }))
