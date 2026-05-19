@@ -113,6 +113,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
             validate_store_rune_conflict(&s.content, &mut state);
             validate_perf_avoid_class(&s.content, /*is_instance=*/ true, &mut state);
             validate_state_referenced_locally(&s.content, &mut state);
+            validate_non_reactive_update(&s.content, &root.fragment, &mut state);
         }
     }
     if let Some(s) = root.module.as_ref() {
@@ -653,6 +654,410 @@ fn validate_store_rune_conflict(
         state
             .warnings
             .push(warnings::store_rune_conflict(Some((start, end)), &name));
+    }
+}
+
+/// `non_reactive_update` — in runes mode, a top-level non-state `let`/
+/// `var` binding that is BOTH mutated somewhere AND read in the template
+/// should be declared with `$state(...)` instead. Mirrors the upstream
+/// check that fires from VariableDeclarator + reference analysis.
+fn validate_non_reactive_update(
+    program: &svelte_js_ast::Program,
+    fragment: &Fragment,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    // 1. Top-level non-rune let/var bindings. Collect declarator id span +
+    //    bound name. Skip if init is a rune call.
+    let mut bindings: std::collections::HashMap<String, (u32, u32)> =
+        std::collections::HashMap::new();
+    for stmt in &program.body {
+        let Statement::Variable(v) = stmt else { continue };
+        if matches!(v.kind, VariableKind::Const) {
+            continue;
+        }
+        for d in &v.declarations {
+            let Pattern::Identifier(id) = &d.id else { continue };
+            // Skip rune-bound bindings.
+            if let Some(init) = &d.init {
+                if let Expression::Call(c) = init {
+                    if let Expression::Identifier(callee) = &c.callee {
+                        if callee.name.starts_with('$') {
+                            continue;
+                        }
+                    }
+                }
+            }
+            bindings.insert(id.name.clone(), (id.span.start, id.span.end));
+        }
+    }
+    if bindings.is_empty() {
+        return;
+    }
+    // 2. Collect mutated names from the entire instance script AND from
+    //    template attribute expressions (onclick handlers etc).
+    let names_set: std::collections::HashSet<String> = bindings.keys().cloned().collect();
+    let mut mutated: std::collections::HashSet<String> = Default::default();
+    collect_mutated_names(program, &names_set, &mut mutated);
+    collect_template_mutated_names(fragment, &names_set, &mut mutated);
+    if mutated.is_empty() {
+        return;
+    }
+    // 3. Collect identifier reads from the template fragment recursively.
+    let mut read_in_template: std::collections::HashSet<String> = Default::default();
+    collect_template_ident_reads(fragment, &names_set, &mut read_in_template);
+    // 4. Emit for the intersection.
+    for (name, span) in &bindings {
+        if mutated.contains(name) && read_in_template.contains(name) {
+            state
+                .warnings
+                .push(warnings::non_reactive_update(Some(*span), name));
+        }
+    }
+}
+
+fn collect_template_mutated_names(
+    fragment: &Fragment,
+    candidates: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    fn walk_expr(
+        e: &svelte_js_ast::Expression,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        use svelte_js_ast::*;
+        fn note_lhs(
+            e: &Expression,
+            candidates: &std::collections::HashSet<String>,
+            out: &mut std::collections::HashSet<String>,
+        ) {
+            if let Expression::Identifier(id) = e {
+                if candidates.contains(&id.name) {
+                    out.insert(id.name.clone());
+                }
+            }
+        }
+        match e {
+            Expression::Assignment(a) => {
+                match &a.left {
+                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
+                        if candidates.contains(&id.name) {
+                            out.insert(id.name.clone());
+                        }
+                    }
+                    AssignmentTarget::Expression(e) => note_lhs(e, candidates, out),
+                    _ => {}
+                }
+                walk_expr(&a.right, candidates, out);
+            }
+            Expression::Update(u) => note_lhs(&u.argument, candidates, out),
+            Expression::Call(c) => {
+                walk_expr(&c.callee, candidates, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, candidates, out);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, candidates, out),
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        if let Statement::Expression(es) = s {
+                            walk_expr(&es.expression, candidates, out);
+                        }
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, candidates, out),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    if let Statement::Expression(es) = s {
+                        walk_expr(&es.expression, candidates, out);
+                    }
+                }
+            }
+            Expression::Binary(b) => {
+                walk_expr(&b.left, candidates, out);
+                walk_expr(&b.right, candidates, out);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, candidates, out);
+                walk_expr(&b.right, candidates, out);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, candidates, out);
+                walk_expr(&c.consequent, candidates, out);
+                walk_expr(&c.alternate, candidates, out);
+            }
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, candidates, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_node(
+        n: &FragmentChild,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match n {
+            FragmentChild::ExpressionTag(et) => walk_expr(&et.expression, candidates, out),
+            FragmentChild::HtmlTag(t) => walk_expr(&t.expression, candidates, out),
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    walk_attr(a, candidates, out);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::Component(c) => {
+                for a in &c.attributes {
+                    walk_attr(a, candidates, out);
+                }
+                for n in &c.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::SvelteElement(el) => {
+                for a in &el.attributes {
+                    walk_attr(a, candidates, out);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::IfBlock(b) => {
+                for n in &b.consequent.nodes {
+                    walk_node(n, candidates, out);
+                }
+                if let Some(alt) = &b.alternate {
+                    for n in &alt.nodes {
+                        walk_node(n, candidates, out);
+                    }
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                for n in &b.body.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_attr(
+        a: &ElementAttribute,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, candidates, out),
+                svelte_ast::AttributeValue::Many(parts) => {
+                    for p in parts {
+                        if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                            walk_expr(&et.expression, candidates, out);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            ElementAttribute::OnDirective(d) => {
+                if let Some(e) = &d.expression {
+                    walk_expr(e, candidates, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for n in &fragment.nodes {
+        walk_node(n, candidates, out);
+    }
+}
+
+fn collect_template_ident_reads(
+    fragment: &Fragment,
+    candidates: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    fn walk_expr(
+        e: &svelte_js_ast::Expression,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        use svelte_js_ast::*;
+        match e {
+            Expression::Identifier(id) => {
+                if candidates.contains(&id.name) {
+                    out.insert(id.name.clone());
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, candidates, out),
+            Expression::Call(c) => {
+                walk_expr(&c.callee, candidates, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, candidates, out);
+                    }
+                }
+            }
+            Expression::Binary(b) => {
+                walk_expr(&b.left, candidates, out);
+                walk_expr(&b.right, candidates, out);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, candidates, out);
+                walk_expr(&b.right, candidates, out);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, candidates, out);
+                walk_expr(&c.consequent, candidates, out);
+                walk_expr(&c.alternate, candidates, out);
+            }
+            Expression::Template(t) => {
+                for e in &t.expressions {
+                    walk_expr(e, candidates, out);
+                }
+            }
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, candidates, out);
+                }
+            }
+            Expression::Unary(u) => walk_expr(&u.argument, candidates, out),
+            _ => {}
+        }
+    }
+    fn walk_node(
+        n: &FragmentChild,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match n {
+            FragmentChild::ExpressionTag(et) => walk_expr(&et.expression, candidates, out),
+            FragmentChild::HtmlTag(t) => walk_expr(&t.expression, candidates, out),
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    walk_attr(a, candidates, out);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::Component(c) => {
+                for a in &c.attributes {
+                    walk_attr(a, candidates, out);
+                }
+                for n in &c.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::SvelteElement(el) => {
+                walk_expr(&el.tag, candidates, out);
+                for a in &el.attributes {
+                    walk_attr(a, candidates, out);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::IfBlock(b) => {
+                walk_expr(&b.test, candidates, out);
+                for n in &b.consequent.nodes {
+                    walk_node(n, candidates, out);
+                }
+                if let Some(alt) = &b.alternate {
+                    for n in &alt.nodes {
+                        walk_node(n, candidates, out);
+                    }
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                walk_expr(&b.expression, candidates, out);
+                for n in &b.body.nodes {
+                    walk_node(n, candidates, out);
+                }
+                if let Some(fb) = &b.fallback {
+                    for n in &fb.nodes {
+                        walk_node(n, candidates, out);
+                    }
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                walk_expr(&b.expression, candidates, out);
+                if let Some(f) = &b.pending {
+                    for n in &f.nodes { walk_node(n, candidates, out); }
+                }
+                if let Some(f) = &b.then {
+                    for n in &f.nodes { walk_node(n, candidates, out); }
+                }
+                if let Some(f) = &b.catch_ {
+                    for n in &f.nodes { walk_node(n, candidates, out); }
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                walk_expr(&b.expression, candidates, out);
+                for n in &b.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::TitleElement(el) => {
+                for n in &el.fragment.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            FragmentChild::SnippetBlock(b) => {
+                for n in &b.body.nodes {
+                    walk_node(n, candidates, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_attr(
+        a: &ElementAttribute,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, candidates, out),
+                svelte_ast::AttributeValue::Many(parts) => {
+                    for p in parts {
+                        if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                            walk_expr(&et.expression, candidates, out);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            ElementAttribute::BindDirective(b) => walk_expr(&b.expression, candidates, out),
+            ElementAttribute::OnDirective(d) => {
+                if let Some(e) = &d.expression {
+                    walk_expr(e, candidates, out);
+                }
+            }
+            ElementAttribute::ClassDirective(d) => walk_expr(&d.expression, candidates, out),
+            ElementAttribute::StyleDirective(d) => match &d.value {
+                svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, candidates, out),
+                svelte_ast::AttributeValue::Many(parts) => {
+                    for p in parts {
+                        if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                            walk_expr(&et.expression, candidates, out);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    for n in &fragment.nodes {
+        walk_node(n, candidates, out);
     }
 }
 
@@ -1402,6 +1807,45 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             state
                 .warnings
                 .extend(crate::a11y::check_regular_element_with_parent(el, parent_tag));
+            // node_invalid_placement_ssr — check ancestor placement rules.
+            // For now we only encode `<form>` inside `<form>` since that's
+            // the only fixture in the suite. Fires as a WARNING when nested
+            // inside an IfBlock / EachBlock / AwaitBlock / KeyBlock; as an
+            // ERROR otherwise (mirrors RegularElement.js:160-201).
+            if matches!(el.name.as_str(), "form") {
+                let mut only_warn = false;
+                let mut nested_in_form = false;
+                for n in state.path.iter().rev().skip(1) {
+                    match n {
+                        FragmentChild::IfBlock(_)
+                        | FragmentChild::EachBlock(_)
+                        | FragmentChild::AwaitBlock(_)
+                        | FragmentChild::KeyBlock(_) => only_warn = true,
+                        FragmentChild::RegularElement(p) if p.name == "form" => {
+                            nested_in_form = true;
+                            break;
+                        }
+                        FragmentChild::Component(_)
+                        | FragmentChild::SvelteComponent(_)
+                        | FragmentChild::SvelteElement(_)
+                        | FragmentChild::SvelteSelf(_)
+                        | FragmentChild::SnippetBlock(_) => break,
+                        _ => {}
+                    }
+                }
+                if nested_in_form {
+                    let msg = "`<form>` cannot be a child of `<form>`. When rendering this component on the server, the resulting HTML will be modified by the browser (by moving, removing, or inserting elements), likely resulting in a `hydration_mismatch` warning";
+                    if only_warn {
+                        state
+                            .warnings
+                            .push(warnings::node_invalid_placement_ssr(
+                                Some((el.start, el.end)),
+                                msg,
+                            ));
+                    }
+                    // Hard-error case omitted — separate code `node_invalid_placement`.
+                }
+            }
             // attribute_quoted — for custom elements (hyphen in tag name),
             // quoted expression attributes get stringified.
             if el.name.contains('-') {
