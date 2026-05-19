@@ -64,6 +64,7 @@ fn hydration_client_sweep() {
         match result {
             Ok(Ok(r)) if r.js.trim() == exp.trim() => {
                 ok += 1;
+                println!("[OK  ] {name}");
             }
             Ok(Ok(r)) => {
                 diff += 1;

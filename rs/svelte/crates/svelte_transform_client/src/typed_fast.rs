@@ -36,7 +36,8 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
     if root.css.is_some() {
         return None;
     }
-    let (root_var_name, html, is_multi_root) = static_root(&root.fragment)?;
+    let (root_var_name, html, multi_root_count) = static_root(&root.fragment)?;
+    let is_multi_root = multi_root_count > 1;
 
     let import_disclose = t::import_side_effect("svelte/internal/disclose-version");
     let import_flags = t::import_side_effect("svelte/internal/flags/legacy");
@@ -57,7 +58,18 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
         t::member_id(t::id("$"), "append"),
         vec![t::id("$$anchor"), t::id(&root_var_name)],
     );
-    let func_body = vec![inner_var, t::stmt(append_call)];
+    let mut func_body = vec![inner_var];
+    // Multi-root templates need `$.next(2*(N-1))` to position the cursor
+    // past the spacers between top-level elements before appending.
+    // Mirrors upstream's behavior for static multi-root templates.
+    if multi_root_count > 1 {
+        let offset = (2 * (multi_root_count - 1)) as f64;
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            vec![t::lit_number(offset)],
+        )));
+    }
+    func_body.push(t::stmt(append_call));
 
     let export = t::export_default_function(
         component_name,
@@ -74,10 +86,10 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
     ]))
 }
 
-/// Returns `(var_name, html, is_multi_root)` for a fully-static fragment.
+/// Returns `(var_name, html, top_count)` for a fully-static fragment.
 /// `var_name` is the tag name for single-root templates, `"fragment"` for
-/// multi-root.
-fn static_root(fragment: &Fragment) -> Option<(String, String, bool)> {
+/// multi-root. `top_count` is the number of top-level element-like roots.
+fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
     let non_ws: Vec<&FragmentChild> = fragment
         .nodes
         .iter()
@@ -105,16 +117,16 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, bool)> {
             }
             if is_void(&el.name) {
                 html.push_str("/>");
-                return Some((el.name.clone(), html, false));
+                return Some((el.name.clone(), html, 1));
             }
             html.push('>');
-            for child in &el.fragment.nodes {
+            for child in trim_boundary_whitespace(&el.fragment.nodes) {
                 append_static(child, &mut html)?;
             }
             html.push_str("</");
             html.push_str(&el.name);
             html.push('>');
-            return Some((el.name.clone(), html, false));
+            return Some((el.name.clone(), html, 1));
         }
         return None;
     }
@@ -173,7 +185,13 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, bool)> {
             _ => return None,
         }
     }
-    Some(("fragment".to_string(), html, true))
+    // Count top-level element/text-with-content roots (matches what
+    // upstream considers "siblings" for $.next stride).
+    let top_count = trimmed
+        .iter()
+        .filter(|n| matches!(n, FragmentChild::RegularElement(_)))
+        .count();
+    Some(("fragment".to_string(), html, top_count))
 }
 
 fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
@@ -217,8 +235,10 @@ fn append_static_attr(a: &svelte_ast::attributes::Attribute, html: &mut String) 
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
     match &a.value {
         AttributeValue::Empty => {
+            // Serialize bare attrs as `name=""` to match upstream/server.
             html.push(' ');
             html.push_str(&a.name);
+            html.push_str("=\"\"");
             Some(())
         }
         AttributeValue::Single(_) => None,

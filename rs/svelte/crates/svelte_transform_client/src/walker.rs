@@ -47,12 +47,11 @@ pub fn try_typed_client_walker_with(
     let script = analyze_script(root.instance.as_ref(), &template_assigned)?;
 
     // Apply script-context fold to the fragment: inline plain `let X = LIT`
-    // bindings, fold nullish-coalesce, and any nested Math.X calls. Mutates
-    // a local clone of the fragment so we don't disturb the caller.
+    // bindings, fold nullish-coalesce, fold literal arithmetic
+    // (`40 + 2` → `42`), and any nested Math.X calls. Always run — even
+    // without script constants, expressions like `{40 + 2}` may fold.
     let mut fragment = root.fragment.clone();
-    if !script.constants.is_empty() {
-        fold_fragment_with_consts(&mut fragment, &script.constants);
-    }
+    fold_fragment_with_consts(&mut fragment, &script.constants);
 
     // PRE-DETECT: select-with-rich-content uses snippet bodies that contain
     // `<option>...</option>` (not plain Text), so the regular
@@ -5112,6 +5111,9 @@ fn emit_deep_static_walker_program(
 
     let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
     prog.push(root_decl);
@@ -5489,7 +5491,11 @@ fn serialize_fragment_to_html(
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
-    let nodes = trim_boundary_text_client(&f.nodes);
+    // Mirrors upstream `clean_nodes` (3-transform/utils.js:172-201): drop
+    // leading/trailing pure-whitespace text nodes inside every fragment,
+    // not just at the top level.
+    let nodes_v = trim_pure_whitespace_text(&f.nodes);
+    let nodes = &nodes_v[..];
     let mut last_was_text_with_space = false;
     for (i, n) in nodes.iter().enumerate() {
         match n {
@@ -5563,8 +5569,12 @@ fn serialize_element_to_html(
             }
             match &attr.value {
                 AttributeValue::Empty => {
+                    // Mirrors upstream which serializes empty attrs as
+                    // `name=""` so the HTML matches what the server emits
+                    // (important for hydration matching).
                     out.push(' ');
                     out.push_str(&attr.name);
+                    out.push_str("=\"\"");
                 }
                 AttributeValue::Many(parts) => {
                     let mut s = String::new();
@@ -5627,6 +5637,40 @@ fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
         }
     }
     nodes[start..end].iter().collect()
+}
+
+/// Mirrors upstream `clean_nodes` (3-transform/utils.js:126-251) for the
+/// template-text serializer: drops comments and trims leading/trailing
+/// pure-whitespace text from a fragment's children.
+fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
+    // Drop comments first (upstream does `continue` for them).
+    let mut filtered: Vec<&FragmentChild> = nodes
+        .iter()
+        .filter(|n| !matches!(n, FragmentChild::Comment(_)))
+        .collect();
+    let mut start = 0;
+    let mut end = filtered.len();
+    while start < end {
+        if let FragmentChild::Text(t) = filtered[start] {
+            if t.data.trim().is_empty() {
+                start += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    while end > start {
+        if let FragmentChild::Text(t) = filtered[end - 1] {
+            if t.data.trim().is_empty() {
+                end -= 1;
+                continue;
+            }
+        }
+        break;
+    }
+    filtered.drain(end..);
+    filtered.drain(..start);
+    filtered
 }
 
 fn collapse_ws_client(s: &str) -> String {
@@ -10430,6 +10474,9 @@ fn fold_expr_full(e: &mut Expression) {
         Expression::Binary(b) => {
             fold_expr_full(&mut b.left);
             fold_expr_full(&mut b.right);
+            if let Some(folded) = try_fold_binary(b) {
+                *e = folded;
+            }
         }
         Expression::Conditional(c) => {
             fold_expr_full(&mut c.test);
@@ -10561,6 +10608,55 @@ fn fold_expr(e: &mut Expression) {
         Expression::Paren(p) => fold_expr(&mut p.expression),
         _ => {}
     }
+}
+
+/// Fold a `BinaryExpression` of two numeric or string literals down to a
+/// single literal — `40 + 2` → `42`, `'a' + 'b'` → `'ab'`. Only the
+/// operators that produce a literal-equivalent result; comparisons and
+/// logical-shifts are out of scope.
+fn try_fold_binary(b: &BinaryExpression) -> Option<Expression> {
+    let lit_num = |e: &Expression| match e {
+        Expression::Literal(l) => match l.as_ref() {
+            Literal::Number(n) => Some(n.value),
+            _ => None,
+        },
+        _ => None,
+    };
+    let lit_str = |e: &Expression| match e {
+        Expression::Literal(l) => match l.as_ref() {
+            Literal::String(s) => Some(s.value.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let (Some(l), Some(r)) = (lit_num(&b.left), lit_num(&b.right)) {
+        use svelte_js_ast::BinaryOperator as Op;
+        let v = match b.operator {
+            Op::Plus => Some(l + r),
+            Op::Minus => Some(l - r),
+            Op::Mul => Some(l * r),
+            Op::Div => Some(l / r),
+            Op::Mod => Some(l % r),
+            _ => None,
+        };
+        if let Some(v) = v {
+            return Some(Expression::Literal(Box::new(Literal::Number(NumberLiteral {
+                value: v,
+                raw: None,
+                span: Span::ZERO,
+            }))));
+        }
+    }
+    if matches!(b.operator, svelte_js_ast::BinaryOperator::Plus) {
+        if let (Some(l), Some(r)) = (lit_str(&b.left), lit_str(&b.right)) {
+            return Some(Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: format!("{l}{r}"),
+                raw: None,
+                span: Span::ZERO,
+            }))));
+        }
+    }
+    None
 }
 
 fn try_fold_math_call(c: &CallExpression) -> Option<Expression> {
