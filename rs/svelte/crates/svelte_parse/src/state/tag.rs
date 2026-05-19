@@ -290,18 +290,20 @@ fn read_at_tag(
                 }));
             }
             // `{@debug expr1, expr2}` — parse a comma-separated identifier
-            // list. Upstream only accepts identifiers (not member expressions).
+            // list. Upstream only accepts identifiers (not member expressions);
+            // anything else emits `debug_tag_invalid_arguments`.
             let mut identifiers: Vec<svelte_js_ast::Identifier> = Vec::new();
+            let mut had_non_ident = false;
+            let mut non_ident_pos: usize = parser.index;
             loop {
                 parser.allow_whitespace();
+                let arg_start = parser.index;
                 let (expr, expr_end) = parser.parse_expression_at(parser.index)?;
                 match expr {
                     svelte_js_ast::Expression::Identifier(id) => identifiers.push(id),
                     _ => {
-                        return Err(errors::expected_token(
-                            Some((parser.index as u32, parser.index as u32)),
-                            "identifier",
-                        ));
+                        had_non_ident = true;
+                        non_ident_pos = arg_start;
                     }
                 }
                 parser.index = expr_end;
@@ -317,6 +319,12 @@ fn read_at_tag(
                     Some((parser.index as u32, parser.index as u32)),
                     "}",
                 ));
+            }
+            if had_non_ident {
+                return Err(errors::debug_tag_invalid_arguments(Some((
+                    non_ident_pos as u32,
+                    non_ident_pos as u32,
+                ))));
             }
             Ok(FragmentChild::DebugTag(DebugTag {
                 start: start as u32,
