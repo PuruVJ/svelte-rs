@@ -2550,34 +2550,93 @@ fn emit_single_element_wrapping_ifs_program(
         return None;
     }
 
-    // Body: list of IfBlocks (non-async, no else, single-element static
-    // consequent), optionally separated by whitespace text / comments.
-    let non_ws: Vec<&FragmentChild> = el
-        .fragment
-        .nodes
-        .iter()
-        .filter(|n| match n {
-            FragmentChild::Text(t) => !t.data.trim().is_empty(),
-            FragmentChild::Comment(_) => false,
-            _ => true,
-        })
-        .collect();
-    if non_ws.is_empty() {
+    // Body slots: mixture of StaticEl, StaticText, If — same gap-aware
+    // approach as `emit_top_level_multi_if_program`.
+    enum Slot<'a> {
+        StaticEl(&'a svelte_ast::elements::RegularElement),
+        StaticText(String),
+        If(&'a svelte_ast::blocks::IfBlock),
+    }
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut gap_after: Vec<bool> = Vec::new();
+    let mut pending_gap = false;
+    for n in el.fragment.nodes.iter() {
+        match n {
+            FragmentChild::Text(t) => {
+                if t.data.trim().is_empty() {
+                    pending_gap = true;
+                } else {
+                    let leading_ws = t.data.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+                    let trailing_ws = t.data.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+                    if !slots.is_empty() {
+                        gap_after.push(pending_gap || leading_ws);
+                    }
+                    pending_gap = trailing_ws;
+                    slots.push(Slot::StaticText(t.data.trim().to_string()));
+                }
+            }
+            FragmentChild::Comment(_) => {}
+            FragmentChild::IfBlock(ib) => {
+                if ib.alternate.is_some() || expr_top_await(&ib.test) {
+                    return None;
+                }
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
+                slots.push(Slot::If(ib));
+            }
+            FragmentChild::RegularElement(child) => {
+                if !is_element_fully_static(child) {
+                    return None;
+                }
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
+                slots.push(Slot::StaticEl(child));
+            }
+            _ => return None,
+        }
+    }
+    if !slots.iter().any(|s| matches!(s, Slot::If(_))) {
         return None;
     }
-    let ifs: Vec<&svelte_ast::blocks::IfBlock> = non_ws
+    let ifs: Vec<&svelte_ast::blocks::IfBlock> = slots
         .iter()
-        .filter_map(|n| match n {
-            FragmentChild::IfBlock(ib) => Some(ib),
+        .filter_map(|s| match s {
+            Slot::If(ib) => Some(*ib),
             _ => None,
         })
         .collect();
-    if ifs.len() != non_ws.len() {
-        return None;
+
+    // Compute DOM sibling positions for each slot.
+    let mut positions: Vec<usize> = vec![0; slots.len()];
+    let mut pos: usize = 0;
+    let mut pending_text = false;
+    for (i, slot) in slots.iter().enumerate() {
+        let preceding_gap = i > 0 && gap_after[i - 1];
+        match slot {
+            Slot::StaticEl(_) | Slot::If(_) => {
+                if pending_text || preceding_gap {
+                    pos += 1;
+                    pending_text = false;
+                }
+                positions[i] = pos;
+                pos += 1;
+            }
+            Slot::StaticText(_) => {
+                positions[i] = pos;
+                pending_text = true;
+            }
+        }
     }
-    if ifs.iter().any(|ib| ib.alternate.is_some() || expr_top_await(&ib.test)) {
-        return None;
-    }
+    let first_if_slot = slots.iter().position(|s| matches!(s, Slot::If(_))).unwrap();
+    let last_if_slot = slots.iter().rposition(|s| matches!(s, Slot::If(_))).unwrap();
+    let first_if_pos = positions[first_if_slot];
+    let last_if_pos = positions[last_if_slot];
+    let final_pos = pos;
+    let trailing_advance = final_pos - last_if_pos - 1;
 
     let mut root_decls: Vec<Statement> = Vec::new();
     let mut root_idx: usize = 0;
@@ -2617,12 +2676,19 @@ fn emit_single_element_wrapping_ifs_program(
         }
     }
     html.push('>');
-    // Anchor comments separated by single space.
-    for (i, _) in ifs.iter().enumerate() {
-        if i > 0 {
+    // Slot contents.
+    for (i, slot) in slots.iter().enumerate() {
+        if i > 0 && gap_after[i - 1] {
             html.push(' ');
         }
-        html.push_str("<!>");
+        match slot {
+            Slot::If(_) => html.push_str("<!>"),
+            Slot::StaticEl(child) => {
+                let mut needs = false;
+                serialize_element_to_html(child, &mut html, &mut needs)?;
+            }
+            Slot::StaticText(s) => html.push_str(s),
+        }
     }
     html.push_str("</");
     html.push_str(&el.name);
@@ -2635,7 +2701,15 @@ fn emit_single_element_wrapping_ifs_program(
         .map(|(n, _)| n.clone())
         .collect();
     let mut block_stmts: Vec<Statement> = Vec::new();
-    for (i, ib) in ifs.iter().enumerate() {
+    let mut if_count = 0usize;
+    let mut prev_if_slot: Option<usize> = None;
+    for (slot_i, slot) in slots.iter().enumerate() {
+        let ib = match slot {
+            Slot::If(ib) => *ib,
+            Slot::StaticEl(_) | Slot::StaticText(_) => continue,
+        };
+        let i = if_count;
+        if_count += 1;
         let consequent_text_name = if i == 0 {
             "text".to_string()
         } else {
@@ -2690,18 +2764,21 @@ fn emit_single_element_wrapping_ifs_program(
             t::member_id(t::id("$"), "if"),
             vec![t::id(&node_var), render_arrow],
         )));
-        // Between blocks, emit sibling navigation: `var node_i = $.sibling(prev_node, 2);`
         if i > 0 {
             let prev_node = if i - 1 == 0 {
                 "node".to_string()
             } else {
                 format!("node_{}", i - 1)
             };
+            let prev_slot_i = prev_if_slot.unwrap();
+            let prev_pos = positions[prev_slot_i];
+            let this_pos = positions[slot_i];
+            let offset = this_pos - prev_pos;
             block_stmts.push(t::var(
                 &node_var,
                 t::call(
                     t::member_id(t::id("$"), "sibling"),
-                    vec![t::id(&prev_node), t::lit_number(2.0)],
+                    vec![t::id(&prev_node), t::lit_number(offset as f64)],
                 ),
             ));
         }
@@ -2709,6 +2786,7 @@ fn emit_single_element_wrapping_ifs_program(
             body: inner_block,
             span: Span::ZERO,
         })));
+        prev_if_slot = Some(slot_i);
     }
 
     // Top-level function body.
@@ -2745,14 +2823,38 @@ fn emit_single_element_wrapping_ifs_program(
     }
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
-    func_body.push(t::var(
-        "node",
+    // Navigate to first if-block anchor inside this element.
+    let child_call = t::call(
+        t::member_id(t::id("$"), "child"),
+        vec![t::id(&tag_var)],
+    );
+    let first_node_init = if first_if_pos == 0 {
+        child_call
+    } else if first_if_pos == 1 {
         t::call(
-            t::member_id(t::id("$"), "child"),
-            vec![t::id(&tag_var)],
-        ),
-    ));
+            t::member_id(t::id("$"), "sibling"),
+            vec![child_call],
+        )
+    } else {
+        t::call(
+            t::member_id(t::id("$"), "sibling"),
+            vec![child_call, t::lit_number(first_if_pos as f64)],
+        )
+    };
+    func_body.push(t::var("node", first_node_init));
     func_body.extend(block_stmts);
+    // Trailing positions after the last if-block within the element.
+    if trailing_advance > 0 {
+        let arg = if trailing_advance == 1 {
+            Vec::new()
+        } else {
+            vec![t::lit_number(trailing_advance as f64)]
+        };
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            arg,
+        )));
+    }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "reset"),
         vec![t::id(&tag_var)],
@@ -2776,6 +2878,7 @@ fn emit_single_element_wrapping_ifs_program(
         params.push(t::pat_id("$$props"));
     }
     let export = t::export_default_function(component_name, params, func_body);
+    let _ = ifs;
 
     let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
