@@ -188,6 +188,11 @@ pub fn try_typed_client_walker_with(
             {
                 return Some(p);
             }
+            if let Some(p) =
+                emit_single_element_with_component_program(el, component_name, &script)
+            {
+                return Some(p);
+            }
         }
     }
 
@@ -1635,6 +1640,168 @@ fn emit_single_vanilla_if_program(
 /// directives/events, no spread, no async. Returns `None` for anything
 /// outside the supported shape so the caller falls through to the
 /// general walker.
+/// Emit the upstream shape for a single wrapper element containing
+/// exactly one Component child — e.g.
+///
+///   <div><Nested /></div>
+///
+/// →
+///
+///   var root = $.from_html(`<div><!></div>`);
+///   export default function Main($$anchor) {
+///       var div = root();
+///       var node = $.child(div);
+///       Nested(node, {});
+///       $.reset(div);
+///       $.append($$anchor, div);
+///   }
+///
+/// Constrained to: no script reactivity, no dyn attrs on the wrapper,
+/// no Component props/children, only whitespace text/comments around
+/// the inner Component.
+fn emit_single_element_with_component_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+        || !script.legacy_export_props.is_empty()
+    {
+        return None;
+    }
+    // Wrapper must have no dynamic attrs and no spread/directives.
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => static_attrs.push(attr),
+                AttributeValue::Many(parts) => {
+                    if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        static_attrs.push(attr);
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    // Body must be exactly one Component (ignoring surrounding whitespace
+    // text + comments).
+    let non_ws: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let comp = match non_ws[0] {
+        FragmentChild::Component(c) => c,
+        _ => return None,
+    };
+    // Component must have no props, no attrs, no children body.
+    if !comp.attributes.is_empty() || !comp.fragment.nodes.is_empty() {
+        return None;
+    }
+
+    // Build template HTML — `<TAG STATIC_ATTRS><!></TAG>`.
+    let mut html = String::with_capacity(32);
+    html.push('<');
+    html.push_str(&el.name);
+    for attr in &static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => html.push_str("&quot;"),
+                                '&' => html.push_str("&amp;"),
+                                _ => html.push(c),
+                            }
+                        }
+                    }
+                }
+                html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    html.push_str("><!></");
+    html.push_str(&el.name);
+    html.push('>');
+
+    let tag_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "child"),
+            vec![t::id(&tag_var)],
+        ),
+    ));
+    func_body.push(t::stmt(t::call(
+        t::id(&comp.name),
+        vec![
+            t::id("node"),
+            Expression::Object(Box::new(ObjectExpression {
+                properties: Vec::new(),
+                span: Span::ZERO,
+            })),
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&tag_var)],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&tag_var)],
+    )));
+
+    let params = vec![t::pat_id("$$anchor")];
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 fn emit_single_dynamic_element_program(
     el: &svelte_ast::elements::RegularElement,
     component_name: &str,
