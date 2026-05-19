@@ -258,10 +258,16 @@ pub fn try_typed_client_walker_with(
             && non_ws.iter().any(|n| matches!(n, FragmentChild::IfBlock(_)))
             && non_ws.iter().all(|n| matches!(
                 n,
-                FragmentChild::IfBlock(_) | FragmentChild::RegularElement(_)
+                FragmentChild::IfBlock(_)
+                    | FragmentChild::RegularElement(_)
+                    | FragmentChild::Text(_)
             ))
         {
-            if let Some(p) = emit_top_level_multi_if_program(&nodes, component_name, &script) {
+            if let Some(p) = emit_top_level_multi_if_program(
+                &root.fragment.nodes,
+                component_name,
+                &script,
+            ) {
                 return Some(p);
             }
         }
@@ -1544,10 +1550,14 @@ fn emit_vanilla_branch_body(
     match non_ws[0] {
         FragmentChild::Text(t) => {
             // Static-text-only consequent: `var text = $.text('hello');`
+            // Upstream trims leading/trailing whitespace in branch bodies.
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::var(
                 text_name,
-                t::call(t::member_id(t::id("$"), "text"), vec![t::literal_str(&t.data)]),
+                t::call(
+                    t::member_id(t::id("$"), "text"),
+                    vec![t::literal_str(t.data.trim())],
+                ),
             ));
             body.push(t::stmt(t::call(
                 t::member_id(t::id("$"), "append"),
@@ -2809,7 +2819,7 @@ fn emit_single_element_wrapping_ifs_program(
 ///     ...
 ///   }
 fn emit_top_level_multi_if_program(
-    nodes: &[&FragmentChild],
+    nodes: &[FragmentChild],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -2821,42 +2831,68 @@ fn emit_top_level_multi_if_program(
     {
         return None;
     }
-    let non_ws: Vec<&FragmentChild> = nodes
-        .iter()
-        .filter(|n| match n {
-            FragmentChild::Text(t) => !t.data.trim().is_empty(),
-            FragmentChild::Comment(_) => false,
-            FragmentChild::SvelteOptions(_) => false,
-            _ => true,
-        })
-        .copied()
-        .collect();
-    if non_ws.len() < 2 {
-        return None;
-    }
     // Allow nodes that are either IfBlock (with constraints) or fully-static
     // RegularElement. Track per-slot kind via an enum.
     enum Slot<'a> {
         StaticEl(&'a svelte_ast::elements::RegularElement),
+        StaticText(String),
         If(&'a svelte_ast::blocks::IfBlock),
     }
-    let mut slots: Vec<Slot> = Vec::with_capacity(non_ws.len());
-    for n in &non_ws {
+    let mut slots: Vec<Slot> = Vec::new();
+    // `gap_after[i]` is true iff there was whitespace text (or any
+    // separator) between slots[i] and slots[i+1] in the source — used to
+    // decide whether the emitted template should insert a space between
+    // them (matches `cloudflare-mirage-borking-2` which has no whitespace
+    // and uses default `$.sibling()`).
+    let mut gap_after: Vec<bool> = Vec::new();
+    let mut pending_gap = false;
+    for n in nodes.iter() {
         match n {
+            FragmentChild::Text(t) => {
+                if t.data.trim().is_empty() {
+                    pending_gap = true;
+                } else {
+                    // Non-whitespace text — leading whitespace in the
+                    // raw data acts as a gap before this slot; trailing
+                    // whitespace acts as a gap after.
+                    let leading_ws = t.data.chars().next().map(|c| c.is_whitespace()).unwrap_or(false);
+                    let trailing_ws = t.data.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+                    if !slots.is_empty() {
+                        gap_after.push(pending_gap || leading_ws);
+                    }
+                    pending_gap = trailing_ws;
+                    slots.push(Slot::StaticText(t.data.trim().to_string()));
+                }
+            }
+            FragmentChild::Comment(_) => {
+                // Skip — doesn't affect navigation (they're not in client templates).
+            }
+            FragmentChild::SvelteOptions(_) => {}
             FragmentChild::IfBlock(ib) => {
                 if ib.alternate.is_some() || expr_top_await(&ib.test) {
                     return None;
                 }
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
                 slots.push(Slot::If(ib));
             }
             FragmentChild::RegularElement(el) => {
                 if !is_element_fully_static(el) {
                     return None;
                 }
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
                 slots.push(Slot::StaticEl(el));
             }
             _ => return None,
         }
+    }
+    if slots.len() < 2 {
+        return None;
     }
     // Must contain at least one IfBlock.
     if !slots.iter().any(|s| matches!(s, Slot::If(_))) {
@@ -2879,6 +2915,38 @@ fn emit_top_level_multi_if_program(
         .iter()
         .map(|(n, _)| n.clone())
         .collect();
+    // Compute the DOM sibling position of each slot. Each StaticEl / If
+    // occupies its own position; runs of StaticText (with or without
+    // surrounding whitespace gaps) merge into a single text-node position.
+    // A whitespace gap between two non-text slots creates an intermediate
+    // text node.
+    let mut positions: Vec<usize> = vec![0; slots.len()];
+    let mut pos: usize = 0;
+    let mut pending_text = false;
+    for (i, slot) in slots.iter().enumerate() {
+        // The gap before slot[i] (if i > 0) is gap_after[i-1]. If true,
+        // a text node forms (unless this slot itself is StaticText).
+        let preceding_gap = i > 0 && gap_after[i - 1];
+        match slot {
+            Slot::StaticEl(_) | Slot::If(_) => {
+                if pending_text || preceding_gap {
+                    pos += 1;
+                    pending_text = false;
+                }
+                positions[i] = pos;
+                pos += 1;
+            }
+            Slot::StaticText(_) => {
+                if !pending_text {
+                    positions[i] = pos;
+                    pending_text = true;
+                } else {
+                    positions[i] = pos;
+                }
+                let _ = preceding_gap;
+            }
+        }
+    }
     // Find the first and last if slot indices for navigation / next() computation.
     let first_if_slot = slots
         .iter()
@@ -2888,14 +2956,17 @@ fn emit_top_level_multi_if_program(
         .iter()
         .rposition(|s| matches!(s, Slot::If(_)))
         .unwrap();
-    let trailing_static = slots.len() - last_if_slot - 1;
+    let first_if_pos = positions[first_if_slot];
+    let last_if_pos = positions[last_if_slot];
+    let final_pos = pos; // total sibling count
+    let trailing_advance = final_pos - last_if_pos - 1;
     let mut block_stmts: Vec<Statement> = Vec::new();
     let mut if_count = 0usize;
     let mut prev_if_slot: Option<usize> = None;
     for (slot_i, slot) in slots.iter().enumerate() {
         let ib = match slot {
             Slot::If(ib) => *ib,
-            Slot::StaticEl(_) => continue,
+            Slot::StaticEl(_) | Slot::StaticText(_) => continue,
         };
         let i = if_count;
         if_count += 1;
@@ -2960,7 +3031,9 @@ fn emit_top_level_multi_if_program(
                 format!("node_{}", i - 1)
             };
             let prev_slot_i = prev_if_slot.unwrap();
-            let offset = (slot_i - prev_slot_i) * 2;
+            let prev_pos = positions[prev_slot_i];
+            let this_pos = positions[slot_i];
+            let offset = this_pos - prev_pos;
             block_stmts.push(t::var(
                 &node_var,
                 t::call(
@@ -3009,28 +3082,40 @@ fn emit_top_level_multi_if_program(
     }
     func_body.extend(script.body.clone());
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
-    // Navigate to first if-block anchor. If first_if_slot==0, that's
-    // `$.first_child(fragment)`; otherwise `$.sibling($.first_child(fragment), 2*first_if_slot)`.
+    // Navigate to first if-block anchor. If first_if_pos==0, that's
+    // `$.first_child(fragment)`. If first_if_pos==1, omit the second arg
+    // (uses default `$.sibling(NODE)` which advances by 1). Otherwise
+    // emit `$.sibling($.first_child(fragment), N)`.
     let first_child_call = t::call(
         t::member_id(t::id("$"), "first_child"),
         vec![t::id("fragment")],
     );
-    let first_node_init = if first_if_slot == 0 {
+    let first_node_init = if first_if_pos == 0 {
         first_child_call
+    } else if first_if_pos == 1 {
+        t::call(
+            t::member_id(t::id("$"), "sibling"),
+            vec![first_child_call],
+        )
     } else {
         t::call(
             t::member_id(t::id("$"), "sibling"),
-            vec![first_child_call, t::lit_number((first_if_slot * 2) as f64)],
+            vec![first_child_call, t::lit_number(first_if_pos as f64)],
         )
     };
     func_body.push(t::var("node", first_node_init));
     func_body.extend(block_stmts);
-    // Trailing static elements: emit $.next(2*trailing_static) to advance
-    // past each (whitespace + static) pair.
-    if trailing_static > 0 {
+    // Trailing positions after the last if-block: emit $.next(N) to
+    // advance to the trailing static area.
+    if trailing_advance > 0 {
+        let arg = if trailing_advance == 1 {
+            Vec::new()
+        } else {
+            vec![t::lit_number(trailing_advance as f64)]
+        };
         func_body.push(t::stmt(t::call(
             t::member_id(t::id("$"), "next"),
-            vec![t::lit_number((trailing_static * 2) as f64)],
+            arg,
         )));
     }
     func_body.push(t::stmt(t::call(
@@ -3054,10 +3139,12 @@ fn emit_top_level_multi_if_program(
     let export = t::export_default_function(component_name, params, func_body);
 
     // Build the wrapper template: each slot becomes itself (static element
-    // serialized to HTML, or `<!>` for if-block), separated by single space.
+    // serialized to HTML, `<!>` for if-block, or literal text). A space
+    // is inserted between consecutive slots iff the source had whitespace
+    // text between them (so the DOM sibling count matches upstream).
     let mut html = String::with_capacity(16);
     for (i, slot) in slots.iter().enumerate() {
-        if i > 0 {
+        if i > 0 && gap_after[i - 1] {
             html.push(' ');
         }
         match slot {
@@ -3066,6 +3153,7 @@ fn emit_top_level_multi_if_program(
                 let mut needs = false;
                 serialize_element_to_html(el, &mut html, &mut needs)?;
             }
+            Slot::StaticText(s) => html.push_str(s.trim()),
         }
     }
 
