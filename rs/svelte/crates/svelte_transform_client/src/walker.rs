@@ -239,9 +239,10 @@ pub fn try_typed_client_walker_with(
         }
     }
 
-    // Multi-IfBlock non-async case: top-level non-trivial nodes are all
-    // IfBlocks (whitespace text + comments + svelte:options dropped).
-    // Matches if-block-update.
+    // Multi-IfBlock non-async case: top-level non-trivial nodes are
+    // IfBlocks (with optional fully-static RegularElement neighbours,
+    // whitespace text + comments + svelte:options dropped). Must contain
+    // at least one IfBlock. Matches if-block-update, if-block-false.
     if script.async_info.is_none() {
         let non_ws: Vec<&FragmentChild> = nodes
             .iter()
@@ -254,7 +255,11 @@ pub fn try_typed_client_walker_with(
             .copied()
             .collect();
         if non_ws.len() >= 2
-            && non_ws.iter().all(|n| matches!(n, FragmentChild::IfBlock(_)))
+            && non_ws.iter().any(|n| matches!(n, FragmentChild::IfBlock(_)))
+            && non_ws.iter().all(|n| matches!(
+                n,
+                FragmentChild::IfBlock(_) | FragmentChild::RegularElement(_)
+            ))
         {
             if let Some(p) = emit_top_level_multi_if_program(&nodes, component_name, &script) {
                 return Some(p);
@@ -2829,19 +2834,41 @@ fn emit_top_level_multi_if_program(
     if non_ws.len() < 2 {
         return None;
     }
-    let ifs: Vec<&svelte_ast::blocks::IfBlock> = non_ws
+    // Allow nodes that are either IfBlock (with constraints) or fully-static
+    // RegularElement. Track per-slot kind via an enum.
+    enum Slot<'a> {
+        StaticEl(&'a svelte_ast::elements::RegularElement),
+        If(&'a svelte_ast::blocks::IfBlock),
+    }
+    let mut slots: Vec<Slot> = Vec::with_capacity(non_ws.len());
+    for n in &non_ws {
+        match n {
+            FragmentChild::IfBlock(ib) => {
+                if ib.alternate.is_some() || expr_top_await(&ib.test) {
+                    return None;
+                }
+                slots.push(Slot::If(ib));
+            }
+            FragmentChild::RegularElement(el) => {
+                if !is_element_fully_static(el) {
+                    return None;
+                }
+                slots.push(Slot::StaticEl(el));
+            }
+            _ => return None,
+        }
+    }
+    // Must contain at least one IfBlock.
+    if !slots.iter().any(|s| matches!(s, Slot::If(_))) {
+        return None;
+    }
+    let ifs: Vec<&svelte_ast::blocks::IfBlock> = slots
         .iter()
-        .filter_map(|n| match n {
-            FragmentChild::IfBlock(ib) => Some(ib),
+        .filter_map(|s| match s {
+            Slot::If(ib) => Some(*ib),
             _ => None,
         })
         .collect();
-    if ifs.len() != non_ws.len() {
-        return None;
-    }
-    if ifs.iter().any(|ib| ib.alternate.is_some() || expr_top_await(&ib.test)) {
-        return None;
-    }
 
     let mut root_decls: Vec<Statement> = Vec::new();
     let mut root_idx: usize = 0;
@@ -2852,8 +2879,26 @@ fn emit_top_level_multi_if_program(
         .iter()
         .map(|(n, _)| n.clone())
         .collect();
+    // Find the first and last if slot indices for navigation / next() computation.
+    let first_if_slot = slots
+        .iter()
+        .position(|s| matches!(s, Slot::If(_)))
+        .unwrap();
+    let last_if_slot = slots
+        .iter()
+        .rposition(|s| matches!(s, Slot::If(_)))
+        .unwrap();
+    let trailing_static = slots.len() - last_if_slot - 1;
     let mut block_stmts: Vec<Statement> = Vec::new();
-    for (i, ib) in ifs.iter().enumerate() {
+    let mut if_count = 0usize;
+    let mut prev_if_slot: Option<usize> = None;
+    for (slot_i, slot) in slots.iter().enumerate() {
+        let ib = match slot {
+            Slot::If(ib) => *ib,
+            Slot::StaticEl(_) => continue,
+        };
+        let i = if_count;
+        if_count += 1;
         let consequent_text_name = if i == 0 {
             "text".to_string()
         } else {
@@ -2914,11 +2959,13 @@ fn emit_top_level_multi_if_program(
             } else {
                 format!("node_{}", i - 1)
             };
+            let prev_slot_i = prev_if_slot.unwrap();
+            let offset = (slot_i - prev_slot_i) * 2;
             block_stmts.push(t::var(
                 &node_var,
                 t::call(
                     t::member_id(t::id("$"), "sibling"),
-                    vec![t::id(&prev_node), t::lit_number(2.0)],
+                    vec![t::id(&prev_node), t::lit_number(offset as f64)],
                 ),
             ));
         }
@@ -2926,6 +2973,7 @@ fn emit_top_level_multi_if_program(
             body: inner_block,
             span: Span::ZERO,
         })));
+        prev_if_slot = Some(slot_i);
     }
 
     // Top-level function body.
@@ -2961,14 +3009,30 @@ fn emit_top_level_multi_if_program(
     }
     func_body.extend(script.body.clone());
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
-    func_body.push(t::var(
-        "node",
+    // Navigate to first if-block anchor. If first_if_slot==0, that's
+    // `$.first_child(fragment)`; otherwise `$.sibling($.first_child(fragment), 2*first_if_slot)`.
+    let first_child_call = t::call(
+        t::member_id(t::id("$"), "first_child"),
+        vec![t::id("fragment")],
+    );
+    let first_node_init = if first_if_slot == 0 {
+        first_child_call
+    } else {
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
-        ),
-    ));
+            t::member_id(t::id("$"), "sibling"),
+            vec![first_child_call, t::lit_number((first_if_slot * 2) as f64)],
+        )
+    };
+    func_body.push(t::var("node", first_node_init));
     func_body.extend(block_stmts);
+    // Trailing static elements: emit $.next(2*trailing_static) to advance
+    // past each (whitespace + static) pair.
+    if trailing_static > 0 {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            vec![t::lit_number((trailing_static * 2) as f64)],
+        )));
+    }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "append"),
         vec![t::id("$$anchor"), t::id("fragment")],
@@ -2989,13 +3053,20 @@ fn emit_top_level_multi_if_program(
     }
     let export = t::export_default_function(component_name, params, func_body);
 
-    // Build the wrapper template: `<!> <!>` (anchors separated by single space).
-    let mut html = String::with_capacity(8);
-    for (i, _) in ifs.iter().enumerate() {
+    // Build the wrapper template: each slot becomes itself (static element
+    // serialized to HTML, or `<!>` for if-block), separated by single space.
+    let mut html = String::with_capacity(16);
+    for (i, slot) in slots.iter().enumerate() {
         if i > 0 {
             html.push(' ');
         }
-        html.push_str("<!>");
+        match slot {
+            Slot::If(_) => html.push_str("<!>"),
+            Slot::StaticEl(el) => {
+                let mut needs = false;
+                serialize_element_to_html(el, &mut html, &mut needs)?;
+            }
+        }
     }
 
     let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
@@ -5104,6 +5175,40 @@ fn is_only_blocker_derived(
 /// Returns true iff the fragment contains a "deep reactive point": a
 /// nested ExpressionTag, HtmlTag, or an Element with reactive-trigger
 /// attribute (autofocus, muted, value-on-option, custom-element-data).
+/// Returns true iff the element has only static attributes and a
+/// fully-static body (no expression tags, blocks, components, directives,
+/// or nested reactive content). Used by emitters that pass the element
+/// verbatim into the template HTML.
+fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => {}
+                AttributeValue::Many(parts) => {
+                    if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(child) => {
+                if !is_element_fully_static(child) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(node_has_deep_reactive)
 }
