@@ -268,6 +268,11 @@ pub fn try_typed_client_walker_with(
             {
                 return inject_snippets(Some(p));
             }
+            if let Some(p) =
+                emit_single_element_with_inner_snippet_program(el, component_name, &script)
+            {
+                return inject_snippets(Some(p));
+            }
         }
     }
 
@@ -2673,6 +2678,183 @@ fn emit_single_element_with_component_program(
     ));
     prog.push(export);
     Some(t::program(prog))
+}
+
+/// Emit a program for the shape:
+///
+///   <TAG>{#snippet NAME()}{/snippet}<STATIC></TAG>
+///
+/// where the element body is exclusively SnippetBlock(s) + fully-static
+/// content (no reactive content). Snippets are emitted as a `{ const NAME = ... }`
+/// block inside the function body; the static rest stays in the template.
+/// Mirrors `no-reset-snippet`.
+fn emit_single_element_with_inner_snippet_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+        || !script.legacy_export_props.is_empty()
+    {
+        return None;
+    }
+    if !is_element_static_attrs(el) {
+        return None;
+    }
+    // Body partitioned into: snippets (collected) + remaining nodes
+    // (must be fully static after snippet removal).
+    let mut snippets: Vec<&svelte_ast::blocks::SnippetBlock> = Vec::new();
+    let mut rest_nodes: Vec<FragmentChild> = Vec::new();
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::SnippetBlock(sb) => snippets.push(sb),
+            other => rest_nodes.push(other.clone()),
+        }
+    }
+    if snippets.is_empty() {
+        return None;
+    }
+    // After snippet removal, the rest must form a fully-static body.
+    // Build a temporary element with only rest nodes to reuse static-check.
+    let rest_el = svelte_ast::elements::RegularElement {
+        fragment: svelte_ast::fragment::Fragment {
+            nodes: rest_nodes,
+            ..el.fragment.clone()
+        },
+        ..el.clone()
+    };
+    if !is_element_fully_static(&rest_el) {
+        return None;
+    }
+
+    // Build template HTML (snippet-free).
+    let mut html = String::new();
+    let mut needs = false;
+    serialize_element_to_html(&rest_el, &mut html, &mut needs)?;
+
+    // Snippet declarations as a block.
+    let mut snippet_block: Vec<Statement> = Vec::new();
+    for sb in &snippets {
+        let name = sb.expression.name.clone();
+        let body_non_ws: Vec<&FragmentChild> = sb
+            .body
+            .nodes
+            .iter()
+            .filter(|c| match c {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                _ => true,
+            })
+            .collect();
+        if body_non_ws.len() > 1 {
+            return None;
+        }
+        let body: Vec<Statement> = if body_non_ws.is_empty() {
+            Vec::new()
+        } else {
+            match body_non_ws[0] {
+                FragmentChild::Text(t) => {
+                    let trimmed = t.data.trim();
+                    vec![
+                        t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+                        t::var(
+                            "text",
+                            t::call(
+                                t::member_id(t::id("$"), "text"),
+                                vec![Expression::Literal(Box::new(Literal::String(
+                                    StringLiteral {
+                                        value: trimmed.to_string(),
+                                        raw: None,
+                                        span: Span::ZERO,
+                                    },
+                                )))],
+                            ),
+                        ),
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "append"),
+                            vec![t::id("$$anchor"), t::id("text")],
+                        )),
+                    ]
+                }
+                _ => return None,
+            }
+        };
+        let mut params = vec![t::pat_id("$$anchor")];
+        for p in &sb.parameters {
+            params.push(p.clone());
+        }
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params,
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        snippet_block.push(t::const_decl(&name, arrow));
+    }
+
+    let tag_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+    // Snippets go inside a block, not at module-level for inside-element snippets.
+    func_body.push(Statement::Block(Box::new(BlockStatement {
+        body: snippet_block,
+        span: Span::ZERO,
+    })));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&tag_var)],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// True iff the element has only static attributes (no spread, no
+/// directives, no dynamic values).
+fn is_element_static_attrs(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => {}
+                AttributeValue::Many(parts) => {
+                    if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Emit a runes/legacy-mode program for the shape:
