@@ -82,6 +82,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
         }
         validate_legacy_component_creation(&s.content, &mut state);
         if !state.is_runes {
+            validate_export_let_unused(&s.content, &root.fragment, &mut state);
             validate_reactive_declaration_placement(&s.content, &mut state);
             // Build the set of module-script bindings that are mutated
             // somewhere in the module script. Pure const-like bindings
@@ -137,6 +138,518 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
             .push(errors::mixed_event_handler_syntaxes(Some((start, end)), &name));
     }
     (state.warnings, state.errors)
+}
+
+/// `export_let_unused` — non-runes-mode `export let X` / `export var X`
+/// (or `export { X }` where X is let/var) that is never read in the
+/// script or referenced as `$X` in script/template. Mirrors
+/// `index.js:801-813`.
+fn validate_export_let_unused(
+    instance: &svelte_js_ast::Program,
+    fragment: &Fragment,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    // 1. Build a map of name -> (kind, span_of_export_target).
+    //    Only consider INSTANCE-script `let` / `var`.
+    enum DeclKind {
+        Let,
+        Var,
+        Const,
+        Function,
+    }
+    let mut decls: std::collections::HashMap<String, DeclKind> =
+        std::collections::HashMap::new();
+    for stmt in &instance.body {
+        match stmt {
+            Statement::Variable(v) => {
+                let kind = match v.kind {
+                    VariableKind::Let => DeclKind::Let,
+                    VariableKind::Var => DeclKind::Var,
+                    VariableKind::Const => DeclKind::Const,
+                };
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        decls.insert(id.name.clone(), match kind {
+                            DeclKind::Let => DeclKind::Let,
+                            DeclKind::Var => DeclKind::Var,
+                            _ => DeclKind::Const,
+                        });
+                    }
+                }
+            }
+            Statement::Function(f) => {
+                if let Some(id) = &f.id {
+                    decls.insert(id.name.clone(), DeclKind::Function);
+                }
+            }
+            Statement::ExportNamed(e) => {
+                if let Some(decl) = &e.declaration {
+                    match decl {
+                        Statement::Variable(v) => {
+                            let kind = match v.kind {
+                                VariableKind::Let => DeclKind::Let,
+                                VariableKind::Var => DeclKind::Var,
+                                VariableKind::Const => DeclKind::Const,
+                            };
+                            for d in &v.declarations {
+                                if let Pattern::Identifier(id) = &d.id {
+                                    decls.insert(id.name.clone(), match kind {
+                                        DeclKind::Let => DeclKind::Let,
+                                        DeclKind::Var => DeclKind::Var,
+                                        _ => DeclKind::Const,
+                                    });
+                                }
+                            }
+                        }
+                        Statement::Function(f) => {
+                            if let Some(id) = &f.id {
+                                decls.insert(id.name.clone(), DeclKind::Function);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // 2. Collect names that are "exported" (either via `export let/var X = ...`
+    //    or via `export { X }`). For inline exports, the span is the
+    //    declarator id; for re-export, it's the export specifier local name.
+    let mut exports: Vec<(String, (u32, u32))> = Vec::new();
+    for stmt in &instance.body {
+        let Statement::ExportNamed(e) = stmt else { continue };
+        if let Some(decl) = &e.declaration {
+            match decl {
+                Statement::Variable(v) => {
+                    for d in &v.declarations {
+                        if let Pattern::Identifier(id) = &d.id {
+                            exports.push((
+                                id.name.clone(),
+                                (id.span.start, id.span.end),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for spec in &e.specifiers {
+            if let ModuleExportName::Identifier(local) = &spec.local {
+                exports.push((local.name.clone(), (local.span.start, local.span.end)));
+            }
+        }
+    }
+    if exports.is_empty() {
+        return;
+    }
+    // 3. For each export, gate by declaration kind. Only `let` or `var` props
+    //    that are referenced ONLY via the export specifier (no other reads)
+    //    AND not referenced as `$X` anywhere fire.
+    let names_set: std::collections::HashSet<String> =
+        exports.iter().map(|(n, _)| n.clone()).collect();
+    let mut script_refs: std::collections::HashSet<String> = Default::default();
+    let mut store_refs: std::collections::HashSet<String> = Default::default();
+    collect_script_reads(instance, &names_set, &mut script_refs, &mut store_refs);
+    collect_template_reads(fragment, &names_set, &mut script_refs, &mut store_refs);
+    for (name, span) in exports {
+        let Some(kind) = decls.get(&name) else { continue };
+        if !matches!(kind, DeclKind::Let | DeclKind::Var) {
+            continue;
+        }
+        if script_refs.contains(&name) || store_refs.contains(&name) {
+            continue;
+        }
+        state.warnings.push(warnings::export_let_unused(
+            Some(span),
+            &name,
+        ));
+    }
+}
+
+/// Walk a script Program collecting identifier reads of `candidates`. Tracks
+/// `$X` reads separately into `store_refs`. Skips:
+/// - the binding declaration itself
+/// - `export { X }` specifiers (those are the "exports", not reads)
+fn collect_script_reads(
+    program: &svelte_js_ast::Program,
+    candidates: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+    store_refs: &mut std::collections::HashSet<String>,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(
+        e: &Expression,
+        cands: &std::collections::HashSet<String>,
+        refs: &mut std::collections::HashSet<String>,
+        store_refs: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expression::Identifier(id) => {
+                if let Some(stripped) = id.name.strip_prefix('$') {
+                    if cands.contains(stripped) {
+                        store_refs.insert(stripped.to_string());
+                    }
+                } else if cands.contains(&id.name) {
+                    refs.insert(id.name.clone());
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, cands, refs, store_refs),
+            Expression::Call(c) => {
+                walk_expr(&c.callee, cands, refs, store_refs);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, cands, refs, store_refs);
+                    }
+                }
+            }
+            Expression::New(n) => {
+                walk_expr(&n.callee, cands, refs, store_refs);
+                for a in &n.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, cands, refs, store_refs);
+                    }
+                }
+            }
+            Expression::Binary(b) => {
+                walk_expr(&b.left, cands, refs, store_refs);
+                walk_expr(&b.right, cands, refs, store_refs);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, cands, refs, store_refs);
+                walk_expr(&b.right, cands, refs, store_refs);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, cands, refs, store_refs);
+                walk_expr(&c.consequent, cands, refs, store_refs);
+                walk_expr(&c.alternate, cands, refs, store_refs);
+            }
+            Expression::Assignment(a) => {
+                // LHS counts as a "read" of `let X` only if X appears as a
+                // simple identifier; for our purpose any mention counts.
+                if let AssignmentTarget::Expression(e) = &a.left {
+                    walk_expr(e, cands, refs, store_refs);
+                }
+                walk_expr(&a.right, cands, refs, store_refs);
+            }
+            Expression::Update(u) => walk_expr(&u.argument, cands, refs, store_refs),
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, cands, refs, store_refs);
+                }
+            }
+            Expression::Unary(u) => walk_expr(&u.argument, cands, refs, store_refs),
+            Expression::Template(t) => {
+                for e in &t.expressions {
+                    walk_expr(e, cands, refs, store_refs);
+                }
+            }
+            Expression::Array(a) => {
+                for el in &a.elements {
+                    if let ArrayElement::Expression(e) = el {
+                        walk_expr(e, cands, refs, store_refs);
+                    }
+                }
+            }
+            Expression::Object(o) => {
+                for m in &o.properties {
+                    if let ObjectMember::Property(p) = m {
+                        walk_expr(&p.value, cands, refs, store_refs);
+                    }
+                }
+            }
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        walk_stmt(s, cands, refs, store_refs);
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, cands, refs, store_refs),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, cands, refs, store_refs);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        s: &Statement,
+        cands: &std::collections::HashSet<String>,
+        refs: &mut std::collections::HashSet<String>,
+        store_refs: &mut std::collections::HashSet<String>,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, cands, refs, store_refs),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, cands, refs, store_refs);
+                    }
+                }
+            }
+            Statement::Return(r) => {
+                if let Some(arg) = &r.argument {
+                    walk_expr(arg, cands, refs, store_refs);
+                }
+            }
+            Statement::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, cands, refs, store_refs);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, cands, refs, store_refs);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, cands, refs, store_refs);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, cands, refs, store_refs);
+                }
+            }
+            Statement::For(f) => walk_stmt(&f.body, cands, refs, store_refs),
+            Statement::While(w) => walk_stmt(&w.body, cands, refs, store_refs),
+            Statement::DoWhile(d) => walk_stmt(&d.body, cands, refs, store_refs),
+            Statement::Labeled(l) => walk_stmt(&l.body, cands, refs, store_refs),
+            // `export {X}` specifiers must not count as references.
+            Statement::ExportNamed(_) => {}
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt(stmt, candidates, refs, store_refs);
+    }
+}
+
+/// Collect identifier reads from the template fragment (including `$X`
+/// store-subscription forms).
+fn collect_template_reads(
+    fragment: &Fragment,
+    candidates: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+    store_refs: &mut std::collections::HashSet<String>,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(
+        e: &Expression,
+        cands: &std::collections::HashSet<String>,
+        refs: &mut std::collections::HashSet<String>,
+        store_refs: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expression::Identifier(id) => {
+                if let Some(stripped) = id.name.strip_prefix('$') {
+                    if cands.contains(stripped) {
+                        store_refs.insert(stripped.to_string());
+                    }
+                } else if cands.contains(&id.name) {
+                    refs.insert(id.name.clone());
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, cands, refs, store_refs),
+            Expression::Call(c) => {
+                walk_expr(&c.callee, cands, refs, store_refs);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, cands, refs, store_refs);
+                    }
+                }
+            }
+            Expression::Binary(b) => {
+                walk_expr(&b.left, cands, refs, store_refs);
+                walk_expr(&b.right, cands, refs, store_refs);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, cands, refs, store_refs);
+                walk_expr(&b.right, cands, refs, store_refs);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, cands, refs, store_refs);
+                walk_expr(&c.consequent, cands, refs, store_refs);
+                walk_expr(&c.alternate, cands, refs, store_refs);
+            }
+            Expression::Template(t) => {
+                for e in &t.expressions {
+                    walk_expr(e, cands, refs, store_refs);
+                }
+            }
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Expression(e) => walk_expr(e, cands, refs, store_refs),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    fn walk_node(
+        n: &FragmentChild,
+        cands: &std::collections::HashSet<String>,
+        refs: &mut std::collections::HashSet<String>,
+        store_refs: &mut std::collections::HashSet<String>,
+    ) {
+        match n {
+            FragmentChild::ExpressionTag(et) => walk_expr(&et.expression, cands, refs, store_refs),
+            FragmentChild::HtmlTag(t) => walk_expr(&t.expression, cands, refs, store_refs),
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    walk_attr(a, cands, refs, store_refs);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::Component(c) => {
+                for a in &c.attributes {
+                    walk_attr(a, cands, refs, store_refs);
+                }
+                for n in &c.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::SvelteElement(el) => {
+                walk_expr(&el.tag, cands, refs, store_refs);
+                for a in &el.attributes {
+                    walk_attr(a, cands, refs, store_refs);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::IfBlock(b) => {
+                walk_expr(&b.test, cands, refs, store_refs);
+                for n in &b.consequent.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+                if let Some(alt) = &b.alternate {
+                    for n in &alt.nodes {
+                        walk_node(n, cands, refs, store_refs);
+                    }
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                walk_expr(&b.expression, cands, refs, store_refs);
+                for n in &b.body.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+                if let Some(fb) = &b.fallback {
+                    for n in &fb.nodes {
+                        walk_node(n, cands, refs, store_refs);
+                    }
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                walk_expr(&b.expression, cands, refs, store_refs);
+                if let Some(f) = &b.pending {
+                    for n in &f.nodes { walk_node(n, cands, refs, store_refs); }
+                }
+                if let Some(f) = &b.then {
+                    for n in &f.nodes { walk_node(n, cands, refs, store_refs); }
+                }
+                if let Some(f) = &b.catch_ {
+                    for n in &f.nodes { walk_node(n, cands, refs, store_refs); }
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                walk_expr(&b.expression, cands, refs, store_refs);
+                for n in &b.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::TitleElement(el) => {
+                for n in &el.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::SnippetBlock(b) => {
+                for n in &b.body.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::SvelteHead(el) | FragmentChild::SvelteBoundary(el) => {
+                for n in &el.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::SvelteComponent(c) => {
+                walk_expr(&c.expression, cands, refs, store_refs);
+                for a in &c.attributes {
+                    walk_attr(a, cands, refs, store_refs);
+                }
+                for n in &c.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::SvelteSelf(el) => {
+                for a in &el.attributes {
+                    walk_attr(a, cands, refs, store_refs);
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, cands, refs, store_refs);
+                }
+            }
+            FragmentChild::ConstTag(t) => {
+                for d in &t.declaration.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, cands, refs, store_refs);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_attr(
+        a: &ElementAttribute,
+        cands: &std::collections::HashSet<String>,
+        refs: &mut std::collections::HashSet<String>,
+        store_refs: &mut std::collections::HashSet<String>,
+    ) {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, cands, refs, store_refs),
+                svelte_ast::AttributeValue::Many(parts) => {
+                    for p in parts {
+                        if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                            walk_expr(&et.expression, cands, refs, store_refs);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            ElementAttribute::BindDirective(b) => walk_expr(&b.expression, cands, refs, store_refs),
+            ElementAttribute::OnDirective(d) => {
+                if let Some(e) = &d.expression {
+                    walk_expr(e, cands, refs, store_refs);
+                }
+            }
+            ElementAttribute::ClassDirective(d) => walk_expr(&d.expression, cands, refs, store_refs),
+            ElementAttribute::StyleDirective(d) => {
+                // Bare `style:height` desugars to `style:height={height}`,
+                // so the directive name itself is an identifier read.
+                if matches!(d.value, svelte_ast::AttributeValue::Empty) && cands.contains(&d.name) {
+                    refs.insert(d.name.clone());
+                }
+                match &d.value {
+                    svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, cands, refs, store_refs),
+                    svelte_ast::AttributeValue::Many(parts) => {
+                        for p in parts {
+                            if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                                walk_expr(&et.expression, cands, refs, store_refs);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            ElementAttribute::SpreadAttribute(_) => {}
+            _ => {}
+        }
+    }
+    for n in &fragment.nodes {
+        walk_node(n, candidates, refs, store_refs);
+    }
 }
 
 /// `reactive_declaration_invalid_placement`: a `$:` label inside a function
@@ -1742,6 +2255,241 @@ fn parse_svelte_ignore(comment: &str) -> Vec<String> {
         .collect()
 }
 
+/// In runes mode, parse svelte-ignore codes strictly — only known codes
+/// silence warnings; non-matching tokens emit `legacy_code` (when the
+/// dash→underscore form is known) or `unknown_code` (otherwise) and don't
+/// silence. Once a non-matching token is hit, the rest is treated as prose.
+/// Mirrors `extract_svelte_ignore.js` runes branch.
+fn parse_svelte_ignore_runes(
+    comment_data: &str,
+    comment_start: u32,
+) -> (Vec<String>, Vec<CompileDiagnostic>) {
+    let trimmed = comment_data.trim_start();
+    let leading_ws = comment_data.len() - trimmed.len();
+    let after = match trimmed.strip_prefix("svelte-ignore") {
+        Some(s) => s,
+        None => return (Vec::new(), Vec::new()),
+    };
+    let svelte_ignore_len = "svelte-ignore".len();
+    let after_ws = after.trim_start();
+    let prefix_skip = after.len() - after_ws.len();
+    // Source offset of the first code character.
+    // <!-- inside source: 4 chars, then leading whitespace inside comment,
+    // then "svelte-ignore", then any whitespace before the first code.
+    let codes_base = comment_start + 4 + leading_ws as u32 + svelte_ignore_len as u32
+        + prefix_skip as u32;
+    let mut codes = Vec::new();
+    let mut diags = Vec::new();
+    let mut cursor_in_after_ws: u32 = 0;
+    let mut chars = after_ws.char_indices().peekable();
+    loop {
+        // Skip whitespace between tokens.
+        while let Some(&(i, c)) = chars.peek() {
+            if c.is_whitespace() || c == ',' {
+                cursor_in_after_ws = (i + c.len_utf8()) as u32;
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let Some(&(tok_start, _)) = chars.peek() else { break };
+        let mut tok_end = tok_start;
+        while let Some(&(i, c)) = chars.peek() {
+            if c.is_alphanumeric() || c == '_' || c == '-' || c == '$' {
+                tok_end = i + c.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let token = &after_ws[tok_start..tok_end];
+        cursor_in_after_ws = tok_end as u32;
+        // Check if comma-or-whitespace follows (continue) or this is the
+        // last comma-separated token. Upstream's runes-mode regex expects
+        // `(token)(,)?` — when no `,`, stop parsing.
+        let mut had_comma = false;
+        while let Some(&(_, c)) = chars.peek() {
+            if c == ',' {
+                had_comma = true;
+                chars.next();
+                break;
+            } else if c.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if KNOWN_WARNING_CODES.contains(&token) {
+            codes.push(token.to_string());
+        } else {
+            let replacement: Option<&'static str> = if token.contains('-') {
+                let underscore = token.replace('-', "_");
+                if KNOWN_WARNING_CODES.contains(&underscore.as_str()) {
+                    // Move into &'static str via a leak-free path; we just
+                    // pass the underscore version as the suggestion text.
+                    Some(LEGACY_MAP
+                        .iter()
+                        .find(|(k, _)| *k == token)
+                        .map(|(_, v)| *v)
+                        .unwrap_or_else(|| {
+                            // Allocate a small static-by-fmt fallback via
+                            // a tiny inline match; we instead pass via the
+                            // String version below.
+                            ""
+                        }))
+                } else {
+                    None
+                }
+            } else {
+                // No dashes — fully unknown.
+                None
+            };
+            let code_span = (
+                codes_base + tok_start as u32,
+                codes_base + tok_end as u32,
+            );
+            if token.contains('-') && KNOWN_WARNING_CODES.contains(&token.replace('-', "_").as_str()) {
+                let suggestion = token.replace('-', "_");
+                diags.push(warnings::legacy_code(Some(code_span), token, &suggestion));
+            } else {
+                let suggestion = fuzzy_suggest(token, KNOWN_WARNING_CODES);
+                diags.push(warnings::unknown_code(
+                    Some(code_span),
+                    token,
+                    suggestion.as_deref(),
+                ));
+            }
+            let _ = replacement;
+        }
+        if !had_comma {
+            let _ = cursor_in_after_ws;
+            break;
+        }
+    }
+    (codes, diags)
+}
+
+const LEGACY_MAP: &[(&str, &str)] = &[];
+
+/// Closest known code by simple Levenshtein distance, or None if all are
+/// too far. Cap distance at 3 to keep "did you mean?" suggestions useful.
+fn fuzzy_suggest(token: &str, codes: &[&str]) -> Option<String> {
+    let mut best: Option<(usize, &str)> = None;
+    for c in codes {
+        let d = levenshtein(token, c);
+        if d <= 3 && best.map_or(true, |(b, _)| d < b) {
+            best = Some((d, c));
+        }
+    }
+    best.map(|(_, s)| s.to_string())
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let av: Vec<char> = a.chars().collect();
+    let bv: Vec<char> = b.chars().collect();
+    let m = av.len();
+    let n = bv.len();
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur: Vec<usize> = vec![0; n + 1];
+    for i in 1..=m {
+        cur[0] = i;
+        for j in 1..=n {
+            let cost = if av[i - 1] == bv[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[n]
+}
+
+const KNOWN_WARNING_CODES: &[&str] = &[
+    "a11y_accesskey",
+    "a11y_aria_activedescendant_has_tabindex",
+    "a11y_aria_attributes",
+    "a11y_autocomplete_valid",
+    "a11y_autofocus",
+    "a11y_click_events_have_key_events",
+    "a11y_consider_explicit_label",
+    "a11y_distracting_elements",
+    "a11y_figcaption_index",
+    "a11y_figcaption_parent",
+    "a11y_hidden",
+    "a11y_img_redundant_alt",
+    "a11y_incorrect_aria_attribute_type",
+    "a11y_incorrect_aria_attribute_type_boolean",
+    "a11y_incorrect_aria_attribute_type_id",
+    "a11y_incorrect_aria_attribute_type_idlist",
+    "a11y_incorrect_aria_attribute_type_integer",
+    "a11y_incorrect_aria_attribute_type_token",
+    "a11y_incorrect_aria_attribute_type_tokenlist",
+    "a11y_incorrect_aria_attribute_type_tristate",
+    "a11y_interactive_supports_focus",
+    "a11y_invalid_attribute",
+    "a11y_label_has_associated_control",
+    "a11y_media_has_caption",
+    "a11y_misplaced_role",
+    "a11y_misplaced_scope",
+    "a11y_missing_attribute",
+    "a11y_missing_content",
+    "a11y_mouse_events_have_key_events",
+    "a11y_no_abstract_role",
+    "a11y_no_interactive_element_to_noninteractive_role",
+    "a11y_no_noninteractive_element_interactions",
+    "a11y_no_noninteractive_element_to_interactive_role",
+    "a11y_no_noninteractive_tabindex",
+    "a11y_no_redundant_roles",
+    "a11y_no_static_element_interactions",
+    "a11y_positive_tabindex",
+    "a11y_role_has_required_aria_props",
+    "a11y_role_supports_aria_props",
+    "a11y_role_supports_aria_props_implicit",
+    "a11y_unknown_aria_attribute",
+    "a11y_unknown_role",
+    "attribute_avoid_is",
+    "attribute_global_event_reference",
+    "attribute_illegal_colon",
+    "attribute_invalid_property_name",
+    "attribute_quoted",
+    "bidirectional_control_characters",
+    "bind_invalid_each_rest",
+    "block_empty",
+    "component_name_lowercase",
+    "css_unused_selector",
+    "custom_element_props_identifier",
+    "dynamic_void_element_content",
+    "element_implicitly_closed",
+    "element_invalid_self_closing_tag",
+    "event_directive_deprecated",
+    "export_let_unused",
+    "legacy_code",
+    "legacy_component_creation",
+    "node_invalid_placement_ssr",
+    "non_reactive_update",
+    "options_deprecated_accessors",
+    "options_deprecated_immutable",
+    "options_missing_custom_element",
+    "options_removed_enable_sourcemap",
+    "options_removed_hydratable",
+    "options_removed_loop_guard_timeout",
+    "options_renamed_ssr_dom",
+    "perf_avoid_inline_class",
+    "perf_avoid_nested_class",
+    "reactive_declaration_invalid_placement",
+    "reactive_declaration_module_script_dependency",
+    "script_context_deprecated",
+    "script_unknown_attribute",
+    "slot_element_deprecated",
+    "state_referenced_locally",
+    "state_snapshot_uncloneable",
+    "store_rune_conflict",
+    "svelte_component_deprecated",
+    "svelte_element_invalid_this",
+    "svelte_self_deprecated",
+    "unknown_code",
+];
+
 fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
     // Track svelte-ignore codes from sibling Comment nodes — they apply to the
     // *next* non-comment/non-whitespace sibling and (via visit_node recursion)
@@ -1751,7 +2499,16 @@ fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
     for node in &fragment.nodes {
         match node {
             FragmentChild::Comment(c) => {
-                pending_ignores.extend(parse_svelte_ignore(&c.data));
+                // In runes mode, emit `legacy_code` / `unknown_code` for
+                // mis-named svelte-ignore codes. Mirrors
+                // `extract_svelte_ignore.js`.
+                if state.is_runes {
+                    let (codes, diags) = parse_svelte_ignore_runes(&c.data, c.start);
+                    pending_ignores.extend(codes);
+                    state.warnings.extend(diags);
+                } else {
+                    pending_ignores.extend(parse_svelte_ignore(&c.data));
+                }
             }
             FragmentChild::Text(_) => {
                 // Whitespace/text between comment and target — neither emits
