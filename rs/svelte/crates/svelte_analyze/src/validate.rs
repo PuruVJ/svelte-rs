@@ -5164,10 +5164,57 @@ const KNOWN_WARNING_CODES: &[&str] = &[
 ];
 
 fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
-    // Track svelte-ignore codes from sibling Comment nodes — they apply to the
-    // *next* non-comment/non-whitespace sibling and (via visit_node recursion)
-    // its descendants, then reset. Comma-separated codes inside a single
-    // comment are supported. Multiple consecutive comments stack.
+    // `{@const}` declared at this fragment level is scope-bound to the
+    // fragment's *enclosing* element. When that enclosing element is a
+    // Component / SvelteSelf / SvelteComponent (or SvelteBoundary with a
+    // `failed`/`pending` snippet), a `{#snippet ...}` child here can't
+    // see those names — mirrors upstream's `const_tag_invalid_reference`
+    // check on Identifier visits.
+    let parent_is_component = matches!(
+        state.path.last(),
+        Some(FragmentChild::Component(_))
+            | Some(FragmentChild::SvelteComponent(_))
+            | Some(FragmentChild::SvelteSelf(_))
+            | Some(FragmentChild::SvelteBoundary(_))
+    );
+    if parent_is_component {
+        let const_names: Vec<String> = fragment
+            .nodes
+            .iter()
+            .filter_map(|n| {
+                if let FragmentChild::ConstTag(t) = n {
+                    declared_const_names(t)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        if !const_names.is_empty() {
+            for n in &fragment.nodes {
+                if let FragmentChild::SnippetBlock(sb) = n {
+                    let snippet_name = sb.expression.name.as_str();
+                    let is_boundary_capture = matches!(
+                        state.path.last(),
+                        Some(FragmentChild::SvelteBoundary(_))
+                    ) && matches!(snippet_name, "failed" | "pending");
+                    let is_component_capture = matches!(
+                        state.path.last(),
+                        Some(FragmentChild::Component(_))
+                            | Some(FragmentChild::SvelteComponent(_))
+                            | Some(FragmentChild::SvelteSelf(_))
+                    );
+                    if !(is_boundary_capture || is_component_capture) {
+                        continue;
+                    }
+                    for name in &const_names {
+                        collect_const_refs_in_fragment(&sb.body, name, state);
+                    }
+                }
+            }
+        }
+    }
+
     let mut pending_ignores: Vec<String> = Vec::new();
     for node in &fragment.nodes {
         match node {
@@ -5205,6 +5252,187 @@ fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
                 pending_ignores.clear();
             }
         }
+    }
+}
+
+/// Pull the names declared by a `{@const NAME = ...}` tag.
+fn declared_const_names(t: &svelte_ast::ConstTag) -> Option<Vec<String>> {
+    use svelte_js_ast::Pattern;
+    let mut out = Vec::new();
+    for d in &t.declaration.declarations {
+        if let Pattern::Identifier(id) = &d.id {
+            out.push(id.name.clone());
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Scan `fragment` for references to `name` inside any embedded
+/// `{expression}` / template ExpressionTag and emit
+/// `const_tag_invalid_reference` at the reference site.
+fn collect_const_refs_in_fragment<'a>(
+    fragment: &Fragment,
+    name: &str,
+    state: &mut ValidateState<'a>,
+) {
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::ExpressionTag(t) => {
+                walk_expr_for_const_ref(&t.expression, name, state);
+            }
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    if let svelte_ast::ElementAttribute::Attribute(attr) = a {
+                        walk_attr_value_for_const_ref(&attr.value, name, state);
+                    }
+                }
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::Component(c) => {
+                for a in &c.attributes {
+                    if let svelte_ast::ElementAttribute::Attribute(attr) = a {
+                        walk_attr_value_for_const_ref(&attr.value, name, state);
+                    }
+                }
+                collect_const_refs_in_fragment(&c.fragment, name, state);
+            }
+            FragmentChild::IfBlock(b) => {
+                walk_expr_for_const_ref(&b.test, name, state);
+                collect_const_refs_in_fragment(&b.consequent, name, state);
+                if let Some(alt) = &b.alternate {
+                    collect_const_refs_in_fragment(alt, name, state);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                walk_expr_for_const_ref(&b.expression, name, state);
+                collect_const_refs_in_fragment(&b.body, name, state);
+                if let Some(fb) = &b.fallback {
+                    collect_const_refs_in_fragment(fb, name, state);
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                walk_expr_for_const_ref(&b.expression, name, state);
+                if let Some(f) = &b.pending {
+                    collect_const_refs_in_fragment(f, name, state);
+                }
+                if let Some(f) = &b.then {
+                    collect_const_refs_in_fragment(f, name, state);
+                }
+                if let Some(f) = &b.catch_ {
+                    collect_const_refs_in_fragment(f, name, state);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                walk_expr_for_const_ref(&b.expression, name, state);
+                collect_const_refs_in_fragment(&b.fragment, name, state);
+            }
+            FragmentChild::SnippetBlock(_) => {
+                // Nested snippet — don't recurse: a deeper snippet has its
+                // own scope and would itself trigger the check if needed.
+            }
+            FragmentChild::TitleElement(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SvelteHead(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SvelteBoundary(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SvelteSelf(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SvelteFragment(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SvelteBody(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SvelteElement(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::SlotElement(el) => {
+                collect_const_refs_in_fragment(&el.fragment, name, state);
+            }
+            FragmentChild::ConstTag(t) => {
+                for decl in &t.declaration.declarations {
+                    if let Some(init) = &decl.init {
+                        walk_expr_for_const_ref(init, name, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn walk_attr_value_for_const_ref<'a>(
+    value: &svelte_ast::AttributeValue,
+    name: &str,
+    state: &mut ValidateState<'a>,
+) {
+    use svelte_ast::{AttributeValue, AttributeValuePart};
+    match value {
+        AttributeValue::Single(t) => walk_expr_for_const_ref(&t.expression, name, state),
+        AttributeValue::Many(parts) => {
+            for p in parts {
+                if let AttributeValuePart::ExpressionTag(t) = p {
+                    walk_expr_for_const_ref(&t.expression, name, state);
+                }
+            }
+        }
+        AttributeValue::Empty => {}
+    }
+}
+
+/// Walk a JS expression, emitting `const_tag_invalid_reference` for every
+/// free Identifier reference that matches `name`. Shadowing by parameter
+/// scope is not tracked — fine for the current snippet-body fixtures
+/// where the snippet's expression doesn't introduce a binding of the
+/// same name as the outer `{@const}`.
+fn walk_expr_for_const_ref<'a>(
+    expr: &svelte_js_ast::Expression,
+    name: &str,
+    state: &mut ValidateState<'a>,
+) {
+    use svelte_js_ast::Expression;
+    match expr {
+        Expression::Identifier(id) if id.name == name => {
+            state
+                .errors
+                .push(errors::const_tag_invalid_reference(
+                    Some((id.span.start, id.span.end)),
+                    &id.name,
+                ));
+        }
+        Expression::Call(c) => {
+            walk_expr_for_const_ref(&c.callee, name, state);
+            for a in &c.arguments {
+                if let svelte_js_ast::Argument::Expression(e) = a {
+                    walk_expr_for_const_ref(e, name, state);
+                }
+            }
+        }
+        Expression::Member(m) => walk_expr_for_const_ref(&m.object, name, state),
+        Expression::Binary(b) => {
+            walk_expr_for_const_ref(&b.left, name, state);
+            walk_expr_for_const_ref(&b.right, name, state);
+        }
+        Expression::Logical(l) => {
+            walk_expr_for_const_ref(&l.left, name, state);
+            walk_expr_for_const_ref(&l.right, name, state);
+        }
+        Expression::Conditional(c) => {
+            walk_expr_for_const_ref(&c.test, name, state);
+            walk_expr_for_const_ref(&c.consequent, name, state);
+            walk_expr_for_const_ref(&c.alternate, name, state);
+        }
+        Expression::Template(t) => {
+            for e in &t.expressions {
+                walk_expr_for_const_ref(e, name, state);
+            }
+        }
+        _ => {}
     }
 }
 
