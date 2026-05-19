@@ -90,6 +90,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
         validate_script_const_assignment(&s.content, &mut state);
         validate_dollar_bindings(&s.content, /*runes=*/ state.is_runes, &mut state);
         validate_arguments_usage(&s.content, &mut state);
+        validate_store_scoped_subscription(&s.content, &root.fragment, &mut state);
         visit_program(&s.content, /*is_instance=*/ true, &mut state);
         let has_custom_element_attr = svelte_options_has_custom_element(root);
         let has_custom_element_props = svelte_options_customelement_has_props(root);
@@ -138,6 +139,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
         validate_script_attributes(&s.attributes, &mut state);
         visit_program(&s.content, /*is_instance=*/ false, &mut state);
         validate_module_exports(&s.content, &root.fragment, &mut state);
+        validate_module_store_subscription(&s.content, &mut state);
         if state.is_runes {
             validate_perf_avoid_class(&s.content, /*is_instance=*/ false, &mut state);
             validate_runes(&s.content, /*is_instance=*/ false, &mut state);
@@ -2313,6 +2315,373 @@ fn validate_module_exports(
                 }
             }
         }
+    }
+}
+
+/// `store_invalid_subscription` — `$X` reference inside `<script module>`.
+/// Module scripts run at module load time; store subscriptions need a
+/// component instance.
+fn validate_module_store_subscription(
+    program: &svelte_js_ast::Program,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(e: &Expression, state: &mut ValidateState) {
+        match e {
+            Expression::Identifier(id)
+                if id.name.starts_with('$')
+                    && id.name.len() > 1
+                    && !matches!(
+                        id.name.as_str(),
+                        "$state" | "$derived" | "$props" | "$effect"
+                            | "$host" | "$bindable" | "$inspect"
+                    ) =>
+            {
+                state.errors.push(errors::store_invalid_subscription(Some((
+                    id.span.start,
+                    id.span.end,
+                ))));
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.callee, state);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, state);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, state),
+            Expression::Binary(b) => {
+                walk_expr(&b.left, state);
+                walk_expr(&b.right, state);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, state);
+                walk_expr(&b.right, state);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, state);
+                walk_expr(&c.consequent, state);
+                walk_expr(&c.alternate, state);
+            }
+            Expression::Assignment(a) => walk_expr(&a.right, state),
+            _ => {}
+        }
+    }
+    fn walk_stmt(s: &Statement, state: &mut ValidateState) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt(stmt, state);
+    }
+}
+
+/// `store_invalid_scoped_subscription` — `$store` references inside a
+/// nested scope (function/arrow/each-block/template-attr-arrow) where
+/// `store` is shadowed by a local binding. The outer-scope `store` would
+/// have been a real store, but the inner reference can no longer subscribe.
+fn validate_store_scoped_subscription(
+    program: &svelte_js_ast::Program,
+    fragment: &Fragment,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    // Top-level declared names — candidates for store bindings.
+    let mut top_level: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    collect_pattern_names(&d.id, &mut top_level);
+                }
+            }
+            Statement::Import(d) => {
+                for spec in &d.specifiers {
+                    let local = match spec {
+                        ImportSpecifierKind::Named(s) => &s.local,
+                        ImportSpecifierKind::Default(s) => &s.local,
+                        ImportSpecifierKind::Namespace(s) => &s.local,
+                    };
+                    top_level.insert(local.name.clone());
+                }
+            }
+            Statement::ExportNamed(e) => {
+                if let Some(decl) = &e.declaration {
+                    if let Statement::Variable(v) = decl {
+                        for d in &v.declarations {
+                            collect_pattern_names(&d.id, &mut top_level);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_expr(
+        e: &Expression,
+        top: &std::collections::HashSet<String>,
+        local: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match e {
+            Expression::Identifier(id) if id.name.starts_with('$') && id.name.len() > 1 => {
+                let stripped = &id.name[1..];
+                // Skip rune names.
+                if matches!(
+                    id.name.as_str(),
+                    "$state" | "$derived" | "$props" | "$effect" | "$host" | "$bindable" | "$inspect"
+                ) {
+                    return;
+                }
+                if local.contains(stripped) {
+                    state.errors.push(errors::store_invalid_scoped_subscription(
+                        Some((id.span.start, id.span.end)),
+                    ));
+                }
+                let _ = top;
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.callee, top, local, state);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, top, local, state);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, top, local, state),
+            Expression::Binary(b) => {
+                walk_expr(&b.left, top, local, state);
+                walk_expr(&b.right, top, local, state);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, top, local, state);
+                walk_expr(&b.right, top, local, state);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, top, local, state);
+                walk_expr(&c.consequent, top, local, state);
+                walk_expr(&c.alternate, top, local, state);
+            }
+            Expression::Assignment(a) => {
+                match &a.left {
+                    AssignmentTarget::Expression(e) => walk_expr(e, top, local, state),
+                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
+                        // Treat `$X = ...` like a read of `$X` for scoped-sub
+                        // detection.
+                        if id.name.starts_with('$') && id.name.len() > 1 {
+                            let stripped = &id.name[1..];
+                            let is_rune = matches!(
+                                id.name.as_str(),
+                                "$state" | "$derived" | "$props" | "$effect"
+                                    | "$host" | "$bindable" | "$inspect"
+                            );
+                            if !is_rune && local.contains(stripped) {
+                                state.errors.push(errors::store_invalid_scoped_subscription(
+                                    Some((id.span.start, id.span.end)),
+                                ));
+                            }
+                            let _ = top;
+                        }
+                    }
+                    _ => {}
+                }
+                walk_expr(&a.right, top, local, state);
+            }
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, top, local, state);
+                }
+            }
+            Expression::Arrow(a) => {
+                // Arrow body opens a new scope. Collect arrow params + body
+                // declarations into a new local set.
+                let mut new_local = local.clone();
+                for p in &a.params {
+                    collect_pattern_names(p, &mut new_local);
+                }
+                match &a.body {
+                    ArrowBody::Block(b) => {
+                        // Pre-pass: collect declared names in this block as local.
+                        for s in &b.body {
+                            if let Statement::Variable(v) = s {
+                                for d in &v.declarations {
+                                    collect_pattern_names(&d.id, &mut new_local);
+                                }
+                            }
+                        }
+                        for s in &b.body {
+                            walk_stmt(s, top, &new_local, state);
+                        }
+                    }
+                    ArrowBody::Expression(e) => walk_expr(e, top, &new_local, state),
+                }
+            }
+            Expression::Function(f) => {
+                let mut new_local = local.clone();
+                for p in &f.params {
+                    collect_pattern_names(p, &mut new_local);
+                }
+                for s in &f.body.body {
+                    if let Statement::Variable(v) = s {
+                        for d in &v.declarations {
+                            collect_pattern_names(&d.id, &mut new_local);
+                        }
+                    }
+                }
+                for s in &f.body.body {
+                    walk_stmt(s, top, &new_local, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        s: &Statement,
+        top: &std::collections::HashSet<String>,
+        local: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, top, local, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, top, local, state);
+                    }
+                }
+            }
+            Statement::Function(f) => {
+                let mut new_local = local.clone();
+                for p in &f.params {
+                    collect_pattern_names(p, &mut new_local);
+                }
+                for s in &f.body.body {
+                    if let Statement::Variable(v) = s {
+                        for d in &v.declarations {
+                            collect_pattern_names(&d.id, &mut new_local);
+                        }
+                    }
+                }
+                for s in &f.body.body {
+                    walk_stmt(s, top, &new_local, state);
+                }
+            }
+            Statement::Labeled(l) => walk_stmt(&l.body, top, local, state),
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, top, local, state);
+                }
+            }
+            Statement::Return(r) => {
+                if let Some(arg) = &r.argument {
+                    walk_expr(arg, top, local, state);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, top, local, state);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, top, local, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Walk script top-level — top-level $X is OK, only nested are flagged
+    // (since walk_stmt's `local` set is empty at top, the binding-shadowed
+    // condition is impossible).
+    let empty: std::collections::HashSet<String> = Default::default();
+    for stmt in &program.body {
+        walk_stmt(stmt, &top_level, &empty, state);
+    }
+    // Walk template fragments — `$X` references inside `on:click={(X) => $X}`
+    // arrow params, each-context bindings, etc.
+    fn walk_node(
+        n: &FragmentChild,
+        top: &std::collections::HashSet<String>,
+        each: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        use svelte_ast::ElementAttribute;
+        fn walk_attr_expr(
+            e: &svelte_js_ast::Expression,
+            top: &std::collections::HashSet<String>,
+            each: &std::collections::HashSet<String>,
+            state: &mut ValidateState,
+        ) {
+            walk_expr(e, top, each, state);
+        }
+        match n {
+            FragmentChild::ExpressionTag(et) => walk_attr_expr(&et.expression, top, each, state),
+            FragmentChild::HtmlTag(t) => walk_attr_expr(&t.expression, top, each, state),
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    match a {
+                        ElementAttribute::Attribute(attr) => match &attr.value {
+                            svelte_ast::AttributeValue::Single(et) => walk_attr_expr(&et.expression, top, each, state),
+                            svelte_ast::AttributeValue::Many(parts) => {
+                                for p in parts {
+                                    if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                                        walk_attr_expr(&et.expression, top, each, state);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        ElementAttribute::OnDirective(d) => {
+                            if let Some(e) = &d.expression {
+                                walk_attr_expr(e, top, each, state);
+                            }
+                        }
+                        ElementAttribute::BindDirective(b) => walk_attr_expr(&b.expression, top, each, state),
+                        _ => {}
+                    }
+                }
+                for n in &el.fragment.nodes {
+                    walk_node(n, top, each, state);
+                }
+            }
+            FragmentChild::Component(c) => {
+                for n in &c.fragment.nodes {
+                    walk_node(n, top, each, state);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                walk_attr_expr(&b.expression, top, each, state);
+                let mut new_each = each.clone();
+                if let Some(ctx) = &b.context {
+                    collect_pattern_names(ctx, &mut new_each);
+                }
+                for n in &b.body.nodes {
+                    walk_node(n, top, &new_each, state);
+                }
+            }
+            FragmentChild::IfBlock(b) => {
+                walk_attr_expr(&b.test, top, each, state);
+                for n in &b.consequent.nodes {
+                    walk_node(n, top, each, state);
+                }
+                if let Some(alt) = &b.alternate {
+                    for n in &alt.nodes {
+                        walk_node(n, top, each, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let empty_each: std::collections::HashSet<String> = Default::default();
+    for n in &fragment.nodes {
+        walk_node(n, &top_level, &empty_each, state);
     }
 }
 
@@ -5674,6 +6043,21 @@ fn visit_const_tag(t: &svelte_ast::ConstTag, state: &mut ValidateState) {
         state
             .errors
             .push(errors::const_tag_invalid_placement(Some((t.start, t.end))));
+    }
+    // `{@const x = ..., y = ...}` — multiple declarators are invalid.
+    // `{@const x = (a, b)}` — sequence-init is also invalid.
+    if t.declaration.declarations.len() > 1 {
+        state
+            .errors
+            .push(errors::const_tag_invalid_expression(Some((t.start, t.end))));
+    } else if let Some(d) = t.declaration.declarations.first() {
+        if let Some(init) = &d.init {
+            if matches!(init, svelte_js_ast::Expression::Sequence(_)) {
+                state
+                    .errors
+                    .push(errors::const_tag_invalid_expression(Some((t.start, t.end))));
+            }
+        }
     }
 }
 
