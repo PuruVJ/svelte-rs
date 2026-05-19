@@ -37,9 +37,19 @@ fn client_compile_matches_all_fixtures() {
     let mut skipped = 0usize;
     for entry in entries {
         let name = entry.file_name().into_string().unwrap();
-        let svelte = entry.path().join("index.svelte");
-        let expected_path = entry.path().join("_expected/client/index.svelte.js");
-        if !svelte.exists() || !expected_path.exists() {
+        // Support `index.svelte` (default) and `main.svelte` (e.g.
+        // dynamic-attributes-casing) — pick whichever exists.
+        let (svelte, src_basename) = if entry.path().join("index.svelte").exists() {
+            (entry.path().join("index.svelte"), "index.svelte")
+        } else if entry.path().join("main.svelte").exists() {
+            (entry.path().join("main.svelte"), "main.svelte")
+        } else {
+            continue;
+        };
+        let expected_path = entry
+            .path()
+            .join(format!("_expected/client/{src_basename}.js"));
+        if !expected_path.exists() {
             continue;
         }
         // Skip fixtures whose expected output requires non-default
