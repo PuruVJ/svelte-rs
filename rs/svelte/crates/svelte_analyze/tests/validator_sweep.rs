@@ -76,6 +76,10 @@ fn sweep_validator_fixtures() {
         // `options.customElement`; our analyzer doesn't yet take options, so
         // we filter after the fact.
         let config = fs::read_to_string(dir.join("_config.js")).unwrap_or_default();
+        if config.contains("skip: true") {
+            // Honor upstream's per-fixture skip marker.
+            continue;
+        }
         let custom_element_compile_option = config.contains("customElement: true");
         let runes_false = config.contains("runes: false");
         // Scan _config.js for `warningFilter` referencing `.includes(warning.code)`

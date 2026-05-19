@@ -75,11 +75,44 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
     if let Some(s) = root.instance.as_ref() {
         validate_script_attributes(&s.attributes, &mut state);
         visit_program(&s.content, /*is_instance=*/ true, &mut state);
-        validate_props_identifier(&s.content, &mut state);
+        let has_custom_element_attr = svelte_options_has_custom_element(root);
+        let has_custom_element_props = svelte_options_customelement_has_props(root);
+        if has_custom_element_attr && !has_custom_element_props {
+            validate_props_identifier(&s.content, &mut state);
+        }
         validate_legacy_component_creation(&s.content, &mut state);
+        if !state.is_runes {
+            validate_reactive_declaration_placement(&s.content, &mut state);
+            // Build the set of module-script bindings that are mutated
+            // somewhere in the module script. Pure const-like bindings
+            // (`let X = 3.14;` never reassigned) don't need the warning
+            // because they can never trigger a reactive update.
+            let module_decls: std::collections::HashSet<String> = root
+                .module
+                .as_ref()
+                .map(|m| {
+                    let mut decls: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for stmt in &m.content.body {
+                        use svelte_js_ast::*;
+                        if let Statement::Variable(v) = stmt {
+                            for d in &v.declarations {
+                                collect_pattern_names(&d.id, &mut decls);
+                            }
+                        }
+                    }
+                    let mut mutated: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    collect_mutated_names(&m.content, &decls, &mut mutated);
+                    mutated
+                })
+                .unwrap_or_default();
+            validate_reactive_declaration_module_dep(&s.content, &module_decls, &mut state);
+        }
         if state.is_runes {
             validate_store_rune_conflict(&s.content, &mut state);
             validate_perf_avoid_class(&s.content, /*is_instance=*/ true, &mut state);
+            validate_state_referenced_locally(&s.content, &mut state);
         }
     }
     if let Some(s) = root.module.as_ref() {
@@ -103,6 +136,157 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
             .push(errors::mixed_event_handler_syntaxes(Some((start, end)), &name));
     }
     (state.warnings, state.errors)
+}
+
+/// `reactive_declaration_invalid_placement`: a `$:` label inside a function
+/// body (not at the top of the instance script) doesn't get reactive
+/// treatment. Mirrors `visitors/LabeledStatement.js`.
+fn validate_reactive_declaration_placement(
+    program: &svelte_js_ast::Program,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(e: &Expression, inside_fn: bool, out: &mut Vec<(u32, u32)>) {
+        match e {
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        walk_stmt(s, true, out);
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, true, out),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, true, out);
+                }
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.callee, inside_fn, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, inside_fn, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(s: &Statement, inside_fn: bool, out: &mut Vec<(u32, u32)>) {
+        match s {
+            Statement::Labeled(l) if l.label.name == "$" && inside_fn => {
+                out.push((l.span.start, l.span.end));
+            }
+            Statement::Labeled(l) => walk_stmt(&l.body, inside_fn, out),
+            Statement::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, true, out);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, inside_fn, out);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, inside_fn, out);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, inside_fn, out);
+                }
+            }
+            Statement::For(f) => walk_stmt(&f.body, inside_fn, out),
+            Statement::While(w) => walk_stmt(&w.body, inside_fn, out),
+            Statement::DoWhile(d) => walk_stmt(&d.body, inside_fn, out),
+            Statement::Expression(e) => walk_expr(&e.expression, inside_fn, out),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, inside_fn, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hits = Vec::new();
+    for stmt in &program.body {
+        walk_stmt(stmt, false, &mut hits);
+    }
+    for (start, end) in hits {
+        state
+            .warnings
+            .push(warnings::reactive_declaration_invalid_placement(Some((
+                start, end,
+            ))));
+    }
+}
+
+/// `reactive_declaration_module_script_dependency`: a `$:` reactive statement
+/// that depends on a binding declared in the module script. Module-level
+/// reassignments don't trigger reactive updates. Mirrors `visitors/
+/// LabeledStatement.js` for the module-binding check.
+fn validate_reactive_declaration_module_dep(
+    instance: &svelte_js_ast::Program,
+    module_decls: &std::collections::HashSet<String>,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    if module_decls.is_empty() {
+        return;
+    }
+    fn collect_idents(e: &Expression, out: &mut Vec<(u32, u32, String)>) {
+        match e {
+            Expression::Identifier(id) => out.push((id.span.start, id.span.end, id.name.clone())),
+            Expression::Binary(b) => {
+                collect_idents(&b.left, out);
+                collect_idents(&b.right, out);
+            }
+            Expression::Logical(b) => {
+                collect_idents(&b.left, out);
+                collect_idents(&b.right, out);
+            }
+            Expression::Conditional(c) => {
+                collect_idents(&c.test, out);
+                collect_idents(&c.consequent, out);
+                collect_idents(&c.alternate, out);
+            }
+            Expression::Assignment(a) => collect_idents(&a.right, out),
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    collect_idents(e, out);
+                }
+            }
+            Expression::Call(c) => {
+                collect_idents(&c.callee, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        collect_idents(ax, out);
+                    }
+                }
+            }
+            Expression::Member(m) => collect_idents(&m.object, out),
+            _ => {}
+        }
+    }
+    for stmt in &instance.body {
+        let Statement::Labeled(l) = stmt else { continue };
+        if l.label.name != "$" {
+            continue;
+        }
+        let Statement::Expression(es) = &l.body else { continue };
+        let Expression::Assignment(a) = &es.expression else { continue };
+        let mut refs = Vec::new();
+        collect_idents(&a.right, &mut refs);
+        for (start, end, name) in refs {
+            if module_decls.contains(&name) {
+                state
+                    .warnings
+                    .push(warnings::reactive_declaration_module_script_dependency(
+                        Some((start, end)),
+                    ));
+            }
+        }
+    }
 }
 
 /// `legacy_component_creation`: emit when `new Component({ target: ... })`
@@ -472,6 +656,296 @@ fn validate_store_rune_conflict(
     }
 }
 
+/// `state_referenced_locally` — reading a rune-bound binding at the top
+/// level of the script (outside any closure) captures only the initial
+/// value. Mirrors `visitors/Identifier.js:104-152`.
+fn validate_state_referenced_locally(
+    program: &svelte_js_ast::Program,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    // 1. Collect names whose initializer is a rune call, along with the
+    //    rune kind. Mirrors VariableDeclarator.js:29-48.
+    #[derive(Clone, Copy)]
+    enum Kind {
+        State,    // $state — gated by should_proxy + reassigned
+        RawState, // $state.raw — always fires
+        Derived,  // $derived / $derived.by — always fires
+        Prop,     // $props — always fires (destructured names)
+    }
+    let mut bound: std::collections::HashMap<String, Kind> =
+        std::collections::HashMap::new();
+    fn rune_call_name(e: &Expression) -> Option<&'static str> {
+        let Expression::Call(c) = e else { return None };
+        match &c.callee {
+            Expression::Identifier(id) => match id.name.as_str() {
+                "$state" => Some("$state"),
+                "$derived" => Some("$derived"),
+                "$props" => Some("$props"),
+                "$bindable" => Some("$bindable"),
+                _ => None,
+            },
+            Expression::Member(m) => {
+                let Expression::Identifier(obj) = &m.object else { return None };
+                let MemberProperty::Identifier(prop) = &m.property else { return None };
+                match (obj.name.as_str(), prop.name.as_str()) {
+                    ("$state", "raw") => Some("$state.raw"),
+                    ("$derived", "by") => Some("$derived"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    // Track names that are init'd from $state() with a proxy-able arg AND
+    // never reassigned — those don't fire the warning. Mirrors the
+    // `should_proxy` carve-out in Identifier.js:108-115.
+    let mut state_proxy_init_arg: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
+    for stmt in &program.body {
+        let Statement::Variable(v) = stmt else { continue };
+        for d in &v.declarations {
+            let Some(init) = &d.init else { continue };
+            let Some(rune) = rune_call_name(init) else { continue };
+            let kind = match rune {
+                "$state" => Kind::State,
+                "$state.raw" => Kind::RawState,
+                "$derived" => Kind::Derived,
+                "$props" | "$bindable" => Kind::Prop,
+                _ => continue,
+            };
+            let mut names = std::collections::HashSet::new();
+            collect_pattern_names(&d.id, &mut names);
+            // For State kind, check if init arg is proxy-able.
+            let proxy_ok = if matches!(kind, Kind::State) {
+                if let Expression::Call(c) = init {
+                    c.arguments.first().map_or(false, |a| match a {
+                        Argument::Expression(e) => is_proxy_able(e),
+                        _ => false,
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            for n in names {
+                bound.insert(n.clone(), kind);
+                if proxy_ok {
+                    state_proxy_init_arg.insert(n, true);
+                }
+            }
+        }
+    }
+    if bound.is_empty() {
+        return;
+    }
+    // Compute set of names that are reassigned anywhere in the program.
+    let names_set: std::collections::HashSet<String> = bound.keys().cloned().collect();
+    let mut reassigned: std::collections::HashSet<String> = Default::default();
+    collect_mutated_names(program, &names_set, &mut reassigned);
+    // 2. Walk top-level expression contexts for identifier reads of bound
+    //    names that aren't on the LHS of an assignment or inside a closure.
+    //    Track `inside_state_call` to choose the `derived` vs `closure`
+    //    message variant.
+    fn walk_expr(
+        e: &Expression,
+        bound: &std::collections::HashSet<String>,
+        inside_state_call: bool,
+        is_lhs: bool,
+        out: &mut Vec<(u32, u32, String, bool)>,
+    ) {
+        match e {
+            Expression::Identifier(id) => {
+                if !is_lhs && bound.contains(&id.name) {
+                    out.push((
+                        id.span.start,
+                        id.span.end,
+                        id.name.clone(),
+                        inside_state_call,
+                    ));
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, bound, inside_state_call, false, out),
+            Expression::Call(c) => {
+                let rune = rune_call_name(e);
+                let is_state =
+                    matches!(rune, Some("$state") | Some("$state.raw"));
+                let is_derived = matches!(rune, Some("$derived"));
+                walk_expr(&c.callee, bound, inside_state_call, false, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        if is_derived {
+                            // Reads inside `$derived(...)` aren't "stale" —
+                            // the derived re-runs reactively. Skip entirely.
+                            continue;
+                        }
+                        let new_state = inside_state_call || is_state;
+                        walk_expr(ax, bound, new_state, false, out);
+                    }
+                }
+            }
+            Expression::New(n) => {
+                walk_expr(&n.callee, bound, inside_state_call, false, out);
+                for a in &n.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, bound, inside_state_call, false, out);
+                    }
+                }
+            }
+            Expression::Binary(b) => {
+                walk_expr(&b.left, bound, inside_state_call, false, out);
+                walk_expr(&b.right, bound, inside_state_call, false, out);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, bound, inside_state_call, false, out);
+                walk_expr(&b.right, bound, inside_state_call, false, out);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, bound, inside_state_call, false, out);
+                walk_expr(&c.consequent, bound, inside_state_call, false, out);
+                walk_expr(&c.alternate, bound, inside_state_call, false, out);
+            }
+            Expression::Assignment(a) => {
+                // LHS doesn't count as a read; RHS does.
+                walk_expr(&a.right, bound, inside_state_call, false, out);
+            }
+            Expression::Update(_) => {} // update target is not a "read"
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, bound, inside_state_call, false, out);
+                }
+            }
+            Expression::Unary(u) => walk_expr(&u.argument, bound, inside_state_call, false, out),
+            Expression::Template(t) => {
+                for e in &t.expressions {
+                    walk_expr(e, bound, inside_state_call, false, out);
+                }
+            }
+            Expression::Array(a) => {
+                for el in &a.elements {
+                    if let ArrayElement::Expression(e) = el {
+                        walk_expr(e, bound, inside_state_call, false, out);
+                    }
+                }
+            }
+            Expression::Object(o) => {
+                for m in &o.properties {
+                    if let ObjectMember::Property(p) = m {
+                        walk_expr(&p.value, bound, inside_state_call, false, out);
+                    }
+                }
+            }
+            // Closure boundary — anything inside is not "top-level".
+            Expression::Arrow(_) | Expression::Function(_) | Expression::Class(_) => {}
+            _ => {}
+        }
+    }
+    let mut hits = Vec::new();
+    let names_set: std::collections::HashSet<String> = bound.keys().cloned().collect();
+    for stmt in &program.body {
+        match stmt {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, &names_set, false, false, &mut hits);
+                    }
+                }
+            }
+            Statement::Expression(e) => {
+                walk_expr(&e.expression, &names_set, false, false, &mut hits);
+            }
+            _ => {}
+        }
+    }
+    for (start, end, name, inside_state) in hits {
+        // Apply per-binding gating from kind + reassigned + proxy_ok.
+        let Some(kind) = bound.get(&name) else { continue };
+        let should_emit = match kind {
+            Kind::State => {
+                reassigned.contains(&name)
+                    || !state_proxy_init_arg.contains_key(&name)
+            }
+            Kind::RawState | Kind::Derived | Kind::Prop => true,
+        };
+        if !should_emit {
+            continue;
+        }
+        let type_str = if inside_state { "derived" } else { "closure" };
+        state.warnings.push(warnings::state_referenced_locally(
+            Some((start, end)),
+            &name,
+            type_str,
+        ));
+    }
+}
+
+/// Mirrors `should_proxy` in upstream: an init value that benefits from
+/// being wrapped in a proxy. We approximate by accepting Array / Object /
+/// New / Class expressions.
+fn is_proxy_able(e: &svelte_js_ast::Expression) -> bool {
+    use svelte_js_ast::Expression;
+    matches!(
+        e,
+        Expression::Array(_) | Expression::Object(_) | Expression::New(_) | Expression::Class(_)
+    )
+}
+
+/// Returns true when `<svelte:options customElement=...>` is present in
+/// the source. This sets `analysis.custom_element` upstream and gates
+/// `custom_element_props_identifier`.
+fn svelte_options_has_custom_element(root: &Root) -> bool {
+    for n in &root.fragment.nodes {
+        if let FragmentChild::SvelteOptions(opts) = n {
+            for a in &opts.attributes {
+                if let ElementAttribute::Attribute(attr) = a {
+                    if attr.name == "customElement" {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Look for `<svelte:options customElement={{ ..., props: ... }}>`. When
+/// an explicit `props` option is configured, `custom_element_props_identifier`
+/// is suppressed because Svelte already knows what to expose.
+fn svelte_options_customelement_has_props(root: &Root) -> bool {
+    use svelte_js_ast::*;
+    for n in &root.fragment.nodes {
+        let FragmentChild::SvelteOptions(opts) = n else { continue };
+        for a in &opts.attributes {
+            let ElementAttribute::Attribute(attr) = a else { continue };
+            if attr.name != "customElement" {
+                continue;
+            }
+            let parts = match &attr.value {
+                svelte_ast::AttributeValue::Single(et) => return obj_has_props(&et.expression),
+                svelte_ast::AttributeValue::Many(parts) => parts,
+                _ => continue,
+            };
+            if parts.len() == 1 {
+                if let svelte_ast::AttributeValuePart::ExpressionTag(et) = &parts[0] {
+                    if obj_has_props(&et.expression) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+
+    fn obj_has_props(e: &Expression) -> bool {
+        let Expression::Object(obj) = e else { return false };
+        obj.properties.iter().any(|p| {
+            matches!(p, ObjectMember::Property(prop)
+                if matches!(&prop.key, PropertyKey::Identifier(k) if k.name == "props"))
+        })
+    }
+}
+
 /// `custom_element_props_identifier`: emit when `$props()` is bound to a
 /// bare identifier (`let props = $props()`) or destructure with a rest
 /// element (`let { ...rest } = $props()`). Upstream gates this on
@@ -591,6 +1065,147 @@ fn collect_instance_declared(root: &Root) -> std::collections::HashSet<String> {
     out
 }
 
+/// Walk a program and collect names that are mutated (assignment or
+/// update) — anything that would actually reassign the binding. Used to
+/// gate `reactive_declaration_module_script_dependency` so it doesn't
+/// fire on effectively-const bindings.
+fn collect_mutated_names(
+    program: &svelte_js_ast::Program,
+    candidates: &std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use svelte_js_ast::*;
+    fn note_lhs(
+        e: &Expression,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        if let Expression::Identifier(id) = e {
+            if candidates.contains(&id.name) {
+                out.insert(id.name.clone());
+            }
+        }
+    }
+    fn note_lhs_pat(
+        p: &Pattern,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        if let Pattern::Identifier(id) = p {
+            if candidates.contains(&id.name) {
+                out.insert(id.name.clone());
+            }
+        }
+    }
+    fn walk_expr(
+        e: &Expression,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match e {
+            Expression::Assignment(a) => {
+                match &a.left {
+                    AssignmentTarget::Pattern(p) => note_lhs_pat(p, candidates, out),
+                    AssignmentTarget::Expression(e) => note_lhs(e, candidates, out),
+                }
+                walk_expr(&a.right, candidates, out);
+            }
+            Expression::Update(u) => note_lhs(&u.argument, candidates, out),
+            Expression::Call(c) => {
+                walk_expr(&c.callee, candidates, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, candidates, out);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, candidates, out),
+            Expression::Binary(b) => {
+                walk_expr(&b.left, candidates, out);
+                walk_expr(&b.right, candidates, out);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, candidates, out);
+                walk_expr(&b.right, candidates, out);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, candidates, out);
+                walk_expr(&c.consequent, candidates, out);
+                walk_expr(&c.alternate, candidates, out);
+            }
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, candidates, out);
+                }
+            }
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        walk_stmt(s, candidates, out);
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, candidates, out),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, candidates, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        s: &Statement,
+        candidates: &std::collections::HashSet<String>,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, candidates, out),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, candidates, out);
+                    }
+                }
+            }
+            Statement::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, candidates, out);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, candidates, out);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, candidates, out);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, candidates, out);
+                }
+            }
+            Statement::For(f) => walk_stmt(&f.body, candidates, out),
+            Statement::While(w) => walk_stmt(&w.body, candidates, out),
+            Statement::DoWhile(d) => walk_stmt(&d.body, candidates, out),
+            Statement::Return(r) => {
+                if let Some(arg) = &r.argument {
+                    walk_expr(arg, candidates, out);
+                }
+            }
+            Statement::ExportNamed(e) => {
+                if let Some(decl) = &e.declaration {
+                    walk_stmt(decl, candidates, out);
+                }
+            }
+            Statement::ExportDefault(_) => {}
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt(stmt, candidates, out);
+    }
+}
+
 /// Recursively collect identifier names declared by a binding pattern.
 fn collect_pattern_names(
     pat: &svelte_js_ast::Pattern,
@@ -691,11 +1306,33 @@ fn parse_svelte_ignore(comment: &str) -> Vec<String> {
     after
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|s| !s.is_empty())
-        .map(|s| {
+        .flat_map(|s| {
             // Upstream accepts both `a11y-foo` and `a11y_foo` syntax. Convert
             // the dash-syntax variant into the underscore-canonical form so
-            // it matches `CompileDiagnostic.code`.
-            s.replace('-', "_")
+            // it matches `CompileDiagnostic.code`. Also accept legacy code
+            // names that were renamed between Svelte 4 → 5.
+            let normalized = s.replace('-', "_");
+            let replacement: Option<&'static str> = match normalized.as_str() {
+                "non_top_level_reactive_declaration" => {
+                    Some("reactive_declaration_invalid_placement")
+                }
+                "module_script_reactive_declaration" => {
+                    Some("reactive_declaration_module_script_dependency")
+                }
+                "empty_block" => Some("block_empty"),
+                "avoid_is" => Some("attribute_avoid_is"),
+                "invalid_html_attribute" => Some("attribute_invalid_property_name"),
+                "a11y_structure" => Some("a11y_figcaption_parent"),
+                "illegal_attribute_character" => Some("attribute_illegal_colon"),
+                "invalid_rest_eachblock_binding" => Some("bind_invalid_each_rest"),
+                "unused_export_let" => Some("export_let_unused"),
+                _ => None,
+            };
+            let mut out = vec![normalized];
+            if let Some(r) = replacement {
+                out.push(r.to_string());
+            }
+            out
         })
         .collect()
 }

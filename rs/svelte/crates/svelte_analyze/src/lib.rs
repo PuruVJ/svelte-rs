@@ -108,28 +108,35 @@ pub fn analyze_component(
     // `phases/2-analyze/index.js`.
     let (validator_warnings, validator_errors) = validate::validate(&analysis.root, &analysis);
     analysis.warnings.extend(validator_warnings);
-    // Apply top-level `<!-- svelte-ignore css_* -->` comments to CSS
-    // warnings (they target the hoisted `<style>` which `visit_fragment`
-    // can't pair with by the time we visit). Mirrors the
-    // `state.ignores_at_top` handling in upstream's analyze entry.
-    let css_global_ignores: std::collections::HashSet<String> = analysis
-        .root
-        .fragment
-        .nodes
-        .iter()
-        .filter_map(|n| match n {
+    // Apply top-of-file `<!-- svelte-ignore X -->` to script + CSS warnings
+    // whose targets are hoisted out of the fragment by the parser. A comment
+    // is "top-of-file" if it appears in the root fragment before the first
+    // non-comment, non-whitespace-text child. Mirrors the `state.ignores`
+    // bootstrapping in upstream's analyze entry.
+    let mut top_of_file_ignores: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for n in &analysis.root.fragment.nodes {
+        match n {
             svelte_ast::fragment::FragmentChild::Comment(c) => {
-                Some(parse_svelte_ignore_codes(&c.data))
+                for code in parse_svelte_ignore_codes(&c.data) {
+                    top_of_file_ignores.insert(code);
+                }
             }
-            _ => None,
-        })
-        .flatten()
-        .filter(|code| code.starts_with("css_"))
-        .collect();
-    if !css_global_ignores.is_empty() {
-        analysis
-            .warnings
-            .retain(|w| !css_global_ignores.contains(w.code));
+            svelte_ast::fragment::FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            _ => break,
+        }
+    }
+    if !top_of_file_ignores.is_empty() {
+        analysis.warnings.retain(|w| {
+            // Only filter warnings whose target was hoisted out (css, reactive
+            // declarations from the script). Other warnings have proper
+            // element targets and use the per-fragment ignore mechanism.
+            let hoist_target = w.code.starts_with("css_")
+                || w.code.starts_with("reactive_declaration_")
+                || w.code == "non_reactive_update"
+                || w.code == "store_rune_conflict";
+            !(hoist_target && top_of_file_ignores.contains(w.code))
+        });
     }
     if let Some(first_error) = validator_errors.into_iter().next() {
         // Upstream throws on the first error; we surface it the same way

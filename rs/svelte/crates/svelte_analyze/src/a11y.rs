@@ -270,12 +270,17 @@ pub fn check_regular_element_with_parent(
         || (el.name == "input"
             && attr_static_string(attr_get("type")).as_deref() == Some("hidden"));
     let role_is_non_presentation = role.is_some() && !role_is_presentation;
+    // When the `role` attribute is present but its value is a dynamic
+    // expression (not a static string), we can't know whether it's
+    // interactive — be conservative and skip role-dependent checks.
+    let role_is_dynamic = attr_get("role").is_some() && role.is_none();
     // click_events_have_key_events — onclick + non-interactive + no key.
     if has_onclick
         && !has_key_event
         && !hidden_from_sr
         && !disabled
         && !has_spread
+        && !role_is_dynamic
         && (role.is_none() || role_is_non_presentation)
         && !is_strict_interactive
         && !role_is_interactive
@@ -523,11 +528,12 @@ pub fn check_regular_element_with_parent(
         let n = tabindex_val.parse::<i32>().ok();
         let element_is_interactive = is_interactive_html_element(&el.name, &attrs);
         let role_interactive = role.as_deref().map_or(false, is_interactive_role);
-        // tabindex < 0 doesn't bring focus, no warning.
+        // tabindex < 0 doesn't bring focus, no warning. Skip when role is
+        // dynamic (we don't know if it would be interactive).
         if n.map_or(true, |x| x >= 0)
             && !element_is_interactive
             && !role_interactive
-            && !is_static_html_element(&el.name)
+            && !role_is_dynamic
         {
             let attr_span = el.attributes.iter().find_map(|a| {
                 if let ElementAttribute::Attribute(att) = a {
@@ -603,6 +609,57 @@ pub fn check_regular_element_with_parent(
             if role_is_int && element_is_non_interactive_strict {
                 diags.push(warnings::a11y_no_noninteractive_element_to_interactive_role(
                     role_span, &el.name, role_name,
+                ));
+            }
+        }
+    }
+
+    // 26b. a11y_role_has_required_aria_props — certain roles must have
+    //   specific `aria-*` attributes defined. Mirrors aria-query's
+    //   `requiredProps`. We only encode the commonly-required-props subset.
+    if let Some(role_name) = role.as_deref() {
+        let required: &[&str] = match role_name {
+            "checkbox" => &["aria-checked"],
+            "meter" => &["aria-valuenow"],
+            "option" => &["aria-selected"],
+            "radio" => &["aria-checked"],
+            "scrollbar" => &["aria-controls", "aria-valuenow"],
+            "slider" => &["aria-valuenow"],
+            "switch" => &["aria-checked"],
+            // heading: only required if not implicit (h1-h6 supplies level).
+            "heading" if !matches!(el.name.as_str(),
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6") => &["aria-level"],
+            _ => &[],
+        };
+        if !required.is_empty() && !is_redundant_role(&el.name, role_name) {
+            let missing: Vec<&&str> = required.iter().filter(|p| !has_attr(p)).collect();
+            // Don't fire if the element's implicit role already supplies the
+            // required attribute (e.g. `<input type="checkbox" role="switch">`
+            // — input[type=checkbox] is interactive and supplies state).
+            let element_is_interactive = is_interactive_html_element(&el.name, &attrs);
+            if !missing.is_empty() && !element_is_interactive {
+                let mut quoted: Vec<String> =
+                    missing.iter().map(|p| format!("\"{}\"", p)).collect();
+                let props_str = match quoted.len() {
+                    0 => String::new(),
+                    1 => quoted.remove(0),
+                    _ => {
+                        let last = quoted.pop().unwrap();
+                        format!("{} and {}", quoted.join(", "), last)
+                    }
+                };
+                let attr_span = el.attributes.iter().find_map(|a| {
+                    if let ElementAttribute::Attribute(att) = a {
+                        if att.name == "role" {
+                            return Some((att.start, att.end));
+                        }
+                    }
+                    None
+                });
+                diags.push(warnings::a11y_role_has_required_aria_props(
+                    attr_span.or(span),
+                    role_name,
+                    &props_str,
                 ));
             }
         }
@@ -1247,6 +1304,27 @@ fn fragment_has_text(f: &Fragment) -> bool {
             FragmentChild::Text(t) if !t.data.trim().is_empty() => return true,
             FragmentChild::ExpressionTag(_) => return true,
             FragmentChild::RegularElement(el) => {
+                // Mirrors upstream `has_content` carve-outs:
+                //  - `popover`-anchored children don't count as button label
+                //    (they pop OUT of the button visually).
+                //  - `<img alt="...">` and `<selectedcontent>` count as content
+                //    directly without needing descendant text.
+                let has_popover = el.attributes.iter().any(|a| {
+                    matches!(a, ElementAttribute::Attribute(att) if att.name == "popover")
+                });
+                if has_popover {
+                    continue;
+                }
+                if el.name == "img"
+                    && el.attributes.iter().any(|a| {
+                        matches!(a, ElementAttribute::Attribute(att) if att.name == "alt")
+                    })
+                {
+                    return true;
+                }
+                if el.name == "selectedcontent" {
+                    return true;
+                }
                 if fragment_has_text(&el.fragment) {
                     return true;
                 }
