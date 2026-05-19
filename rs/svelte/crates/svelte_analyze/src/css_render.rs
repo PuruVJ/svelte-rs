@@ -176,10 +176,21 @@ fn visit_rule(
             }
             return;
         }
-        // Non-lone global block (e.g. `div :global { ... }`): walk each
-        // ComplexSelector directly — `:global` gets stripped, `div` gets
-        // scoped — but skip partial-pruning (mirrors upstream's
-        // SelectorList visitor early-return when `is_in_global_block`).
+        // Non-lone global block (e.g. `div :global { ... }`): if no prelude
+        // complex selector actually matched a template element, the rule's
+        // local prefix is unused — wrap the entire rule as `(unused) ...`.
+        // Otherwise, walk each ComplexSelector directly — `:global` gets
+        // stripped, the local part gets scoped — and skip partial pruning
+        // of the SelectorList (mirrors upstream's SelectorList visitor
+        // early-return when `is_in_global_block`).
+        if !inside_global_block && !is_rule_used(rule, css_meta) {
+            let start = rel(state, rule.start);
+            let end = rel(state, rule.end);
+            code.prepend_right(start, "/* (unused) ");
+            code.append_left(end, "*/");
+            escape_comment_close(rule, code, state);
+            return;
+        }
         for sel in &rule.prelude.children {
             visit_complex_selector(
                 sel,
@@ -472,10 +483,15 @@ fn visit_complex_selector(
                 }
             }
         }
-        // NOTE: at the top level we don't gate on rmeta.scoped because our
-        // css_prune doesn't classify every case correctly yet. Inner
-        // recursion (visit_inner_complex) does gate on scoped, which is what
-        // `:not(.foo)`-style filters actually need.
+        // Only scope when the rel sel was actually flagged scoped by the
+        // pruner — mirrors upstream's
+        // `if (relative_selector.metadata.scoped)` gate at index.js:320.
+        if !rmeta.scoped {
+            for s in &rsel.selectors {
+                visit_inner_pseudo(s, code, state, css_meta, inside_global_block, &mut bumped);
+            }
+            continue;
+        }
         // Skip standalone `:is(...)` / `:where(...)` / `&` selectors — the
         // inner selectors get scoped via recursion.
         if rsel.selectors.len() == 1 {
@@ -613,18 +629,72 @@ fn visit_inner_pseudo(
         return;
     }
     let Some(list) = p.args.as_ref() else { return };
-    // Each ComplexSelector inside the args shares the outer specificity state.
+    // `:not(...)` inverts matching — every arg is kept regardless of
+    // whether anything matches it. Skip the unused-comment pass for `:not`.
+    if p.name != "not" {
+        visit_selector_list_prune(list, code, state, css_meta, inside_global_block);
+    }
+    // Then visit each child complex for inner scoping (for `:not` we visit
+    // all of them; for the rest, only the used ones — pruned ones are
+    // already inside the `/* (unused) */` wrapper).
     for inner in &list.children {
-        let saved = *bumped;
-        visit_inner_complex(inner, code, state, css_meta, inside_global_block, bumped);
-        // Restore bumped: upstream restores via `before_bumped` after the
-        // outer ComplexSelector visit completes. But the inner SelectorList
-        // visitor itself doesn't reset between siblings inside an args list
-        // — each `:is(a, b)` complex sibling can independently bump.
-        if !saved && *bumped {
-            // keep bumped for siblings — matches upstream's shared
-            // `specificity` object.
+        let should_visit = p.name == "not" || is_complex_used(inner, css_meta);
+        if should_visit {
+            let saved = *bumped;
+            visit_inner_complex(inner, code, state, css_meta, inside_global_block, bumped);
+            let _ = saved;
         }
+    }
+}
+
+/// Comment-wrap unused complex selectors in a SelectorList — extracted
+/// from `visit_selector_list` so the inner-pseudo visitor (`:is`, `:has`,
+/// `:where`, `:not`) can apply the same SelectorList pruning that
+/// top-level rule preludes get.
+fn visit_selector_list_prune(
+    list: &SelectorList,
+    code: &mut MagicString,
+    state: &RenderState,
+    css_meta: &CssAnalysis,
+    inside_global_block: bool,
+) {
+    if inside_global_block || list.children.is_empty() {
+        return;
+    }
+    let raw = code.original.clone();
+    let bytes = raw.as_bytes();
+    let children = &list.children;
+    let first_start = rel(state, children[0].start);
+    let mut prune_start: usize = first_start;
+    let mut last: usize = first_start;
+    let mut pruning = false;
+    let mut has_previous_used = false;
+    for (i, sel) in children.iter().enumerate() {
+        let used = is_complex_used(sel, css_meta);
+        if used == pruning {
+            if pruning {
+                let mut k = rel(state, sel.start);
+                while k > 0 && bytes.get(k).copied() != Some(b',') {
+                    k -= 1;
+                }
+                let insert_at = if has_previous_used { k } else { k + 1 };
+                code.append_right(insert_at, "*/");
+            } else if i == 0 {
+                code.prepend_right(rel(state, sel.start), "/* (unused) ");
+            } else {
+                code.overwrite(last, rel(state, sel.start), " /* (unused) ");
+            }
+            pruning = !pruning;
+            let _ = prune_start;
+            prune_start = if i == 0 { rel(state, sel.start) } else { last };
+        }
+        if !pruning && used {
+            has_previous_used = true;
+        }
+        last = rel(state, sel.end);
+    }
+    if pruning {
+        code.append_left(last, "*/");
     }
 }
 

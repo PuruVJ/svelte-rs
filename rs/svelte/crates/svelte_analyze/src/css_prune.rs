@@ -173,8 +173,14 @@ fn walk_rule<'a>(
         .unwrap_or_default();
 
     if rule_meta.is_global_block {
-        // Visit the prelude (so :global { :hover {} } still tracks) but
-        // don't try to match against the template.
+        // For a non-lone global block (e.g. `div :global { ... }`) the
+        // local prefix (`div`) still needs to be pruned/scoped — the
+        // `:global` part just signals that descendants in the body are
+        // unscoped. Mirrors upstream's behavior at css/index.js:283 where
+        // ComplexSelector visitor still runs on global-block rules.
+        for complex in &rule.prelude.children {
+            prune_complex_selector(complex, rule, parent_rule, tree, css_meta, rules_by_key);
+        }
     } else {
         for complex in &rule.prelude.children {
             prune_complex_selector(complex, rule, parent_rule, tree, css_meta, rules_by_key);
@@ -230,7 +236,7 @@ fn prune_complex_selector<'a>(
         return;
     }
 
-    let selectors = get_relative_selectors(complex, rule, parent_rule);
+    let selectors = get_relative_selectors(complex, rule, parent_rule, Some(css_meta));
     if selectors.is_empty() {
         return;
     }
@@ -289,8 +295,9 @@ fn get_relative_selectors(
     complex: &ComplexSelector,
     rule: &Rule,
     parent_rule: Option<&Rule>,
+    css_meta: Option<&CssAnalysis>,
 ) -> Vec<RelativeSelector> {
-    let mut selectors = truncate(complex);
+    let mut selectors = truncate_with_meta(complex, css_meta);
 
     if parent_rule.is_some() && !selectors.is_empty() {
         let mut has_explicit_nesting = false;
@@ -1016,34 +1023,43 @@ fn relative_selector_might_apply_to_node<'a>(
                 }
             }
             SimpleSelector::NestingSelector(_) => {
-                // Walk the parent rule's prelude and check each complex
-                // selector against this element. Mirrors css-prune.js:649-668.
                 let Some(parent) = parent_rule else {
-                    // Stand-alone `&` outside a nested rule — invalid.
                     return false;
                 };
-                // Resolve the grandparent so the parent's own `&` (in
-                // multi-level nesting) can chain up.
                 let grandparent = rule_parent(parent, css_meta, rules_by_key);
                 let mut matched = false;
                 for complex_arg in &parent.prelude.children {
-                    let parent_selectors = get_relative_selectors(complex_arg, parent, grandparent);
-                    if apply_selector(
-                        &parent_selectors,
-                        parent,
-                        grandparent,
-                        el_idx,
-                        tree,
-                        css_meta,
-                        Direction::Backward,
-                        0,
-                        parent_selectors.len(),
-                        rules_by_key,
-                    ) || complex_arg
-                        .children
-                        .iter()
-                        .all(is_global)
-                    {
+                    let parent_selectors = get_relative_selectors(complex_arg, parent, grandparent, Some(css_meta));
+                    // If truncate dropped every rel of the parent prelude
+                    // (all of them were global / global-like / `:root`),
+                    // then `&` is effectively in a global context — every
+                    // element matches it. Mirrors upstream's behavior
+                    // where `all` is used as a fallback when truncate
+                    // returns an empty list.
+                    let all_global = complex_arg.children.iter().all(is_global);
+                    let parent_meta = css_meta
+                        .rule_metadata
+                        .get(&(parent.start, parent.end))
+                        .copied()
+                        .unwrap_or_default();
+                    let empty_after_truncate = parent_selectors.is_empty()
+                        && (all_global || parent_meta.has_global_selectors);
+                    let mut applied = false;
+                    if !parent_selectors.is_empty() {
+                        applied = apply_selector(
+                            &parent_selectors,
+                            parent,
+                            grandparent,
+                            el_idx,
+                            tree,
+                            css_meta,
+                            Direction::Backward,
+                            0,
+                            parent_selectors.len(),
+                            rules_by_key,
+                        );
+                    }
+                    if applied || all_global || empty_after_truncate {
                         css_meta
                             .complex_selector_metadata
                             .entry((complex_arg.start, complex_arg.end))
