@@ -145,16 +145,83 @@ fn analyze_rule(
     // at the head. Mirrors css-analyze.js:201-264. Also propagates
     // `is_global_like = true` to relative selectors that follow a `:global`
     // within the same complex selector (so `:global div` → div is_global_like).
-    for complex in &rule.prelude.children {
+    let nselectors = rule.prelude.children.len();
+    for (_prelude_idx, complex) in rule.prelude.children.iter().enumerate() {
         let mut after_global = false;
-        for rel in &complex.children {
-            if rel
-                .selectors
-                .first()
-                .is_some_and(is_global_block_selector)
-            {
-                meta.is_global_block = true;
-                after_global = true;
+        let mut this_is_global_block = false;
+        for (rel_idx, rel) in complex.children.iter().enumerate() {
+            // Find first `:global` selector in this relative selector.
+            let g_idx = rel.selectors.iter().position(|s| {
+                matches!(
+                    s,
+                    SimpleSelector::PseudoClassSelector(p) if p.name == "global" && p.args.is_none()
+                )
+            });
+            let starts_global = matches!(g_idx, Some(0));
+            if starts_global {
+                if err.is_none() {
+                    // `:global xyz` with siblings + first relative + non-nested
+                    // → css_global_block_invalid_modifier_start.
+                    if rel.selectors.len() > 1
+                        && rel_idx == 0
+                        && parent_rule.is_none()
+                    {
+                        let next = &rel.selectors[1];
+                        let span = simple_span(next);
+                        *err = Some(svelte_diagnostics::errors::css_global_block_invalid_modifier_start(
+                            Some(span),
+                        ));
+                    } else {
+                        meta.is_global_block = true;
+                        this_is_global_block = true;
+                        after_global = true;
+                        // `>:global` etc. — non-space combinator on a :global
+                        // → css_global_block_invalid_combinator.
+                        if let Some(combinator) = &rel.combinator {
+                            if combinator.name != " " {
+                                *err = Some(svelte_diagnostics::errors::css_global_block_invalid_combinator(
+                                    Some((combinator.start, combinator.end)),
+                                    &combinator.name,
+                                ));
+                            }
+                        }
+                        // Lone `:global { color: red }` (no descendants, one
+                        // selector in the prelude) → invalid_declaration.
+                        let is_lone_global =
+                            complex.children.len() == 1 && complex.children[0].selectors.len() == 1;
+                        if is_lone_global && nselectors > 1 {
+                            *err = Some(svelte_diagnostics::errors::css_global_block_invalid_list(
+                                Some((rule.prelude.start, rule.prelude.end)),
+                            ));
+                        }
+                        if err.is_none() {
+                            let has_decl = rule.block.children.iter().any(|c| {
+                                matches!(c, svelte_ast::css::BlockChild::Declaration(_))
+                            });
+                            if is_lone_global && nselectors == 1 && has_decl {
+                                if let Some(decl) = rule.block.children.iter().find_map(|c| {
+                                    if let svelte_ast::css::BlockChild::Declaration(d) = c {
+                                        Some(d)
+                                    } else {
+                                        None
+                                    }
+                                }) {
+                                    *err = Some(svelte_diagnostics::errors::css_global_block_invalid_declaration(
+                                        Some((decl.start, decl.end)),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if let Some(idx) = g_idx {
+                // `:global` not at idx 0 — e.g. `.x:global` → invalid_modifier.
+                if err.is_none() {
+                    let span = simple_span(&rel.selectors[idx]);
+                    *err = Some(svelte_diagnostics::errors::css_global_block_invalid_modifier(
+                        Some(span),
+                    ));
+                }
             } else if after_global {
                 a.relative_selector_metadata
                     .entry(node_key(rel.start, rel.end))
@@ -162,10 +229,44 @@ fn analyze_rule(
                     .is_global_like = true;
             }
         }
+        // If THIS prelude is a `:global` block but another prelude isn't a
+        // global-block, the whole list is invalid (`:global, .y {...}`).
+        if meta.is_global_block && !this_is_global_block && err.is_none() {
+            *err = Some(svelte_diagnostics::errors::css_global_block_invalid_list(
+                Some((rule.prelude.start, rule.prelude.end)),
+            ));
+        }
     }
 
     // Walk selectors to populate complex / relative metadata.
     for complex in &rule.prelude.children {
+        // `:is(:global)` / `:where(:global)` etc. — :global inside a
+        // pseudoclass argument is css_global_block_invalid_placement.
+        for rel in &complex.children {
+            for s in &rel.selectors {
+                if let SimpleSelector::PseudoClassSelector(p) = s {
+                    if let Some(args) = &p.args {
+                        for inner_complex in &args.children {
+                            for inner_rel in &inner_complex.children {
+                                for inner_s in &inner_rel.selectors {
+                                    if let SimpleSelector::PseudoClassSelector(ip) = inner_s {
+                                        if ip.name == "global" && ip.args.is_none() {
+                                            if err.is_none() {
+                                                *err = Some(
+                                                    svelte_diagnostics::errors::css_global_block_invalid_placement(
+                                                        Some((ip.start, ip.end)),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         analyze_complex_selector(complex, a);
         // `css_selector_invalid`: a top-level (non-nested) rule whose first
         // relative selector has a leading combinator is invalid. Mirrors
@@ -379,6 +480,20 @@ fn validate_global_placement(
 
 /// True if `simple` is `:global` with no args. Mirrors
 /// `is_global_block_selector` in css-analyze.js:25-32.
+fn simple_span(s: &SimpleSelector) -> (u32, u32) {
+    match s {
+        SimpleSelector::TypeSelector(t) => (t.start, t.end),
+        SimpleSelector::ClassSelector(t) => (t.start, t.end),
+        SimpleSelector::IdSelector(t) => (t.start, t.end),
+        SimpleSelector::AttributeSelector(t) => (t.start, t.end),
+        SimpleSelector::PseudoClassSelector(t) => (t.start, t.end),
+        SimpleSelector::PseudoElementSelector(t) => (t.start, t.end),
+        SimpleSelector::Nth(t) => (t.start, t.end),
+        SimpleSelector::NestingSelector(t) => (t.start, t.end),
+        SimpleSelector::Percentage(t) => (t.start, t.end),
+    }
+}
+
 fn is_global_block_selector(simple: &SimpleSelector) -> bool {
     matches!(
         simple,
