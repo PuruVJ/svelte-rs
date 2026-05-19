@@ -106,6 +106,8 @@ pub fn analyze_component(
     // per-AST-node visitors (svelte:window / svelte:body / svelte:self /
     // ...). Mirrors the `walk(root, visitors)` call in upstream
     // `phases/2-analyze/index.js`.
+    // Parser-emitted soft diagnostics surface as analysis warnings.
+    analysis.warnings.extend(analysis.root.parse_warnings.clone());
     let (validator_warnings, validator_errors) = validate::validate(&analysis.root, &analysis);
     analysis.warnings.extend(validator_warnings);
     // Apply top-of-file `<!-- svelte-ignore X -->` to script + CSS warnings
@@ -126,16 +128,44 @@ pub fn analyze_component(
             _ => break,
         }
     }
-    if !top_of_file_ignores.is_empty() {
+    // Also pick up JS-comment svelte-ignore directives in the instance script.
+    // Mirrors upstream's `extract_svelte_ignore_above` mechanism — JS-side
+    // `// svelte-ignore X` comments suppress script-emitted warnings of code
+    // X globally for that script.
+    let mut script_ignores: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for c in &analysis.root.comments {
+        for code in parse_svelte_ignore_codes(&c.value) {
+            script_ignores.insert(code);
+        }
+    }
+    let script_target_codes: &[&str] = &[
+        "export_let_unused",
+        "non_reactive_update",
+        "state_referenced_locally",
+        "store_rune_conflict",
+        "reactive_declaration_invalid_placement",
+        "reactive_declaration_module_script_dependency",
+        "perf_avoid_inline_class",
+        "perf_avoid_nested_class",
+        "legacy_component_creation",
+        "custom_element_props_identifier",
+    ];
+    if !top_of_file_ignores.is_empty() || !script_ignores.is_empty() {
         analysis.warnings.retain(|w| {
-            // Only filter warnings whose target was hoisted out (css, reactive
-            // declarations from the script). Other warnings have proper
-            // element targets and use the per-fragment ignore mechanism.
+            // Top-of-file applies to css_* and script-hoisted-target codes.
             let hoist_target = w.code.starts_with("css_")
                 || w.code.starts_with("reactive_declaration_")
                 || w.code == "non_reactive_update"
                 || w.code == "store_rune_conflict";
-            !(hoist_target && top_of_file_ignores.contains(w.code))
+            if hoist_target && top_of_file_ignores.contains(w.code) {
+                return false;
+            }
+            // JS-script svelte-ignore applies to script-emitted warnings.
+            if script_target_codes.contains(&w.code) && script_ignores.contains(w.code) {
+                return false;
+            }
+            true
         });
     }
     if let Some(first_error) = validator_errors.into_iter().next() {
@@ -158,8 +188,32 @@ fn parse_svelte_ignore_codes(comment: &str) -> Vec<String> {
         return Vec::new();
     };
     after
-        .split_whitespace()
-        .map(|s| s.replace('-', "_"))
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .flat_map(|s| {
+            let normalized = s.replace('-', "_");
+            let replacement: Option<&'static str> = match normalized.as_str() {
+                "non_top_level_reactive_declaration" => {
+                    Some("reactive_declaration_invalid_placement")
+                }
+                "module_script_reactive_declaration" => {
+                    Some("reactive_declaration_module_script_dependency")
+                }
+                "empty_block" => Some("block_empty"),
+                "avoid_is" => Some("attribute_avoid_is"),
+                "invalid_html_attribute" => Some("attribute_invalid_property_name"),
+                "a11y_structure" => Some("a11y_figcaption_parent"),
+                "illegal_attribute_character" => Some("attribute_illegal_colon"),
+                "invalid_rest_eachblock_binding" => Some("bind_invalid_each_rest"),
+                "unused_export_let" => Some("export_let_unused"),
+                _ => None,
+            };
+            let mut out = vec![normalized];
+            if let Some(r) = replacement {
+                out.push(r.to_string());
+            }
+            out
+        })
         .collect()
 }
 

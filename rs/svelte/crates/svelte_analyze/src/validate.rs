@@ -71,6 +71,11 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
     let mut state = ValidateState::new(analysis);
     state.imported_names = collect_imported_names(root);
     state.instance_declared = collect_instance_declared(root);
+    // Detect `{@const X = ...}` declarations and emit
+    // `constant_assignment` errors for any assignments / updates targeting
+    // those names within the block's scope. Mirrors upstream's flow in
+    // const-tag handling.
+    validate_const_assignments(&root.fragment, &[], &mut state);
     visit_fragment(&root.fragment, &mut state);
     if let Some(s) = root.instance.as_ref() {
         validate_script_attributes(&s.attributes, &mut state);
@@ -1170,6 +1175,247 @@ fn validate_store_rune_conflict(
     }
 }
 
+/// `constant_assignment` — walk the template tracking `{@const X = ...}`
+/// scopes; emit at any AssignmentExpression / UpdateExpression target that
+/// resolves to one of those names. Mirrors upstream's check in
+/// Identifier.js / AssignmentExpression.js for const bindings.
+fn validate_const_assignments(
+    fragment: &Fragment,
+    parent_consts: &[String],
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(
+        e: &Expression,
+        consts: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match e {
+            Expression::Assignment(a) => {
+                let target_name = match &a.left {
+                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(&id.name),
+                    AssignmentTarget::Expression(Expression::Identifier(id)) => Some(&id.name),
+                    _ => None,
+                };
+                if let Some(name) = target_name {
+                    if consts.contains(name) {
+                        let span = match &a.left {
+                            AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
+                                (id.span.start, id.span.end)
+                            }
+                            AssignmentTarget::Expression(Expression::Identifier(id)) => {
+                                (id.span.start, id.span.end)
+                            }
+                            _ => unreachable!(),
+                        };
+                        state
+                            .errors
+                            .push(errors::constant_assignment(Some(span), "constant"));
+                    }
+                }
+                walk_expr(&a.right, consts, state);
+            }
+            Expression::Update(u) => {
+                if let Expression::Identifier(id) = &u.argument {
+                    if consts.contains(&id.name) {
+                        state.errors.push(errors::constant_assignment(
+                            Some((id.span.start, id.span.end)),
+                            "constant",
+                        ));
+                    }
+                }
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.callee, consts, state);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, consts, state);
+                    }
+                }
+            }
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        walk_stmt(s, consts, state);
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, consts, state),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, consts, state);
+                }
+            }
+            Expression::Binary(b) => {
+                walk_expr(&b.left, consts, state);
+                walk_expr(&b.right, consts, state);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, consts, state);
+                walk_expr(&b.right, consts, state);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, consts, state);
+                walk_expr(&c.consequent, consts, state);
+                walk_expr(&c.alternate, consts, state);
+            }
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, consts, state);
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, consts, state),
+            Expression::Template(t) => {
+                for e in &t.expressions {
+                    walk_expr(e, consts, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        s: &Statement,
+        consts: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, consts, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, consts, state);
+                    }
+                }
+            }
+            Statement::Return(r) => {
+                if let Some(arg) = &r.argument {
+                    walk_expr(arg, consts, state);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, consts, state);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, consts, state);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, consts, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Collect this scope's const names by looking at sibling ConstTags.
+    let mut scope_consts: Vec<String> = parent_consts.to_vec();
+    for n in &fragment.nodes {
+        if let FragmentChild::ConstTag(t) = n {
+            for d in &t.declaration.declarations {
+                collect_pattern_names_vec(&d.id, &mut scope_consts);
+            }
+        }
+    }
+    let consts_set: std::collections::HashSet<String> = scope_consts.iter().cloned().collect();
+    // Walk every node looking for assignment/update targets.
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::ExpressionTag(et) => walk_expr(&et.expression, &consts_set, state),
+            FragmentChild::HtmlTag(t) => walk_expr(&t.expression, &consts_set, state),
+            FragmentChild::RegularElement(el) => {
+                for a in &el.attributes {
+                    walk_attr(a, &consts_set, state);
+                }
+                validate_const_assignments(&el.fragment, &scope_consts, state);
+            }
+            FragmentChild::Component(c) => {
+                for a in &c.attributes {
+                    walk_attr(a, &consts_set, state);
+                }
+                validate_const_assignments(&c.fragment, &scope_consts, state);
+            }
+            FragmentChild::SvelteElement(el) => {
+                walk_expr(&el.tag, &consts_set, state);
+                for a in &el.attributes {
+                    walk_attr(a, &consts_set, state);
+                }
+                validate_const_assignments(&el.fragment, &scope_consts, state);
+            }
+            FragmentChild::IfBlock(b) => {
+                walk_expr(&b.test, &consts_set, state);
+                validate_const_assignments(&b.consequent, &scope_consts, state);
+                if let Some(alt) = &b.alternate {
+                    validate_const_assignments(alt, &scope_consts, state);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                walk_expr(&b.expression, &consts_set, state);
+                validate_const_assignments(&b.body, &scope_consts, state);
+                if let Some(fb) = &b.fallback {
+                    validate_const_assignments(fb, &scope_consts, state);
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                walk_expr(&b.expression, &consts_set, state);
+                if let Some(f) = &b.pending {
+                    validate_const_assignments(f, &scope_consts, state);
+                }
+                if let Some(f) = &b.then {
+                    validate_const_assignments(f, &scope_consts, state);
+                }
+                if let Some(f) = &b.catch_ {
+                    validate_const_assignments(f, &scope_consts, state);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                walk_expr(&b.expression, &consts_set, state);
+                validate_const_assignments(&b.fragment, &scope_consts, state);
+            }
+            FragmentChild::SnippetBlock(b) => {
+                validate_const_assignments(&b.body, &scope_consts, state);
+            }
+            FragmentChild::TitleElement(el) => {
+                validate_const_assignments(&el.fragment, &scope_consts, state);
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_attr(
+        a: &ElementAttribute,
+        consts: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, consts, state),
+                svelte_ast::AttributeValue::Many(parts) => {
+                    for p in parts {
+                        if let svelte_ast::AttributeValuePart::ExpressionTag(et) = p {
+                            walk_expr(&et.expression, consts, state);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            ElementAttribute::OnDirective(d) => {
+                if let Some(e) = &d.expression {
+                    walk_expr(e, consts, state);
+                }
+            }
+            ElementAttribute::BindDirective(b) => walk_expr(&b.expression, consts, state),
+            _ => {}
+        }
+    }
+}
+
+fn collect_pattern_names_vec(pat: &svelte_js_ast::Pattern, out: &mut Vec<String>) {
+    let mut set = std::collections::HashSet::new();
+    collect_pattern_names(pat, &mut set);
+    for n in set {
+        out.push(n);
+    }
+}
+
 /// `non_reactive_update` — in runes mode, a top-level non-state `let`/
 /// `var` binding that is BOTH mutated somewhere AND read in the template
 /// should be declared with `$state(...)` instead. Mirrors the upstream
@@ -1180,6 +1426,12 @@ fn validate_non_reactive_update(
     state: &mut ValidateState,
 ) {
     use svelte_js_ast::*;
+    // `bind:this` inside a dynamic context (`{#if}`, `{#each}`, etc.) acts
+    // as both a read AND a mutation — the element reference changes as the
+    // dynamic context re-renders. Collect those identifiers separately so we
+    // can mark them as both mutated and read.
+    let mut bind_this_dynamic_names: std::collections::HashSet<String> = Default::default();
+    collect_dynamic_bind_this_names(fragment, &mut bind_this_dynamic_names, false);
     // 1. Top-level non-rune let/var bindings. Collect declarator id span +
     //    bound name. Skip if init is a rune call.
     let mut bindings: std::collections::HashMap<String, (u32, u32)> =
@@ -1213,18 +1465,86 @@ fn validate_non_reactive_update(
     let mut mutated: std::collections::HashSet<String> = Default::default();
     collect_mutated_names(program, &names_set, &mut mutated);
     collect_template_mutated_names(fragment, &names_set, &mut mutated);
-    if mutated.is_empty() {
-        return;
-    }
     // 3. Collect identifier reads from the template fragment recursively.
     let mut read_in_template: std::collections::HashSet<String> = Default::default();
     collect_template_ident_reads(fragment, &names_set, &mut read_in_template);
+    // bind:this in dynamic context counts as both a read and a mutation.
+    for n in &bind_this_dynamic_names {
+        if names_set.contains(n) {
+            mutated.insert(n.clone());
+            read_in_template.insert(n.clone());
+        }
+    }
+    if mutated.is_empty() {
+        return;
+    }
     // 4. Emit for the intersection.
     for (name, span) in &bindings {
         if mutated.contains(name) && read_in_template.contains(name) {
             state
                 .warnings
                 .push(warnings::non_reactive_update(Some(*span), name));
+        }
+    }
+}
+
+/// Walk the fragment collecting identifier names bound via `bind:this={X}`
+/// where the binding occurs inside a dynamic context (if/each/await/key).
+fn collect_dynamic_bind_this_names(
+    fragment: &Fragment,
+    out: &mut std::collections::HashSet<String>,
+    inside_dynamic: bool,
+) {
+    use svelte_ast::ElementAttribute;
+    for n in &fragment.nodes {
+        match n {
+            FragmentChild::RegularElement(el) => {
+                if inside_dynamic {
+                    for a in &el.attributes {
+                        if let ElementAttribute::BindDirective(b) = a {
+                            if b.name == "this" {
+                                if let svelte_js_ast::Expression::Identifier(id) = &b.expression {
+                                    out.insert(id.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                collect_dynamic_bind_this_names(&el.fragment, out, inside_dynamic);
+            }
+            FragmentChild::Component(c) => {
+                collect_dynamic_bind_this_names(&c.fragment, out, inside_dynamic);
+            }
+            FragmentChild::SvelteElement(el) => {
+                collect_dynamic_bind_this_names(&el.fragment, out, inside_dynamic);
+            }
+            FragmentChild::IfBlock(b) => {
+                collect_dynamic_bind_this_names(&b.consequent, out, true);
+                if let Some(alt) = &b.alternate {
+                    collect_dynamic_bind_this_names(alt, out, true);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                collect_dynamic_bind_this_names(&b.body, out, true);
+                if let Some(fb) = &b.fallback {
+                    collect_dynamic_bind_this_names(fb, out, true);
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                if let Some(f) = &b.pending {
+                    collect_dynamic_bind_this_names(f, out, true);
+                }
+                if let Some(f) = &b.then {
+                    collect_dynamic_bind_this_names(f, out, true);
+                }
+                if let Some(f) = &b.catch_ {
+                    collect_dynamic_bind_this_names(f, out, true);
+                }
+            }
+            FragmentChild::KeyBlock(b) => {
+                collect_dynamic_bind_this_names(&b.fragment, out, true);
+            }
+            _ => {}
         }
     }
 }

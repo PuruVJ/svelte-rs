@@ -104,6 +104,25 @@ pub fn read_element_or_comment(
         }
     }
 
+    // `element_invalid_self_closing_tag` warning — emit when an HTML tag
+    // uses `/>` syntax but isn't a void element AND isn't a Component AND
+    // isn't a foreign-namespace tag (svg, math, or a `ns:tag` syntax) AND
+    // isn't `<slot>` (Web Components slot). Mirrors `element.js:407-414`.
+    if self_closing
+        && !is_void(&name)
+        && !is_component_name(&name)
+        && !name.contains(':')
+        && !is_svg_foreign(&name)
+        && name != "slot"
+    {
+        parser
+            .warnings
+            .push(svelte_diagnostics::warnings::element_invalid_self_closing_tag(
+                Some((start as u32, parser.index as u32)),
+                &name,
+            ));
+    }
+
     // Void elements never have a body.
     if self_closing || is_void(&name) {
         return Ok(build_element(
@@ -157,6 +176,19 @@ pub fn read_element_or_comment(
     // parent's close tag to the caller. The element ends right at the
     // current parser position. Matches element.js:213-222.
     if implicit_close {
+        // `element_implicitly_closed` — warn so users can add an explicit
+        // close tag. The closing token is whatever appears at the cursor
+        // (e.g. `</main>` or `<p>`). Mirrors element.js:215-220.
+        let closer = peek_implicit_closer(parser.template, parser.index);
+        if !is_void(&name) && !is_component_name(&name) {
+            parser
+                .warnings
+                .push(svelte_diagnostics::warnings::element_implicitly_closed(
+                    Some((start as u32, parser.index as u32)),
+                    &name,
+                    &closer,
+                ));
+        }
         return Ok(build_element(
             name.into_owned(),
             start as u32,
@@ -448,6 +480,50 @@ fn is_component_name(name: &str) -> bool {
 }
 
 /// Read a tag name. Returns the slice consumed (borrowed from the source).
+/// Peek the implicit-closer tag at `index` (e.g. `</main>` or `<p>`) and
+/// return it as a printable string for the `element_implicitly_closed`
+/// message. Returns an empty string if nothing recognizable is there.
+fn peek_implicit_closer(template: &str, index: usize) -> String {
+    let rest = &template[index..];
+    if rest.starts_with("</") {
+        // `</main>` — read tag name then close.
+        let bytes = rest.as_bytes();
+        let mut i = 2;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        return format!("</{}>", &rest[2..i]);
+    }
+    if rest.starts_with('<') {
+        let bytes = rest.as_bytes();
+        let mut i = 1;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-')
+        {
+            i += 1;
+        }
+        return format!("<{}>", &rest[1..i]);
+    }
+    String::new()
+}
+
+/// True if `name` is inside a foreign-namespace where self-closing is
+/// legitimate. SVG and MathML tags can self-close.
+fn is_svg_foreign(name: &str) -> bool {
+    matches!(
+        name,
+        "circle" | "ellipse" | "line" | "rect" | "path" | "polygon" | "polyline"
+        | "g" | "svg" | "defs" | "use" | "symbol" | "linearGradient"
+        | "radialGradient" | "stop" | "image" | "text" | "tspan" | "marker"
+        | "mask" | "pattern" | "clipPath" | "filter" | "foreignObject"
+        | "mpath" | "set" | "animate" | "animateMotion" | "animateTransform"
+        | "math" | "mspace" | "mi" | "mn" | "mo" | "mrow" | "mfrac" | "msup"
+        | "msub" | "msubsup" | "mfenced" | "mroot" | "msqrt" | "mtext"
+    )
+}
+
 fn read_tag_name<'src>(parser: &mut Parser<'src>) -> Result<std::borrow::Cow<'src, str>, CompileDiagnostic> {
     let start = parser.index;
     // Tag-name characters: alphanumerics, `-`, `.`, `_`, `:` (for svelte:foo).
@@ -498,14 +574,20 @@ fn read_attributes(
             }
             // `{...spread}` and `{name}` shorthand attribute. Mirrors the
             // `{`-prefixed branch of `read_attribute` in element.js:530-606.
-            // Not allowed in static-only mode (script/style).
+            // In static-only mode (`<script>` / `<style>`), parse it as a
+            // soft `script_unknown_attribute` warning rather than erroring,
+            // mirroring upstream's lenient behavior in element.js:583-589.
+            let brace_start = parser.index;
+            let parsed = read_braced_attribute(parser)?;
             if static_only {
-                return Err(errors::expected_token(
-                    Some((parser.index as u32, parser.index as u32)),
-                    "attribute name",
-                ));
+                parser
+                    .warnings
+                    .push(svelte_diagnostics::warnings::script_unknown_attribute(
+                        Some((brace_start as u32, parser.index as u32)),
+                    ));
+            } else {
+                out.push(parsed);
             }
-            out.push(read_braced_attribute(parser)?);
             continue;
         }
         out.push(read_attribute(parser, static_only)?);
@@ -1190,6 +1272,34 @@ fn read_attr_sequence(
         }
 
         if parser.peek() == Some(b'{') {
+            // Reject `{#...}` blocks and `{@...}` tags inside attribute
+            // values — they're not allowed by upstream. Mirrors
+            // `read_sequence` in element.js:878-889.
+            let bytes = parser.template.as_bytes();
+            let next = bytes.get(parser.index + 1).copied();
+            if matches!(next, Some(b'#') | Some(b'@')) {
+                let kind = next.unwrap();
+                let block_start = parser.index;
+                let mut j = parser.index + 2;
+                while j < bytes.len() && (bytes[j] as char).is_ascii_lowercase() {
+                    j += 1;
+                }
+                let name = &parser.template[parser.index + 2..j];
+                let span = Some((block_start as u32, block_start as u32));
+                return Err(if kind == b'#' {
+                    svelte_diagnostics::errors::block_invalid_placement(
+                        span,
+                        name,
+                        "attribute value",
+                    )
+                } else {
+                    svelte_diagnostics::errors::tag_invalid_placement(
+                        span,
+                        name,
+                        "attribute value",
+                    )
+                });
+            }
             // Flush any pending text, then parse the mustache.
             flush_text(&mut parts, text_start, parser.index, parser.template);
             let tag = read_expression_tag(parser)?;
@@ -1237,6 +1347,33 @@ fn read_textarea_fragment(
         }
 
         if parser.peek() == Some(b'{') {
+            // Reject `{#...}` and `{@...}` inside `<textarea>` — same as
+            // attribute values, just a different `location` label.
+            let bytes = parser.template.as_bytes();
+            let next = bytes.get(parser.index + 1).copied();
+            if matches!(next, Some(b'#') | Some(b'@')) {
+                let kind = next.unwrap();
+                let block_start = parser.index;
+                let mut j = parser.index + 2;
+                while j < bytes.len() && (bytes[j] as char).is_ascii_lowercase() {
+                    j += 1;
+                }
+                let name = &parser.template[parser.index + 2..j];
+                let span = Some((block_start as u32, block_start as u32));
+                return Err(if kind == b'#' {
+                    svelte_diagnostics::errors::block_invalid_placement(
+                        span,
+                        name,
+                        "<textarea>",
+                    )
+                } else {
+                    svelte_diagnostics::errors::tag_invalid_placement(
+                        span,
+                        name,
+                        "<textarea>",
+                    )
+                });
+            }
             flush_text(&mut nodes, text_start, parser.index, parser.template);
             let tag = read_expression_tag(parser)?;
             nodes.push(FragmentChild::ExpressionTag(tag));

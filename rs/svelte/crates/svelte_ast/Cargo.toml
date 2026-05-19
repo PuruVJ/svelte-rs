@@ -8,3 +8,4 @@ description = "Svelte template AST. Typed throughout — no serde_json::Value."
 
 [dependencies]
 svelte_js_ast = { workspace = true }
+svelte_diagnostics = { workspace = true }

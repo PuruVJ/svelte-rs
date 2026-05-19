@@ -17,6 +17,11 @@ pub struct Root {
     pub comments: Vec<JsComment>,
     pub instance: Option<Script>,
     pub module: Option<Script>,
+    /// Soft diagnostics emitted during parsing (treated as warnings by
+    /// analyze). Examples: `element_invalid_self_closing_tag`,
+    /// `element_implicitly_closed`. Hard errors are surfaced via the
+    /// Result return; these are recoverable.
+    pub parse_warnings: Vec<svelte_diagnostics::CompileDiagnostic>,
 }
 
 impl Root {
@@ -31,6 +36,7 @@ impl Root {
             comments: Vec::new(),
             instance: None,
             module: None,
+            parse_warnings: Vec::new(),
         }
     }
 }

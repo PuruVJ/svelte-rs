@@ -947,6 +947,7 @@ dependencies = [
 name = "svelte_ast"
 version = "0.0.0"
 dependencies = [
+ "svelte_diagnostics",
  "svelte_js_ast",
 ]
 

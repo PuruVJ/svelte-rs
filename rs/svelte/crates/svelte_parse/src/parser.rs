@@ -33,6 +33,10 @@ pub struct Parser<'src> {
     /// a `RegularElement` (real DOM slot), not Svelte's `SlotElement`. See
     /// `parent_is_shadowroot_template` in `element.js:455-468`.
     pub shadowroot_depth: u32,
+    /// Soft diagnostics accumulated during parsing. Surface alongside the
+    /// final Root so analyze can treat them as warnings (e.g.
+    /// `element_invalid_self_closing_tag`, `element_implicitly_closed`).
+    pub warnings: Vec<CompileDiagnostic>,
 }
 
 impl<'src> Parser<'src> {
@@ -48,6 +52,7 @@ impl<'src> Parser<'src> {
             line_map,
             comments: Vec::new(),
             shadowroot_depth: 0,
+            warnings: Vec::new(),
         }
     }
 

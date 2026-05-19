@@ -382,6 +382,14 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::P
         }
         let pat_end = i;
         let name = parser.template[pat_start..pat_end].to_string();
+        // Reject JS reserved words used as `as` patterns. Mirrors
+        // `is_reserved` in 1-parse/utils/names.js.
+        if is_reserved_word(&name) {
+            return Err(errors::unexpected_reserved_word(
+                Some((pat_start as u32, pat_start as u32)),
+                &name,
+            ));
+        }
         parser.index = pat_end;
         return Ok(svelte_js_ast::Pattern::Identifier(svelte_js_ast::Identifier {
             name,
@@ -404,6 +412,20 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::P
 
 fn is_identifier_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+fn is_reserved_word(name: &str) -> bool {
+    matches!(
+        name,
+        // ES strict-mode reserved words.
+        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger"
+        | "default" | "delete" | "do" | "else" | "export" | "extends" | "false"
+        | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
+        | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
+        | "true" | "try" | "typeof" | "var" | "void" | "while" | "with" | "yield"
+        | "enum" | "implements" | "interface" | "package" | "private" | "protected"
+        | "public" | "static" | "let"
+    )
 }
 
 fn is_identifier_continue(b: u8) -> bool {

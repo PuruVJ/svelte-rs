@@ -66,6 +66,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
         comments: vec![],
         instance: None,
         module: None,
+        parse_warnings: vec![],
     };
 
     // Hoist <script> and <style> children to Root.instance / module / css.
@@ -79,6 +80,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
     for c in std::mem::take(&mut parser.comments) {
         root.comments.push(raw_to_js_comment(&c, &parser.line_map));
     }
+    root.parse_warnings.extend(std::mem::take(&mut parser.warnings));
 
     Ok(root)
 }

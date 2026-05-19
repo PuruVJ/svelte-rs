@@ -31,6 +31,21 @@ pub fn is_valid_tag_name(name: &str) -> bool {
     if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
         return false;
     }
+    // Allow a single namespace prefix (e.g. `enhanced:img`). Split on the
+    // first `:` and validate both sides independently.
+    if let Some(colon) = name.find(':') {
+        let (ns, rest) = name.split_at(colon);
+        let rest = &rest[1..];
+        return is_simple_tag_name(ns) && is_simple_tag_name(rest);
+    }
+    is_simple_tag_name(name)
+}
+
+fn is_simple_tag_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
     let mut has_hyphen = false;
     for &b in &bytes[1..] {
         match b {
