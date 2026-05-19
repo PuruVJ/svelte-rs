@@ -212,6 +212,11 @@ pub fn try_typed_client_walker_with(
             {
                 return Some(p);
             }
+            if let Some(p) =
+                emit_single_element_wrapping_ifs_program(el, component_name, &script)
+            {
+                return Some(p);
+            }
         }
     }
 
@@ -2061,6 +2066,290 @@ fn emit_single_element_with_component_program(
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit a runes/legacy-mode program for the shape:
+///
+///   <TAG>{#if A}...{/if} {#if B}...{/if}</TAG>
+///
+/// where the element body is exactly N>=1 if-blocks (no else) separated by
+/// whitespace, each with a fully-static single-element consequent. Mirrors
+/// `if-block-anchor`.
+fn emit_single_element_wrapping_ifs_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    // Wrapper must have no dynamic attrs/spread/directives.
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    if !el.attributes.iter().all(|a| match a {
+        ElementAttribute::Attribute(attr) => matches!(
+            &attr.value,
+            AttributeValue::Empty
+                | AttributeValue::Many(_)
+        ) && match &attr.value {
+            AttributeValue::Many(parts) => {
+                parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_)))
+            }
+            _ => true,
+        },
+        _ => false,
+    }) {
+        return None;
+    }
+
+    // Body: list of IfBlocks (non-async, no else, single-element static
+    // consequent), optionally separated by whitespace text / comments.
+    let non_ws: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.is_empty() {
+        return None;
+    }
+    let ifs: Vec<&svelte_ast::blocks::IfBlock> = non_ws
+        .iter()
+        .filter_map(|n| match n {
+            FragmentChild::IfBlock(ib) => Some(ib),
+            _ => None,
+        })
+        .collect();
+    if ifs.len() != non_ws.len() {
+        return None;
+    }
+    if ifs.iter().any(|ib| ib.alternate.is_some() || expr_top_await(&ib.test)) {
+        return None;
+    }
+
+    let mut root_decls: Vec<Statement> = Vec::new();
+    let mut root_idx: usize = 0;
+    let mut elem_var_idx: usize = 0;
+
+    // Build template HTML for the wrapper, plus consequent arrows.
+    let mut html = String::with_capacity(32);
+    html.push('<');
+    html.push_str(&el.name);
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            match &attr.value {
+                AttributeValue::Empty => {
+                    html.push(' ');
+                    html.push_str(&attr.name);
+                    html.push_str("=\"\"");
+                }
+                AttributeValue::Many(parts) => {
+                    html.push(' ');
+                    html.push_str(&attr.name);
+                    html.push_str("=\"");
+                    for p in parts {
+                        if let AttributeValuePart::Text(t) = p {
+                            for c in t.data.chars() {
+                                match c {
+                                    '"' => html.push_str("&quot;"),
+                                    '&' => html.push_str("&amp;"),
+                                    _ => html.push(c),
+                                }
+                            }
+                        }
+                    }
+                    html.push('"');
+                }
+                _ => {}
+            }
+        }
+    }
+    html.push('>');
+    // Anchor comments separated by single space.
+    for (i, _) in ifs.iter().enumerate() {
+        if i > 0 {
+            html.push(' ');
+        }
+        html.push_str("<!>");
+    }
+    html.push_str("</");
+    html.push_str(&el.name);
+    html.push('>');
+
+    // Build each if-block's consequent body and emission.
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let mut block_stmts: Vec<Statement> = Vec::new();
+    for (i, ib) in ifs.iter().enumerate() {
+        let consequent_text_name = if i == 0 {
+            "text".to_string()
+        } else {
+            format!("text_{}", i)
+        };
+        let consequent_body = emit_vanilla_branch_body(
+            &ib.consequent,
+            &consequent_text_name,
+            &mut root_decls,
+            &mut root_idx,
+            &mut elem_var_idx,
+        )?;
+        let consequent_var = if i == 0 {
+            "consequent".to_string()
+        } else {
+            format!("consequent_{}", i)
+        };
+        let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$anchor")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: consequent_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let mut inner_block: Vec<Statement> = Vec::new();
+        inner_block.push(t::var(&consequent_var, consequent_arrow));
+        let test = rewrite_props_destructured(&ib.test, &script.props_destructured);
+        let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
+        let render_if = Statement::If(Box::new(IfStatement {
+            test,
+            consequent: t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)])),
+            alternate: None,
+            span: Span::ZERO,
+        }));
+        let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$render")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![render_if],
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let node_var = if i == 0 {
+            "node".to_string()
+        } else {
+            format!("node_{}", i)
+        };
+        inner_block.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "if"),
+            vec![t::id(&node_var), render_arrow],
+        )));
+        // Between blocks, emit sibling navigation: `var node_i = $.sibling(prev_node, 2);`
+        if i > 0 {
+            let prev_node = if i - 1 == 0 {
+                "node".to_string()
+            } else {
+                format!("node_{}", i - 1)
+            };
+            block_stmts.push(t::var(
+                &node_var,
+                t::call(
+                    t::member_id(t::id("$"), "sibling"),
+                    vec![t::id(&prev_node), t::lit_number(2.0)],
+                ),
+            ));
+        }
+        block_stmts.push(Statement::Block(Box::new(BlockStatement {
+            body: inner_block,
+            span: Span::ZERO,
+        })));
+    }
+
+    // Top-level function body.
+    let tag_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "child"),
+            vec![t::id(&tag_var)],
+        ),
+    ));
+    func_body.extend(block_stmts);
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&tag_var)],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&tag_var)],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props || !script.legacy_export_props.is_empty() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.extend(root_decls);
     prog.push(t::var(
         "root",
         t::call(
