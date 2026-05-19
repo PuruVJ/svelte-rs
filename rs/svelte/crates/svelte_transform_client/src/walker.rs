@@ -273,6 +273,11 @@ pub fn try_typed_client_walker_with(
             {
                 return inject_snippets(Some(p));
             }
+            if let Some(p) =
+                emit_single_element_with_folded_prefix_program(el, component_name, &script)
+            {
+                return inject_snippets(Some(p));
+            }
         }
     }
 
@@ -4369,6 +4374,222 @@ fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
         })),
         e => e.clone(),
     }
+}
+
+/// Emit a program for the shape:
+///
+///   <TAG>{LITERAL} text <STATIC>...</STATIC></TAG>
+///
+/// where the element body starts with a foldable run of (Text +
+/// ExpressionTag-with-literal) that collapses to a single string, followed
+/// by zero-or-more fully-static elements. The folded text becomes the
+/// `nodeValue` of a text-anchor at the head of the body. Mirrors
+/// `expression-sibling`, `safari-borking`.
+fn emit_single_element_with_folded_prefix_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+        || !script.legacy_export_props.is_empty()
+    {
+        return None;
+    }
+    if !is_element_static_attrs(el) {
+        return None;
+    }
+    // Walk the body: collect leading Text + ExpressionTag-with-literal as
+    // a folded string; then collect any trailing fully-static elements.
+    let mut folded = String::new();
+    let mut had_expr = false;
+    let mut had_text = false;
+    let mut trailing_static: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
+    let mut state = 0u8; // 0 = collecting prefix run, 1 = collecting trailing static
+    for n in &el.fragment.nodes {
+        match (state, n) {
+            (0, FragmentChild::Text(t)) => {
+                folded.push_str(&collapse_ws_client(&t.data));
+                had_text = true;
+            }
+            (0, FragmentChild::ExpressionTag(et)) => {
+                let s = literal_to_template_string(&et.expression)?;
+                folded.push_str(&s);
+                had_expr = true;
+            }
+            (0, FragmentChild::Comment(_)) => {}
+            (0, FragmentChild::RegularElement(child)) => {
+                if !is_element_fully_static(child) {
+                    return None;
+                }
+                state = 1;
+                trailing_static.push(child);
+            }
+            (1, FragmentChild::Text(t)) => {
+                // Whitespace-only text between trailing statics is OK.
+                if !t.data.trim().is_empty() {
+                    return None;
+                }
+            }
+            (1, FragmentChild::Comment(_)) => {}
+            (1, FragmentChild::RegularElement(child)) => {
+                if !is_element_fully_static(child) {
+                    return None;
+                }
+                trailing_static.push(child);
+            }
+            _ => return None,
+        }
+    }
+    // Must have at least one ExpressionTag in the prefix run AND at least
+    // one trailing static element. Pure text-or-expression bodies are
+    // handled by the existing `<h1>{const}</h1>` → `h1.textContent = ...`
+    // path which uses no text anchor in the template.
+    if !had_expr || trailing_static.is_empty() {
+        return None;
+    }
+    // Trim leading/trailing whitespace from folded — upstream's text node
+    // is the leading anchor in the element so we don't trim, we keep as-is.
+    // Actually upstream KEEPS the surrounding whitespace ('1 2 ' includes
+    // trailing space). So no trim here.
+
+    // Build template HTML: `<TAG ATTRS> SERIALIZED_STATICS</TAG>` (single
+    // space for the text anchor, then serialized statics with a leading
+    // space if needed — upstream emits `<p> <span>3</span></p>`).
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&el.name);
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            match &attr.value {
+                AttributeValue::Empty => {
+                    html.push(' ');
+                    html.push_str(&attr.name);
+                    html.push_str("=\"\"");
+                }
+                AttributeValue::Many(parts) => {
+                    html.push(' ');
+                    html.push_str(&attr.name);
+                    html.push_str("=\"");
+                    for p in parts {
+                        if let AttributeValuePart::Text(t) = p {
+                            for c in t.data.chars() {
+                                match c {
+                                    '"' => html.push_str("&quot;"),
+                                    '&' => html.push_str("&amp;"),
+                                    _ => html.push(c),
+                                }
+                            }
+                        }
+                    }
+                    html.push('"');
+                }
+                _ => return None,
+            }
+        }
+    }
+    html.push('>');
+    html.push(' '); // text anchor
+    for child in &trailing_static {
+        let mut needs = false;
+        serialize_element_to_html(child, &mut html, &mut needs)?;
+    }
+    html.push_str("</");
+    html.push_str(&el.name);
+    html.push('>');
+
+    let tag_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+    // var text = $.child(TAG[, true]);
+    // The `true` flag is emitted when the body has no raw Text nodes —
+    // only ExpressionTag-with-literal — so the runtime knows to create
+    // a text node if the hydrated DOM doesn't have one.
+    let child_args: Vec<Expression> = if had_text {
+        vec![t::id(&tag_var)]
+    } else {
+        vec![
+            t::id(&tag_var),
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: true,
+                span: Span::ZERO,
+            }))),
+        ]
+    };
+    func_body.push(t::var(
+        "text",
+        t::call(t::member_id(t::id("$"), "child"), child_args),
+    ));
+    // text.nodeValue = LITERAL;
+    let nodevalue_assign = Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
+            object: t::id("text"),
+            property: MemberProperty::Identifier(Identifier {
+                name: "nodeValue".to_string(),
+                span: Span::ZERO,
+            }),
+            computed: false,
+            optional: false,
+            span: Span::ZERO,
+        }))),
+        operator: AssignmentOperator::Assign,
+        right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+            value: folded,
+            raw: None,
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    }));
+    func_body.push(t::stmt(nodevalue_assign));
+    // For each trailing static: emit `$.next();` to advance past it.
+    if !trailing_static.is_empty() {
+        let n = trailing_static.len();
+        let arg = if n == 1 {
+            Vec::new()
+        } else {
+            vec![t::lit_number(n as f64)]
+        };
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            arg,
+        )));
+    }
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&tag_var)],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&tag_var)],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 fn emit_single_dynamic_element_program(
@@ -11556,7 +11777,13 @@ fn is_props_call(e: &Expression) -> bool {
 }
 
 fn is_literal_expression(e: &Expression) -> bool {
-    matches!(e, Expression::Literal(_))
+    match e {
+        Expression::Literal(_) => true,
+        // Plain template literal with no substitutions — equivalent to a
+        // string literal for constant-fold purposes.
+        Expression::Template(t) => t.expressions.is_empty(),
+        _ => false,
+    }
 }
 
 /// Rewrite a top-level script statement for the client. Handles:
@@ -14225,6 +14452,15 @@ fn literal_to_template_string(e: &Expression) -> Option<String> {
             _ => None,
         },
         Expression::Identifier(i) if i.name == "undefined" => Some(String::new()),
+        // Plain template literal with no substitutions — concatenate quasi
+        // cooked values.
+        Expression::Template(t) if t.expressions.is_empty() => {
+            let mut out = String::new();
+            for q in &t.quasis {
+                out.push_str(&q.cooked);
+            }
+            Some(out)
+        }
         _ => None,
     }
 }
