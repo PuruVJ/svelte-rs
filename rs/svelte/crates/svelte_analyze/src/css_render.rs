@@ -179,10 +179,9 @@ fn visit_rule(
         // Non-lone global block (e.g. `div :global { ... }`): if no prelude
         // complex selector actually matched a template element, the rule's
         // local prefix is unused — wrap the entire rule as `(unused) ...`.
-        // Otherwise, walk each ComplexSelector directly — `:global` gets
-        // stripped, the local part gets scoped — and skip partial pruning
-        // of the SelectorList (mirrors upstream's SelectorList visitor
-        // early-return when `is_in_global_block`).
+        // Otherwise, run the SelectorList prune-wrap pass and walk each
+        // ComplexSelector directly — `:global` gets stripped, the local
+        // part gets scoped.
         if !inside_global_block && !is_rule_used(rule, css_meta) {
             let start = rel(state, rule.start);
             let end = rel(state, rule.end);
@@ -191,7 +190,28 @@ fn visit_rule(
             escape_comment_close(rule, code, state);
             return;
         }
+        // Strip trailing `:global` from each complex selector first, so
+        // the (unused) comment wrap pass doesn't capture or interfere
+        // with the deletion range. Mirrors upstream's order:
+        // ComplexSelector visitor strips, then SelectorList prune wraps.
         for sel in &rule.prelude.children {
+            for rsel in &sel.children {
+                let rkey = (rsel.start, rsel.end);
+                let rmeta = css_meta
+                    .relative_selector_metadata
+                    .get(&rkey)
+                    .copied()
+                    .unwrap_or_default();
+                if rmeta.is_global || rmeta.is_global_like {
+                    unwrap_global_pseudo(rsel, code, state);
+                }
+            }
+        }
+        visit_selector_list_prune(&rule.prelude, code, state, css_meta, inside_global_block);
+        for sel in &rule.prelude.children {
+            if !is_complex_used(sel, css_meta) {
+                continue;
+            }
             visit_complex_selector(
                 sel,
                 code,
@@ -468,8 +488,12 @@ fn visit_complex_selector(
             .unwrap_or_default();
         if rmeta.is_global || rmeta.is_global_like {
             unwrap_global_pseudo(rsel, code, state);
+            // An is_global_like rel sel is itself unscoped, so any
+            // `:is/:has/:where` inside it is also unscoped — don't
+            // prune-wrap its args (mirrors upstream which doesn't
+            // re-prune `:is(...)` args inside an outer `:global` context).
             for s in &rsel.selectors {
-                visit_inner_pseudo(s, code, state, css_meta, inside_global_block, &mut bumped);
+                visit_inner_pseudo(s, code, state, css_meta, true, &mut bumped);
             }
             continue;
         }
