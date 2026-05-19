@@ -8098,7 +8098,11 @@ fn serialize_element_to_html(
         return Some(());
     }
     out.push('>');
-    if is_text_only {
+    if el.name == "noscript" {
+        // <noscript> contents are intentionally empty in the client template —
+        // hydration only matches the opening/closing tags, and the original
+        // content lives in the server payload (where it matters).
+    } else if is_text_only {
         // Placeholder space for the text anchor.
         out.push(' ');
     } else {
