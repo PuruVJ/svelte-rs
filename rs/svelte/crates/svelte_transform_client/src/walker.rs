@@ -231,6 +231,11 @@ pub fn try_typed_client_walker_with(
             {
                 return Some(p);
             }
+            if let Some(p) =
+                emit_single_element_wrapping_html_tag_program(el, component_name, &script)
+            {
+                return Some(p);
+            }
         }
     }
 
@@ -1930,6 +1935,223 @@ fn emit_top_level_html_tag_program(
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit a program for the shape:
+///
+///   <TAG STATIC_ATTRS>{@html EXPR}</TAG>
+///
+/// →
+///
+///   var root = $.from_html(`<TAG STATIC_ATTRS></TAG>`);
+///   export default function Main($$anchor) {
+///       var tag = root();
+///       $.html(tag, () => EXPR, true);
+///       $.reset(tag);
+///       $.append($$anchor, tag);
+///   }
+///
+/// The third `true` argument indicates the html-tag is inside an element
+/// wrapper (so the runtime fills the element rather than placing nodes
+/// before an anchor comment). Mirrors `raw-empty`.
+fn emit_single_element_wrapping_html_tag_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => static_attrs.push(attr),
+                AttributeValue::Many(parts) => {
+                    if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        static_attrs.push(attr);
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    // SVG namespace requires `$.from_svg`; bail for now.
+    if el.name == "svg" || el.name == "math" {
+        return None;
+    }
+    // Body: exactly one HtmlTag.
+    let non_ws: Vec<&FragmentChild> = el
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return None;
+    }
+    let ht = match non_ws[0] {
+        FragmentChild::HtmlTag(h) => h,
+        _ => return None,
+    };
+
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let is_bare_legacy_prop = matches!(
+        &ht.expression,
+        Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+    );
+    let inner = rewrite_props_destructured(&ht.expression, &script.props_destructured);
+    let inner = if is_bare_legacy_prop {
+        ht.expression.clone()
+    } else {
+        rewrite_legacy_prop_reads(&inner, &legacy_prop_names)
+    };
+    let html_arg = if is_bare_legacy_prop {
+        inner
+    } else {
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(inner),
+            r#async: false,
+            span: Span::ZERO,
+        }))
+    };
+
+    // Build template HTML: `<TAG STATIC_ATTRS></TAG>`.
+    let mut html = String::with_capacity(32);
+    html.push('<');
+    html.push_str(&el.name);
+    for attr in &static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => html.push_str("&quot;"),
+                                '&' => html.push_str("&amp;"),
+                                _ => html.push(c),
+                            }
+                        }
+                    }
+                }
+                html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    html.push_str("></");
+    html.push_str(&el.name);
+    html.push('>');
+
+    let tag_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "html"),
+        vec![
+            t::id(&tag_var),
+            html_arg,
+            Expression::Literal(Box::new(Literal::Boolean(
+                svelte_js_ast::BooleanLiteral { value: true, span: Span::ZERO },
+            ))),
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&tag_var)],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&tag_var)],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props || !script.legacy_export_props.is_empty() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
     prog.push(export);
     Some(t::program(prog))
 }
