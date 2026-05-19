@@ -1908,6 +1908,40 @@ fn emit_vanilla_branch_body(
             }));
             Some(vec![t::stmt(render_call)])
         }
+        FragmentChild::HtmlTag(ht) => {
+            // `{@html EXPR}` standalone → `$.comment()` + `$.html(...)`.
+            // Uses `fragment_1` / `node_1` to avoid colliding with the
+            // outer `fragment` / `node` declared at the multi-block level.
+            // We don't have each-iter-var context here, so pass the
+            // expression as-is (caller's responsibility to wrap if needed).
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::var(
+                "fragment_1",
+                t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+            ));
+            body.push(t::var(
+                "node_1",
+                t::call(
+                    t::member_id(t::id("$"), "first_child"),
+                    vec![t::id("fragment_1")],
+                ),
+            ));
+            let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Expression(ht.expression.clone()),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "html"),
+                vec![t::id("node_1"), inner_arrow],
+            )));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id("fragment_1")],
+            )));
+            Some(body)
+        }
         _ => None,
     }
 }
@@ -3886,8 +3920,10 @@ fn emit_top_level_multi_if_program(
                     Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
                     _ => return None,
                 };
-                // Inner body via the same branch helper. Each iter var
-                // not wrapped in $.get since flag 0 doesn't use mutable_source.
+                // ITEM_REACTIVE flag (bit 0) on iff the body references
+                // the iter var. Wrap iter-var refs in $.get(VAR) inside
+                // the body in that case.
+                let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
                 let body_text_name = if i == 0 {
                     "text".to_string()
                 } else {
@@ -3900,6 +3936,15 @@ fn emit_top_level_multi_if_program(
                     &mut root_idx,
                     &mut elem_var_idx,
                 )?;
+                // Wrap iter-var refs in `$.get(VAR)` if item is reactive.
+                let inner_body = if item_referenced {
+                    inner_body
+                        .into_iter()
+                        .map(|s| rewrite_stmt_get_for_each_var(&s, &item_name))
+                        .collect()
+                } else {
+                    inner_body
+                };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
                     body: ArrowBody::Block(Box::new(BlockStatement {
@@ -3928,11 +3973,12 @@ fn emit_top_level_multi_if_program(
                         span: Span::ZERO,
                     }))
                 };
+                let flag = if item_referenced { 1.0 } else { 0.0 };
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id("$"), "each"),
                     vec![
                         t::id(&cur_var),
-                        t::lit_number(0.0),
+                        t::lit_number(flag),
                         each_collection,
                         t::member_id(t::id("$"), "index"),
                         item_arrow,
@@ -4548,6 +4594,74 @@ fn emit_single_element_wrapping_each_program(
     Some(t::program(prog))
 }
 
+/// Walk a fragment looking for any reference to a given identifier name.
+fn fragment_uses_identifier(f: &svelte_ast::fragment::Fragment, name: &str) -> bool {
+    f.nodes.iter().any(|n| node_uses_identifier(n, name))
+}
+
+fn node_uses_identifier(n: &FragmentChild, name: &str) -> bool {
+    match n {
+        FragmentChild::ExpressionTag(et) => expr_uses_identifier(&et.expression, name),
+        FragmentChild::HtmlTag(ht) => expr_uses_identifier(&ht.expression, name),
+        FragmentChild::RegularElement(el) => fragment_uses_identifier(&el.fragment, name),
+        FragmentChild::Component(c) => fragment_uses_identifier(&c.fragment, name),
+        FragmentChild::IfBlock(ib) => {
+            expr_uses_identifier(&ib.test, name)
+                || fragment_uses_identifier(&ib.consequent, name)
+                || ib
+                    .alternate
+                    .as_ref()
+                    .map(|a| fragment_uses_identifier(a, name))
+                    .unwrap_or(false)
+        }
+        FragmentChild::EachBlock(eb) => fragment_uses_identifier(&eb.body, name),
+        _ => false,
+    }
+}
+
+fn expr_uses_identifier(e: &Expression, name: &str) -> bool {
+    match e {
+        Expression::Identifier(id) => id.name == name,
+        Expression::Member(m) => expr_uses_identifier(&m.object, name),
+        Expression::Call(c) => {
+            expr_uses_identifier(&c.callee, name)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expr_uses_identifier(e, name),
+                    Argument::Spread(s) => expr_uses_identifier(&s.argument, name),
+                })
+        }
+        Expression::Binary(b) => {
+            expr_uses_identifier(&b.left, name) || expr_uses_identifier(&b.right, name)
+        }
+        Expression::Logical(l) => {
+            expr_uses_identifier(&l.left, name) || expr_uses_identifier(&l.right, name)
+        }
+        Expression::Unary(u) => expr_uses_identifier(&u.argument, name),
+        Expression::Paren(p) => expr_uses_identifier(&p.expression, name),
+        Expression::Conditional(c) => {
+            expr_uses_identifier(&c.test, name)
+                || expr_uses_identifier(&c.consequent, name)
+                || expr_uses_identifier(&c.alternate, name)
+        }
+        _ => false,
+    }
+}
+
+/// Rewrite all expression-level Identifier(VAR) references in a Statement
+/// to `$.get(VAR)`. Used to wrap each-iter-var reads in mutable_source
+/// accessors when ITEM_REACTIVE flag is on.
+fn rewrite_stmt_get_for_each_var(s: &Statement, var_name: &str) -> Statement {
+    match s {
+        Statement::Expression(e) => Statement::Expression(Box::new(
+            svelte_js_ast::ExpressionStatement {
+                expression: rewrite_get_for_each_var(&e.expression, var_name),
+                span: e.span,
+            },
+        )),
+        _ => s.clone(),
+    }
+}
+
 /// Walk an expression and replace any bare reference to `var_name` with
 /// `$.get(var_name)`. Used to wrap each-block iterators with mutable_source
 /// accessors.
@@ -4600,6 +4714,24 @@ fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
         Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
             expression: rewrite_get_for_each_var(&p.expression, var_name),
             span: p.span,
+        })),
+        Expression::Arrow(a) => Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: a.params.clone(),
+            body: match &a.body {
+                ArrowBody::Expression(e) => {
+                    ArrowBody::Expression(rewrite_get_for_each_var(e, var_name))
+                }
+                ArrowBody::Block(b) => ArrowBody::Block(Box::new(BlockStatement {
+                    body: b
+                        .body
+                        .iter()
+                        .map(|s| rewrite_stmt_get_for_each_var(s, var_name))
+                        .collect(),
+                    span: b.span,
+                })),
+            },
+            r#async: a.r#async,
+            span: a.span,
         })),
         e => e.clone(),
     }
