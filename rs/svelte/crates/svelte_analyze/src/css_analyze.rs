@@ -320,6 +320,101 @@ fn analyze_rule(
     }
     a.rule_metadata.insert(node_key(rule.start, rule.end), meta);
 
+    // Validate every NestingSelector inside this rule's prelude. Mirrors
+    // upstream's NestingSelector visitor at css-analyze.js:289-313.
+    // At the top level, `&` must be the head selector of the first
+    // complex inside a lone `:global(...)` arg list. Otherwise it's
+    // `css_nesting_selector_invalid_placement`.
+    if parent_rule.is_none() {
+        let is_lone_global_args = rule.prelude.children.len() == 1
+            && rule.prelude.children[0].children.len() == 1
+            && rule.prelude.children[0].children[0].selectors.len() == 1
+            && matches!(
+                rule.prelude.children[0].children[0].selectors.first(),
+                Some(SimpleSelector::PseudoClassSelector(p))
+                    if p.name == "global" && p.args.is_some()
+            );
+        let head_nest_in_global = if is_lone_global_args {
+            if let Some(SimpleSelector::PseudoClassSelector(p)) =
+                rule.prelude.children[0].children[0].selectors.first()
+            {
+                p.args
+                    .as_ref()
+                    .and_then(|sl| sl.children.first())
+                    .and_then(|c| c.children.first())
+                    .and_then(|rel| rel.selectors.first())
+                    .map(|s| {
+                        if let SimpleSelector::NestingSelector(n) = s {
+                            Some((n.start, n.end))
+                        } else {
+                            None
+                        }
+                    })
+                    .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut nest_positions: Vec<(u32, u32)> = Vec::new();
+        for complex in &rule.prelude.children {
+            collect_nesting_selectors(complex, &mut nest_positions);
+        }
+        for span in nest_positions {
+            // Skip the legal head-of-:global(...) case.
+            if Some(span) == head_nest_in_global {
+                continue;
+            }
+            if err.is_none() {
+                *err = Some(
+                    svelte_diagnostics::errors::css_nesting_selector_invalid_placement(
+                        Some(span),
+                    ),
+                );
+            }
+        }
+    }
+
+    // `:global { &.x { … } }` at the top level — the nested rule starts
+    // with `&`, but its only ancestor is a bare `:global` block (no
+    // surrounding selector), so `&` has nothing to bind to. Mirrors
+    // upstream's `css_global_block_invalid_modifier_start` check.
+    if meta.is_global_block && parent_rule.is_none() {
+        let is_lone_global_block = rule.prelude.children.iter().all(|c| {
+            c.children.len() == 1
+                && c.children[0].selectors.len() == 1
+                && matches!(
+                    c.children[0].selectors.first(),
+                    Some(SimpleSelector::PseudoClassSelector(p))
+                        if p.name == "global" && p.args.is_none()
+                )
+        });
+        if is_lone_global_block {
+            for child in &rule.block.children {
+                if let svelte_ast::css::BlockChild::Rule(nested) = child {
+                    if let Some(first_complex) = nested.prelude.children.first() {
+                        if let Some(first_rel) = first_complex.children.first() {
+                            if matches!(
+                                first_rel.selectors.first(),
+                                Some(SimpleSelector::NestingSelector(_))
+                            ) {
+                                if err.is_none() {
+                                    let span = simple_span(&first_rel.selectors[0]);
+                                    *err = Some(
+                                        svelte_diagnostics::errors::css_global_block_invalid_modifier_start(
+                                            Some(span),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Recurse into nested rules.
     for child in &rule.block.children {
         match child {
@@ -331,6 +426,28 @@ fn analyze_rule(
         }
     }
     let _ = parent_rule;
+}
+
+/// Recursively walk a ComplexSelector collecting every NestingSelector's
+/// span — including ones nested inside `:has/:is/:where/:not/:global` args.
+fn collect_nesting_selectors(complex: &ComplexSelector, out: &mut Vec<(u32, u32)>) {
+    for rel in &complex.children {
+        for s in &rel.selectors {
+            match s {
+                SimpleSelector::NestingSelector(n) => {
+                    out.push((n.start, n.end));
+                }
+                SimpleSelector::PseudoClassSelector(p) => {
+                    if let Some(args) = &p.args {
+                        for arg in &args.children {
+                            collect_nesting_selectors(arg, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn analyze_complex_selector(complex: &ComplexSelector, a: &mut CssAnalysis) {

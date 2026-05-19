@@ -37,6 +37,28 @@ pub struct Parser<'src> {
     /// final Root so analyze can treat them as warnings (e.g.
     /// `element_invalid_self_closing_tag`, `element_implicitly_closed`).
     pub warnings: Vec<CompileDiagnostic>,
+    /// Name of the tag that was most recently auto-closed by HTML
+    /// implicit-close rules (e.g. `<p>` closed by `<pre>`). Cleared once
+    /// the next element finishes. Used to emit
+    /// `element_invalid_closing_tag_autoclosed` when a stray `</p>` shows
+    /// up immediately after.
+    pub last_auto_closed_tag: Option<LastAutoClosed>,
+    /// Current nesting depth of regular elements being parsed. Used so a
+    /// surfaced `last_auto_closed_tag` can be cleared once we've popped
+    /// past the element it was set inside of.
+    pub element_depth: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct LastAutoClosed {
+    pub tag: String,
+    pub closer: String,
+    /// Element-depth at which the auto-close happened. When the parser's
+    /// stack drops below this depth (i.e. we've popped past the
+    /// surrounding element), the auto-close info should be forgotten.
+    /// Mirrors upstream's `parser.last_auto_closed_tag.depth` check at
+    /// element.js:133-134.
+    pub depth: usize,
 }
 
 impl<'src> Parser<'src> {
@@ -53,6 +75,8 @@ impl<'src> Parser<'src> {
             comments: Vec::new(),
             shadowroot_depth: 0,
             warnings: Vec::new(),
+            last_auto_closed_tag: None,
+            element_depth: 0,
         }
     }
 

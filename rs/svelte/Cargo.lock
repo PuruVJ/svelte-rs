@@ -1054,6 +1054,7 @@ dependencies = [
  "svelte_css_parser",
  "svelte_diagnostics",
  "svelte_js_ast",
+ "unicode-ident",
 ]
 
 [[package]]

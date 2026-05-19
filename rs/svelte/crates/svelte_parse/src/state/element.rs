@@ -75,6 +75,30 @@ pub fn read_element_or_comment(
                 Some((start as u32, start as u32)),
             ));
         }
+        // If the most recent auto-close was for this tag, surface
+        // `element_invalid_closing_tag_autoclosed` — upstream signals to
+        // the user that the parser already closed the element when it
+        // hit a non-nestable child (e.g. `<pre>` inside `<p>`). Mirrors
+        // upstream's `last_auto_closed_tag` check at element.js:111-126.
+        if let Some(last) = parser.last_auto_closed_tag.take() {
+            if last.tag == close_name {
+                // `closer` is e.g. `<pre>` — strip the angle brackets
+                // (and optional `/`) so the error message reads
+                // `cannot nest \`<pre>\` inside \`<p>\``.
+                let trimmed = last
+                    .closer
+                    .trim_start_matches('<')
+                    .trim_start_matches('/')
+                    .trim_end_matches('>');
+                return Err(
+                    svelte_diagnostics::errors::element_invalid_closing_tag_autoclosed(
+                        Some((start as u32, start as u32)),
+                        &close_name,
+                        trimmed,
+                    ),
+                );
+            }
+        }
         return Err(svelte_diagnostics::errors::element_invalid_closing_tag(
             Some((start as u32, parser.index as u32)),
             &close_name,
@@ -82,6 +106,23 @@ pub fn read_element_or_comment(
     }
 
     let name = read_tag_name(parser)?;
+    parser.element_depth += 1;
+    // Drop-guard so every early return decrements element_depth.
+    struct DepthGuard<'p, 'src: 'p>(&'p mut Parser<'src>);
+    impl Drop for DepthGuard<'_, '_> {
+        fn drop(&mut self) {
+            self.0.element_depth = self.0.element_depth.saturating_sub(1);
+            // Clear last_auto_closed_tag if we've popped past where it
+            // was set (mirrors upstream's element.js:133-134).
+            if let Some(last) = self.0.last_auto_closed_tag.as_ref() {
+                if self.0.element_depth < last.depth {
+                    self.0.last_auto_closed_tag = None;
+                }
+            }
+        }
+    }
+    let _depth_guard = DepthGuard(parser);
+    let parser = &mut *_depth_guard.0;
 
     if is_svelte_meta_name(&name) {
         // TODO(2c follow-up): SvelteBody / SvelteHead / etc.
@@ -208,6 +249,18 @@ pub fn read_element_or_comment(
                     &closer,
                 ));
         }
+        // Record the auto-close so a later stray `</name>` can surface
+        // `element_invalid_closing_tag_autoclosed` instead of the generic
+        // closing-tag error. Mirrors upstream's `parser.last_auto_closed_tag`.
+        parser.last_auto_closed_tag = Some(crate::parser::LastAutoClosed {
+            tag: name.to_string(),
+            closer: closer.clone(),
+            // Depth AFTER the implicit pop — mirrors upstream which sets
+            // `depth = parser.stack.length` AFTER `parser.pop()` at
+            // element.js:131-132. Means: clear once we've popped past
+            // the *parent* of the auto-closed element.
+            depth: parser.element_depth.saturating_sub(1),
+        });
         return Ok(build_element(
             name.into_owned(),
             start as u32,
@@ -269,6 +322,23 @@ pub fn read_element_or_comment(
                 Some((parser.index as u32, parser.index as u32)),
                 "</style",
             ));
+        }
+        // `<style>` with body but no close tag: upstream invokes the CSS
+        // parser on the body inline (style.js:25). If CSS parsing fails,
+        // that diagnostic surfaces FIRST, before the unclosed-tag error.
+        if name == "style" {
+            if let Some(FragmentChild::Text(t)) = fragment.nodes.first() {
+                let css_attrs: Vec<svelte_ast::ElementAttribute> = attributes.clone();
+                if let Err(css_err) = svelte_css_parser::read_style(
+                    parser.template,
+                    start as u32,
+                    t.start as usize,
+                    css_attrs,
+                    None,
+                ) {
+                    return Err(css_err);
+                }
+            }
         }
         return Err(errors::element_unclosed(
             Some((start as u32, (start + 1) as u32)),
@@ -504,17 +574,46 @@ fn build_svelte_this_expression(
     }
 }
 
-/// A tag name resolves to a Component if it starts with an uppercase ASCII
-/// letter (e.g. `<MyComponent>`), or contains a `.` after an identifier-start
-/// (e.g. `<Lib.Modal>`). Loose port of upstream's `regex_valid_component_name`.
+/// A tag name resolves to a Component if it matches upstream's
+/// `regex_valid_component_name`:
+/// - Starts with an uppercase letter; rest is identifier-continue chars
+///   plus `.` (e.g. `MyComponent`, `Lib.Modal`).
+/// - OR starts with an ID_Start char (any case), one or more
+///   identifier-continue chars, then at least one `.NAME` segment
+///   (e.g. `lib.Modal`).
 fn is_component_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else { return false };
-    if first.is_ascii_uppercase() {
-        return true;
+    let is_id_continue = |c: char| {
+        c == '$' || c == '_' || c == '\u{200c}' || c == '\u{200d}'
+            || unicode_ident::is_xid_continue(c)
+    };
+    if first.is_uppercase() {
+        // Uppercase form — rest can be id-continue or `.`.
+        return chars.all(|c| c == '.' || is_id_continue(c));
     }
-    // Allow `<lib.Modal>` style — identifier-start followed by at least one `.`.
-    if (first.is_ascii_alphabetic() || first == '_' || first == '$') && name.contains('.') {
+    // Dot-notation form: ID_Start (any case) then `id-continue*` then one or
+    // more `.id-continue+` segments.
+    if unicode_ident::is_xid_start(first) || first == '$' || first == '_' {
+        // After the head, walk segments separated by `.`.
+        let rest = chars.as_str();
+        if !rest.contains('.') {
+            return false;
+        }
+        for (i, seg) in rest.split('.').enumerate() {
+            if i == 0 {
+                if !seg.chars().all(is_id_continue) {
+                    return false;
+                }
+            } else {
+                if seg.is_empty() {
+                    return false;
+                }
+                if !seg.chars().all(is_id_continue) {
+                    return false;
+                }
+            }
+        }
         return true;
     }
     false
@@ -573,19 +672,22 @@ fn read_tag_name<'src>(parser: &mut Parser<'src>) -> Result<std::borrow::Cow<'sr
             parser.index as u32,
         ))));
     }
-    // Tag-name characters: alphanumerics, `-`, `.`, `_`, `:` (for svelte:foo).
+    // Mirrors upstream's `read_until(/(\s|\/|>)/)` — consume everything up
+    // to whitespace, `/`, or `>`. Validation happens after, so syntactically
+    // invalid names get a `tag_invalid_name` diagnostic instead of being
+    // truncated silently.
     let name = parser.read_while(|b| {
-        b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b':' || b == b'!'
+        !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'/' | b'>')
     });
     if !is_valid_tag_name(name)
         && !is_svelte_meta_name(name)
         && !is_component_name(name)
         && !name.eq_ignore_ascii_case("!doctype")
     {
-        return Err(errors::expected_token(
-            Some((start as u32, parser.index as u32)),
-            "valid tag name",
-        ));
+        return Err(svelte_diagnostics::errors::tag_invalid_name(Some((
+            start as u32,
+            parser.index as u32,
+        ))));
     }
     Ok(std::borrow::Cow::Borrowed(name))
 }
@@ -860,6 +962,22 @@ fn read_expression_tag(parser: &mut Parser<'_>) -> Result<ExpressionTag, Compile
     let start = parser.index;
     parser.index += 1; // `{`
     parser.allow_whitespace();
+    // `{ />` or `{ >` inside an attribute value — the brace was never
+    // matched. Upstream surfaces this as `expected_token "}"` at the
+    // position right after the brace; we preempt OXC's `js_parse_error`
+    // here so the diagnostic code matches. Be careful not to match
+    // `/* ... */` JS comments (which legitimately start with `/`).
+    let next_two = parser
+        .template
+        .as_bytes()
+        .get(parser.index..parser.index + 2)
+        .unwrap_or(&[]);
+    if next_two == b"/>" || matches!(parser.peek(), Some(b'>')) {
+        return Err(errors::expected_token(
+            Some((parser.index as u32, parser.index as u32)),
+            "}",
+        ));
+    }
     let (expression, expr_end) = parser.parse_expression_at(parser.index)?;
     parser.index = expr_end;
     parser.allow_whitespace();
@@ -1645,11 +1763,19 @@ fn parse_fragment_until_close_tag(
             continue;
         }
         if parser.match_str("{") {
-            // Block continuations (`{:else}`, `{/if}`, etc.) terminate this
-            // element implicitly when the enclosing block exits. Distinguish
-            // `{/if}` (close-block) from `{/* ... */}` (JS comment inside an
-            // expression mustache) by peeking the char AFTER `/` — block
-            // close-tags are followed by an identifier letter, not `*`.
+            // Block close markers (`{/if}`, `{/each}`, …) implicitly close
+            // this element so the enclosing block can match its close —
+            // mirrors upstream's `close()` recursive pop in tag.js:551-555.
+            //
+            // Block continuation markers (`{:else}`, `{:then}`, …) are
+            // NOT auto-close triggers: an element open at the moment the
+            // continuation appears is an error. Mirrors upstream's
+            // `next()` final fall-through `e.block_invalid_continuation_placement`
+            // at tag.js:536.
+            //
+            // Distinguish `{/if}` (close-block) from `{/* ... */}` (JS
+            // block-comment inside an expression mustache) by requiring an
+            // identifier letter after `/`.
             let rest = parser.template[parser.index + 1..].as_bytes();
             let mut iter = rest.iter().copied();
             let first = loop {
@@ -1658,18 +1784,23 @@ fn parse_fragment_until_close_tag(
                     other => break other,
                 }
             };
-            let is_implicit_close = match first {
+            match first {
                 Some(b':') => {
-                    // `{:foo}` — continuation marker only if followed by an
-                    // identifier letter (not e.g. `{:` then odd chars).
-                    matches!(iter.next(), Some(c) if c.is_ascii_alphabetic())
+                    if matches!(iter.next(), Some(c) if c.is_ascii_alphabetic()) {
+                        return Err(
+                            svelte_diagnostics::errors::block_invalid_continuation_placement(
+                                Some((parser.index as u32, parser.index as u32)),
+                            ),
+                        );
+                    }
                 }
-                Some(b'/') => matches!(iter.next(), Some(c) if c.is_ascii_alphabetic()),
-                _ => false,
-            };
-            if is_implicit_close {
-                implicit_close = true;
-                break;
+                Some(b'/') => {
+                    if matches!(iter.next(), Some(c) if c.is_ascii_alphabetic()) {
+                        implicit_close = true;
+                        break;
+                    }
+                }
+                _ => {}
             }
             nodes.push(super::tag::read_tag(parser)?);
             continue;

@@ -19,6 +19,7 @@ oxc_span = { workspace = true }
 oxc_syntax = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+unicode-ident = "1"
 
 [dev-dependencies]
 svelte_analyze = { workspace = true }

@@ -1319,7 +1319,15 @@ fn walk_ancestors(
     let mut cur = idx;
     loop {
         if let Some(p) = tree.elements[cur].parent {
-            if is_match_candidate(tree.elements[p].kind) {
+            // Mirrors upstream css-prune.js:859 — only RegularElement /
+            // SvelteElement count as ancestors. `<slot>` / Component /
+            // SvelteComponent / SvelteSelf are walked PAST without being
+            // added to the result.
+            let is_ancestor = matches!(
+                tree.elements[p].kind,
+                Some(NodeKind::RegularElement) | Some(NodeKind::SvelteElement)
+            );
+            if is_ancestor {
                 let existing = out.get(&p).copied().unwrap_or(Existence::Probable);
                 out.insert(p, Existence::max(existing, tree.elements[p].existence));
                 // Special case: when ascending through an `<option>` whose
