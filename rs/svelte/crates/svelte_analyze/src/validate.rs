@@ -83,11 +83,13 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
     validate_each_and_snippet_assignments(&root.fragment, &mut state);
     validate_slot_attributes(&root.fragment, /*is_component_child=*/ false, &mut state);
     validate_snippet_conflict(&root.fragment, &mut state);
+    validate_slot_snippet_conflict(&root.fragment, &mut state);
     visit_fragment(&root.fragment, &mut state);
     if let Some(s) = root.instance.as_ref() {
         validate_script_attributes(&s.attributes, &mut state);
         validate_script_const_assignment(&s.content, &mut state);
         validate_dollar_bindings(&s.content, /*runes=*/ state.is_runes, &mut state);
+        validate_arguments_usage(&s.content, &mut state);
         visit_program(&s.content, /*is_instance=*/ true, &mut state);
         let has_custom_element_attr = svelte_options_has_custom_element(root);
         let has_custom_element_props = svelte_options_customelement_has_props(root);
@@ -135,6 +137,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
     if let Some(s) = root.module.as_ref() {
         validate_script_attributes(&s.attributes, &mut state);
         visit_program(&s.content, /*is_instance=*/ false, &mut state);
+        validate_module_exports(&s.content, &root.fragment, &mut state);
         if state.is_runes {
             validate_perf_avoid_class(&s.content, /*is_instance=*/ false, &mut state);
             validate_runes(&s.content, /*is_instance=*/ false, &mut state);
@@ -2212,6 +2215,153 @@ fn check_props_member_access(
     }
 }
 
+/// `export_undefined` / `snippet_invalid_export` — walk module-script
+/// `export { X }` specifiers and verify each name is declared in the
+/// module script. If `X` is declared as a snippet in the template,
+/// emit `snippet_invalid_export` instead.
+fn validate_module_exports(
+    program: &svelte_js_ast::Program,
+    fragment: &Fragment,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    collect_pattern_names(&d.id, &mut declared);
+                }
+            }
+            Statement::Function(f) => {
+                if let Some(id) = &f.id {
+                    declared.insert(id.name.clone());
+                }
+            }
+            Statement::Class(c) => {
+                if let Some(id) = &c.id {
+                    declared.insert(id.name.clone());
+                }
+            }
+            Statement::Import(d) => {
+                for spec in &d.specifiers {
+                    let local = match spec {
+                        ImportSpecifierKind::Named(s) => &s.local,
+                        ImportSpecifierKind::Default(s) => &s.local,
+                        ImportSpecifierKind::Namespace(s) => &s.local,
+                    };
+                    declared.insert(local.name.clone());
+                }
+            }
+            Statement::ExportNamed(e) => {
+                if let Some(decl) = &e.declaration {
+                    match decl {
+                        Statement::Variable(v) => {
+                            for d in &v.declarations {
+                                collect_pattern_names(&d.id, &mut declared);
+                            }
+                        }
+                        Statement::Function(f) => {
+                            if let Some(id) = &f.id {
+                                declared.insert(id.name.clone());
+                            }
+                        }
+                        Statement::Class(c) => {
+                            if let Some(id) = &c.id {
+                                declared.insert(id.name.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Collect snippet names from template (top-level only — upstream walks
+    // the whole template but only top-level snippets are exportable).
+    let mut snippet_names: std::collections::HashSet<String> = Default::default();
+    fn collect_snippets(
+        fragment: &Fragment,
+        out: &mut std::collections::HashSet<String>,
+    ) {
+        for n in &fragment.nodes {
+            if let FragmentChild::SnippetBlock(b) = n {
+                out.insert(b.expression.name.clone());
+            }
+        }
+    }
+    collect_snippets(fragment, &mut snippet_names);
+    // Now verify each export specifier. Skip re-exports (`export {X} from "..."`).
+    for stmt in &program.body {
+        let Statement::ExportNamed(e) = stmt else { continue };
+        if e.source.is_some() {
+            continue;
+        }
+        for spec in &e.specifiers {
+            if let ModuleExportName::Identifier(local) = &spec.local {
+                let span = (local.span.start, local.span.end);
+                if !declared.contains(&local.name) {
+                    if snippet_names.contains(&local.name) {
+                        state.errors.push(errors::snippet_invalid_export(Some(span)));
+                    } else {
+                        state.errors.push(errors::export_undefined(
+                            Some(span),
+                            &local.name,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `invalid_arguments_usage` — `arguments` is not available in Svelte
+/// component scripts (the body is transformed into an arrow function).
+fn validate_arguments_usage(
+    program: &svelte_js_ast::Program,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    fn walk_expr(e: &Expression, state: &mut ValidateState) {
+        match e {
+            Expression::Identifier(id) if id.name == "arguments" => {
+                state.errors.push(errors::invalid_arguments_usage(Some((
+                    id.span.start,
+                    id.span.end,
+                ))));
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.callee, state);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, state);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, state),
+            Expression::Assignment(a) => walk_expr(&a.right, state),
+            _ => {}
+        }
+    }
+    fn walk_stmt(s: &Statement, state: &mut ValidateState) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt(stmt, state);
+    }
+}
+
 /// Walk the script for `let $`, `const $`, `import { $ }`, `function $`
 /// etc. — `$` is reserved as a store-prefix; declaring it as a binding is
 /// invalid. In legacy mode, only top-level declarations error; in runes
@@ -2314,8 +2464,14 @@ fn validate_dollar_bindings(
         walk_stmt(stmt, true, runes, state);
     }
     // `console.log($)` — bare global `$` reference. Mirrors
-    // `global_reference_invalid` on identifier read.
-    fn walk_expr_globalref(e: &Expression, state: &mut ValidateState) {
+    // `global_reference_invalid` on identifier read. Also catches
+    // `$foo` calls where `foo` isn't declared (`$foo()` -> store sub
+    // of undeclared `foo` -> global_reference_invalid).
+    fn walk_expr_globalref(
+        e: &Expression,
+        declared: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
         match e {
             Expression::Identifier(id) if id.name == "$" => {
                 state.errors.push(errors::global_reference_invalid(
@@ -2323,49 +2479,110 @@ fn validate_dollar_bindings(
                     "$",
                 ));
             }
+            Expression::Identifier(id) if id.name.starts_with('$') && id.name.len() > 1 => {
+                let stripped = &id.name[1..];
+                // Skip rune names and declared bindings — only fire for
+                // truly-unresolved store-sub-style references.
+                let is_rune = matches!(
+                    id.name.as_str(),
+                    "$state" | "$derived" | "$props" | "$effect" | "$host" | "$bindable" | "$inspect"
+                );
+                if !is_rune && !declared.contains(stripped) {
+                    state.errors.push(errors::global_reference_invalid(
+                        Some((id.span.start, id.span.end)),
+                        &id.name,
+                    ));
+                }
+            }
             Expression::Call(c) => {
-                walk_expr_globalref(&c.callee, state);
+                walk_expr_globalref(&c.callee, declared, state);
                 for a in &c.arguments {
                     if let Argument::Expression(ax) = a {
-                        walk_expr_globalref(ax, state);
+                        walk_expr_globalref(ax, declared, state);
                     }
                 }
             }
-            Expression::Member(m) => walk_expr_globalref(&m.object, state),
+            Expression::Member(m) => walk_expr_globalref(&m.object, declared, state),
             _ => {}
         }
     }
-    fn walk_stmt_for_globalref(s: &Statement, state: &mut ValidateState) {
-        match s {
-            Statement::Expression(e) => walk_expr_globalref(&e.expression, state),
+    // Collect declared identifiers (let/const/var/function/class/import,
+    // including those wrapped in `export ...`).
+    let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn collect_decl(stmt: &Statement, declared: &mut std::collections::HashSet<String>) {
+        match stmt {
             Statement::Variable(v) => {
                 for d in &v.declarations {
-                    if let Some(init) = &d.init {
-                        walk_expr_globalref(init, state);
-                    }
+                    collect_pattern_names(&d.id, declared);
                 }
             }
             Statement::Function(f) => {
-                for s in &f.body.body {
-                    walk_stmt_for_globalref(s, state);
+                if let Some(id) = &f.id {
+                    declared.insert(id.name.clone());
                 }
             }
-            Statement::Block(b) => {
-                for s in &b.body {
-                    walk_stmt_for_globalref(s, state);
+            Statement::Class(c) => {
+                if let Some(id) = &c.id {
+                    declared.insert(id.name.clone());
                 }
             }
-            Statement::If(i) => {
-                walk_stmt_for_globalref(&i.consequent, state);
-                if let Some(alt) = &i.alternate {
-                    walk_stmt_for_globalref(alt, state);
+            Statement::Import(d) => {
+                for spec in &d.specifiers {
+                    let local = match spec {
+                        ImportSpecifierKind::Named(s) => &s.local,
+                        ImportSpecifierKind::Default(s) => &s.local,
+                        ImportSpecifierKind::Namespace(s) => &s.local,
+                    };
+                    declared.insert(local.name.clone());
+                }
+            }
+            Statement::ExportNamed(e) => {
+                if let Some(decl) = &e.declaration {
+                    collect_decl(decl, declared);
                 }
             }
             _ => {}
         }
     }
     for stmt in &program.body {
-        walk_stmt_for_globalref(stmt, state);
+        collect_decl(stmt, &mut declared);
+    }
+
+    fn walk_stmt_for_globalref(
+        s: &Statement,
+        declared: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr_globalref(&e.expression, declared, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr_globalref(init, declared, state);
+                    }
+                }
+            }
+            Statement::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt_for_globalref(s, declared, state);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt_for_globalref(s, declared, state);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt_for_globalref(&i.consequent, declared, state);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt_for_globalref(alt, declared, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt_for_globalref(stmt, &declared, state);
     }
 }
 
@@ -2507,6 +2724,53 @@ fn check_props_destructure(pat: &svelte_js_ast::Pattern, state: &mut ValidateSta
         }
     }
     walk(pat, state);
+}
+
+/// `slot_snippet_conflict` — a template that contains BOTH a `<slot>`
+/// (legacy slot) AND a `{@render children()}` (snippet-based slot) is
+/// invalid. Mirrors upstream.
+fn validate_slot_snippet_conflict(fragment: &Fragment, state: &mut ValidateState) {
+    fn collect(
+        fragment: &Fragment,
+        slot_span: &mut Option<(u32, u32)>,
+        render_children_span: &mut Option<(u32, u32)>,
+    ) {
+        for n in &fragment.nodes {
+            match n {
+                FragmentChild::SlotElement(el) => {
+                    if slot_span.is_none() {
+                        *slot_span = Some((el.start, el.end));
+                    }
+                }
+                FragmentChild::RenderTag(t) => {
+                    if let svelte_js_ast::Expression::Call(c) = &t.expression {
+                        if let svelte_js_ast::Expression::Identifier(id) = &c.callee {
+                            if id.name == "children" && render_children_span.is_none() {
+                                *render_children_span = Some((t.start, t.end));
+                            }
+                        }
+                    }
+                }
+                FragmentChild::RegularElement(el) => collect(&el.fragment, slot_span, render_children_span),
+                FragmentChild::Component(c) => collect(&c.fragment, slot_span, render_children_span),
+                FragmentChild::SvelteElement(el) => collect(&el.fragment, slot_span, render_children_span),
+                FragmentChild::IfBlock(b) => {
+                    collect(&b.consequent, slot_span, render_children_span);
+                    if let Some(alt) = &b.alternate {
+                        collect(alt, slot_span, render_children_span);
+                    }
+                }
+                FragmentChild::EachBlock(b) => collect(&b.body, slot_span, render_children_span),
+                _ => {}
+            }
+        }
+    }
+    let mut slot_span: Option<(u32, u32)> = None;
+    let mut render_span: Option<(u32, u32)> = None;
+    collect(fragment, &mut slot_span, &mut render_span);
+    if let (Some(s), Some(_)) = (slot_span, render_span) {
+        state.errors.push(errors::slot_snippet_conflict(Some(s)));
+    }
 }
 
 /// Inside a Component, `{#snippet children()}` cannot coexist with other
@@ -5699,7 +5963,18 @@ fn visit_bind_directive(
     // SvelteDocument / SvelteBody).
     let parent_name: Option<&str> = match parent {
         FragmentChild::RegularElement(el) => Some(el.name.as_str()),
-        FragmentChild::SvelteElement(_) => None, // dynamic — can't validate statically
+        FragmentChild::SvelteElement(_) => {
+            // Dynamic element. Only `bind:this` is always-valid; everything
+            // else is target-dependent and we can't validate at compile-time.
+            if d.name != "this" {
+                state.errors.push(errors::bind_invalid_target(
+                    Some((d.start, d.end)),
+                    &d.name,
+                    "regular elements (input/select/etc.)",
+                ));
+            }
+            return;
+        }
         FragmentChild::SvelteWindow(_) => Some("svelte:window"),
         FragmentChild::SvelteDocument(_) => Some("svelte:document"),
         FragmentChild::SvelteBody(_) => Some("body"),
