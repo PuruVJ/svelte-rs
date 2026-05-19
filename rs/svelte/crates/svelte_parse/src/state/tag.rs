@@ -289,12 +289,29 @@ fn read_at_tag(
                     identifiers: Vec::new(),
                 }));
             }
-            // STUB: DebugTag identifiers — typed Expression -> Vec<Identifier>
-            // unpacking pending Phase B. For now we just consume the expression
-            // and leave identifiers empty.
-            let (_expr, expr_end) = parser.parse_expression_at(parser.index)?;
-            parser.index = expr_end;
-            parser.allow_whitespace();
+            // `{@debug expr1, expr2}` — parse a comma-separated identifier
+            // list. Upstream only accepts identifiers (not member expressions).
+            let mut identifiers: Vec<svelte_js_ast::Identifier> = Vec::new();
+            loop {
+                parser.allow_whitespace();
+                let (expr, expr_end) = parser.parse_expression_at(parser.index)?;
+                match expr {
+                    svelte_js_ast::Expression::Identifier(id) => identifiers.push(id),
+                    _ => {
+                        return Err(errors::expected_token(
+                            Some((parser.index as u32, parser.index as u32)),
+                            "identifier",
+                        ));
+                    }
+                }
+                parser.index = expr_end;
+                parser.allow_whitespace();
+                if parser.peek() == Some(b',') {
+                    parser.index += 1;
+                    continue;
+                }
+                break;
+            }
             if !parser.eat("}") {
                 return Err(errors::expected_token(
                     Some((parser.index as u32, parser.index as u32)),
@@ -304,7 +321,7 @@ fn read_at_tag(
             Ok(FragmentChild::DebugTag(DebugTag {
                 start: start as u32,
                 end: parser.index as u32,
-                identifiers: Vec::new(),
+                identifiers,
             }))
         }
         other => Err(errors::expected_token(

@@ -2885,18 +2885,20 @@ fn emit_single_element_with_component_program(
 /// Emit a program for the shape:
 ///
 ///   <TAG>{#snippet NAME()}{/snippet}<STATIC></TAG>
+///   <TAG>{@debug X}<STATIC></TAG>
 ///
-/// where the element body is exclusively SnippetBlock(s) + fully-static
-/// content (no reactive content). Snippets are emitted as a `{ const NAME = ... }`
-/// block inside the function body; the static rest stays in the template.
-/// Mirrors `no-reset-snippet`.
+/// where the element body is exclusively SnippetBlock / DebugTag + fully-
+/// static content (no reactive content). Snippets are emitted as a
+/// `{ const NAME = ... }` block inside the function body; @debug tags
+/// become a `$.template_effect(() => { console.log({...}); debugger; })`.
+/// The static rest stays in the template. Mirrors `no-reset-snippet` and
+/// `no-reset-debug`.
 fn emit_single_element_with_inner_snippet_program(
     el: &svelte_ast::elements::RegularElement,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
     if script.has_class_with_runes
-        || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
         || !script.derived_bindings.is_empty()
         || script.async_info.is_some()
@@ -2907,17 +2909,19 @@ fn emit_single_element_with_inner_snippet_program(
     if !is_element_static_attrs(el) {
         return None;
     }
-    // Body partitioned into: snippets (collected) + remaining nodes
-    // (must be fully static after snippet removal).
+    // Body partitioned into: snippets (collected) + debug tags + remaining nodes
+    // (must be fully static after removal).
     let mut snippets: Vec<&svelte_ast::blocks::SnippetBlock> = Vec::new();
+    let mut debug_tags: Vec<&svelte_ast::tags::DebugTag> = Vec::new();
     let mut rest_nodes: Vec<FragmentChild> = Vec::new();
     for n in &el.fragment.nodes {
         match n {
             FragmentChild::SnippetBlock(sb) => snippets.push(sb),
+            FragmentChild::DebugTag(dt) => debug_tags.push(dt),
             other => rest_nodes.push(other.clone()),
         }
     }
-    if snippets.is_empty() {
+    if snippets.is_empty() && debug_tags.is_empty() {
         return None;
     }
     // After snippet removal, the rest must form a fully-static body.
@@ -3005,10 +3009,70 @@ fn emit_single_element_with_inner_snippet_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     // Snippets go inside a block, not at module-level for inside-element snippets.
-    func_body.push(Statement::Block(Box::new(BlockStatement {
-        body: snippet_block,
-        span: Span::ZERO,
-    })));
+    if !snippet_block.is_empty() {
+        func_body.push(Statement::Block(Box::new(BlockStatement {
+            body: snippet_block,
+            span: Span::ZERO,
+        })));
+    }
+    // Debug tags → template_effect with console.log + debugger.
+    if !debug_tags.is_empty() {
+        let mut effect_body: Vec<Statement> = Vec::new();
+        for dt in &debug_tags {
+            // console.log({ NAME: $.untrack(() => $.snapshot(NAME)), ... });
+            let mut props: Vec<ObjectMember> = Vec::new();
+            for id in &dt.identifiers {
+                let snapshot_call = t::call(
+                    t::member_id(t::id("$"), "snapshot"),
+                    vec![Expression::Identifier(id.clone())],
+                );
+                let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(snapshot_call),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                let untrack_call = t::call(
+                    t::member_id(t::id("$"), "untrack"),
+                    vec![inner_arrow],
+                );
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: id.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value: untrack_call,
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            }
+            let console_log = t::call(
+                t::member_id(t::id("console"), "log"),
+                vec![Expression::Object(Box::new(ObjectExpression {
+                    properties: props,
+                    span: Span::ZERO,
+                }))],
+            );
+            effect_body.push(t::stmt(console_log));
+            effect_body.push(Statement::Debugger(Span::ZERO));
+        }
+        let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: effect_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![effect_arrow],
+        )));
+    }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "append"),
         vec![t::id("$$anchor"), t::id(&tag_var)],
