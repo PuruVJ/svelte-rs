@@ -293,6 +293,9 @@ pub fn try_typed_client_walker_with(
     // the root element variable IS the holder.
     let root_holder: String;
 
+    if classified.is_empty() {
+        return None;
+    }
     if is_multi_root {
         body_stmts.push(t::var("fragment", t::call(t::id("root"), vec![])));
         root_holder = "fragment".to_string();
