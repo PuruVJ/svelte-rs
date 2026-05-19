@@ -87,7 +87,7 @@ pub fn try_typed_client_walker_with(
                 component_name,
                 &script,
             ) {
-                return Some(p);
+                return Option::Some(p);
             }
         }
     }
@@ -97,11 +97,34 @@ pub fn try_typed_client_walker_with(
     // Pre-allocate `var_counts` so the snippet's `text` consumes the bare
     // slot; subsequent vars in the main function become `text_1` etc.
     let mut var_counts: HashMap<String, usize> = HashMap::new();
-    let snippet_decls = extract_client_snippets(
+    let (snippet_decls, snippet_extra_roots) = extract_client_snippets(
         &mut fragment,
         &script.state_bindings,
         &mut var_counts,
     )?;
+    // Helper closure: inject snippet declarations + extra root templates
+    // after the import block of any typed-fast program.
+    let inject_snippets = |opt: Option<Program>| -> Option<Program> {
+        let mut p = opt?;
+        if snippet_decls.is_empty() && snippet_extra_roots.is_empty() {
+            return Option::Some(p);
+        }
+        let mut insert_at = 0;
+        for (i, stmt) in p.body.iter().enumerate() {
+            if matches!(stmt, Statement::Import(_)) {
+                insert_at = i + 1;
+            } else {
+                break;
+            }
+        }
+        let mut new_body: Vec<Statement> =
+            p.body[..insert_at].to_vec();
+        new_body.extend(snippet_decls.iter().cloned());
+        new_body.extend(snippet_extra_roots.iter().cloned());
+        new_body.extend(p.body[insert_at..].iter().cloned());
+        p.body = new_body;
+        Some(p)
+    };
     let root_owned = svelte_ast::root::Root {
         fragment,
         ..root.clone()
@@ -152,7 +175,7 @@ pub fn try_typed_client_walker_with(
                 component_name,
                 &script,
             ) {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
         }
         if let FragmentChild::HtmlTag(ht) = nodes[0] {
@@ -161,7 +184,7 @@ pub fn try_typed_client_walker_with(
                 component_name,
                 &script,
             ) {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
         }
         if let FragmentChild::Text(t) = nodes[0] {
@@ -169,7 +192,7 @@ pub fn try_typed_client_walker_with(
                 if let Some(p) =
                     emit_top_level_single_text_program(&t.data, component_name, &script)
                 {
-                    return Some(p);
+                    return inject_snippets(Some(p));
                 }
             }
         }
@@ -200,7 +223,7 @@ pub fn try_typed_client_walker_with(
             // Non-async if-block — try the vanilla emitter (single-root,
             // text-only consequent, optional text-only alternate).
             if let Some(p) = emit_single_vanilla_if_program(ib, component_name, &script) {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
             return None;
         }
@@ -214,27 +237,27 @@ pub fn try_typed_client_walker_with(
             if let Some(p) =
                 emit_single_dynamic_element_program(el, component_name, &script)
             {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
             if let Some(p) =
                 emit_single_element_with_component_program(el, component_name, &script)
             {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
             if let Some(p) =
                 emit_single_element_wrapping_ifs_program(el, component_name, &script)
             {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
             if let Some(p) =
                 emit_single_element_wrapping_each_program(el, component_name, &script)
             {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
             if let Some(p) =
                 emit_single_element_wrapping_html_tag_program(el, component_name, &script)
             {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
         }
     }
@@ -272,7 +295,7 @@ pub fn try_typed_client_walker_with(
                 component_name,
                 &script,
             ) {
-                return Some(p);
+                return inject_snippets(Some(p));
             }
         }
     }
@@ -301,7 +324,7 @@ pub fn try_typed_client_walker_with(
             component_name,
             &script,
         ) {
-            return Some(p);
+            return inject_snippets(Some(p));
         }
     }
 
@@ -341,7 +364,7 @@ pub fn try_typed_client_walker_with(
                     component_name,
                     &script,
                 ) {
-                    return Some(p);
+                    return inject_snippets(Some(p));
                 }
             }
             return emit_async_if_chain_program(&if_blocks, component_name, &script);
@@ -1638,6 +1661,26 @@ fn emit_vanilla_branch_body(
                 ],
             )));
             Some(body)
+        }
+        FragmentChild::RenderTag(rt) => {
+            // `{@render thing()}` → call the snippet with `$$anchor` as the
+            // first arg, preserving any user-passed args.
+            let call = match &rt.expression {
+                Expression::Call(c) => c,
+                _ => return None,
+            };
+            let mut new_args: Vec<Argument> =
+                vec![Argument::Expression(t::id("$$anchor"))];
+            for a in &call.arguments {
+                new_args.push(a.clone());
+            }
+            let render_call = Expression::Call(Box::new(CallExpression {
+                callee: call.callee.clone(),
+                arguments: new_args,
+                optional: false,
+                span: Span::ZERO,
+            }));
+            Some(vec![t::stmt(render_call)])
         }
         _ => None,
     }
@@ -13139,16 +13182,15 @@ fn extract_client_snippets(
     fragment: &mut svelte_ast::fragment::Fragment,
     state_bindings: &HashSet<String>,
     var_counts: &mut HashMap<String, usize>,
-) -> Option<Vec<Statement>> {
+) -> Option<(Vec<Statement>, Vec<Statement>)> {
     let _ = state_bindings;
     let mut out: Vec<Statement> = Vec::new();
+    let mut extra_roots: Vec<Statement> = Vec::new();
     let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
+    let mut root_idx: usize = 0;
     for n in std::mem::take(&mut fragment.nodes) {
         if let FragmentChild::SnippetBlock(sb) = &n {
             let name = sb.expression.name.clone();
-            // Snippet body: `$.next(); var text = $.text('Something'); $.append($$anchor, text);`
-            // for a single static text body. More complex bodies fall back to
-            // None (caller would bail).
             let body_non_ws: Vec<&FragmentChild> = sb
                 .body
                 .nodes
@@ -13159,33 +13201,85 @@ fn extract_client_snippets(
                 })
                 .collect();
             if body_non_ws.len() != 1 {
+                // Empty body: emit `const NAME = ($$anchor[, params]) => {};`.
+                if body_non_ws.is_empty() {
+                    let mut params = vec![t::pat_id("$$anchor")];
+                    for p in &sb.parameters {
+                        params.push(p.clone());
+                    }
+                    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params,
+                        body: ArrowBody::Block(Box::new(BlockStatement {
+                            body: Vec::new(),
+                            span: Span::ZERO,
+                        })),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }));
+                    out.push(t::const_decl(&name, arrow));
+                    continue;
+                }
                 return None;
             }
-            let text_value = match body_non_ws[0] {
-                FragmentChild::Text(t) => t.data.trim().to_string(),
+            let body: Vec<Statement> = match body_non_ws[0] {
+                FragmentChild::Text(t) => {
+                    // `$.next(); var text = $.text('Foo'); $.append($$anchor, text);`
+                    let text_var = unique_var("text", var_counts);
+                    let mut body: Vec<Statement> = Vec::new();
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "next"),
+                        Vec::new(),
+                    )));
+                    body.push(t::var(
+                        &text_var,
+                        t::call(
+                            t::member_id(t::id("$"), "text"),
+                            vec![Expression::Literal(Box::new(Literal::String(
+                                StringLiteral {
+                                    value: t.data.trim().to_string(),
+                                    raw: None,
+                                    span: Span::ZERO,
+                                },
+                            )))],
+                        ),
+                    ));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id("$$anchor"), t::id(&text_var)],
+                    )));
+                    body
+                }
+                FragmentChild::RegularElement(el) => {
+                    // Fully-static single element: `var <name> = root_N(); $.append($$anchor, <name>);`
+                    if !is_element_fully_static(el) {
+                        return None;
+                    }
+                    let mut html = String::new();
+                    let mut needs = false;
+                    serialize_element_to_html(el, &mut html, &mut needs)?;
+                    root_idx += 1;
+                    let root_name = format!("root_{}", root_idx);
+                    extra_roots.push(t::var(
+                        &root_name,
+                        t::call(
+                            t::member_id(t::id("$"), "from_html"),
+                            vec![t::template_raw(vec![html], vec![])],
+                        ),
+                    ));
+                    let el_var = unique_var(&el.name, var_counts);
+                    let mut body: Vec<Statement> = Vec::new();
+                    body.push(t::var(
+                        &el_var,
+                        t::call(t::id(&root_name), Vec::new()),
+                    ));
+                    body.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id("$$anchor"), t::id(&el_var)],
+                    )));
+                    body
+                }
                 _ => return None,
             };
-            let text_var = unique_var("text", var_counts);
-            let mut body: Vec<Statement> = Vec::new();
-            body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "next"),
-                Vec::new(),
-            )));
-            body.push(t::var(
-                &text_var,
-                t::call(
-                    t::member_id(t::id("$"), "text"),
-                    vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: text_value,
-                        raw: None,
-                        span: Span::ZERO,
-                    })))],
-                ),
-            ));
-            body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(&text_var)],
-            )));
             let mut params = vec![t::pat_id("$$anchor")];
             for p in &sb.parameters {
                 params.push(p.clone());
@@ -13205,7 +13299,7 @@ fn extract_client_snippets(
         remaining.push(n);
     }
     fragment.nodes = remaining;
-    Some(out)
+    Some((out, extra_roots))
 }
 
 fn component_call(c: &Component, node_var: &str) -> Option<Statement> {
