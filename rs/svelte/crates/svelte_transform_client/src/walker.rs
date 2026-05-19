@@ -155,6 +155,15 @@ pub fn try_typed_client_walker_with(
                 return Some(p);
             }
         }
+        if let FragmentChild::HtmlTag(ht) = nodes[0] {
+            if let Some(p) = emit_top_level_html_tag_program(
+                &ht.expression,
+                component_name,
+                &script,
+            ) {
+                return Some(p);
+            }
+        }
     }
 
     // Special case: a single top-level `{#each}` block uses a different
@@ -1650,6 +1659,139 @@ fn emit_single_vanilla_if_program(
 /// directives/events, no spread, no async. Returns `None` for anything
 /// outside the supported shape so the caller falls through to the
 /// general walker.
+/// Emit the upstream shape for a top-level fragment that is exactly one
+/// `{@html ...}` tag — e.g.
+///
+///   <script>let { html } = $props();</script>
+///   {@html html}
+///
+/// →
+///
+///   var fragment = $.comment();
+///   var node = $.first_child(fragment);
+///   $.html(node, () => $$props.html);
+///   $.append($$anchor, fragment);
+fn emit_top_level_html_tag_program(
+    expr: &Expression,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    // For `{@html raw}` where `raw` is a legacy prop accessor, upstream
+    // passes the accessor function directly to `$.html(node, raw)` —
+    // no `() => raw()` thunk. Detect that bare-prop case.
+    let is_bare_legacy_prop = matches!(
+        expr,
+        Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+    );
+    let inner = rewrite_props_destructured(expr, &script.props_destructured);
+    let inner = if is_bare_legacy_prop {
+        // Strip the call wrap that `rewrite_legacy_prop_reads` adds, since
+        // we want the bare identifier here.
+        expr.clone()
+    } else {
+        rewrite_legacy_prop_reads(&inner, &legacy_prop_names)
+    };
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(
+        "fragment",
+        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+    ));
+    func_body.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "first_child"),
+            vec![t::id("fragment")],
+        ),
+    ));
+    let html_arg = if is_bare_legacy_prop {
+        inner
+    } else {
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(inner),
+            r#async: false,
+            span: Span::ZERO,
+        }))
+    };
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "html"),
+        vec![t::id("node"), html_arg],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Emit the upstream shape for a top-level fragment that is exactly one
 /// non-async ExpressionTag — e.g.
 ///
