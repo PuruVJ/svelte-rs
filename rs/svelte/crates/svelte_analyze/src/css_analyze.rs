@@ -51,6 +51,9 @@ pub struct RuleMetadata {
     /// True for `:global { ... }` style rules whose body is entirely
     /// unscoped.
     pub is_global_block: bool,
+    /// The parent rule's NodeKey if this rule is nested. Used by the
+    /// pruner to resolve `&` chains in multi-level nesting.
+    pub parent_rule_key: Option<NodeKey>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -312,6 +315,9 @@ fn analyze_rule(
         a.has_global = true;
     }
 
+    if let Some(p) = parent_rule {
+        meta.parent_rule_key = Some(node_key(p.start, p.end));
+    }
     a.rule_metadata.insert(node_key(rule.start, rule.end), meta);
 
     // Recurse into nested rules.

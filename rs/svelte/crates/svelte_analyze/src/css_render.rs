@@ -28,6 +28,18 @@ pub fn render_stylesheet(
     css_meta: &CssAnalysis,
     hash: &str,
 ) -> String {
+    render_stylesheet_with_opts(source, stylesheet, css_meta, hash, false)
+}
+
+/// Same as [`render_stylesheet`] but lets the caller force dev mode, which
+/// preserves empty rules (upstream keeps them so they show up in devtools).
+pub fn render_stylesheet_with_opts(
+    source: &str,
+    stylesheet: &StyleSheet,
+    css_meta: &CssAnalysis,
+    hash: &str,
+    dev: bool,
+) -> String {
     // Operate on a MagicString of just the content range so all edits are
     // relative-positioned and `to_string()` returns exactly the rendered CSS.
     let content_start = stylesheet.content.start as usize;
@@ -39,6 +51,7 @@ pub fn render_stylesheet(
         keyframes: css_meta.keyframes.clone(),
         selector_suffix: format!(".{hash}"),
         content_offset: content_start as u32,
+        dev,
     };
     for child in &stylesheet.children {
         match child {
@@ -68,6 +81,8 @@ struct RenderState {
     /// source. Used to translate AST positions (absolute) to MagicString
     /// positions (relative to content).
     content_offset: u32,
+    /// Dev mode preserves empty rules so they show up in devtools.
+    dev: bool,
 }
 
 fn visit_atrule(
@@ -193,7 +208,8 @@ fn visit_rule(
     // Empty rule (no Declarations and no used non-empty inner rules) →
     // `/* (empty) ... */` wrapper. Upstream's `Rule` visitor at
     // packages/svelte/src/compiler/phases/3-transform/css/index.js:146.
-    if !inside_global_block && is_empty_rule(rule, css_meta, inside_global_block) {
+    // Dev mode keeps empty rules so they show up in devtools.
+    if !state.dev && !inside_global_block && is_empty_rule(rule, css_meta, inside_global_block) {
         let start = rel(state, rule.start);
         let end = rel(state, rule.end);
         code.prepend_right(start, "/* (empty) ");

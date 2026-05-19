@@ -80,7 +80,12 @@ impl<'src> CssParser<'src> {
     }
 
     fn matches(&self, s: &str) -> bool {
-        self.template[self.index..].starts_with(s)
+        let bytes = self.template.as_bytes();
+        let s_bytes = s.as_bytes();
+        if self.index + s_bytes.len() > bytes.len() {
+            return false;
+        }
+        &bytes[self.index..self.index + s_bytes.len()] == s_bytes
     }
 
     fn try_eat(&mut self, s: &str) -> bool {

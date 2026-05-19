@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use svelte_ast::css::{
     AttributeSelector, ClassSelector, Combinator, CombinatorKind, ComplexSelector, IdSelector,
-    NestingSelectorName, PseudoClassSelector, RelativeSelector, RelativeSelectorKind, Rule,
+    NestingSelectorName, PseudoClassSelector, RelativeSelector, RelativeSelectorKind, Rule, SelectorList,
     SimpleSelector, StyleSheet, StyleSheetChild, TypeSelector, TypeSelectorKind,
 };
 
@@ -23,7 +23,9 @@ use crate::css_possible_values::PossibleValues;
 use crate::css_prune_data::{
     case_insensitive_attributes, whitelist_attribute_selector, Existence,
 };
-use crate::template_elements::{AttrValueSet, ElementInfo, ElementTree, NodeKind};
+use crate::template_elements::{
+    AttrValueSet, BlockKind, ElementInfo, ElementTree, FragChild, NodeKind,
+};
 
 /// Direction in which `apply_selector` walks the relative-selector chain.
 /// Mirrors `FORWARD` / `BACKWARD` constants in css-prune.js:18-19.
@@ -84,27 +86,85 @@ fn any_selector() -> RelativeSelector {
 
 /// Entry point. Mirrors `prune(stylesheet, elements)` in css-prune.js:130-162.
 pub fn prune(stylesheet: &StyleSheet, tree: &ElementTree, css_meta: &mut CssAnalysis) {
-    walk_stylesheet(stylesheet, tree, css_meta);
+    // Build a lookup so `&` resolution can walk multi-level nesting
+    // (a nested rule's `&` resolves to the immediate parent, whose `&`
+    // resolves to *its* parent, and so on).
+    let mut rules_by_key: HashMap<(u32, u32), &Rule> = HashMap::new();
+    collect_rules(stylesheet, &mut rules_by_key);
+    walk_stylesheet(stylesheet, tree, css_meta, &rules_by_key);
 }
 
-fn walk_stylesheet(
-    stylesheet: &StyleSheet,
-    tree: &ElementTree,
-    css_meta: &mut CssAnalysis,
+fn collect_rules<'a>(
+    stylesheet: &'a StyleSheet,
+    out: &mut HashMap<(u32, u32), &'a Rule>,
 ) {
     for child in &stylesheet.children {
         match child {
-            StyleSheetChild::Rule(rule) => walk_rule(rule, None, tree, css_meta),
-            StyleSheetChild::Atrule(at) => walk_atrule(at, tree, css_meta),
+            StyleSheetChild::Rule(r) => collect_rules_in_rule(r, out),
+            StyleSheetChild::Atrule(at) => collect_rules_in_atrule(at, out),
         }
     }
 }
 
-fn walk_rule(
-    rule: &Rule,
-    parent_rule: Option<&Rule>,
+fn collect_rules_in_rule<'a>(rule: &'a Rule, out: &mut HashMap<(u32, u32), &'a Rule>) {
+    out.insert((rule.start, rule.end), rule);
+    for child in &rule.block.children {
+        match child {
+            svelte_ast::css::BlockChild::Rule(r) => collect_rules_in_rule(r, out),
+            svelte_ast::css::BlockChild::Atrule(at) => collect_rules_in_atrule(at, out),
+            svelte_ast::css::BlockChild::Declaration(_) => {}
+        }
+    }
+}
+
+fn collect_rules_in_atrule<'a>(
+    at: &'a svelte_ast::css::Atrule,
+    out: &mut HashMap<(u32, u32), &'a Rule>,
+) {
+    if let Some(b) = &at.block {
+        for child in &b.children {
+            match child {
+                svelte_ast::css::BlockChild::Rule(r) => collect_rules_in_rule(r, out),
+                svelte_ast::css::BlockChild::Atrule(inner) => collect_rules_in_atrule(inner, out),
+                svelte_ast::css::BlockChild::Declaration(_) => {}
+            }
+        }
+    }
+}
+
+fn walk_stylesheet<'a>(
+    stylesheet: &'a StyleSheet,
     tree: &ElementTree,
     css_meta: &mut CssAnalysis,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
+) {
+    for child in &stylesheet.children {
+        match child {
+            StyleSheetChild::Rule(rule) => walk_rule(rule, None, tree, css_meta, rules_by_key),
+            StyleSheetChild::Atrule(at) => walk_atrule(at, tree, css_meta, rules_by_key),
+        }
+    }
+}
+
+/// Resolve the parent of a rule via its `RuleMetadata::parent_rule_key`,
+/// then look up the corresponding `&Rule` via `rules_by_key`. Returns
+/// `None` for top-level rules.
+fn rule_parent<'a>(
+    rule: &Rule,
+    css_meta: &CssAnalysis,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
+) -> Option<&'a Rule> {
+    let meta = css_meta.rule_metadata.get(&(rule.start, rule.end))?;
+    let key = meta.parent_rule_key?;
+    rules_by_key.get(&key).copied()
+}
+
+fn walk_rule<'a>(
+    rule: &'a Rule,
+    parent_rule: Option<&'a Rule>,
+    tree: &ElementTree,
+    css_meta: &mut CssAnalysis,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
 ) {
     let rule_meta = css_meta
         .rule_metadata
@@ -117,7 +177,7 @@ fn walk_rule(
         // don't try to match against the template.
     } else {
         for complex in &rule.prelude.children {
-            prune_complex_selector(complex, rule, parent_rule, tree, css_meta);
+            prune_complex_selector(complex, rule, parent_rule, tree, css_meta, rules_by_key);
         }
     }
 
@@ -126,24 +186,25 @@ fn walk_rule(
     for child in &rule.block.children {
         match child {
             svelte_ast::css::BlockChild::Rule(nested) => {
-                walk_rule(nested, Some(rule), tree, css_meta)
+                walk_rule(nested, Some(rule), tree, css_meta, rules_by_key)
             }
-            svelte_ast::css::BlockChild::Atrule(at) => walk_atrule(at, tree, css_meta),
+            svelte_ast::css::BlockChild::Atrule(at) => walk_atrule(at, tree, css_meta, rules_by_key),
             svelte_ast::css::BlockChild::Declaration(_) => {}
         }
     }
 }
 
-fn walk_atrule(
-    atrule: &svelte_ast::css::Atrule,
+fn walk_atrule<'a>(
+    atrule: &'a svelte_ast::css::Atrule,
     tree: &ElementTree,
     css_meta: &mut CssAnalysis,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
 ) {
     if let Some(block) = &atrule.block {
         for child in &block.children {
             match child {
-                svelte_ast::css::BlockChild::Rule(r) => walk_rule(r, None, tree, css_meta),
-                svelte_ast::css::BlockChild::Atrule(at) => walk_atrule(at, tree, css_meta),
+                svelte_ast::css::BlockChild::Rule(r) => walk_rule(r, None, tree, css_meta, rules_by_key),
+                svelte_ast::css::BlockChild::Atrule(at) => walk_atrule(at, tree, css_meta, rules_by_key),
                 svelte_ast::css::BlockChild::Declaration(_) => {}
             }
         }
@@ -152,12 +213,13 @@ fn walk_atrule(
 
 /// Apply `complex` against every element. Mirrors the `ComplexSelector`
 /// visitor in css-prune.js:139-160.
-fn prune_complex_selector(
+fn prune_complex_selector<'a>(
     complex: &ComplexSelector,
-    rule: &Rule,
-    parent_rule: Option<&Rule>,
+    rule: &'a Rule,
+    parent_rule: Option<&'a Rule>,
     tree: &ElementTree,
     css_meta: &mut CssAnalysis,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
 ) {
     let key = (complex.start, complex.end);
     let already_used = css_meta
@@ -170,8 +232,6 @@ fn prune_complex_selector(
 
     let selectors = get_relative_selectors(complex, rule, parent_rule);
     if selectors.is_empty() {
-        // Selector was just `:global(...)` — already considered used by
-        // analyze.
         return;
     }
 
@@ -191,6 +251,7 @@ fn prune_complex_selector(
             Direction::Backward,
             0,
             selectors.len(),
+            rules_by_key,
         ) {
             matched = true;
         }
@@ -277,32 +338,75 @@ fn has_nesting_selector(rel: &RelativeSelector) -> bool {
 /// Trim trailing global RelativeSelectors. `truncate(node)` in
 /// css-prune.js:209-238.
 fn truncate(complex: &ComplexSelector) -> Vec<RelativeSelector> {
+    truncate_with_meta(complex, None)
+}
+
+/// Same as `truncate`, but uses the analyze-pass `is_global`/`is_global_like`
+/// metadata when available to decide which trailing rel sels to drop.
+/// Mirrors upstream truncate exactly (css-prune.js:209-220).
+fn truncate_with_meta(
+    complex: &ComplexSelector,
+    css_meta: Option<&CssAnalysis>,
+) -> Vec<RelativeSelector> {
     let children = &complex.children;
-    // Find the last index that is NOT global. Everything up to and
-    // including it is kept.
     let mut keep_to = children.len();
     while keep_to > 0 {
         let rel = &children[keep_to - 1];
-        if is_only_global_pseudo(rel) {
+        let m = css_meta
+            .and_then(|cm| {
+                cm.relative_selector_metadata
+                    .get(&(rel.start, rel.end))
+                    .copied()
+            })
+            .unwrap_or_default();
+        let is_bare_global = matches!(
+            rel.selectors.first(),
+            Some(SimpleSelector::PseudoClassSelector(p)) if p.name == "global" && p.args.is_none()
+        );
+        if m.is_global || m.is_global_like || is_bare_global {
+            keep_to -= 1;
+        } else if css_meta.is_none() && is_only_global_pseudo(rel) {
+            // Fallback for callers that don't have metadata available.
             keep_to -= 1;
         } else {
             break;
         }
     }
-    children[..keep_to].to_vec()
+    // Mirrors upstream css-prune.js:221-231 — for any kept selector that
+    // contains `:root`, keep only its `:has(...)` simple selectors.
+    // `:root` itself never matches a template element but the `:has`
+    // check still applies, so this rewrite lets the pruner see the
+    // `:has` against the template.
+    children[..keep_to]
+        .iter()
+        .map(|child| {
+            let has_root = child.selectors.iter().any(|s| {
+                matches!(s, SimpleSelector::PseudoClassSelector(p) if p.name == "root")
+            });
+            if !has_root {
+                return child.clone();
+            }
+            let mut filtered = child.clone();
+            filtered.selectors.retain(|s| {
+                matches!(s, SimpleSelector::PseudoClassSelector(p) if p.name == "has")
+            });
+            filtered
+        })
+        .collect()
 }
 
 /// True if `rel` consists solely of pseudo classes/elements that are
 /// global or `:global`. Used by `truncate`. Mirrors the inline check in
 /// the upstream `truncate`.
+///
+/// Note: `:has`, `:is`, `:where`, `:not` are deliberately excluded —
+/// their args constrain matching and their globality depends on whether
+/// the args are themselves global. Upstream relies on `metadata.is_global`
+/// for those cases.
 fn is_only_global_pseudo(rel: &RelativeSelector) -> bool {
     rel.selectors.iter().all(|s| match s {
         SimpleSelector::PseudoClassSelector(p) => {
             p.name == "global"
-                || p.name == "is"
-                || p.name == "where"
-                || p.name == "has"
-                || p.name == "not"
                 || p.name == "scope"
                 || p.name == "root"
                 || p.name == "host"
@@ -352,16 +456,17 @@ fn is_only_global_pseudo(rel: &RelativeSelector) -> bool {
 /// Backwards-direction selector application. Mirrors `apply_selector` in
 /// css-prune.js:243-279.
 #[allow(clippy::too_many_arguments)]
-fn apply_selector(
+fn apply_selector<'a>(
     selectors: &[RelativeSelector],
-    rule: &Rule,
-    parent_rule: Option<&Rule>,
+    rule: &'a Rule,
+    parent_rule: Option<&'a Rule>,
     el_idx: usize,
     tree: &ElementTree,
     css_meta: &mut CssAnalysis,
     direction: Direction,
     from: usize,
     to: usize,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
 ) -> bool {
     if from >= to {
         return false;
@@ -382,9 +487,10 @@ fn apply_selector(
     let rel = &selectors[selector_index];
 
     let matched = relative_selector_might_apply_to_node(
-        rel, rule, parent_rule, el_idx, tree, css_meta, direction,
+        rel, rule, parent_rule, el_idx, tree, css_meta, direction, rules_by_key,
     ) && apply_combinator(
         rel, selectors, rule, parent_rule, el_idx, tree, css_meta, direction, rest_from, rest_to,
+        rules_by_key,
     );
 
     if matched {
@@ -405,17 +511,18 @@ fn apply_selector(
 
 /// `apply_combinator(...)` — css-prune.js:291-359.
 #[allow(clippy::too_many_arguments)]
-fn apply_combinator(
+fn apply_combinator<'a>(
     relative_selector: &RelativeSelector,
     selectors: &[RelativeSelector],
-    rule: &Rule,
-    parent_rule: Option<&Rule>,
+    rule: &'a Rule,
+    parent_rule: Option<&'a Rule>,
     el_idx: usize,
     tree: &ElementTree,
     css_meta: &mut CssAnalysis,
     direction: Direction,
     from: usize,
     to: usize,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
 ) -> bool {
     let combinator = match direction {
         Direction::Forward => {
@@ -447,7 +554,7 @@ fn apply_combinator(
             keys.sort_unstable();
             for p in keys {
                 if apply_selector(
-                    selectors, rule, parent_rule, p, tree, css_meta, direction, from, to,
+                    selectors, rule, parent_rule, p, tree, css_meta, direction, from, to, rules_by_key,
                 ) {
                     parent_matched = true;
                 }
@@ -460,7 +567,7 @@ fn apply_combinator(
             parent_matched
                 || (direction == Direction::Backward
                     && (!is_adjacent || !has_definite_elements(&parents))
-                    && every_is_global(selectors, from, to, css_meta))
+                    && every_is_global(selectors, from, to, rule, parent_rule, css_meta))
         }
         "+" | "~" => {
             let siblings = get_possible_element_siblings(tree, el_idx, direction, combinator.name == "+");
@@ -486,6 +593,7 @@ fn apply_combinator(
                     }
                 } else if apply_selector(
                     selectors, rule, parent_rule, possible, tree, css_meta, direction, from, to,
+                    rules_by_key,
                 ) {
                     sibling_matched = true;
                 }
@@ -493,7 +601,7 @@ fn apply_combinator(
             sibling_matched
                 || (direction == Direction::Backward
                     && get_element_parent(tree, el_idx).is_none()
-                    && every_is_global(selectors, from, to, css_meta))
+                    && every_is_global(selectors, from, to, rule, parent_rule, css_meta))
         }
         _ => true,
     }
@@ -504,13 +612,15 @@ fn every_is_global(
     selectors: &[RelativeSelector],
     from: usize,
     to: usize,
+    rule: &Rule,
+    parent_rule: Option<&Rule>,
     css_meta: &CssAnalysis,
 ) -> bool {
     if from >= to {
         return false;
     }
     for sel in selectors.iter().take(to).skip(from) {
-        if !is_global_for_prune(sel, css_meta) {
+        if !is_global_for_prune(sel, rule, parent_rule, css_meta) {
             return false;
         }
     }
@@ -521,7 +631,12 @@ fn every_is_global(
 /// returns true when the relative selector's analyze metadata flags it as
 /// `:global` or `:global_like` (which is how `:host`/`:root`/etc. propagate
 /// to the prune fallback). Falls back to the syntactic check.
-fn is_global_for_prune(rel: &RelativeSelector, css_meta: &CssAnalysis) -> bool {
+fn is_global_for_prune(
+    rel: &RelativeSelector,
+    rule: &Rule,
+    parent_rule: Option<&Rule>,
+    css_meta: &CssAnalysis,
+) -> bool {
     let m = css_meta
         .relative_selector_metadata
         .get(&(rel.start, rel.end))
@@ -530,7 +645,90 @@ fn is_global_for_prune(rel: &RelativeSelector, css_meta: &CssAnalysis) -> bool {
     if m.is_global || m.is_global_like {
         return true;
     }
-    is_global(rel)
+    // Mirror upstream's is_global walk per simple selector. For a
+    // NestingSelector, consult the parent rule's `has_global_selectors`
+    // metadata (which is already computed during analyze) — much simpler
+    // than recursing through the parent chain.
+    let mut explicit_global = false;
+    for s in &rel.selectors {
+        let mut nested: Option<&SelectorList> = None;
+        let mut can_be_global = false;
+        match s {
+            SimpleSelector::PseudoClassSelector(p) => {
+                if (p.name == "is" || p.name == "where") && p.args.is_some() {
+                    nested = p.args.as_ref();
+                } else {
+                    can_be_global = is_unscoped_pseudo_class(p);
+                }
+            }
+            SimpleSelector::NestingSelector(_) => {
+                let Some(parent) = parent_rule else {
+                    return false;
+                };
+                // `&` is global iff the parent rule's prelude has at least
+                // one all-global complex selector. The analyze pass already
+                // set `has_global_selectors` to exactly that condition
+                // (per css_analyze.rs:296-303), so consult it directly
+                // instead of recursing into the parent prelude (which
+                // would need the parent's own parent chain).
+                let parent_meta = css_meta
+                    .rule_metadata
+                    .get(&(parent.start, parent.end))
+                    .copied()
+                    .unwrap_or_default();
+                if parent_meta.has_global_selectors && !parent_meta.has_local_selectors {
+                    return true;
+                }
+                if parent_meta.has_global_selectors {
+                    // Parent has a mix — `&` resolves to whichever, so it
+                    // could still match a global context. Treat as global
+                    // for the every_is_global fallback to fire (mirrors
+                    // upstream's `explicitly_global` accumulator).
+                    explicit_global = true;
+                    continue;
+                }
+                return false;
+            }
+            _ => {
+                return false;
+            }
+        }
+        let has_global_selectors = nested
+            .map(|list| {
+                list.children.iter().any(|complex| {
+                    complex
+                        .children
+                        .iter()
+                        .all(|r| is_global_for_prune(r, rule, None, css_meta))
+                })
+            })
+            .unwrap_or(false);
+        explicit_global |= has_global_selectors;
+        if !has_global_selectors && !can_be_global {
+            return false;
+        }
+    }
+    explicit_global || rel.selectors.is_empty()
+}
+
+/// Mirrors upstream `is_unscoped_pseudo_class` in
+/// packages/svelte/src/compiler/phases/2-analyze/css/utils.js:138-155.
+/// A pseudo class is "unscoped" iff scoping wouldn't change its meaning —
+/// most pseudo classes (`:hover`, `:root`, etc.) and `:has`/`:is`/`:where`/
+/// `:not` whose args are all global.
+fn is_unscoped_pseudo_class(p: &PseudoClassSelector) -> bool {
+    let scoped = matches!(p.name.as_str(), "has" | "is" | "where")
+        || (p.name == "not"
+            && p.args
+                .as_ref()
+                .is_some_and(|a| a.children.iter().any(|c| c.children.len() > 1)));
+    if !scoped {
+        return true;
+    }
+    // Otherwise unscoped iff `:has(...)`/`:is(...)`/etc. args are entirely global.
+    p.args
+        .as_ref()
+        .is_some_and(|a| a.children.iter().all(|c| c.children.iter().all(|r| is_global(r))))
 }
 
 /// `has_definite_elements(result)` — css-prune.js:1162-1177.
@@ -578,14 +776,15 @@ fn is_outer_global(rel: &RelativeSelector) -> bool {
 
 /// `relative_selector_might_apply_to_node(...)` — css-prune.js:436-675.
 #[allow(clippy::too_many_arguments)]
-fn relative_selector_might_apply_to_node(
+fn relative_selector_might_apply_to_node<'a>(
     rel: &RelativeSelector,
-    rule: &Rule,
-    parent_rule: Option<&Rule>,
+    rule: &'a Rule,
+    parent_rule: Option<&'a Rule>,
     el_idx: usize,
     tree: &ElementTree,
     css_meta: &mut CssAnalysis,
     direction: Direction,
+    rules_by_key: &HashMap<(u32, u32), &'a Rule>,
 ) -> bool {
     let _ = direction;
     let element = &tree.elements[el_idx];
@@ -632,6 +831,7 @@ fn relative_selector_might_apply_to_node(
                             Direction::Forward,
                             0,
                             sel_with_self.len(),
+                            rules_by_key,
                         ) {
                             css_meta
                                 .complex_selector_metadata
@@ -658,6 +858,7 @@ fn relative_selector_might_apply_to_node(
                         Direction::Forward,
                         0,
                         sel_excl_self.len(),
+                        rules_by_key,
                     ) {
                         css_meta
                             .complex_selector_metadata
@@ -697,6 +898,7 @@ fn relative_selector_might_apply_to_node(
                         Direction::Backward,
                         0,
                         complex_arg.children.len(),
+                        rules_by_key,
                     );
                 }
                 if name == "global" && p.args.is_none() {
@@ -747,6 +949,7 @@ fn relative_selector_might_apply_to_node(
                             Direction::Backward,
                             0,
                             relative.len(),
+                            rules_by_key,
                         ) {
                             css_meta
                                 .complex_selector_metadata
@@ -788,12 +991,14 @@ fn relative_selector_might_apply_to_node(
                 }
             }
             SimpleSelector::ClassSelector(c) => {
-                if !attribute_matches(element, "class", Some(&c.name), Some("~="), false) {
+                let name = unescape_css_name(&c.name);
+                if !attribute_matches(element, "class", Some(&name), Some("~="), false) {
                     return false;
                 }
             }
             SimpleSelector::IdSelector(i) => {
-                if !attribute_matches(element, "id", Some(&i.name), Some("="), false) {
+                let name = unescape_css_name(&i.name);
+                if !attribute_matches(element, "id", Some(&name), Some("="), false) {
                     return false;
                 }
             }
@@ -817,19 +1022,23 @@ fn relative_selector_might_apply_to_node(
                     // Stand-alone `&` outside a nested rule — invalid.
                     return false;
                 };
+                // Resolve the grandparent so the parent's own `&` (in
+                // multi-level nesting) can chain up.
+                let grandparent = rule_parent(parent, css_meta, rules_by_key);
                 let mut matched = false;
                 for complex_arg in &parent.prelude.children {
-                    let parent_selectors = get_relative_selectors(complex_arg, parent, None);
+                    let parent_selectors = get_relative_selectors(complex_arg, parent, grandparent);
                     if apply_selector(
                         &parent_selectors,
                         parent,
-                        None,
+                        grandparent,
                         el_idx,
                         tree,
                         css_meta,
                         Direction::Backward,
                         0,
                         parent_selectors.len(),
+                        rules_by_key,
                     ) || complex_arg
                         .children
                         .iter()
@@ -861,37 +1070,29 @@ fn rule_is_global_context(
     parent_rule: Option<&Rule>,
     css_meta: &CssAnalysis,
 ) -> bool {
-    let mut cur = Some(rule);
-    while let Some(r) = cur {
+    let _ = css_meta;
+    // Walk this rule, then parents up the chain. Any `:root` or
+    // `:global(...)` makes the chain global.
+    let mut chain: Vec<&Rule> = vec![rule];
+    if let Some(p) = parent_rule {
+        chain.push(p);
+    }
+    for r in chain {
         for complex in &r.prelude.children {
             for rel in &complex.children {
                 if is_global(rel) {
                     return true;
                 }
-            }
-        }
-        // Move up the chain. We only have direct parent for now (one
-        // level). Upstream walks `get_parent_rules` which is the full
-        // chain — for our simplified model, peek `parent_rule` once.
-        cur = if let Some(_) = cur {
-            None
-        } else {
-            parent_rule
-        };
-    }
-    // Also: any `:root` or `:global(args)` in the prelude makes it global.
-    for complex in &rule.prelude.children {
-        for rel in &complex.children {
-            for s in &rel.selectors {
-                if let SimpleSelector::PseudoClassSelector(p) = s {
-                    if p.name == "root" || (p.name == "global" && p.args.is_some()) {
-                        return true;
+                for s in &rel.selectors {
+                    if let SimpleSelector::PseudoClassSelector(p) = s {
+                        if p.name == "root" || (p.name == "global" && p.args.is_some()) {
+                            return true;
+                        }
                     }
                 }
             }
         }
     }
-    let _ = css_meta;
     false
 }
 
@@ -1077,29 +1278,116 @@ fn unquote(s: &str) -> String {
 }
 
 /// `get_ancestor_elements(node, adjacent_only)` — css-prune.js:837-905.
-/// In our flat tree, ancestors are the simple `.parent` chain. For
-/// `adjacent_only` we return just the immediate parent.
+/// Walks the element's parent chain. When the chain reaches a node whose
+/// fragment is owned by a `SnippetBlock`, the walker continues from each
+/// of that snippet's render-tag sites (per upstream's path/SnippetBlock
+/// special case).
 fn get_ancestor_elements(
     tree: &ElementTree,
     idx: usize,
     adjacent_only: bool,
 ) -> HashMap<usize, Existence> {
     let mut out = HashMap::new();
-    if adjacent_only {
-        if let Some(p) = get_element_parent(tree, idx) {
-            out.insert(p, tree.elements[p].existence);
-        }
-    } else {
-        let mut cur = tree.elements[idx].parent;
-        while let Some(p) = cur {
+    let mut seen = std::collections::HashSet::new();
+    walk_ancestors(tree, idx, adjacent_only, &mut out, &mut seen);
+    out
+}
+
+fn walk_ancestors(
+    tree: &ElementTree,
+    idx: usize,
+    adjacent_only: bool,
+    out: &mut HashMap<usize, Existence>,
+    seen: &mut std::collections::HashSet<usize>,
+) {
+    let mut cur = idx;
+    loop {
+        if let Some(p) = tree.elements[cur].parent {
             if is_match_candidate(tree.elements[p].kind) {
                 let existing = out.get(&p).copied().unwrap_or(Existence::Probable);
                 out.insert(p, Existence::max(existing, tree.elements[p].existence));
+                // Special case: when ascending through an `<option>` whose
+                // enclosing `<select>` contains a `<selectedcontent>`,
+                // descendants of `<option>` are also rendered into
+                // `<selectedcontent>`. Per css-prune.js:861-888, the
+                // `<selectedcontent>` element joins the ancestor set.
+                if tree.elements[p]
+                    .tag
+                    .as_deref()
+                    .map(|t| t.eq_ignore_ascii_case("option"))
+                    .unwrap_or(false)
+                {
+                    if let Some(select) = find_ancestor_named(tree, p, "select") {
+                        if let Some(sc) = find_selectedcontent_descendant(tree, select) {
+                            let existing =
+                                out.get(&sc).copied().unwrap_or(Existence::Probable);
+                            out.insert(
+                                sc,
+                                Existence::max(existing, tree.elements[sc].existence),
+                            );
+                        }
+                    }
+                }
+                if adjacent_only {
+                    return;
+                }
             }
-            cur = tree.elements[p].parent;
+            cur = p;
+            continue;
         }
+        // No more parents — see if the enclosing fragment is a snippet body.
+        // If so, walk from each render-tag site.
+        let frag = tree.elements[cur].fragment_id;
+        let mut snippet_block: Option<usize> = None;
+        let mut probe_frag = frag;
+        loop {
+            match tree.fragment_owners[probe_frag] {
+                crate::template_elements::FragmentOwner::Root => break,
+                crate::template_elements::FragmentOwner::Element(_) => break,
+                crate::template_elements::FragmentOwner::Block { block_idx, .. } => {
+                    if tree.blocks[block_idx].kind == BlockKind::SnippetBlock {
+                        snippet_block = Some(block_idx);
+                        break;
+                    }
+                    // Other blocks: ascend through their position in parent fragment.
+                    match find_block_position(tree, block_idx) {
+                        Some((up, _)) => {
+                            probe_frag = up;
+                        }
+                        None => return,
+                    }
+                }
+            }
+        }
+        if let Some(block_idx) = snippet_block {
+            if seen.contains(&block_idx) {
+                return;
+            }
+            seen.insert(block_idx);
+            for site_idx in tree.blocks[block_idx].sites.clone() {
+                // Treat the render tag's element parent (and chain) as
+                // ancestors. If the site itself is an element (Component
+                // render), include it.
+                let site_kind = tree.elements[site_idx].kind;
+                if matches!(
+                    site_kind,
+                    Some(NodeKind::RegularElement) | Some(NodeKind::SvelteElement)
+                ) {
+                    let existing =
+                        out.get(&site_idx).copied().unwrap_or(Existence::Probable);
+                    out.insert(
+                        site_idx,
+                        Existence::max(existing, tree.elements[site_idx].existence),
+                    );
+                    if adjacent_only {
+                        return;
+                    }
+                }
+                walk_ancestors(tree, site_idx, adjacent_only, out, seen);
+            }
+        }
+        return;
     }
-    out
 }
 
 /// `get_descendant_elements(node, adjacent_only)` — css-prune.js:907-972.
@@ -1109,23 +1397,191 @@ fn get_descendant_elements(
     adjacent_only: bool,
 ) -> HashMap<usize, Existence> {
     let mut out = HashMap::new();
-    if adjacent_only {
-        // Direct children only.
-        let mut cur = tree.elements[idx].first_child;
-        while let Some(c) = cur {
-            if is_match_candidate(tree.elements[c].kind) {
-                out.insert(c, tree.elements[c].existence);
-            }
-            cur = tree.elements[c].next_sibling;
-        }
-    } else {
-        for d in tree.descendants(idx) {
-            if is_match_candidate(tree.elements[d].kind) {
-                out.insert(d, tree.elements[d].existence);
+    let mut seen_snippets = std::collections::HashSet::new();
+    walk_descendants(tree, idx, adjacent_only, &mut out, &mut seen_snippets);
+    // `<selectedcontent>` clones the content of the selected `<option>`,
+    // so descendants of `<option>` elements within the enclosing `<select>`
+    // also count. Mirrors css-prune.js:941-965.
+    let is_selectedcontent = tree.elements[idx]
+        .tag
+        .as_deref()
+        .map(|t| t.eq_ignore_ascii_case("selectedcontent"))
+        .unwrap_or(false);
+    if is_selectedcontent {
+        if let Some(select) = find_ancestor_named(tree, idx, "select") {
+            let mut option_descendants: Vec<usize> = Vec::new();
+            find_option_descendants(tree, select, &mut option_descendants);
+            for opt in option_descendants {
+                walk_descendants(tree, opt, adjacent_only, &mut out, &mut seen_snippets);
             }
         }
     }
     out
+}
+
+fn find_ancestor_named(tree: &ElementTree, idx: usize, name: &str) -> Option<usize> {
+    let mut cur = tree.elements[idx].parent;
+    while let Some(p) = cur {
+        if tree.elements[p]
+            .tag
+            .as_deref()
+            .map(|t| t.eq_ignore_ascii_case(name))
+            .unwrap_or(false)
+        {
+            return Some(p);
+        }
+        cur = tree.elements[p].parent;
+    }
+    None
+}
+
+fn find_option_descendants(tree: &ElementTree, idx: usize, out: &mut Vec<usize>) {
+    if let Some(body) = tree.elements[idx].body_fragment {
+        find_options_in_fragment(tree, body, out);
+    }
+}
+
+fn find_selectedcontent_descendant(tree: &ElementTree, idx: usize) -> Option<usize> {
+    if let Some(body) = tree.elements[idx].body_fragment {
+        find_selectedcontent_in_fragment(tree, body)
+    } else {
+        None
+    }
+}
+
+fn find_selectedcontent_in_fragment(tree: &ElementTree, fragment_id: usize) -> Option<usize> {
+    for ch in tree.fragments[fragment_id].clone() {
+        if let FragChild::Element(e) = ch {
+            if tree.elements[e]
+                .tag
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("selectedcontent"))
+                .unwrap_or(false)
+            {
+                return Some(e);
+            }
+            if let Some(body) = tree.elements[e].body_fragment {
+                if let Some(sc) = find_selectedcontent_in_fragment(tree, body) {
+                    return Some(sc);
+                }
+            }
+        } else if let FragChild::Block(b) = ch {
+            for &branch in &tree.blocks[b].branches.clone() {
+                if let Some(sc) = find_selectedcontent_in_fragment(tree, branch) {
+                    return Some(sc);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_options_in_fragment(tree: &ElementTree, fragment_id: usize, out: &mut Vec<usize>) {
+    for ch in tree.fragments[fragment_id].clone() {
+        if let FragChild::Element(e) = ch {
+            if tree.elements[e]
+                .tag
+                .as_deref()
+                .map(|t| t.eq_ignore_ascii_case("option"))
+                .unwrap_or(false)
+            {
+                out.push(e);
+            }
+            if let Some(body) = tree.elements[e].body_fragment {
+                find_options_in_fragment(tree, body, out);
+            }
+        } else if let FragChild::Block(b) = ch {
+            for &branch in &tree.blocks[b].branches.clone() {
+                find_options_in_fragment(tree, branch, out);
+            }
+        }
+    }
+}
+
+fn walk_descendants(
+    tree: &ElementTree,
+    idx: usize,
+    adjacent_only: bool,
+    out: &mut HashMap<usize, Existence>,
+    seen_snippets: &mut std::collections::HashSet<usize>,
+) {
+    // Descend into this node's body fragment (and through RenderTags).
+    if let Some(body) = tree.elements[idx].body_fragment {
+        walk_fragment_descendants(tree, body, adjacent_only, out, seen_snippets);
+    } else if tree.elements[idx].kind == Some(NodeKind::RenderTag) {
+        if let Some(name) = &tree.elements[idx].tag {
+            if let Some(block_idx) = find_snippet_by_name(tree, name) {
+                if !seen_snippets.contains(&block_idx) {
+                    seen_snippets.insert(block_idx);
+                    for &branch in &tree.blocks[block_idx].branches.clone() {
+                        walk_fragment_descendants(
+                            tree, branch, adjacent_only, out, seen_snippets,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn walk_fragment_descendants(
+    tree: &ElementTree,
+    fragment_id: usize,
+    adjacent_only: bool,
+    out: &mut HashMap<usize, Existence>,
+    seen_snippets: &mut std::collections::HashSet<usize>,
+) {
+    for ch in tree.fragments[fragment_id].clone() {
+        match ch {
+            FragChild::Element(e) => {
+                let kind = tree.elements[e].kind;
+                if matches!(kind, Some(NodeKind::RegularElement) | Some(NodeKind::SvelteElement)) {
+                    let existing = out.get(&e).copied().unwrap_or(Existence::Probable);
+                    out.insert(e, Existence::max(existing, tree.elements[e].existence));
+                    if !adjacent_only {
+                        if let Some(body) = tree.elements[e].body_fragment {
+                            walk_fragment_descendants(
+                                tree, body, adjacent_only, out, seen_snippets,
+                            );
+                        }
+                    }
+                } else if kind == Some(NodeKind::RenderTag) {
+                    if let Some(name) = &tree.elements[e].tag {
+                        if let Some(block_idx) = find_snippet_by_name(tree, name) {
+                            if !seen_snippets.contains(&block_idx) {
+                                seen_snippets.insert(block_idx);
+                                for &branch in &tree.blocks[block_idx].branches.clone() {
+                                    walk_fragment_descendants(
+                                        tree, branch, adjacent_only, out, seen_snippets,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Pass-through (Component / SvelteComponent / SlotElement /
+                    // SvelteSelf / TitleElement / SvelteBody): recurse into
+                    // body without adding the wrapper itself.
+                    if let Some(body) = tree.elements[e].body_fragment {
+                        walk_fragment_descendants(
+                            tree, body, adjacent_only, out, seen_snippets,
+                        );
+                    }
+                }
+            }
+            FragChild::Block(b) => {
+                // SnippetBlock declarations don't render inline — skip.
+                if tree.blocks[b].kind == BlockKind::SnippetBlock {
+                    continue;
+                }
+                for &branch in &tree.blocks[b].branches.clone() {
+                    walk_fragment_descendants(
+                        tree, branch, adjacent_only, out, seen_snippets,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `get_element_parent(node)` — css-prune.js:974-994. Walks up until we
@@ -1142,55 +1598,424 @@ fn get_element_parent(tree: &ElementTree, idx: usize) -> Option<usize> {
 }
 
 /// `get_possible_element_siblings(node, direction, adjacent_only)` —
-/// css-prune.js:996-1095.
+/// css-prune.js:996-1088.
 ///
-/// For `+` (adjacent_only = true) we keep walking past PROBABLE siblings:
-/// `<div></div>{#if cond}<span></span>{/if}<p></p>` — `div + p` is a
-/// match because the `{#if}` branch might not render, making `<p>`'s
-/// immediate previous sibling `<div>`. The collected map can include
-/// multiple candidate siblings — `<span>` (PROBABLE) and `<div>`
-/// (PROBABLE — because `<span>` might appear in between, so `<div>` is
-/// only conditionally the immediate sibling).
-///
-/// For `~` (adjacent_only = false) we just enumerate every previous /
-/// next sibling element.
+/// Walks the element's parent fragment (and up the fragment ownership
+/// chain) collecting elements that could appear as a sibling. Crosses
+/// non-exhaustive blocks; stops at exhaustive blocks when adjacent_only.
 fn get_possible_element_siblings(
     tree: &ElementTree,
     idx: usize,
     direction: Direction,
     adjacent_only: bool,
 ) -> HashMap<usize, Existence> {
-    let mut out = HashMap::new();
-    let siblings = match direction {
-        Direction::Forward => tree.next_siblings(idx),
-        Direction::Backward => tree.prev_siblings(idx),
-    };
-    let mut crossed_probable = false;
-    for s in siblings {
-        if !is_sibling_candidate(tree.elements[s].kind) {
-            continue;
+    let mut seen = std::collections::HashSet::new();
+    get_possible_element_siblings_seen(tree, idx, direction, adjacent_only, &mut seen)
+}
+
+fn get_possible_element_siblings_seen(
+    tree: &ElementTree,
+    idx: usize,
+    direction: Direction,
+    adjacent_only: bool,
+    seen: &mut std::collections::HashSet<usize>,
+) -> HashMap<usize, Existence> {
+    let mut result: HashMap<usize, Existence> = HashMap::new();
+    // Position from which to walk: start at element's index, then ascend.
+    let mut cur_fragment = tree.elements[idx].fragment_id;
+    let mut cur_pos = tree.elements[idx].index_in_fragment;
+
+    loop {
+        let done = walk_fragment_siblings(
+            tree,
+            cur_fragment,
+            cur_pos,
+            direction,
+            adjacent_only,
+            &mut result,
+        );
+        if done {
+            return result;
         }
-        let own = tree.elements[s].existence;
-        // If we've walked past one or more PROBABLE siblings, this
-        // sibling is also PROBABLE (it's only the immediate one IF the
-        // ones we walked past don't exist).
-        let effective = if adjacent_only && crossed_probable {
-            Existence::Probable
-        } else {
-            own
-        };
-        let prev = *out.get(&s).unwrap_or(&Existence::Probable);
-        out.insert(s, Existence::max(prev, effective));
-        if adjacent_only {
-            if own == Existence::Definite {
-                // A definite sibling stops us — no later sibling can be
-                // the immediate previous.
-                break;
+
+        // Move up: who owns this fragment?
+        match tree.fragment_owners[cur_fragment] {
+            crate::template_elements::FragmentOwner::Root => break,
+            crate::template_elements::FragmentOwner::Element(parent_el) => {
+                // Element owns the fragment — Component / SvelteComponent /
+                // SvelteSelf / SlotElement are transparent: their bodies
+                // may render into the surrounding flow. (Upstream lists
+                // SlotElement under `is_block` and walks past it the same
+                // way it walks past `Component`.)
+                let kind = tree.elements[parent_el].kind;
+                let transparent = matches!(
+                    kind,
+                    Some(NodeKind::Component)
+                        | Some(NodeKind::SvelteComponent)
+                        | Some(NodeKind::SvelteSelf)
+                        | Some(NodeKind::SlotElement)
+                );
+                if !transparent {
+                    break;
+                }
+                cur_fragment = tree.elements[parent_el].fragment_id;
+                cur_pos = tree.elements[parent_el].index_in_fragment;
             }
-            crossed_probable = true;
+            crate::template_elements::FragmentOwner::Block { block_idx, branch_index } => {
+                // Walking past a block boundary in adjacent mode is
+                // permitted (the next iteration continues past it). For
+                // EachBlock body specifically, also include the each
+                // block's own siblings (wrap-around — iter N+1's prev
+                // is iter N's last child).
+                let kind = tree.blocks[block_idx].kind;
+                if kind == BlockKind::EachBlock && branch_index == 0 {
+                    let nested = get_possible_nested_siblings_block(
+                        tree,
+                        block_idx,
+                        direction,
+                        adjacent_only,
+                    );
+                    add_to_map(nested, &mut result);
+                }
+                if kind == BlockKind::SnippetBlock {
+                    if seen.contains(&block_idx) {
+                        break;
+                    }
+                    seen.insert(block_idx);
+                    // Snippet body — walk each render site's siblings.
+                    // Mirrors css-prune.js:1069-1076: for each site, recurse
+                    // into `get_possible_element_siblings(site, ...)`.
+                    for site_idx in tree.blocks[block_idx].sites.clone() {
+                        let nested = get_possible_element_siblings_seen(
+                            tree, site_idx, direction, adjacent_only, seen,
+                        );
+                        add_to_map(nested, &mut result);
+                    }
+                    break;
+                }
+                // Locate the block in its enclosing fragment to continue.
+                // Each fragment carries `FragChild::Block(block_idx)` — find it.
+                let owner_frag = find_block_position(tree, block_idx);
+                match owner_frag {
+                    Some((frag, pos)) => {
+                        cur_fragment = frag;
+                        cur_pos = pos;
+                    }
+                    None => break,
+                }
+            }
         }
     }
-    out
+    result
+}
+
+/// Walk one fragment's children from `start_pos` in `direction` (exclusive
+/// of `start_pos`), accumulating sibling candidates per upstream's loop
+/// body in `get_possible_element_siblings` (css-prune.js:1010-1051).
+/// Returns `true` if a definitely-existing sibling stopped the walk — the
+/// caller should not ascend (matches upstream's `return result`).
+fn walk_fragment_siblings(
+    tree: &ElementTree,
+    fragment_id: usize,
+    start_pos: usize,
+    direction: Direction,
+    adjacent_only: bool,
+    result: &mut HashMap<usize, Existence>,
+) -> bool {
+    let children = &tree.fragments[fragment_id];
+    let mut j = match direction {
+        Direction::Forward => start_pos + 1,
+        Direction::Backward => start_pos.wrapping_sub(1),
+    };
+    loop {
+        if direction == Direction::Forward && j >= children.len() {
+            break;
+        }
+        if direction == Direction::Backward && j == usize::MAX {
+            break;
+        }
+        match children[j] {
+            FragChild::Element(e) => {
+                let kind = tree.elements[e].kind;
+                match kind {
+                    Some(NodeKind::RegularElement) => {
+                        // Mirrors upstream css-prune.js:1014-1023 — elements
+                        // with `slot=` skip the sibling chain (they go to a
+                        // different named slot, not the surrounding flow).
+                        let has_slot_attr = tree.elements[e]
+                            .attr_names
+                            .iter()
+                            .any(|n| n.eq_ignore_ascii_case("slot"));
+                        if !has_slot_attr {
+                            result.insert(
+                                e,
+                                Existence::max(
+                                    *result.get(&e).unwrap_or(&Existence::Probable),
+                                    Existence::Definite,
+                                ),
+                            );
+                            if adjacent_only {
+                                return true;
+                            }
+                        }
+                    }
+                    Some(NodeKind::Component) | Some(NodeKind::SlotElement) => {
+                        result.insert(
+                            e,
+                            Existence::max(
+                                *result.get(&e).unwrap_or(&Existence::Probable),
+                                Existence::Probable,
+                            ),
+                        );
+                        // Upstream's `get_possible_nested_siblings` recurses
+                        // into Component/SlotElement bodies and (for Component)
+                        // their snippet bodies.
+                        if let Some(body) = tree.elements[e].body_fragment {
+                            let nested = loop_child(tree, body, direction, adjacent_only);
+                            let demoted: HashMap<usize, Existence> = nested
+                                .into_iter()
+                                .map(|(k, _)| (k, Existence::Probable))
+                                .collect();
+                            add_to_map(demoted, result);
+                        }
+                        for &snip in &tree.elements[e].snippet_fragments {
+                            let nested = loop_child(tree, snip, direction, adjacent_only);
+                            let demoted: HashMap<usize, Existence> = nested
+                                .into_iter()
+                                .map(|(k, _)| (k, Existence::Probable))
+                                .collect();
+                            add_to_map(demoted, result);
+                        }
+                    }
+                    Some(NodeKind::SvelteElement) => {
+                        result.insert(
+                            e,
+                            Existence::max(
+                                *result.get(&e).unwrap_or(&Existence::Probable),
+                                Existence::Probable,
+                            ),
+                        );
+                    }
+                    Some(NodeKind::RenderTag) => {
+                        result.insert(
+                            e,
+                            Existence::max(
+                                *result.get(&e).unwrap_or(&Existence::Probable),
+                                Existence::Probable,
+                            ),
+                        );
+                        // Recurse into the resolved snippet body — mirrors
+                        // upstream css-prune.js:1043-1048 where each
+                        // `node.metadata.snippets` is folded in.
+                        if let Some(name) = &tree.elements[e].tag {
+                            if let Some(block_idx) = find_snippet_by_name(tree, name) {
+                                let nested = get_possible_nested_siblings_block(
+                                    tree, block_idx, direction, adjacent_only,
+                                );
+                                add_to_map(nested, result);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            FragChild::Block(b) => {
+                // SnippetBlock children don't render at their declaration
+                // site (they render at `{@render}` call sites elsewhere)
+                // — skip them when walking sibling chains.
+                if tree.blocks[b].kind == BlockKind::SnippetBlock {
+                    j = match direction {
+                        Direction::Forward => j + 1,
+                        Direction::Backward => j.wrapping_sub(1),
+                    };
+                    continue;
+                }
+                let nested = get_possible_nested_siblings_block(tree, b, direction, adjacent_only);
+                let nested_has_definite = has_definite_elements(&nested);
+                add_to_map(nested, result);
+                if adjacent_only && nested_has_definite {
+                    return true;
+                }
+            }
+        }
+        j = match direction {
+            Direction::Forward => j + 1,
+            Direction::Backward => j.wrapping_sub(1),
+        };
+    }
+    false
+}
+
+/// `get_possible_nested_siblings(block, direction, adjacent_only)` —
+/// css-prune.js:1097-1156.
+fn get_possible_nested_siblings_block(
+    tree: &ElementTree,
+    block_idx: usize,
+    direction: Direction,
+    adjacent_only: bool,
+) -> HashMap<usize, Existence> {
+    let mut seen = std::collections::HashSet::new();
+    get_possible_nested_siblings_block_seen(tree, block_idx, direction, adjacent_only, &mut seen)
+}
+
+fn get_possible_nested_siblings_block_seen(
+    tree: &ElementTree,
+    block_idx: usize,
+    direction: Direction,
+    adjacent_only: bool,
+    seen: &mut std::collections::HashSet<usize>,
+) -> HashMap<usize, Existence> {
+    // SnippetBlock acts like other blocks but is cycle-prone via RenderTag
+    // resolution — `seen` tracks block indices we've already descended into.
+    if tree.blocks[block_idx].kind == BlockKind::SnippetBlock {
+        if seen.contains(&block_idx) {
+            return HashMap::new();
+        }
+        seen.insert(block_idx);
+    }
+    let mut result: HashMap<usize, Existence> = HashMap::new();
+    let mut exhaustive = tree.blocks[block_idx].exhaustive;
+    for &branch_frag in &tree.blocks[block_idx].branches.clone() {
+        let map = loop_child_seen(tree, branch_frag, direction, adjacent_only, seen);
+        exhaustive &= has_definite_elements(&map);
+        add_to_map(map, &mut result);
+    }
+    if !exhaustive {
+        for v in result.values_mut() {
+            *v = Existence::Probable;
+        }
+    }
+    result
+}
+
+/// `loop_child(children, direction, adjacent_only)` — css-prune.js:1201-1230.
+fn loop_child(
+    tree: &ElementTree,
+    fragment_id: usize,
+    direction: Direction,
+    adjacent_only: bool,
+) -> HashMap<usize, Existence> {
+    let mut seen = std::collections::HashSet::new();
+    loop_child_seen(tree, fragment_id, direction, adjacent_only, &mut seen)
+}
+
+fn loop_child_seen(
+    tree: &ElementTree,
+    fragment_id: usize,
+    direction: Direction,
+    adjacent_only: bool,
+    seen: &mut std::collections::HashSet<usize>,
+) -> HashMap<usize, Existence> {
+    let mut result: HashMap<usize, Existence> = HashMap::new();
+    let children = &tree.fragments[fragment_id];
+    if children.is_empty() {
+        return result;
+    }
+    let mut i: i64 = match direction {
+        Direction::Forward => 0,
+        Direction::Backward => (children.len() as i64) - 1,
+    };
+    while i >= 0 && (i as usize) < children.len() {
+        match children[i as usize] {
+            FragChild::Element(e) => {
+                let kind = tree.elements[e].kind;
+                match kind {
+                    Some(NodeKind::RegularElement) => {
+                        result.insert(e, Existence::Definite);
+                        if adjacent_only {
+                            break;
+                        }
+                    }
+                    Some(NodeKind::SvelteElement) => {
+                        result.insert(e, Existence::Probable);
+                    }
+                    Some(NodeKind::RenderTag) => {
+                        result.insert(e, Existence::Probable);
+                        if let Some(name) = &tree.elements[e].tag {
+                            if let Some(block_idx) = find_snippet_by_name(tree, name) {
+                                let nested = get_possible_nested_siblings_block_seen(
+                                    tree, block_idx, direction, adjacent_only, seen,
+                                );
+                                add_to_map(nested, &mut result);
+                            }
+                        }
+                    }
+                    Some(NodeKind::SlotElement) => {
+                        // Upstream `is_block` includes SlotElement —
+                        // recurse into its body for the nested-siblings
+                        // map and demote (slot may render nothing →
+                        // never exhaustive).
+                        if let Some(body) = tree.elements[e].body_fragment {
+                            let nested = loop_child_seen(tree, body, direction, adjacent_only, seen);
+                            let demoted: HashMap<usize, Existence> = nested
+                                .into_iter()
+                                .map(|(k, _)| (k, Existence::Probable))
+                                .collect();
+                            add_to_map(demoted, &mut result);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            FragChild::Block(b) => {
+                // Skip SnippetBlock declarations — they don't render inline.
+                if tree.blocks[b].kind == BlockKind::SnippetBlock {
+                    i = match direction {
+                        Direction::Forward => i + 1,
+                        Direction::Backward => i - 1,
+                    };
+                    continue;
+                }
+                let child_result =
+                    get_possible_nested_siblings_block_seen(tree, b, direction, adjacent_only, seen);
+                let had_definite = has_definite_elements(&child_result);
+                add_to_map(child_result, &mut result);
+                if adjacent_only && had_definite {
+                    break;
+                }
+            }
+        }
+        i = match direction {
+            Direction::Forward => i + 1,
+            Direction::Backward => i - 1,
+        };
+    }
+    result
+}
+
+fn find_snippet_by_name(tree: &ElementTree, name: &str) -> Option<usize> {
+    for (i, b) in tree.blocks.iter().enumerate() {
+        if b.kind == BlockKind::SnippetBlock {
+            if let Some(n) = &b.snippet_name {
+                if n == name {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find which (fragment_id, position) holds `FragChild::Block(block_idx)`.
+/// Used to ascend past a block during sibling walking.
+fn find_block_position(tree: &ElementTree, block_idx: usize) -> Option<(usize, usize)> {
+    for (fid, children) in tree.fragments.iter().enumerate() {
+        for (pos, ch) in children.iter().enumerate() {
+            if let FragChild::Block(b) = ch {
+                if *b == block_idx {
+                    return Some((fid, pos));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn add_to_map(from: HashMap<usize, Existence>, to: &mut HashMap<usize, Existence>) {
+    for (k, v) in from {
+        let prev = *to.get(&k).unwrap_or(&Existence::Probable);
+        to.insert(k, Existence::max(prev, v));
+    }
 }
 
 fn is_sibling_candidate(kind: Option<NodeKind>) -> bool {
@@ -1208,20 +2033,51 @@ fn is_sibling_candidate(kind: Option<NodeKind>) -> bool {
     )
 }
 
-/// `unescape_css_name` — strip `\` from CSS identifier escapes (e.g.
-/// `\.foo` → `.foo`). Mirrors the inline replacement at css-prune.js:511-513.
+/// `unescape_css_name` — CSS identifier unescape. Two forms:
+/// - `\X` for a non-hex char X → literal X.
+/// - `\HH` (up to 6 hex digits) optionally followed by a single
+///   whitespace → the unicode codepoint with that scalar value.
+/// Mirrors upstream's `unescape` helper in css-prune.js.
 fn unescape_css_name(name: &str) -> String {
-    let bytes = name.as_bytes();
+    let chars: Vec<char> = name.chars().collect();
     let mut out = String::with_capacity(name.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 1 < bytes.len() {
-            out.push(bytes[i + 1] as char);
-            i += 2;
-        } else {
-            out.push(bytes[i] as char);
+    while i < chars.len() {
+        let c = chars[i];
+        if c != '\\' {
+            out.push(c);
             i += 1;
+            continue;
         }
+        // Backslash escape — peek next char(s).
+        if i + 1 >= chars.len() {
+            // Trailing backslash — treat literally.
+            out.push('\\');
+            i += 1;
+            continue;
+        }
+        let next = chars[i + 1];
+        if !next.is_ascii_hexdigit() {
+            out.push(next);
+            i += 2;
+            continue;
+        }
+        // Hex escape: up to 6 hex digits, optional trailing whitespace.
+        let mut hex = String::new();
+        let mut j = i + 1;
+        while j < chars.len() && hex.len() < 6 && chars[j].is_ascii_hexdigit() {
+            hex.push(chars[j]);
+            j += 1;
+        }
+        if j < chars.len() && chars[j] == ' ' {
+            j += 1;
+        }
+        if let Ok(code) = u32::from_str_radix(&hex, 16) {
+            if let Some(c) = char::from_u32(code) {
+                out.push(c);
+            }
+        }
+        i = j;
     }
     out
 }

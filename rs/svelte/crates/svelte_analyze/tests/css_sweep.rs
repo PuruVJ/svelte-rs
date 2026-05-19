@@ -5,8 +5,14 @@
 use std::fs;
 use std::path::PathBuf;
 
-use svelte_analyze::{analyze_component, css_render::render_stylesheet};
+use svelte_analyze::{analyze_component, css_render::{render_stylesheet, render_stylesheet_with_opts}};
 use svelte_parse::parse;
+
+/// Look for `dev: true` inside `_config.js` (only `compileOptions.dev`
+/// matters for CSS rendering — empty rules are preserved in dev mode).
+fn fixture_dev_flag(config: &str) -> bool {
+    config.contains("dev: true") || config.contains("dev:true")
+}
 
 const HASH: &str = "svelte-xyz";
 
@@ -57,6 +63,9 @@ fn sweep_css_fixtures() {
             Ok(s) => s,
             Err(_) => continue,
         };
+        let dev = fs::read_to_string(entry.path().join("_config.js"))
+            .map(|s| fixture_dev_flag(&s))
+            .unwrap_or(false);
         let result = std::panic::catch_unwind(|| {
             let root = parse(&source, false)?;
             let mut analysis = analyze_component(root, None)?;
@@ -65,7 +74,7 @@ fn sweep_css_fixtures() {
                 Some(s) => s,
                 None => return Ok::<_, svelte_diagnostics::CompileDiagnostic>(String::new()),
             };
-            let rendered = render_stylesheet(&source, stylesheet, &analysis.css_meta, HASH);
+            let rendered = render_stylesheet_with_opts(&source, stylesheet, &analysis.css_meta, HASH, dev);
             Ok(rendered)
         });
         match result {

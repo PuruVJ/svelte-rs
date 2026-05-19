@@ -1128,36 +1128,16 @@ fn array_element(e: &oxc::ArrayExpressionElement<'_>, shift: Shift) -> ArrayElem
 }
 
 fn array_element_as_expr(e: &oxc::ArrayExpressionElement<'_>, shift: Shift) -> Expression {
+    // `ArrayExpressionElement` is a superset of `Expression` in OXC —
+    // every non-Elision / non-SpreadElement variant has an equivalent
+    // `Expression`. Use OXC's `to_expression()` accessor to convert, then
+    // funnel through the regular `expression()` mapper so we cover all
+    // variants (Object, Conditional, Logical, …) instead of a tiny
+    // hard-coded subset.
     use oxc::ArrayExpressionElement as E;
     match e {
         E::Elision(_) | E::SpreadElement(_) => unreachable!(),
-        E::BooleanLiteral(b) => Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
-            value: b.value,
-            span: span_of(b.span, shift),
-        }))),
-        E::NullLiteral(n) => Expression::Literal(Box::new(Literal::Null(span_of(n.span, shift)))),
-        E::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
-            value: n.value,
-            raw: n.raw.as_ref().map(|s| s.as_str().to_string()),
-            span: span_of(n.span, shift),
-        }))),
-        E::StringLiteral(s) => {
-            Expression::Literal(Box::new(Literal::String(string_literal(s, shift))))
-        }
-        E::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
-        E::CallExpression(c) => Expression::Call(Box::new(CallExpression {
-            callee: expression(&c.callee, shift),
-            arguments: c.arguments.iter().map(|a| argument(a, shift)).collect(),
-            optional: c.optional,
-            span: span_of(c.span, shift),
-        })),
-        _ => {
-            let s = e.span();
-            Expression::Identifier(Identifier {
-                name: "__array_elem__".to_string(),
-                span: span_of(s, shift),
-            })
-        }
+        _ => expression(e.to_expression(), shift),
     }
 }
 
