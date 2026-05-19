@@ -3576,11 +3576,96 @@ fn validate_const_assignments(
     }
     // Collect this scope's const names by looking at sibling ConstTags.
     let mut scope_consts: Vec<String> = parent_consts.to_vec();
+    let mut const_decls: Vec<(String, &svelte_js_ast::Expression, (u32, u32))> = Vec::new();
     for n in &fragment.nodes {
         if let FragmentChild::ConstTag(t) = n {
             for d in &t.declaration.declarations {
+                if let svelte_js_ast::Pattern::Identifier(id) = &d.id {
+                    if let Some(init) = &d.init {
+                        const_decls.push((
+                            id.name.clone(),
+                            init,
+                            (t.start, t.end),
+                        ));
+                    }
+                }
                 collect_pattern_names_vec(&d.id, &mut scope_consts);
             }
+        }
+    }
+    // Build dependency graph among const-tag names; emit const_tag_cycle on
+    // any cycle. Mirrors upstream's flow.
+    fn collect_idents(e: &svelte_js_ast::Expression, out: &mut Vec<String>) {
+        use svelte_js_ast::*;
+        match e {
+            Expression::Identifier(id) => out.push(id.name.clone()),
+            Expression::Member(m) => collect_idents(&m.object, out),
+            Expression::Binary(b) => {
+                collect_idents(&b.left, out);
+                collect_idents(&b.right, out);
+            }
+            Expression::Logical(b) => {
+                collect_idents(&b.left, out);
+                collect_idents(&b.right, out);
+            }
+            Expression::Call(c) => {
+                collect_idents(&c.callee, out);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        collect_idents(ax, out);
+                    }
+                }
+            }
+            Expression::Conditional(c) => {
+                collect_idents(&c.test, out);
+                collect_idents(&c.consequent, out);
+                collect_idents(&c.alternate, out);
+            }
+            _ => {}
+        }
+    }
+    let names: std::collections::HashSet<String> = const_decls.iter().map(|(n, _, _)| n.clone()).collect();
+    let mut graph: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (name, init, _) in &const_decls {
+        let mut refs = Vec::new();
+        collect_idents(init, &mut refs);
+        graph.insert(
+            name.clone(),
+            refs.into_iter().filter(|r| names.contains(r) && r != name).collect(),
+        );
+    }
+    fn has_cycle(
+        start: &str,
+        graph: &std::collections::HashMap<String, Vec<String>>,
+        visited: &mut std::collections::HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> bool {
+        if path.iter().any(|p| p == start) {
+            return true;
+        }
+        if visited.contains(start) {
+            return false;
+        }
+        visited.insert(start.to_string());
+        path.push(start.to_string());
+        if let Some(deps) = graph.get(start) {
+            for d in deps {
+                if has_cycle(d, graph, visited, path) {
+                    return true;
+                }
+            }
+        }
+        path.pop();
+        false
+    }
+    let mut visited: std::collections::HashSet<String> = Default::default();
+    for (name, _, span) in &const_decls {
+        let mut path: Vec<String> = Vec::new();
+        if has_cycle(name, &graph, &mut visited, &mut path) {
+            let cycle_str = path.join(" → ");
+            state.errors.push(errors::const_tag_cycle(Some(*span), &cycle_str));
+            break;
         }
     }
     let consts_set: std::collections::HashSet<String> = scope_consts.iter().cloned().collect();
