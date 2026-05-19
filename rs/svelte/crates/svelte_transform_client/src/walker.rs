@@ -1169,6 +1169,208 @@ fn emit_single_component_program(
         })
         .collect();
     if !body_non_ws.is_empty() {
+        // Slot child case 0: body has at least one fully-static element
+        // with `slot="NAME"` attr → partition body into default slot +
+        // named-slot map. Default slot = text-only (or empty); named
+        // slots = the elements with slot attrs. Mirrors `text-fallback`.
+        let mut named_slots: Vec<(&svelte_ast::elements::RegularElement, String)> = Vec::new();
+        let mut default_nodes: Vec<&FragmentChild> = Vec::new();
+        for n in &c.fragment.nodes {
+            match n {
+                FragmentChild::RegularElement(el) => {
+                    let slot_name = el.attributes.iter().find_map(|a| {
+                        if let ElementAttribute::Attribute(attr) = a {
+                            if attr.name == "slot" {
+                                if let AttributeValue::Many(parts) = &attr.value {
+                                    if parts.len() == 1 {
+                                        if let AttributeValuePart::Text(t) = &parts[0] {
+                                            return Some(t.data.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        None
+                    });
+                    if let Some(name) = slot_name {
+                        if !is_element_fully_static(el) {
+                            return None;
+                        }
+                        named_slots.push((el, name));
+                    } else {
+                        default_nodes.push(n);
+                    }
+                }
+                _ => default_nodes.push(n),
+            }
+        }
+        if !named_slots.is_empty() {
+            // Emit named slot arrows + root_N decls. Default slot from
+            // remaining nodes (text-only currently).
+            let mut module_extras: Vec<Statement> = Vec::new();
+            let mut slots_props: Vec<ObjectMember> = Vec::new();
+            // default: true marker comes first in `$$slots` object.
+            slots_props.push(ObjectMember::Property(Box::new(Property {
+                key: PropertyKey::Identifier(Identifier {
+                    name: "default".to_string(),
+                    span: Span::ZERO,
+                }),
+                value: Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: true, span: Span::ZERO },
+                ))),
+                kind: PropertyKind::Init,
+                computed: false,
+                shorthand: false,
+                method: false,
+                span: Span::ZERO,
+            })));
+            let mut root_idx_named: usize = 1;
+            for (sel, sname) in &named_slots {
+                root_idx_named += 1;
+                let root_name = format!("root_{}", root_idx_named);
+                let mut html = String::new();
+                let mut needs = false;
+                serialize_element_to_html(sel, &mut html, &mut needs)?;
+                module_extras.push(t::var(
+                    &root_name,
+                    t::call(
+                        t::member_id(t::id("$"), "from_html"),
+                        vec![t::template_raw(vec![html], vec![])],
+                    ),
+                ));
+                let el_var = sel.name.clone();
+                let body: Vec<Statement> = vec![
+                    t::var(&el_var, t::call(t::id(&root_name), Vec::new())),
+                    t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id("$$anchor"), t::id(&el_var)],
+                    )),
+                ];
+                let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body,
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                slots_props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: sname.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value: arrow,
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            }
+            // Default slot: text-only from default_nodes.
+            // Build text parts from default_nodes; only handle pure-text default
+            // (no expressions, no mixed elements).
+            let mut default_text = String::new();
+            for n in &default_nodes {
+                match n {
+                    FragmentChild::Text(t) => default_text.push_str(&t.data),
+                    _ => return None,
+                }
+            }
+            let trimmed = default_text.trim();
+            let default_body: Vec<Statement> = if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![
+                    t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+                    t::var(
+                        "text",
+                        t::call(
+                            t::member_id(t::id("$"), "text"),
+                            vec![Expression::Literal(Box::new(Literal::String(
+                                StringLiteral {
+                                    value: trimmed.to_string(),
+                                    raw: None,
+                                    span: Span::ZERO,
+                                },
+                            )))],
+                        ),
+                    ),
+                    t::stmt(t::call(
+                        t::member_id(t::id("$"), "append"),
+                        vec![t::id("$$anchor"), t::id("text")],
+                    )),
+                ]
+            };
+            let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: default_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            props.push(ObjectMember::Property(Box::new(Property {
+                key: PropertyKey::Identifier(Identifier {
+                    name: "children".to_string(),
+                    span: Span::ZERO,
+                }),
+                value: children_arrow,
+                kind: PropertyKind::Init,
+                computed: false,
+                shorthand: false,
+                method: false,
+                span: Span::ZERO,
+            })));
+            props.push(ObjectMember::Property(Box::new(Property {
+                key: PropertyKey::Identifier(Identifier {
+                    name: "$$slots".to_string(),
+                    span: Span::ZERO,
+                }),
+                value: Expression::Object(Box::new(ObjectExpression {
+                    properties: slots_props,
+                    span: Span::ZERO,
+                })),
+                kind: PropertyKind::Init,
+                computed: false,
+                shorthand: false,
+                method: false,
+                span: Span::ZERO,
+            })));
+            let component_call = Expression::Call(Box::new(CallExpression {
+                callee: t::id(&c.name),
+                arguments: vec![
+                    Argument::Expression(t::id("$$anchor")),
+                    Argument::Expression(Expression::Object(Box::new(ObjectExpression {
+                        properties: props,
+                        span: Span::ZERO,
+                    }))),
+                ],
+                optional: false,
+                span: Span::ZERO,
+            }));
+            let mut func_body: Vec<Statement> = Vec::new();
+            func_body.extend(script.body.clone());
+            func_body.push(t::stmt(component_call));
+            let mut params = vec![t::pat_id("$$anchor")];
+            if script.uses_props {
+                params.push(t::pat_id("$$props"));
+            }
+            let export =
+                t::export_default_function(component_name, params, func_body);
+            let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+            prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+            if script.emit_legacy_flag {
+                prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+            }
+            prog.push(t::import_namespace("$", "svelte/internal/client"));
+            prog.extend(script.imports.clone());
+            prog.extend(module_extras);
+            prog.push(export);
+            return Some(t::program(prog));
+        }
         // Slot child case 1: body is exactly one Component (no props, no
         // body), surrounded by whitespace text and comments only. Emit
         // `children: ($$anchor, $$slotProps) => { Component($$anchor, {}); }`.
@@ -8679,14 +8881,20 @@ fn serialize_fragment_to_html(
     // not just at the top level.
     let nodes_v = trim_pure_whitespace_text(&f.nodes);
     let nodes = &nodes_v[..];
+    let last_idx = nodes.len().saturating_sub(1);
     let mut last_was_text_with_space = false;
     for (i, n) in nodes.iter().enumerate() {
         match n {
             FragmentChild::Text(t) => {
-                let collapsed = collapse_ws_client(&t.data);
-                // Trim around block boundaries: leading whitespace of a
-                // multi-line text run after an element becomes a single
-                // space; same for trailing.
+                let mut collapsed = collapse_ws_client(&t.data);
+                // Trim leading whitespace if at start of fragment body.
+                if i == 0 {
+                    collapsed = collapsed.trim_start().to_string();
+                }
+                // Trim trailing whitespace if at end of fragment body.
+                if i == last_idx {
+                    collapsed = collapsed.trim_end().to_string();
+                }
                 if collapsed.is_empty() {
                     continue;
                 }
