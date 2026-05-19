@@ -182,6 +182,13 @@ pub fn try_typed_client_walker_with(
         if let FragmentChild::Component(c) = nodes[0] {
             return emit_single_component_program(c, component_name, &script);
         }
+        if let FragmentChild::RegularElement(el) = nodes[0] {
+            if let Some(p) =
+                emit_single_dynamic_element_program(el, component_name, &script)
+            {
+                return Some(p);
+            }
+        }
     }
 
     // Deep-static-walker case: multi-root template made entirely of
@@ -1538,6 +1545,232 @@ fn emit_single_vanilla_if_program(
     // Module-level `var root_N = $.from_html(...)` for any element
     // branches captured.
     prog.extend(root_decls);
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit the upstream client shape for a runes-mode top-level single
+/// static element with one or more dynamic attributes — e.g.
+///
+///   <script>let { src } = $props();</script>
+///   <img {src} alt="" />
+///
+/// →
+///
+///   var root = $.from_html(`<img alt=""/>`);
+///   export default function Main($$anchor, $$props) {
+///       var img = root();
+///       $.template_effect(() => $.set_attribute(img, 'src', $$props.src));
+///       $.append($$anchor, img);
+///   }
+///
+/// Constrained to: empty (or fully-static) element body, no bindings/
+/// directives/events, no spread, no async. Returns `None` for anything
+/// outside the supported shape so the caller falls through to the
+/// general walker.
+fn emit_single_dynamic_element_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    // Element body must be fully static (no expressions / blocks / etc.).
+    if !el.fragment.nodes.iter().all(|n| matches!(n, FragmentChild::Text(_) | FragmentChild::Comment(_))) {
+        return None;
+    }
+    if !el
+        .fragment
+        .nodes
+        .iter()
+        .all(|n| match n {
+            FragmentChild::Text(_) => true,
+            FragmentChild::Comment(_) => true,
+            _ => false,
+        })
+    {
+        return None;
+    }
+
+    // Classify attributes: static (literal/text) vs dynamic (single
+    // ExpressionTag value). Any other shape (directive, spread, mixed
+    // text+expr) → bail.
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    let mut dyn_attrs: Vec<(&str, Expression)> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => {
+                match &attr.value {
+                    AttributeValue::Empty => static_attrs.push(attr),
+                    AttributeValue::Many(parts) => {
+                        if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                            static_attrs.push(attr);
+                        } else {
+                            return None;
+                        }
+                    }
+                    AttributeValue::Single(et) => {
+                        dyn_attrs.push((attr.name.as_str(), et.expression.clone()));
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    if dyn_attrs.is_empty() {
+        return None;
+    }
+
+    // Build template HTML.
+    let mut html = String::with_capacity(32);
+    html.push('<');
+    html.push_str(&el.name);
+    for attr in &static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => html.push_str("&quot;"),
+                                '&' => html.push_str("&amp;"),
+                                _ => html.push(c),
+                            }
+                        }
+                    }
+                }
+                html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    if is_void_client(&el.name) {
+        html.push_str("/>");
+    } else {
+        html.push('>');
+        for n in &el.fragment.nodes {
+            if let FragmentChild::Text(t) = n {
+                for c in t.data.chars() {
+                    match c {
+                        '`' => html.push_str("\\`"),
+                        '\\' => html.push_str("\\\\"),
+                        _ => html.push(c),
+                    }
+                }
+            }
+        }
+        html.push_str("</");
+        html.push_str(&el.name);
+        html.push('>');
+    }
+
+    // Rewrite dyn-attr expressions through props_destructured.
+    let dyn_attrs: Vec<(String, Expression)> = dyn_attrs
+        .into_iter()
+        .map(|(name, e)| (name.to_string(), rewrite_props_destructured(&e, &script.props_destructured)))
+        .collect();
+
+    // Build function body.
+    let tag_var = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
+
+    // `<input>` needs `$.remove_input_defaults` BEFORE the effect, and
+    // `value` / `checked` attrs use dedicated setters instead of the
+    // generic `set_attribute`.
+    let is_input = el.name == "input";
+    if is_input {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "remove_input_defaults"),
+            vec![t::id(&tag_var)],
+        )));
+    }
+    // Single dyn attr → `$.template_effect(() => $.set_attribute(TAG, NAME, EXPR));`
+    // Multiple dyn attrs → block-body effect with sequential set_attribute calls.
+    let set_attr_call = |name: &str, e: Expression| -> Expression {
+        // Input-specific setters for `value` / `checked`.
+        if is_input && name == "value" {
+            return t::call(
+                t::member_id(t::id("$"), "set_value"),
+                vec![t::id(&tag_var), e],
+            );
+        }
+        if is_input && name == "checked" {
+            return t::call(
+                t::member_id(t::id("$"), "set_checked"),
+                vec![t::id(&tag_var), e],
+            );
+        }
+        t::call(
+            t::member_id(t::id("$"), "set_attribute"),
+            vec![t::id(&tag_var), t::literal_str(name), e],
+        )
+    };
+    let effect_arrow = if dyn_attrs.len() == 1 {
+        let (name, e) = dyn_attrs.into_iter().next().unwrap();
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(set_attr_call(&name, e)),
+            r#async: false,
+            span: Span::ZERO,
+        }))
+    } else {
+        let body: Vec<Statement> = dyn_attrs
+            .into_iter()
+            .map(|(name, e)| t::stmt(set_attr_call(&name, e)))
+            .collect();
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement { body, span: Span::ZERO })),
+            r#async: false,
+            span: Span::ZERO,
+        }))
+    };
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![effect_arrow],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&tag_var)],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
     prog.push(export);
     Some(t::program(prog))
 }
