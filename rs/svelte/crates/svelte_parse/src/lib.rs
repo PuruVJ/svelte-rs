@@ -42,6 +42,24 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
             continue;
         }
         if parser.match_str("{") {
+            // `{:foo}` at the absolute top-level fragment has no parent
+            // block to continue — emit `block_invalid_continuation_placement`
+            // for the precise error code upstream expects.
+            let after = &parser.template[parser.index + 1..];
+            let trimmed = after.trim_start();
+            if trimmed.starts_with(':') {
+                let kw_start = trimmed[1..].as_bytes();
+                let mut j = 0;
+                while j < kw_start.len() && (kw_start[j] as char).is_ascii_lowercase() {
+                    j += 1;
+                }
+                let kw = &trimmed[1..1 + j];
+                if matches!(kw, "else" | "then" | "catch") {
+                    return Err(svelte_diagnostics::errors::block_invalid_continuation_placement(
+                        Some((parser.index as u32, parser.index as u32)),
+                    ));
+                }
+            }
             nodes.push(state::tag::read_tag(&mut parser)?);
             continue;
         }

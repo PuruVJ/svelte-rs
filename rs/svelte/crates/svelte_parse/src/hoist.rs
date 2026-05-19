@@ -79,6 +79,11 @@ pub fn hoist_scripts_and_styles(
                 if let Some(sheet) = build_style(&el, source)? {
                     root.css = Some(sheet);
                 }
+            } else {
+                // Second `<style>` block → `style_duplicate` error.
+                return Err(svelte_diagnostics::errors::style_duplicate(Some((
+                    el.start, el.end,
+                ))));
             }
             continue;
         }

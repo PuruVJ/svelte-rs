@@ -592,6 +592,20 @@ fn read_attributes(
         }
         out.push(read_attribute(parser, static_only)?);
     }
+    // Duplicate-attribute check: same name appearing twice on the same
+    // element. `bind:foo` and `foo` both produce attribute `foo` for this
+    // purpose. Mirrors upstream's attribute_duplicate.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for a in &out {
+        let (name, span) = match a {
+            ElementAttribute::Attribute(att) => (att.name.clone(), (att.start, att.end)),
+            ElementAttribute::BindDirective(b) => (b.name.clone(), (b.start, b.end)),
+            _ => continue,
+        };
+        if !seen.insert(name) {
+            return Err(svelte_diagnostics::errors::attribute_duplicate(Some(span)));
+        }
+    }
     Ok(out)
 }
 
@@ -633,6 +647,12 @@ fn read_braced_attribute(
         b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
     });
     if id_bytes.is_empty() {
+        // `{}` — empty braced attribute. Upstream's specific error code.
+        if parser.peek() == Some(b'}') {
+            return Err(svelte_diagnostics::errors::attribute_empty_shorthand(
+                Some((start as u32, parser.index as u32)),
+            ));
+        }
         return Err(errors::expected_token(
             Some((id_start as u32, id_start as u32)),
             "identifier",
@@ -1167,6 +1187,15 @@ fn read_attribute_value(parser: &mut Parser<'_>) -> Result<AttributeValue, Compi
     // Mustache-only value: `name={expr}` → `AttributeValue::Single(ExpressionTag)`.
     if parser.peek() == Some(b'{') {
         let tag = read_expression_tag(parser)?;
+        // If immediately followed by a trailing `}` (no space), the
+        // attribute value is malformed — upstream emits
+        // `attribute_unquoted_sequence` at the next analyse pass; we
+        // surface it as a parse error to match.
+        if parser.peek() == Some(b'}') {
+            return Err(svelte_diagnostics::errors::attribute_unquoted_sequence(
+                Some((tag.start, parser.index as u32)),
+            ));
+        }
         return Ok(AttributeValue::Single(tag));
     }
 
@@ -1176,6 +1205,18 @@ fn read_attribute_value(parser: &mut Parser<'_>) -> Result<AttributeValue, Compi
         Some(b'\'') => Some(b'\''),
         _ => None,
     };
+    // `name=` with no value (next is `>`, whitespace, or `/>`) → upstream
+    // emits `expected_attribute_value`.
+    if quote.is_none()
+        && matches!(
+            opener,
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') | Some(b'>') | None
+        )
+    {
+        return Err(svelte_diagnostics::errors::expected_attribute_value(
+            Some((parser.index as u32, parser.index as u32)),
+        ));
+    }
 
     // Empty quoted value: `name=""` produces a single empty Text node at the
     // position of the second quote. Matches element.js:792-801.

@@ -145,6 +145,14 @@ fn read_each_block(
 
     let mut key_expr: Option<svelte_js_ast::Expression> = None;
     if parser.eat("(") {
+        // `{#each EXPR, i (KEY)}` — key without preceding `as` is invalid.
+        // Mirrors `each_key_without_as`.
+        if context.is_none() {
+            return Err(svelte_diagnostics::errors::each_key_without_as(Some((
+                parser.index as u32 - 1,
+                parser.index as u32,
+            ))));
+        }
         parser.allow_whitespace();
         let (k, k_end) = parser.parse_expression_at(parser.index)?;
         parser.index = k_end;

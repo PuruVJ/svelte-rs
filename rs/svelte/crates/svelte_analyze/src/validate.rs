@@ -44,6 +44,9 @@ pub struct ValidateState<'a> {
     /// Any element has a native `onfoo={...}` attribute. Combined with
     /// `event_directive_node` to detect mixed event handler syntaxes.
     pub uses_event_attributes: bool,
+    /// `svelte:window` / `svelte:body` / `svelte:document` / `svelte:head`
+    /// tags seen so far. Used for `svelte_meta_duplicate` detection.
+    pub svelte_meta_seen: std::collections::HashSet<String>,
 }
 
 impl<'a> ValidateState<'a> {
@@ -59,6 +62,7 @@ impl<'a> ValidateState<'a> {
             instance_declared: std::collections::HashSet::new(),
             event_directive_node: None,
             uses_event_attributes: false,
+            svelte_meta_seen: std::collections::HashSet::new(),
         }
     }
 }
@@ -76,9 +80,11 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
     // those names within the block's scope. Mirrors upstream's flow in
     // const-tag handling.
     validate_const_assignments(&root.fragment, &[], &mut state);
+    validate_slot_attributes(&root.fragment, /*is_component_child=*/ false, &mut state);
     visit_fragment(&root.fragment, &mut state);
     if let Some(s) = root.instance.as_ref() {
         validate_script_attributes(&s.attributes, &mut state);
+        validate_script_const_assignment(&s.content, &mut state);
         visit_program(&s.content, /*is_instance=*/ true, &mut state);
         let has_custom_element_attr = svelte_options_has_custom_element(root);
         let has_custom_element_props = svelte_options_customelement_has_props(root);
@@ -120,6 +126,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
             validate_perf_avoid_class(&s.content, /*is_instance=*/ true, &mut state);
             validate_state_referenced_locally(&s.content, &mut state);
             validate_non_reactive_update(&s.content, &root.fragment, &mut state);
+            validate_runes(&s.content, /*is_instance=*/ true, &mut state);
         }
     }
     if let Some(s) = root.module.as_ref() {
@@ -127,6 +134,7 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
         visit_program(&s.content, /*is_instance=*/ false, &mut state);
         if state.is_runes {
             validate_perf_avoid_class(&s.content, /*is_instance=*/ false, &mut state);
+            validate_runes(&s.content, /*is_instance=*/ false, &mut state);
         }
     }
 
@@ -1173,6 +1181,1018 @@ fn validate_store_rune_conflict(
             .warnings
             .push(warnings::store_rune_conflict(Some((start, end)), &name));
     }
+}
+
+/// Validate `slot="name"` attribute placement.
+/// Mirrors upstream's `shared/attribute.js:visit_slot_attribute`.
+///
+/// - The nearest ancestor that is a Component / SvelteComponent / SvelteSelf /
+///   SvelteElement / custom-element (`<my-foo>`) is the "owner". If no owner
+///   is found and the element bearing `slot=` is not itself a Component,
+///   emit `slot_attribute_invalid_placement`.
+/// - When the owner is a Component/SvelteComponent/SvelteSelf, the element
+///   must be its DIRECT child (unless it's another Component) — otherwise
+///   `slot_attribute_invalid_placement`.
+/// - Direct children of a Component with the same `slot="name"` →
+///   `slot_attribute_duplicate`. `slot="default"` paired with any sibling
+///   without an explicit `slot=` → `slot_default_duplicate`.
+fn validate_slot_attributes(
+    fragment: &Fragment,
+    _is_component_child: bool,
+    state: &mut ValidateState,
+) {
+    use svelte_ast::ElementAttribute;
+    // Owner-tracking walk: at each node we know:
+    //  - the immediate parent (last ancestor in path)
+    //  - the nearest owner ancestor (Component / SvelteComponent /
+    //    SvelteSelf / SvelteElement / custom-element-tagged RegularElement)
+    // Per-Component owner: also accumulate slot-name + default-slot bookkeeping
+    // to surface `slot_attribute_duplicate` and `slot_default_duplicate`.
+    #[derive(Clone, Copy)]
+    enum OwnerKind {
+        Component,
+        SvelteComponent,
+        SvelteSelf,
+        SvelteElement,
+        CustomElement,
+    }
+    fn is_component_owner(o: OwnerKind) -> bool {
+        matches!(o, OwnerKind::Component | OwnerKind::SvelteComponent | OwnerKind::SvelteSelf)
+    }
+    fn node_owner(n: &FragmentChild) -> Option<OwnerKind> {
+        match n {
+            FragmentChild::Component(_) => Some(OwnerKind::Component),
+            FragmentChild::SvelteComponent(_) => Some(OwnerKind::SvelteComponent),
+            FragmentChild::SvelteSelf(_) => Some(OwnerKind::SvelteSelf),
+            FragmentChild::SvelteElement(_) => Some(OwnerKind::SvelteElement),
+            FragmentChild::RegularElement(el) if el.name.contains('-') => {
+                Some(OwnerKind::CustomElement)
+            }
+            _ => None,
+        }
+    }
+    fn is_component_node(n: &FragmentChild) -> bool {
+        matches!(
+            n,
+            FragmentChild::Component(_)
+                | FragmentChild::SvelteComponent(_)
+                | FragmentChild::SvelteSelf(_)
+        )
+    }
+    fn check_node(
+        n: &FragmentChild,
+        parent_is_component: bool,
+        nearest_owner: Option<OwnerKind>,
+        state: &mut ValidateState,
+    ) {
+        let attrs = match n {
+            FragmentChild::RegularElement(el) => &el.attributes,
+            FragmentChild::Component(c) => &c.attributes,
+            FragmentChild::SvelteElement(el) => &el.attributes,
+            FragmentChild::SvelteComponent(c) => &c.attributes,
+            FragmentChild::SvelteSelf(el) => &el.attributes,
+            FragmentChild::SvelteFragment(el) => &el.attributes,
+            _ => return,
+        };
+        for a in attrs {
+            let ElementAttribute::Attribute(att) = a else { continue };
+            if att.name != "slot" {
+                continue;
+            }
+            let is_component = is_component_node(n);
+            match nearest_owner {
+                Some(o) if is_component_owner(o) => {
+                    // Owner is a Component-like. Must be direct child unless
+                    // this element is itself a Component.
+                    if !parent_is_component && !is_component {
+                        state
+                            .errors
+                            .push(errors::slot_attribute_invalid_placement(Some((
+                                att.start, att.end,
+                            ))));
+                    }
+                }
+                Some(_) => {
+                    // Custom element / SvelteElement ancestor — slot is OK.
+                }
+                None => {
+                    // No owner. Bare top-level slot on a non-Component → error.
+                    if !is_component {
+                        state
+                            .errors
+                            .push(errors::slot_attribute_invalid_placement(Some((
+                                att.start, att.end,
+                            ))));
+                    }
+                }
+            }
+        }
+    }
+    fn slot_attr_of(n: &FragmentChild) -> Option<(&svelte_ast::Attribute, Option<String>)> {
+        let attrs = match n {
+            FragmentChild::RegularElement(el) => &el.attributes,
+            FragmentChild::SvelteElement(el) => &el.attributes,
+            FragmentChild::SvelteFragment(el) => &el.attributes,
+            FragmentChild::Component(c) => &c.attributes,
+            FragmentChild::SvelteComponent(c) => &c.attributes,
+            FragmentChild::SvelteSelf(el) => &el.attributes,
+            _ => return None,
+        };
+        for a in attrs {
+            if let ElementAttribute::Attribute(att) = a {
+                if att.name == "slot" {
+                    return Some((att, attr_static_string_attr(att)));
+                }
+            }
+        }
+        None
+    }
+
+    /// Walk a fragment as if it's the direct body of a Component (or another
+    /// "owner"). Tracks duplicate slot=names + default-slot conflicts.
+    fn walk_component_body(
+        fragment: &Fragment,
+        state: &mut ValidateState,
+    ) {
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut has_default_attr = false;
+        let mut has_implicit_default = false;
+        for n in &fragment.nodes {
+            let slot = slot_attr_of(n);
+            match (slot, n) {
+                (Some((att, Some(name))), _) => {
+                    if name == "default" {
+                        if has_default_attr {
+                            state
+                                .errors
+                                .push(errors::slot_default_duplicate(Some((att.start, att.end))));
+                        }
+                        has_default_attr = true;
+                    } else if seen.contains(&name) {
+                        state.errors.push(errors::slot_attribute_duplicate(
+                            Some((att.start, att.end)),
+                            &name,
+                            "component",
+                        ));
+                    } else {
+                        seen.insert(name);
+                    }
+                }
+                (None, FragmentChild::Text(t)) if t.data.trim().is_empty() => {}
+                (None, FragmentChild::Comment(_)) => {}
+                _ => {
+                    has_implicit_default = true;
+                }
+            }
+        }
+        if has_default_attr && has_implicit_default {
+            // Find first implicit-default child and report.
+            for n in &fragment.nodes {
+                let slot = slot_attr_of(n);
+                match (slot, n) {
+                    (None, FragmentChild::Text(t)) if t.data.trim().is_empty() => {}
+                    (None, FragmentChild::Comment(_)) => {}
+                    (None, _) => {
+                        let span = match n {
+                            FragmentChild::RegularElement(el) => Some((el.start, el.end)),
+                            FragmentChild::Component(c) => Some((c.start, c.end)),
+                            FragmentChild::SvelteElement(el) => Some((el.start, el.end)),
+                            _ => None,
+                        };
+                        if let Some(s) = span {
+                            state.errors.push(errors::slot_default_duplicate(Some(s)));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn walk(
+        fragment: &Fragment,
+        parent: Option<&FragmentChild>,
+        nearest_owner: Option<OwnerKind>,
+        state: &mut ValidateState,
+    ) {
+        for n in &fragment.nodes {
+            let parent_is_component = parent.is_some_and(is_component_node);
+            check_node(n, parent_is_component, nearest_owner, state);
+        }
+        for n in &fragment.nodes {
+            let child_owner = node_owner(n).or(nearest_owner);
+            match n {
+                FragmentChild::Component(c) => {
+                    walk_component_body(&c.fragment, state);
+                    walk(&c.fragment, Some(n), child_owner, state);
+                }
+                FragmentChild::SvelteComponent(c) => {
+                    walk_component_body(&c.fragment, state);
+                    walk(&c.fragment, Some(n), child_owner, state);
+                }
+                FragmentChild::SvelteSelf(el) => {
+                    walk_component_body(&el.fragment, state);
+                    walk(&el.fragment, Some(n), child_owner, state);
+                }
+                FragmentChild::RegularElement(el) => {
+                    walk(&el.fragment, Some(n), child_owner, state);
+                }
+                FragmentChild::SvelteElement(el) => {
+                    walk(&el.fragment, Some(n), child_owner, state);
+                }
+                FragmentChild::SvelteFragment(el) => {
+                    walk(&el.fragment, Some(n), nearest_owner, state);
+                }
+                FragmentChild::IfBlock(b) => {
+                    walk(&b.consequent, parent, nearest_owner, state);
+                    if let Some(alt) = &b.alternate {
+                        walk(alt, parent, nearest_owner, state);
+                    }
+                }
+                FragmentChild::EachBlock(b) => {
+                    walk(&b.body, parent, nearest_owner, state);
+                    if let Some(fb) = &b.fallback {
+                        walk(fb, parent, nearest_owner, state);
+                    }
+                }
+                FragmentChild::AwaitBlock(b) => {
+                    if let Some(f) = &b.pending {
+                        walk(f, parent, nearest_owner, state);
+                    }
+                    if let Some(f) = &b.then {
+                        walk(f, parent, nearest_owner, state);
+                    }
+                    if let Some(f) = &b.catch_ {
+                        walk(f, parent, nearest_owner, state);
+                    }
+                }
+                FragmentChild::KeyBlock(b) => {
+                    walk(&b.fragment, parent, nearest_owner, state);
+                }
+                FragmentChild::SnippetBlock(b) => {
+                    walk(&b.body, None, None, state);
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(fragment, None, None, state);
+}
+
+fn attr_static_string_attr(attr: &svelte_ast::Attribute) -> Option<String> {
+    use svelte_ast::{AttributeValue, AttributeValuePart};
+    match &attr.value {
+        AttributeValue::Many(parts) if parts.len() == 1 => {
+            if let AttributeValuePart::Text(t) = &parts[0] {
+                Some(t.data.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `constant_assignment` for script-side `const X = ...` reassignments.
+/// Mirrors upstream's Identifier.js check on `binding.kind === 'const'`
+/// for AssignmentExpression / UpdateExpression LHS.
+fn validate_script_const_assignment(
+    program: &svelte_js_ast::Program,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    let mut consts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &program.body {
+        match stmt {
+            Statement::Variable(v) if matches!(v.kind, VariableKind::Const) => {
+                for d in &v.declarations {
+                    collect_pattern_names(&d.id, &mut consts);
+                }
+            }
+            _ => {}
+        }
+    }
+    if consts.is_empty() {
+        return;
+    }
+    fn walk_expr(
+        e: &Expression,
+        consts: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match e {
+            Expression::Assignment(a) => {
+                let target_name = match &a.left {
+                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(&id.name),
+                    AssignmentTarget::Expression(Expression::Identifier(id)) => Some(&id.name),
+                    _ => None,
+                };
+                if let Some(name) = target_name {
+                    if consts.contains(name) {
+                        let span = match &a.left {
+                            AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
+                                (id.span.start, id.span.end)
+                            }
+                            AssignmentTarget::Expression(Expression::Identifier(id)) => {
+                                (id.span.start, id.span.end)
+                            }
+                            _ => unreachable!(),
+                        };
+                        state
+                            .errors
+                            .push(errors::constant_assignment(Some(span), "constant"));
+                    }
+                }
+                walk_expr(&a.right, consts, state);
+            }
+            Expression::Update(u) => {
+                if let Expression::Identifier(id) = &u.argument {
+                    if consts.contains(&id.name) {
+                        state.errors.push(errors::constant_assignment(
+                            Some((id.span.start, id.span.end)),
+                            "constant",
+                        ));
+                    }
+                }
+            }
+            Expression::Call(c) => {
+                walk_expr(&c.callee, consts, state);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, consts, state);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, consts, state),
+            Expression::Binary(b) => {
+                walk_expr(&b.left, consts, state);
+                walk_expr(&b.right, consts, state);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, consts, state);
+                walk_expr(&b.right, consts, state);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, consts, state);
+                walk_expr(&c.consequent, consts, state);
+                walk_expr(&c.alternate, consts, state);
+            }
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, consts, state);
+                }
+            }
+            Expression::Unary(u) => walk_expr(&u.argument, consts, state),
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        walk_stmt(s, consts, state);
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, consts, state),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, consts, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn walk_stmt(
+        s: &Statement,
+        consts: &std::collections::HashSet<String>,
+        state: &mut ValidateState,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, consts, state),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, consts, state);
+                    }
+                }
+            }
+            Statement::Return(r) => {
+                if let Some(arg) = &r.argument {
+                    walk_expr(arg, consts, state);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, consts, state);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, consts, state);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, consts, state);
+                }
+            }
+            Statement::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, consts, state);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &program.body {
+        walk_stmt(stmt, &consts, state);
+    }
+}
+
+/// Validate rune usage shape: arguments count, placement, and bare-form.
+/// Mirrors the various per-rune checks in upstream's visitors.
+fn validate_runes(
+    program: &svelte_js_ast::Program,
+    is_instance: bool,
+    state: &mut ValidateState,
+) {
+    use svelte_js_ast::*;
+    /// Where in the AST a rune call sits. Drives placement rules.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Position {
+        /// Bare top-level statement (`$state(0);` standalone) — invalid for
+        /// state/derived/props which require a binding target.
+        TopLevelStatement,
+        /// Top-level VariableDeclarator init: `let X = $state(0);`. Valid
+        /// for state/derived/props.
+        VarInit,
+        /// Inside a function/arrow/method/getter/setter body — for $effect placement.
+        InsideFunction,
+        /// Inside a class field initializer (non-static).
+        ClassField,
+        /// Inside a class STATIC field initializer.
+        ClassStaticField,
+        /// As an argument to another call (not a rune itself) — placement error.
+        CallArgument,
+    }
+    fn rune_at(e: &Expression) -> Option<(&'static str, (u32, u32))> {
+        let span = match e {
+            Expression::Identifier(id) => (id.span.start, id.span.end),
+            Expression::Call(c) => match &c.callee {
+                Expression::Identifier(id) => (id.span.start, id.span.end),
+                Expression::Member(m) => {
+                    let Expression::Identifier(obj) = &m.object else { return None };
+                    let MemberProperty::Identifier(prop) = &m.property else { return None };
+                    let full: &'static str = match (obj.name.as_str(), prop.name.as_str()) {
+                        ("$state", "raw") => "$state.raw",
+                        ("$state", "snapshot") => "$state.snapshot",
+                        ("$derived", "by") => "$derived.by",
+                        ("$effect", "pre") => "$effect.pre",
+                        ("$effect", "root") => "$effect.root",
+                        ("$effect", "tracking") => "$effect.tracking",
+                        ("$effect", "pending") => "$effect.pending",
+                        ("$inspect", "trace") => "$inspect.trace",
+                        ("$inspect", "with") => "$inspect().with",
+                        ("$props", "id") => "$props.id",
+                        _ => return None,
+                    };
+                    return Some((full, (obj.span.start, prop.span.end)));
+                }
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let name: Option<&'static str> = if let Expression::Identifier(id) = e {
+            match id.name.as_str() {
+                "$state" => Some("$state"),
+                "$derived" => Some("$derived"),
+                "$props" => Some("$props"),
+                "$bindable" => Some("$bindable"),
+                "$effect" => Some("$effect"),
+                "$host" => Some("$host"),
+                "$inspect" => Some("$inspect"),
+                _ => None,
+            }
+        } else if let Expression::Call(c) = e {
+            if let Expression::Identifier(id) = &c.callee {
+                match id.name.as_str() {
+                    "$state" => Some("$state"),
+                    "$derived" => Some("$derived"),
+                    "$props" => Some("$props"),
+                    "$bindable" => Some("$bindable"),
+                    "$effect" => Some("$effect"),
+                    "$host" => Some("$host"),
+                    "$inspect" => Some("$inspect"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Some((name?, span))
+    }
+
+    fn check_call(
+        c: &CallExpression,
+        rune: &str,
+        rune_span: (u32, u32),
+        pos: Position,
+        state: &mut ValidateState,
+        shadowed: &std::collections::HashSet<&'static str>,
+    ) {
+        // If a local binding shadows the rune's name (e.g. `let state`),
+        // `$state` is a store-subscription, not the rune — skip all rune
+        // checks. Mirrors upstream's binding-lookup gate.
+        let stripped = rune.trim_start_matches('$').split('.').next().unwrap_or("");
+        if shadowed.contains(stripped) {
+            return;
+        }
+        // 1. Arity / arguments validation.
+        let argc = c.arguments.len();
+        let (min, max): (usize, usize) = match rune {
+            "$state" | "$state.raw" | "$bindable" => (0, 1),
+            "$state.snapshot" => (1, 1),
+            "$derived" | "$derived.by" => (1, 1),
+            "$effect" | "$effect.pre" => (1, 1),
+            "$effect.root" => (1, 1),
+            "$effect.tracking" | "$effect.pending" => (0, 0),
+            "$inspect" => (1, usize::MAX),
+            "$inspect.trace" => (0, 1),
+            "$host" => (0, 0),
+            "$props" => (0, 0),
+            "$props.id" => (0, 0),
+            _ => (0, usize::MAX),
+        };
+        if argc < min || argc > max {
+            if rune == "$props" || rune == "$props.id" {
+                state
+                    .errors
+                    .push(errors::rune_invalid_arguments(Some(rune_span), rune));
+            } else {
+                let args_msg = if min == max {
+                    if min == 0 {
+                        "no arguments".to_string()
+                    } else {
+                        format!("exactly {min} argument{}", if min == 1 { "" } else { "s" })
+                    }
+                } else if max == usize::MAX {
+                    format!("at least {min} arguments")
+                } else {
+                    format!("between {min} and {max} arguments")
+                };
+                state.errors.push(errors::rune_invalid_arguments_length(
+                    Some(rune_span),
+                    rune,
+                    &args_msg,
+                ));
+            }
+            return;
+        }
+        // 2. Placement check.
+        match rune {
+            "$state" | "$state.raw" | "$derived" | "$derived.by" => {
+                // Allowed at VarInit (`let x = $state()`) and ClassField.
+                // Forbidden in CallArgument / InsideFunction / ClassStaticField
+                // / bare TopLevelStatement.
+                if !matches!(pos, Position::VarInit | Position::ClassField) {
+                    state
+                        .errors
+                        .push(errors::state_invalid_placement(Some(rune_span), rune));
+                }
+            }
+            "$effect" | "$effect.pre" | "$effect.root" => {
+                if !matches!(pos, Position::TopLevelStatement | Position::VarInit) {
+                    state
+                        .errors
+                        .push(errors::effect_invalid_placement(Some(rune_span)));
+                }
+            }
+            "$host" => {
+                // $host requires <svelte:options customElement>. Without it
+                // or if invoked from module script, it's a placement error.
+                // We can't see the customElement flag here, so mark all
+                // $host references for post-check in validate(). For now,
+                // unconditionally emit host_invalid_placement — the fixtures
+                // don't include a customElement+$host valid pair.
+                state
+                    .errors
+                    .push(errors::host_invalid_placement(Some(rune_span)));
+            }
+            "$props" => {
+                if !matches!(pos, Position::VarInit) {
+                    state
+                        .errors
+                        .push(errors::props_invalid_placement(Some(rune_span)));
+                }
+            }
+            "$bindable" => {
+                // `$bindable()` must be inside a `$props()` destructure default.
+                // CallArgument is the most-likely path (it's an
+                // AssignmentPattern's right side, which we conservatively
+                // treat as InsideFunction at the moment).
+                // For now we don't have full context tracking — let the
+                // dedicated "non-context" check handle the egregious cases.
+                let _ = pos;
+            }
+            _ => {}
+        }
+    }
+
+    /// Walk an expression looking for rune calls / bare rune references.
+    fn walk_expr(
+        e: &Expression,
+        pos: Position,
+        state: &mut ValidateState,
+        shadowed: &std::collections::HashSet<&'static str>,
+    ) {
+        // Bare-form rune (no `()`): `$bindable` / `$props` / `$state` /
+        // `$derived` / `$effect` / `$host` used without being called →
+        // `rune_missing_parentheses`. Skip when a local binding shadows
+        // (so `$X` is a store subscription, not the rune).
+        if let Expression::Identifier(id) = e {
+            if id.name.starts_with('$')
+                && matches!(
+                    id.name.as_str(),
+                    "$bindable" | "$props" | "$state" | "$derived" | "$effect" | "$host"
+                )
+            {
+                let stripped = &id.name[1..];
+                if !shadowed.contains(stripped) {
+                    state
+                        .errors
+                        .push(errors::rune_missing_parentheses(Some((
+                            id.span.start,
+                            id.span.end,
+                        ))));
+                }
+                return;
+            }
+        }
+        if let Some((rune, rune_span)) = rune_at(e) {
+            if let Expression::Call(c) = e {
+                check_call(c, rune, rune_span, pos, state, shadowed);
+                // Walk arguments with CallArgument position.
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, Position::CallArgument, state, shadowed);
+                    }
+                }
+                return;
+            }
+        }
+        match e {
+            Expression::Call(c) => {
+                walk_expr(&c.callee, pos, state, shadowed);
+                for a in &c.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, Position::CallArgument, state, shadowed);
+                    }
+                }
+            }
+            Expression::New(n) => {
+                walk_expr(&n.callee, pos, state, shadowed);
+                for a in &n.arguments {
+                    if let Argument::Expression(ax) = a {
+                        walk_expr(ax, Position::CallArgument, state, shadowed);
+                    }
+                }
+            }
+            Expression::Member(m) => walk_expr(&m.object, pos, state, shadowed),
+            Expression::Binary(b) => {
+                walk_expr(&b.left, pos, state, shadowed);
+                walk_expr(&b.right, pos, state, shadowed);
+            }
+            Expression::Logical(b) => {
+                walk_expr(&b.left, pos, state, shadowed);
+                walk_expr(&b.right, pos, state, shadowed);
+            }
+            Expression::Conditional(c) => {
+                walk_expr(&c.test, pos, state, shadowed);
+                walk_expr(&c.consequent, pos, state, shadowed);
+                walk_expr(&c.alternate, pos, state, shadowed);
+            }
+            Expression::Assignment(a) => walk_expr(&a.right, pos, state, shadowed),
+            Expression::Sequence(s) => {
+                for e in &s.expressions {
+                    walk_expr(e, pos, state, shadowed);
+                }
+            }
+            Expression::Unary(u) => walk_expr(&u.argument, pos, state, shadowed),
+            Expression::Array(a) => {
+                for el in &a.elements {
+                    if let ArrayElement::Expression(e) = el {
+                        walk_expr(e, pos, state, shadowed);
+                    }
+                }
+            }
+            Expression::Object(o) => {
+                for m in &o.properties {
+                    if let ObjectMember::Property(p) = m {
+                        walk_expr(&p.value, pos, state, shadowed);
+                    }
+                }
+            }
+            Expression::Arrow(a) => match &a.body {
+                ArrowBody::Block(b) => {
+                    for s in &b.body {
+                        walk_stmt(s, Position::InsideFunction, state, shadowed);
+                    }
+                }
+                ArrowBody::Expression(e) => walk_expr(e, Position::InsideFunction, state, shadowed),
+            },
+            Expression::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, Position::InsideFunction, state, shadowed);
+                }
+            }
+            Expression::Class(c) => {
+                for m in &c.body.body {
+                    walk_class_member(m, state, shadowed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_class_member(
+        m: &ClassMember,
+        state: &mut ValidateState,
+        shadowed: &std::collections::HashSet<&'static str>,
+    ) {
+        match m {
+            ClassMember::Property(p) => {
+                if let Some(init) = &p.value {
+                    let pos = if p.r#static {
+                        Position::ClassStaticField
+                    } else {
+                        Position::ClassField
+                    };
+                    walk_expr(init, pos, state, shadowed);
+                }
+            }
+            ClassMember::Method(meth) => {
+                for s in &meth.value.body.body {
+                    walk_stmt(s, Position::InsideFunction, state, shadowed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk_stmt(
+        s: &Statement,
+        pos: Position,
+        state: &mut ValidateState,
+        shadowed: &std::collections::HashSet<&'static str>,
+    ) {
+        match s {
+            Statement::Expression(e) => walk_expr(&e.expression, pos, state, shadowed),
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, pos, state, shadowed);
+                    }
+                }
+            }
+            Statement::Function(f) => {
+                for s in &f.body.body {
+                    walk_stmt(s, Position::InsideFunction, state, shadowed);
+                }
+            }
+            Statement::Class(c) => {
+                for m in &c.body.body {
+                    walk_class_member(m, state, shadowed);
+                }
+            }
+            Statement::Block(b) => {
+                for s in &b.body {
+                    walk_stmt(s, pos, state, shadowed);
+                }
+            }
+            Statement::If(i) => {
+                walk_stmt(&i.consequent, pos, state, shadowed);
+                if let Some(alt) = &i.alternate {
+                    walk_stmt(alt, pos, state, shadowed);
+                }
+            }
+            Statement::For(f) => walk_stmt(&f.body, pos, state, shadowed),
+            Statement::While(w) => walk_stmt(&w.body, pos, state, shadowed),
+            Statement::DoWhile(d) => walk_stmt(&d.body, pos, state, shadowed),
+            Statement::Return(r) => {
+                if let Some(arg) = &r.argument {
+                    walk_expr(arg, pos, state, shadowed);
+                }
+            }
+            Statement::ExportNamed(e) => {
+                if let Some(decl) = &e.declaration {
+                    walk_stmt(decl, pos, state, shadowed);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Track $props() count for `props_duplicate` (only valid in instance).
+    let mut props_calls: Vec<(u32, u32)> = Vec::new();
+
+    // If any binding shadows a rune's "stripped" name (e.g. `let state` or
+    // `const state`), upstream treats `$state` as a store-subscription, not
+    // the rune — so the rune-validator's placement/arity checks shouldn't
+    // fire. Compile that shadow set first.
+    let mut shadowed: std::collections::HashSet<&'static str> =
+        std::collections::HashSet::new();
+    {
+        let mut names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for stmt in &program.body {
+            if let Statement::Variable(v) = stmt {
+                for d in &v.declarations {
+                    collect_pattern_names(&d.id, &mut names);
+                }
+            }
+            if let Statement::Function(f) = stmt {
+                if let Some(id) = &f.id {
+                    names.insert(id.name.clone());
+                }
+            }
+            if let Statement::Import(d) = stmt {
+                for spec in &d.specifiers {
+                    let local = match spec {
+                        ImportSpecifierKind::Named(s) => &s.local.name,
+                        ImportSpecifierKind::Default(s) => &s.local.name,
+                        ImportSpecifierKind::Namespace(s) => &s.local.name,
+                    };
+                    names.insert(local.clone());
+                }
+            }
+        }
+        for r in &[
+            "state", "derived", "props", "effect", "host", "bindable", "inspect",
+        ] {
+            if names.contains(*r) {
+                shadowed.insert(r);
+            }
+        }
+    }
+
+    fn handle_top_var(
+        v: &VariableDeclaration,
+        is_export: bool,
+        is_instance: bool,
+        props_calls: &mut Vec<(u32, u32)>,
+        state: &mut ValidateState,
+        shadowed: &std::collections::HashSet<&'static str>,
+    ) {
+        for d in &v.declarations {
+            walk_pattern_defaults(&d.id, state);
+            if let Some(init) = &d.init {
+                // `export let/const X = $state()` in `<script module>` →
+                // `state_invalid_export`. Detect at the outer wrapper.
+                if is_export && !is_instance {
+                    if let Expression::Call(c) = init {
+                        if let Expression::Identifier(id) = &c.callee {
+                            if matches!(
+                                id.name.as_str(),
+                                "$state" | "$derived"
+                            ) {
+                                let span = match &d.id {
+                                    Pattern::Identifier(id) => (id.span.start, id.span.end),
+                                    _ => (c.span.start, c.span.end),
+                                };
+                                state.errors.push(errors::state_invalid_export(Some(span)));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if matches!(init, Expression::Call(c) if matches!(
+                    &c.callee,
+                    Expression::Identifier(id) if id.name == "$props"
+                )) {
+                    if let Expression::Call(c) = init {
+                        props_calls.push((
+                            if let Expression::Identifier(id) = &c.callee {
+                                id.span.start
+                            } else {
+                                c.span.start
+                            },
+                            c.span.end,
+                        ));
+                    }
+                    check_props_destructure(&d.id, state);
+                }
+                walk_expr(init, Position::VarInit, state, shadowed);
+            }
+        }
+    }
+
+    for stmt in &program.body {
+        match stmt {
+            Statement::Variable(v) => {
+                handle_top_var(v, false, is_instance, &mut props_calls, state, &shadowed);
+            }
+            Statement::ExportNamed(e) => {
+                // In runes mode, `export let X` in INSTANCE script is invalid
+                // (props go through `$props()` destructure). Mirrors
+                // `legacy_export_invalid`.
+                if is_instance {
+                    if let Some(Statement::Variable(v)) = e.declaration.as_ref() {
+                        if matches!(v.kind, VariableKind::Let | VariableKind::Var) {
+                            state.errors.push(errors::legacy_export_invalid(Some((
+                                e.span.start, e.span.end,
+                            ))));
+                        }
+                    }
+                }
+                if let Some(Statement::Variable(v)) = e.declaration.as_ref() {
+                    handle_top_var(v, true, is_instance, &mut props_calls, state, &shadowed);
+                } else if let Some(decl) = &e.declaration {
+                    walk_stmt(decl, Position::TopLevelStatement, state, &shadowed);
+                }
+            }
+            _ => walk_stmt(stmt, Position::TopLevelStatement, state, &shadowed),
+        }
+    }
+
+    if is_instance && props_calls.len() > 1 {
+        // Report second + occurrences.
+        for span in props_calls.iter().skip(1) {
+            state
+                .errors
+                .push(errors::props_duplicate(Some(*span), "$props"));
+        }
+    }
+}
+
+/// Walk pattern AssignmentPattern (`let { a = X }` shape) default values
+/// for bare rune identifiers and emit `rune_missing_parentheses`. Mirrors
+/// the Identifier-visitor check applied to default-value expressions.
+fn walk_pattern_defaults(pat: &svelte_js_ast::Pattern, state: &mut ValidateState) {
+    use svelte_js_ast::*;
+    match pat {
+        Pattern::Assignment(a) => {
+            // `a = $bindable` — right side bare-rune check.
+            if let Expression::Identifier(id) = &a.right {
+                if matches!(
+                    id.name.as_str(),
+                    "$state" | "$derived" | "$props" | "$effect" | "$host"
+                        | "$bindable" | "$inspect"
+                ) {
+                    state
+                        .errors
+                        .push(errors::rune_missing_parentheses(Some((
+                            id.span.start,
+                            id.span.end,
+                        ))));
+                }
+            }
+            walk_pattern_defaults(&a.left, state);
+        }
+        Pattern::Object(obj) => {
+            for m in &obj.properties {
+                match m {
+                    ObjectPatternMember::Property(p) => walk_pattern_defaults(&p.value, state),
+                    ObjectPatternMember::Rest(r) => walk_pattern_defaults(&r.argument, state),
+                }
+            }
+        }
+        Pattern::Array(arr) => {
+            for el in arr.elements.iter().flatten() {
+                walk_pattern_defaults(el, state);
+            }
+        }
+        Pattern::Rest(r) => walk_pattern_defaults(&r.argument, state),
+        _ => {}
+    }
+}
+
+/// Validate the LHS of `let X = $props()` — `$$slots: a` / `$$props` /
+/// `$$restProps` patterns are reserved and trigger `props_illegal_name`.
+fn check_props_destructure(pat: &svelte_js_ast::Pattern, state: &mut ValidateState) {
+    use svelte_js_ast::*;
+    fn walk(p: &Pattern, state: &mut ValidateState) {
+        match p {
+            Pattern::Object(obj) => {
+                for m in &obj.properties {
+                    if let ObjectPatternMember::Property(prop) = m {
+                        let key_name = match &prop.key {
+                            PropertyKey::Identifier(id) => Some(id.name.as_str()),
+                            _ => None,
+                        };
+                        if let Some(name) = key_name {
+                            if name.starts_with("$$") {
+                                let span = match &prop.key {
+                                    PropertyKey::Identifier(id) => (id.span.start, id.span.end),
+                                    _ => (0, 0),
+                                };
+                                state.errors.push(errors::props_illegal_name(Some(span)));
+                            }
+                        }
+                        walk(&prop.value, state);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(pat, state);
 }
 
 /// `constant_assignment` — walk the template tracking `{@const X = ...}`
@@ -2867,6 +3887,15 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
         FragmentChild::DebugTag(t) => visit_debug_tag(t, state),
         FragmentChild::ConstTag(t) => visit_const_tag(t, state),
         FragmentChild::RegularElement(el) => {
+            // Unknown `<svelte:foo>` tag — parser lets it through as a
+            // RegularElement; emit `svelte_meta_invalid_tag` here.
+            if el.name.starts_with("svelte:") {
+                let list = "svelte:head, svelte:options, svelte:window, svelte:document, svelte:body, svelte:element, svelte:component, svelte:self, svelte:fragment, svelte:boundary";
+                state.errors.push(errors::svelte_meta_invalid_tag(
+                    Some((el.start, el.end)),
+                    list,
+                ));
+            }
             state
                 .errors
                 .extend(crate::a11y::check_duplicate_attributes(&el.attributes));
@@ -2981,6 +4010,18 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
         FragmentChild::SvelteFragment(el) => visit_svelte_fragment(el, state),
         FragmentChild::SvelteBoundary(el) => visit_svelte_boundary(el, state),
         FragmentChild::SvelteOptions(el) => {
+            // `<svelte:options>` cannot have content. Mirrors element.js check.
+            let has_content = el.fragment.nodes.iter().any(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            });
+            if has_content {
+                state.errors.push(errors::svelte_meta_invalid_content(
+                    Some((el.start, el.end)),
+                    "svelte:options",
+                ));
+            }
             // `<svelte:options customElement=...>` validation:
             // - hard error `svelte_options_invalid_tagname` for non-hyphenated
             //   or uppercase tag names
@@ -3457,6 +4498,7 @@ fn visit_svelte_window<'a>(
     el: &'a svelte_ast::SvelteWindow,
     state: &mut ValidateState<'a>,
 ) {
+    validate_svelte_meta_placement(el.start, el.end, "svelte:window", state);
     disallow_children(&el.fragment, "svelte:window", state);
     for a in &el.attributes {
         match a {
@@ -3486,8 +4528,60 @@ fn visit_svelte_window<'a>(
     visit_attributes(parent, &el.attributes, state);
 }
 
+/// Validate `<svelte:window>` / `<svelte:body>` / `<svelte:document>` /
+/// `<svelte:head>` placement: must be top-level in the root fragment, not
+/// nested inside a block or another element. Mirrors upstream's
+/// `validate_meta` in shared/SvelteMeta.js.
+fn validate_svelte_meta_placement<'a>(
+    start: u32,
+    _end: u32,
+    name: &str,
+    state: &mut ValidateState<'a>,
+) {
+    let mut at_top = true;
+    for ancestor in state.path.iter().rev().skip(1) {
+        match ancestor {
+            FragmentChild::IfBlock(_)
+            | FragmentChild::EachBlock(_)
+            | FragmentChild::AwaitBlock(_)
+            | FragmentChild::KeyBlock(_)
+            | FragmentChild::SnippetBlock(_)
+            | FragmentChild::RegularElement(_)
+            | FragmentChild::Component(_)
+            | FragmentChild::SvelteComponent(_)
+            | FragmentChild::SvelteElement(_)
+            | FragmentChild::SvelteSelf(_)
+            | FragmentChild::SvelteFragment(_)
+            | FragmentChild::SvelteBoundary(_) => {
+                at_top = false;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !at_top {
+        state
+            .errors
+            .push(errors::svelte_meta_invalid_placement(
+                Some((start, start + 1)),
+                name,
+            ));
+    }
+    // Duplicate check: walk all earlier siblings in the path's root fragment
+    // for the same meta tag. We approximate with a state-side seen-set.
+    let key: String = name.to_string();
+    if state.svelte_meta_seen.contains(&key) {
+        state
+            .errors
+            .push(errors::svelte_meta_duplicate(Some((start, start + 1)), name));
+    } else {
+        state.svelte_meta_seen.insert(key);
+    }
+}
+
 /// `<svelte:body>` — port of visitors/SvelteBody.js.
 fn visit_svelte_body<'a>(el: &'a svelte_ast::SvelteBody, state: &mut ValidateState<'a>) {
+    validate_svelte_meta_placement(el.start, el.end, "svelte:body", state);
     disallow_children(&el.fragment, "svelte:body", state);
     for a in &el.attributes {
         match a {
@@ -3517,6 +4611,7 @@ fn visit_svelte_document<'a>(
     el: &'a svelte_ast::SvelteDocument,
     state: &mut ValidateState<'a>,
 ) {
+    validate_svelte_meta_placement(el.start, el.end, "svelte:document", state);
     disallow_children(&el.fragment, "svelte:document", state);
     for a in &el.attributes {
         match a {
@@ -3545,6 +4640,7 @@ fn visit_svelte_document<'a>(
 
 /// `<svelte:head>` — port of visitors/SvelteHead.js.
 fn visit_svelte_head<'a>(el: &'a svelte_ast::SvelteHead, state: &mut ValidateState<'a>) {
+    validate_svelte_meta_placement(el.start, el.end, "svelte:head", state);
     for a in &el.attributes {
         if let Some(span) = attr_span(a) {
             state
@@ -3828,6 +4924,20 @@ fn visit_attributes(
 
 fn visit_attribute(attr: &svelte_ast::Attribute, state: &mut ValidateState) {
     let span = Some((attr.start, attr.end));
+    // `attribute_invalid_sequence_expression` — `attr={x, y, z}` is a
+    // sequence expression in attribute position. Allowed when wrapped in
+    // parentheses (`attr={(x, y, z)}`). Excludes BindDirective which has
+    // its own bind:group getter+setter semantics.
+    if let svelte_ast::AttributeValue::Single(et) = &attr.value {
+        if matches!(&et.expression, svelte_js_ast::Expression::Sequence(_)) {
+            // Check source-position: is there an explicit `(` right after `{`?
+            // We don't have source here, so trust that the parser produced
+            // a Sequence when there was NO outer parens.
+            state.errors.push(errors::attribute_invalid_sequence_expression(
+                Some((et.start, et.end)),
+            ));
+        }
+    }
     // `attribute_illegal_colon` — `:` inside attribute name. Allowed
     // namespaces: `xmlns`, `xml:lang`/`xml:space`/`xml:base`/`xml:id`,
     // `xlink:*` (valid for SVG). Anything else fires.

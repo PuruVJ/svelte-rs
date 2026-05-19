@@ -504,6 +504,16 @@ fn expr_uses_runes(e: &svelte_js_ast::Expression) -> bool {
         },
         E::Function(f) => f.body.body.iter().any(stmt_uses_runes),
         E::Class(c) => c.body.body.iter().any(class_member_uses_runes),
+        E::Identifier(id) => {
+            // Bare rune identifier (e.g. `let { a } = $props;`) — upstream
+            // treats this as a runes-mode signal too, allowing the validator
+            // to emit `rune_missing_parentheses`.
+            matches!(
+                id.name.as_str(),
+                "$state" | "$derived" | "$props" | "$effect" | "$host"
+                    | "$bindable" | "$inspect"
+            )
+        }
         _ => false,
     }
 }
