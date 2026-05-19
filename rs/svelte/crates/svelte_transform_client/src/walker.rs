@@ -196,6 +196,15 @@ pub fn try_typed_client_walker_with(
                 }
             }
         }
+        if let FragmentChild::RenderTag(rt) = nodes[0] {
+            if let Some(p) = emit_top_level_render_tag_program(
+                &rt.expression,
+                component_name,
+                &script,
+            ) {
+                return inject_snippets(Some(p));
+            }
+        }
     }
 
     // Special case: a single top-level `{#each}` block uses a different
@@ -2004,6 +2013,95 @@ fn emit_top_level_html_tag_program(
 
     let mut params = vec![t::pat_id("$$anchor")];
     if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Emit a program for the shape:
+///
+///   {@render NAME(args)}
+///
+/// →
+///
+///   export default function Main($$anchor, $$props) {
+///       $.push($$props, false);
+///       ...script...
+///       $.init();
+///       NAME($$anchor, ...args);
+///       $.pop();
+///   }
+///
+/// Used when the only top-level fragment node is a `RenderTag`. Mirrors
+/// `snippet-raw-hydrate`.
+fn emit_top_level_render_tag_program(
+    rt_expr: &Expression,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    let call = match rt_expr {
+        Expression::Call(c) => c,
+        _ => return None,
+    };
+    let mut new_args: Vec<Argument> = vec![Argument::Expression(t::id("$$anchor"))];
+    for a in &call.arguments {
+        new_args.push(a.clone());
+    }
+    let render_call = Expression::Call(Box::new(CallExpression {
+        callee: call.callee.clone(),
+        arguments: new_args,
+        optional: false,
+        span: Span::ZERO,
+    }));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    let needs_legacy_wrap = script.emit_legacy_flag;
+    if needs_legacy_wrap {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+    }
+    func_body.extend(script.body.clone());
+    if needs_legacy_wrap {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "init"),
+            Vec::new(),
+        )));
+    }
+    func_body.push(t::stmt(render_call));
+    if needs_legacy_wrap {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "pop"),
+            Vec::new(),
+        )));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props || needs_legacy_wrap {
         params.push(t::pat_id("$$props"));
     }
     let export = t::export_default_function(component_name, params, func_body);
