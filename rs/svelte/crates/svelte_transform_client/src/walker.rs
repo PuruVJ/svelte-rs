@@ -7021,7 +7021,13 @@ fn emit_single_each_program(
     let mut body_stmts: Vec<Statement> = Vec::new();
 
     let mut delegated_events: HashSet<String> = HashSet::new();
-    if body_nodes.len() == 1 {
+    // Use the text-only branch unless the body is exactly one
+    // RegularElement (the wrapper-element shape). Single ExpressionTag
+    // bodies (`{l}` inside `{#each 'abc' as l}`) flow through the
+    // text-only path.
+    let single_wrapper_element = body_nodes.len() == 1
+        && matches!(body_nodes[0], FragmentChild::RegularElement(_));
+    if single_wrapper_element {
         if let FragmentChild::RegularElement(el) = body_nodes[0] {
             // Wrapper element body. Categorize attributes: static (HTML),
             // dynamic (\$.set_attribute), event (\$.delegated).
@@ -10441,6 +10447,17 @@ fn build_inline_template(
     parts: &[TextPart],
     state_bindings: &HashSet<String>,
 ) -> Expression {
+    // Single-expression body with no surrounding text → pass the raw
+    // expression through (no template-literal wrap). Mirrors upstream
+    // which emits e.g. `$.set_text(text, l)` instead of
+    // `$.set_text(text, \`${l ?? ''}\`)` when the body is just `{l}`.
+    if parts.len() == 1 {
+        if let TextPart::Expr(e) = &parts[0] {
+            let mut sub = (*e).clone();
+            rewrite_expr_for_state(&mut sub, state_bindings);
+            return sub;
+        }
+    }
     let mut quasis: Vec<String> = Vec::new();
     let mut subs: Vec<Expression> = Vec::new();
     let mut current = String::new();
