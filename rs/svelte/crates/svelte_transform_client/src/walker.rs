@@ -299,7 +299,10 @@ pub fn try_typed_client_walker_with(
         if non_ws.len() >= 2
             && non_ws.iter().any(|n| matches!(
                 n,
-                FragmentChild::IfBlock(_) | FragmentChild::EachBlock(_)
+                FragmentChild::IfBlock(_)
+                    | FragmentChild::EachBlock(_)
+                    | FragmentChild::ExpressionTag(_)
+                    | FragmentChild::HtmlTag(_)
             ))
             && non_ws.iter().all(|n| matches!(
                 n,
@@ -307,6 +310,8 @@ pub fn try_typed_client_walker_with(
                     | FragmentChild::EachBlock(_)
                     | FragmentChild::RegularElement(_)
                     | FragmentChild::Text(_)
+                    | FragmentChild::ExpressionTag(_)
+                    | FragmentChild::HtmlTag(_)
             ))
         {
             if let Some(p) = emit_top_level_multi_if_program(
@@ -3107,6 +3112,39 @@ fn emit_single_element_with_inner_snippet_program(
     Some(t::program(prog))
 }
 
+/// Collapse runs of consecutive ASCII spaces in the template HTML, but
+/// only between elements/comments (i.e., not inside tag bodies). Mirrors
+/// HTML's text-node merging during parse — adjacent text contributes to
+/// a single text node, so emitting `<a> <b>` is equivalent to `<a>  <b>`.
+fn collapse_template_inter_element_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_tag = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'<' {
+            in_tag = true;
+            out.push(b as char);
+            i += 1;
+        } else if b == b'>' {
+            in_tag = false;
+            out.push(b as char);
+            i += 1;
+        } else if !in_tag && b == b' ' {
+            // Collapse run of spaces to one.
+            out.push(' ');
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// True iff the element has only static attributes (no spread, no
 /// directives, no dynamic values).
 fn is_element_static_attrs(el: &svelte_ast::elements::RegularElement) -> bool {
@@ -3557,6 +3595,11 @@ fn emit_top_level_multi_if_program(
         StaticText(String),
         If(&'a svelte_ast::blocks::IfBlock),
         Each(&'a svelte_ast::blocks::EachBlock),
+        /// `{LITERAL}` ExpressionTag with literal-foldable value. Becomes a
+        /// text anchor whose `nodeValue` is set in the body.
+        LiteralAnchor(String),
+        /// `{@html EXPR}` HtmlTag. Becomes a `<!>` anchor + `$.html(node, () => EXPR)`.
+        Html(&'a svelte_ast::tags::HtmlTag),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3612,6 +3655,25 @@ fn emit_top_level_multi_if_program(
                 pending_gap = false;
                 slots.push(Slot::Each(eb));
             }
+            FragmentChild::ExpressionTag(et) => {
+                // Only literal-foldable expressions become anchor slots.
+                let lit = literal_to_template_string(&et.expression);
+                let Some(s) = lit else {
+                    return None;
+                };
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
+                slots.push(Slot::LiteralAnchor(s));
+            }
+            FragmentChild::HtmlTag(ht) => {
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
+                slots.push(Slot::Html(ht));
+            }
             FragmentChild::RegularElement(el) => {
                 if !is_element_fully_static(el) {
                     return None;
@@ -3629,7 +3691,12 @@ fn emit_top_level_multi_if_program(
         return None;
     }
     // Must contain at least one IfBlock.
-    let is_anchor_slot = |s: &Slot| matches!(s, Slot::If(_) | Slot::Each(_));
+    let is_anchor_slot = |s: &Slot| {
+        matches!(
+            s,
+            Slot::If(_) | Slot::Each(_) | Slot::LiteralAnchor(_) | Slot::Html(_)
+        )
+    };
     if !slots.iter().any(is_anchor_slot) {
         return None;
     }
@@ -3654,7 +3721,7 @@ fn emit_top_level_multi_if_program(
     for (i, slot) in slots.iter().enumerate() {
         let preceding_gap = i > 0 && gap_after[i - 1];
         match slot {
-            Slot::StaticEl(_) | Slot::If(_) | Slot::Each(_) => {
+            Slot::StaticEl(_) | Slot::If(_) | Slot::Each(_) | Slot::Html(_) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -3662,12 +3729,23 @@ fn emit_top_level_multi_if_program(
                 positions[i] = pos;
                 pos += 1;
             }
-            Slot::StaticText(_) => {
+            Slot::StaticText(_) | Slot::LiteralAnchor(_) => {
+                // Both contribute to a merged text node at the current
+                // position. The LiteralAnchor's nodeValue is set at
+                // runtime; StaticText is inlined in the template.
+                if preceding_gap && !pending_text {
+                    // Flush any preceding text gap into its own position
+                    // (matches upstream when a text run follows an element
+                    // with a gap).
+                }
                 positions[i] = pos;
                 pending_text = true;
-                let _ = preceding_gap;
             }
         }
+    }
+    // Flush a trailing text run so `pos` represents the total sibling count.
+    if pending_text {
+        pos += 1;
     }
     // Find first/last anchor slot for navigation / next() computation.
     let first_anchor_slot = slots.iter().position(is_anchor_slot).unwrap();
@@ -3675,37 +3753,53 @@ fn emit_top_level_multi_if_program(
     let first_if_pos = positions[first_anchor_slot];
     let last_if_pos = positions[last_anchor_slot];
     let final_pos = pos;
-    let trailing_advance = final_pos - last_if_pos - 1;
+    let trailing_advance = final_pos.saturating_sub(last_if_pos + 1);
     let mut block_stmts: Vec<Statement> = Vec::new();
     let mut anchor_count = 0usize;
     let mut prev_anchor_slot: Option<usize> = None;
+    let mut prev_anchor_var: Option<String> = None;
+    let mut node_idx = 0usize;
+    let mut text_idx = 0usize;
+    // First anchor variable name (returned to caller for the
+    // `var X = first_child(...)` initializer).
+    let mut first_anchor_var: Option<String> = None;
     for (slot_i, slot) in slots.iter().enumerate() {
         if !is_anchor_slot(slot) {
             continue;
         }
         let i = anchor_count;
         anchor_count += 1;
-        let node_var = if i == 0 {
-            "node".to_string()
+        // Choose var name per slot type. LiteralAnchor → text/text_N, others → node/node_N.
+        let is_literal = matches!(slot, Slot::LiteralAnchor(_));
+        let cur_var = if is_literal {
+            let n = if text_idx == 0 { "text".to_string() } else { format!("text_{}", text_idx) };
+            text_idx += 1;
+            n
         } else {
-            format!("node_{}", i)
+            let n = if node_idx == 0 { "node".to_string() } else { format!("node_{}", node_idx) };
+            node_idx += 1;
+            n
         };
+        if i == 0 {
+            first_anchor_var = Some(cur_var.clone());
+        }
         // Emit sibling navigation between anchor slots before this one.
         if i > 0 {
-            let prev_node = if i - 1 == 0 {
-                "node".to_string()
-            } else {
-                format!("node_{}", i - 1)
-            };
+            let prev_node = prev_anchor_var.clone().unwrap();
             let prev_slot_i = prev_anchor_slot.unwrap();
             let prev_pos = positions[prev_slot_i];
             let this_pos = positions[slot_i];
             let offset = this_pos - prev_pos;
+            let nav_args: Vec<Expression> = if offset == 1 {
+                vec![t::id(&prev_node)]
+            } else {
+                vec![t::id(&prev_node), t::lit_number(offset as f64)]
+            };
             block_stmts.push(t::var(
-                &node_var,
+                &cur_var,
                 t::call(
                     t::member_id(t::id("$"), "sibling"),
-                    vec![t::id(&prev_node), t::lit_number(offset as f64)],
+                    nav_args,
                 ),
             ));
         }
@@ -3758,7 +3852,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 inner_block.push(t::stmt(t::call(
                     t::member_id(t::id("$"), "if"),
-                    vec![t::id(&node_var), render_arrow],
+                    vec![t::id(&cur_var), render_arrow],
                 )));
                 block_stmts.push(Statement::Block(Box::new(BlockStatement {
                     body: inner_block,
@@ -3815,7 +3909,7 @@ fn emit_top_level_multi_if_program(
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id("$"), "each"),
                     vec![
-                        t::id(&node_var),
+                        t::id(&cur_var),
                         t::lit_number(0.0),
                         each_collection,
                         t::member_id(t::id("$"), "index"),
@@ -3823,9 +3917,66 @@ fn emit_top_level_multi_if_program(
                     ],
                 )));
             }
+            Slot::LiteralAnchor(lit) => {
+                // Compose the full text content for this anchor: leading gap
+                // (if previous slot existed and gap_after[slot_i-1]=true) +
+                // literal value + trailing gap (gap_after[slot_i]=true and a
+                // next slot exists).
+                let mut text_content = String::new();
+                if slot_i > 0 && gap_after[slot_i - 1] {
+                    text_content.push(' ');
+                }
+                text_content.push_str(lit);
+                if slot_i + 1 < slots.len() && gap_after[slot_i] {
+                    text_content.push(' ');
+                }
+                let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                    left: AssignmentTarget::Expression(Expression::Member(Box::new(
+                        MemberExpression {
+                            object: t::id(&cur_var),
+                            property: MemberProperty::Identifier(Identifier {
+                                name: "nodeValue".to_string(),
+                                span: Span::ZERO,
+                            }),
+                            computed: false,
+                            optional: false,
+                            span: Span::ZERO,
+                        },
+                    ))),
+                    operator: AssignmentOperator::Assign,
+                    right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                        value: text_content,
+                        raw: None,
+                        span: Span::ZERO,
+                    }))),
+                    span: Span::ZERO,
+                }));
+                block_stmts.push(t::stmt(assign));
+            }
+            Slot::Html(ht) => {
+                // `$.html(node, () => EXPR);` — pass a thunk for the html
+                // value (always a thunk for runes; legacy bare-prop case
+                // would be different, but not common in multi-block).
+                let inner = rewrite_props_destructured(
+                    &ht.expression,
+                    &script.props_destructured,
+                );
+                let inner = rewrite_legacy_prop_reads(&inner, &legacy_prop_names);
+                let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(inner),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "html"),
+                    vec![t::id(&cur_var), arrow],
+                )));
+            }
             _ => unreachable!(),
         }
         prev_anchor_slot = Some(slot_i);
+        prev_anchor_var = Some(cur_var);
     }
 
     // Top-level function body.
@@ -3860,8 +4011,18 @@ fn emit_top_level_multi_if_program(
         ));
     }
     func_body.extend(script.body.clone());
+    // When the first anchor is a LiteralAnchor at position 0, emit
+    // `$.next();` to position the hydration cursor at the leading text
+    // node. Mirrors `html-tag-hydration` / `dynamic-text-nil`.
+    let first_anchor_is_text = matches!(slots[first_anchor_slot], Slot::LiteralAnchor(_));
+    if first_if_pos == 0 && first_anchor_is_text {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            Vec::new(),
+        )));
+    }
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
-    // Navigate to first if-block anchor. If first_if_pos==0, that's
+    // Navigate to first anchor. If first_if_pos==0, that's
     // `$.first_child(fragment)`. If first_if_pos==1, omit the second arg
     // (uses default `$.sibling(NODE)` which advances by 1). Otherwise
     // emit `$.sibling($.first_child(fragment), N)`.
@@ -3882,9 +4043,10 @@ fn emit_top_level_multi_if_program(
             vec![first_child_call, t::lit_number(first_if_pos as f64)],
         )
     };
-    func_body.push(t::var("node", first_node_init));
+    let first_var_name = first_anchor_var.unwrap_or_else(|| "node".to_string());
+    func_body.push(t::var(&first_var_name, first_node_init));
     func_body.extend(block_stmts);
-    // Trailing positions after the last if-block: emit $.next(N) to
+    // Trailing positions after the last anchor: emit $.next(N) to
     // advance to the trailing static area.
     if trailing_advance > 0 {
         let arg = if trailing_advance == 1 {
@@ -3927,14 +4089,34 @@ fn emit_top_level_multi_if_program(
             html.push(' ');
         }
         match slot {
-            Slot::If(_) | Slot::Each(_) => html.push_str("<!>"),
+            Slot::If(_) | Slot::Each(_) | Slot::Html(_) => html.push_str("<!>"),
             Slot::StaticEl(el) => {
                 let mut needs = false;
                 serialize_element_to_html(el, &mut html, &mut needs)?;
             }
             Slot::StaticText(s) => html.push_str(s.trim()),
+            // LiteralAnchor contributes nothing to template HTML — its
+            // value is set at runtime via `text.nodeValue = ...`. The
+            // surrounding gaps remain (text node forms naturally).
+            Slot::LiteralAnchor(_) => {
+                let _ = i;
+            }
         }
     }
+    // If the FIRST slot is a LiteralAnchor and has no leading gap, the
+    // template needs a leading space so a text node exists at sibling 0.
+    if matches!(slots.first(), Some(Slot::LiteralAnchor(_))) && !html.starts_with(' ') {
+        html.insert(0, ' ');
+    }
+    // Same for trailing.
+    if matches!(slots.last(), Some(Slot::LiteralAnchor(_))) && !html.ends_with(' ') {
+        html.push(' ');
+    }
+    // Note: the loop above intentionally over-emits a space when both
+    // sides of a LiteralAnchor have gaps. Fix by collapsing runs of
+    // consecutive whitespace between elements/comments in the template
+    // — this matches upstream's text node merging.
+    let html = collapse_template_inter_element_ws(&html);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
@@ -11018,11 +11200,33 @@ fn analyze_script(
             uses_runes = true; // async implies runes-like emission rules
         }
     }
-    let body_out = if let Some(ai) = &async_info {
+    let body_out_raw = if let Some(ai) = &async_info {
         ai.setup_stmts.clone()
     } else {
         rest
     };
+    // Split multi-declarator Variable statements (where every declarator
+    // has an initializer) into one statement per declarator. Matches
+    // upstream's behavior. Hoisted multi-var declarations like
+    // `var yes1, yes2, no1, no2;` (no inits) stay combined.
+    let mut body_out: Vec<Statement> = Vec::with_capacity(body_out_raw.len());
+    for s in body_out_raw {
+        if let Statement::Variable(v) = &s {
+            if v.declarations.len() > 1
+                && v.declarations.iter().all(|d| d.init.is_some())
+            {
+                for d in &v.declarations {
+                    body_out.push(Statement::Variable(Box::new(VariableDeclaration {
+                        kind: v.kind,
+                        declarations: vec![d.clone()],
+                        span: Span::ZERO,
+                    })));
+                }
+                continue;
+            }
+        }
+        body_out.push(s);
+    }
 
     Some(ScriptInfo {
         imports,
@@ -14272,7 +14476,10 @@ fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expressi
 fn fold_node_with_consts(n: &mut FragmentChild, consts: &HashMap<String, Expression>) {
     match n {
         FragmentChild::ExpressionTag(t) => fold_expr_with_consts(&mut t.expression, consts),
-        FragmentChild::HtmlTag(t) => fold_expr_with_consts(&mut t.expression, consts),
+        // HtmlTag intentionally does NOT fold: upstream emits the html
+        // expression as a thunk (`() => EXPR`) without substituting
+        // script-constant identifiers.
+        FragmentChild::HtmlTag(_) => {}
         FragmentChild::RegularElement(el) => {
             for attr in &mut el.attributes {
                 fold_attr_with_consts(attr, consts);
