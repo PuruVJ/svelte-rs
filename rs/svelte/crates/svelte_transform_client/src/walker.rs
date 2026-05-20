@@ -153,7 +153,7 @@ fn emit_svelte_head_program(
     let mut body_needs = false;
     serialize_element_to_html(body_el, &mut body_html, &mut body_needs)?;
 
-    let body_tag = body_el.name.clone();
+    let body_tag = sanitize_name(&body_el.name);
 
     // Compute hash from filename.
     let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
@@ -1586,7 +1586,7 @@ fn emit_single_component_program(
                         vec![t::template_raw(vec![html], vec![])],
                     ),
                 ));
-                let el_var = sel.name.clone();
+                let el_var = sanitize_name(&sel.name);
                 let body: Vec<Statement> = vec![
                     t::var(&el_var, t::call(t::id(&root_name), Vec::new())),
                     t::stmt(t::call(
@@ -2432,10 +2432,11 @@ fn emit_vanilla_branch_body_with_context(
                 ),
             ));
             *elem_var_idx += 1;
+            let safe = sanitize_name(&el.name);
             let var_name = if *elem_var_idx == 1 {
-                el.name.clone()
+                safe
             } else {
-                format!("{}_{}", el.name, *elem_var_idx - 1)
+                format!("{}_{}", safe, *elem_var_idx - 1)
             };
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::var(&var_name, t::call(t::id(&root_name), Vec::new())));
@@ -5638,10 +5639,11 @@ fn emit_top_level_multi_if_program(
                     continue;
                 }
                 trailing_el_idx += 1;
+                let safe = sanitize_name(&el.name);
                 let var = if trailing_el_idx == 1 {
-                    el.name.clone()
+                    safe
                 } else {
-                    format!("{}_{}", el.name, trailing_el_idx - 1)
+                    format!("{}_{}", safe, trailing_el_idx - 1)
                 };
                 let this_pos = positions[*slot_i];
                 let offset = this_pos - prev_pos;
@@ -6270,7 +6272,7 @@ fn emit_single_element_wrapping_each_program(
     inner_html.push('>');
 
     // Each callback: ($$anchor, item) => { var li = root_1(); var text = $.child(li, true); $.reset(li); $.template_effect(() => $.set_text(text, $.get(item).field)); $.append($$anchor, li); }
-    let inner_var = inner_el.name.clone();
+    let inner_var = sanitize_name(&inner_el.name);
     let mut item_body: Vec<Statement> = Vec::new();
     item_body.push(t::var(&inner_var, t::call(t::id("root_1"), Vec::new())));
     item_body.push(t::var(
@@ -6355,7 +6357,7 @@ fn emit_single_element_wrapping_each_program(
         ],
     ));
 
-    let outer_var = el.name.clone();
+    let outer_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
@@ -7038,10 +7040,11 @@ fn emit_single_element_with_bind_this_program(
         Expression::Identifier(id) => id.name.clone(),
         _ => return None,
     };
+    let safe_el = sanitize_name(&el.name);
     let var_name = if target_name == el.name {
-        format!("{}_1", el.name)
+        format!("{}_1", safe_el)
     } else {
-        el.name.clone()
+        safe_el
     };
     let legacy_prop_names: HashSet<String> = script
         .legacy_export_props
@@ -13573,7 +13576,7 @@ fn emit_single_each_program(
                     vec![t::template_raw(vec![html], vec![])],
                 ),
             ));
-            let var = el.name.clone();
+            let var = sanitize_name(&el.name);
             body_stmts.push(t::var(&var, t::call(t::id("root_1"), vec![])));
 
             // Body interpolation: `el.textContent = \`...\`` if expressions present.
@@ -16248,8 +16251,8 @@ enum TextPart<'a> {
 
 fn single_root_var_name(kind: &NodeKind) -> String {
     match kind {
-        NodeKind::StaticElement(el) => el.name.clone(),
-        NodeKind::InterpElement(el, _, _) => el.name.clone(),
+        NodeKind::StaticElement(el) => sanitize_name(&el.name),
+        NodeKind::InterpElement(el, _, _) => sanitize_name(&el.name),
         NodeKind::Component(_) => "fragment".to_string(),
         NodeKind::AwaitBlock(_) => "fragment".to_string(),
         NodeKind::TopLevelExpr(_) => "fragment".to_string(),

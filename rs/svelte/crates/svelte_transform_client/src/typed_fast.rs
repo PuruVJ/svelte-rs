@@ -128,7 +128,7 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
             }
             if is_void(&el.name) {
                 html.push_str("/>");
-                return Some((el.name.clone(), html, 1));
+                return Some((sanitize_var(&el.name), html, 1));
             }
             html.push('>');
             for child in trim_boundary_whitespace(&el.fragment.nodes) {
@@ -137,7 +137,7 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
             html.push_str("</");
             html.push_str(&el.name);
             html.push('>');
-            return Some((el.name.clone(), html, 1));
+            return Some((sanitize_var(&el.name), html, 1));
         }
         return None;
     }
@@ -355,6 +355,12 @@ fn append_static_to_string(child: &FragmentChild, out: &mut String) -> Option<()
         }
         _ => None,
     }
+}
+
+fn sanitize_var(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
 }
 
 fn is_void(name: &str) -> bool {
