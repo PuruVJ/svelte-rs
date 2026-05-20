@@ -3789,6 +3789,11 @@ fn emit_top_level_multi_if_program(
         /// `<TAG> </TAG>` template + body `var X = ...; var text = $.child(X);
         /// $.reset(X);` and a template_effect for set_text.
         TextAnchorEl(&'a svelte_ast::elements::RegularElement),
+        /// `<TAG ATTRS>{#each ...}{/each}</TAG>` — element wrapping a single
+        /// each-block ("controlled" — runtime manages the children, no
+        /// `<!>` anchor inside). Emits `<TAG></TAG>` template + body
+        /// `var X = ...; $.each(X, FLAG | IS_CONTROLLED, ...); $.reset(X);`.
+        ElementWithEach(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::blocks::EachBlock),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3902,6 +3907,22 @@ fn emit_top_level_multi_if_program(
                         continue;
                     }
                 }
+                // Detect `<TAG ATTRS>{#each ...}{/each}</TAG>` shape.
+                let each_only_body = inner_non_ws.len() == 1
+                    && matches!(inner_non_ws[0], FragmentChild::EachBlock(_))
+                    && is_element_static_attrs(el);
+                if each_only_body {
+                    if let FragmentChild::EachBlock(eb) = inner_non_ws[0] {
+                        if eb.key.is_none() && !expr_top_await(&eb.expression) {
+                            if !slots.is_empty() {
+                                gap_after.push(pending_gap);
+                            }
+                            pending_gap = false;
+                            slots.push(Slot::ElementWithEach(el, eb));
+                            continue;
+                        }
+                    }
+                }
                 // Detect `<TAG ATTRS><slot/></TAG>` shape.
                 let slot_only_body = inner_non_ws.len() == 1
                     && matches!(inner_non_ws[0], FragmentChild::SlotElement(_))
@@ -3993,6 +4014,7 @@ fn emit_top_level_multi_if_program(
                 | Slot::ElementWithSpread(_)
                 | Slot::ElementWithSlot(_, _)
                 | Slot::TextAnchorEl(_)
+                | Slot::ElementWithEach(_, _)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -4029,7 +4051,8 @@ fn emit_top_level_multi_if_program(
             | Slot::DynamicEl(_)
             | Slot::ElementWithSpread(_)
             | Slot::ElementWithSlot(_, _)
-            | Slot::TextAnchorEl(_) => {
+            | Slot::TextAnchorEl(_)
+            | Slot::ElementWithEach(_, _) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -4139,6 +4162,13 @@ fn emit_top_level_multi_if_program(
                 format!("{}_{}", el.name, cnt)
             }
         } else if let Slot::TextAnchorEl(el) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
+        } else if let Slot::ElementWithEach(el, _) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
                 el.name.clone()
@@ -4558,6 +4588,120 @@ fn emit_top_level_multi_if_program(
                         ],
                     )));
                 }
+            }
+            Slot::ElementWithEach(_el, eb) => {
+                // Reuse the Each-slot body emission, but mark as IS_CONTROLLED
+                // (flag |= 4) and wrap with `$.reset(X)` afterward.
+                let item_name = match eb.context.as_ref() {
+                    Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
+                    _ => return None,
+                };
+                let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
+                let body_text_name = if text_idx == 0 {
+                    "text".to_string()
+                } else {
+                    format!("text_{}", text_idx)
+                };
+                text_idx += 1;
+                let inner_body = emit_vanilla_branch_body(
+                    &eb.body,
+                    &body_text_name,
+                    &mut root_decls,
+                    &mut root_idx,
+                    &mut elem_var_idx,
+                )?;
+                let inner_body = if item_referenced {
+                    inner_body
+                        .into_iter()
+                        .map(|s| rewrite_stmt_get_for_each_var(&s, &item_name))
+                        .collect()
+                } else {
+                    inner_body
+                };
+                let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: inner_body,
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                let is_bare_legacy = matches!(
+                    &eb.expression,
+                    Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+                );
+                let each_collection: Expression = if is_bare_legacy {
+                    eb.expression.clone()
+                } else {
+                    let rewritten = rewrite_props_destructured(
+                        &eb.expression,
+                        &script.props_destructured,
+                    );
+                    let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
+                    Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(rewritten),
+                        r#async: false,
+                        span: Span::ZERO,
+                    }))
+                };
+                let is_runes_iter = matches!(
+                    &eb.expression,
+                    Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+                ) || expression_uses_props_destructured(
+                    &eb.expression,
+                    &script.props_destructured,
+                );
+                // Flag bits: 1 = ITEM_REACTIVE, 4 = IS_CONTROLLED, 16 = ITEM_IMMUTABLE.
+                let mut flag = 4u32; // controlled
+                if item_referenced {
+                    flag |= 1;
+                }
+                if is_runes_iter {
+                    flag |= 16;
+                }
+                let fallback_arrow: Option<Expression> = match &eb.fallback {
+                    Some(fb) => {
+                        let fb_text_name = format!("text_fb_{}", text_idx);
+                        text_idx += 1;
+                        let fb_body = emit_vanilla_branch_body(
+                            fb,
+                            &fb_text_name,
+                            &mut root_decls,
+                            &mut root_idx,
+                            &mut elem_var_idx,
+                        )?;
+                        Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                            params: vec![t::pat_id("$$anchor")],
+                            body: ArrowBody::Block(Box::new(BlockStatement {
+                                body: fb_body,
+                                span: Span::ZERO,
+                            })),
+                            r#async: false,
+                            span: Span::ZERO,
+                        })))
+                    }
+                    None => None,
+                };
+                let mut each_args = vec![
+                    t::id(&cur_var),
+                    t::lit_number(flag as f64),
+                    each_collection,
+                    t::member_id(t::id("$"), "index"),
+                    item_arrow,
+                ];
+                if let Some(fb) = fallback_arrow {
+                    each_args.push(fb);
+                }
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "each"),
+                    each_args,
+                )));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(&cur_var)],
+                )));
             }
             Slot::TextAnchorEl(el) => {
                 // `var text_N = $.child(X); $.reset(X);` + queue text_set effect.
@@ -5113,6 +5257,44 @@ fn emit_top_level_multi_if_program(
                     }
                 }
                 html.push_str("> </");
+                html.push_str(&el.name);
+                html.push('>');
+            }
+            Slot::ElementWithEach(el, _) => {
+                // Emit `<TAG STATIC_ATTRS></TAG>` (controlled — no anchor inside).
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"");
+                                for p in parts {
+                                    if let AttributeValuePart::Text(t) = p {
+                                        for c in t.data.chars() {
+                                            match c {
+                                                '"' => html.push_str("&quot;"),
+                                                '&' => html.push_str("&amp;"),
+                                                _ => html.push(c),
+                                            }
+                                        }
+                                    }
+                                }
+                                html.push('"');
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                html.push_str("></");
                 html.push_str(&el.name);
                 html.push('>');
             }
