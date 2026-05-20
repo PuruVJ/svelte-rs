@@ -609,7 +609,7 @@ impl<'a> Emitter<'a> {
         match &a.body {
             ArrowBody::Block(b) => self.emit_block(b),
             ArrowBody::Expression(e) => {
-                if matches!(e, Expression::Object(_)) {
+                if matches!(e, Expression::Object(_) | Expression::Sequence(_)) {
                     self.write("(");
                     self.emit_expression(e);
                     self.write(")");

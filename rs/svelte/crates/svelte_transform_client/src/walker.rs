@@ -6512,8 +6512,51 @@ fn emit_single_element_wrapping_each_program(
         &eb.expression,
         Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
     );
+    // Detect deep access to a legacy prop (e.g. `things().foo`) — wrap with
+    // `($.deep_read_state(LEGACY_CALL), $.untrack(() => ORIG))`.
+    let deep_legacy_object: Option<Expression> = if let Expression::Member(m) = &eb.expression {
+        if let Expression::Identifier(id) = &m.object {
+            if legacy_prop_names.contains(&id.name) {
+                Some(t::call(t::id(&id.name), Vec::new()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let deep_legacy_used = deep_legacy_object.is_some();
     let each_collection: Expression = if is_bare_legacy {
         eb.expression.clone()
+    } else if let Some(deep_obj) = deep_legacy_object {
+        // Inner expression: rewrite the bare-identifier read to call form.
+        let rewritten = rewrite_legacy_prop_reads(&eb.expression, &legacy_prop_names);
+        let untracked_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(rewritten),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        let untracked_call = t::call(
+            t::member_id(t::id("$"), "untrack"),
+            vec![untracked_arrow],
+        );
+        let deep_read_call = t::call(
+            t::member_id(t::id("$"), "deep_read_state"),
+            vec![deep_obj],
+        );
+        let seq = Expression::Sequence(Box::new(SequenceExpression {
+            expressions: vec![deep_read_call, untracked_call],
+            span: Span::ZERO,
+        }));
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(seq),
+            r#async: false,
+            span: Span::ZERO,
+        }))
     } else {
         // Wrap in arrow returning the rewritten expression.
         let rewritten = rewrite_props_destructured(&eb.expression, &script.props_destructured);
@@ -6525,19 +6568,18 @@ fn emit_single_element_wrapping_each_program(
             span: Span::ZERO,
         }))
     };
+    let outer_var = sanitize_name(&el.name);
     // Flags = 5 (unkeyed + mutable_source bound to item).
     let each_call = t::stmt(t::call(
         t::member_id(t::id("$"), "each"),
         vec![
-            t::id(&el.name),
+            t::id(&outer_var),
             t::lit_number(5.0),
             each_collection,
             t::member_id(t::id("$"), "index"),
             item_arrow,
         ],
     ));
-
-    let outer_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
@@ -6569,6 +6611,16 @@ fn emit_single_element_wrapping_each_program(
         ));
     }
     func_body.extend(script.body.clone());
+    // `$.init()` is needed when the each-block reads a legacy prop deeply
+    // (e.g. `things().foo`) — mirrors upstream's emitter that calls
+    // `state.init = true` whenever `deep_read_state` is materialized.
+    let needs_init = deep_legacy_used;
+    if needs_init {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "init"),
+            Vec::new(),
+        )));
+    }
     func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
     func_body.push(each_call);
     func_body.push(t::stmt(t::call(
