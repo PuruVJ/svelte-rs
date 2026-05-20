@@ -138,6 +138,8 @@ pub fn try_typed_client_walker_with(
         .iter()
         .filter(|n| match n {
             FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            // `<svelte:options>` is metadata only — doesn't render anything.
+            FragmentChild::SvelteOptions(_) => false,
             _ => true,
         })
         .collect();
@@ -275,6 +277,11 @@ pub fn try_typed_client_walker_with(
             }
             if let Some(p) =
                 emit_single_element_with_folded_prefix_program(el, component_name, &script)
+            {
+                return inject_snippets(Some(p));
+            }
+            if let Some(p) =
+                emit_single_element_with_bind_this_program(el, component_name, &script)
             {
                 return inject_snippets(Some(p));
             }
@@ -5374,6 +5381,232 @@ fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
         })),
         e => e.clone(),
     }
+}
+
+/// Emit a program for the shape:
+///
+///   <TAG bind:this={X}>body</TAG>
+///
+/// — single element with a `bind:this` directive and fully-static body.
+/// Other attributes must be static. Mirrors `element-ref`.
+fn emit_single_element_with_bind_this_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+    {
+        return None;
+    }
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    // Find exactly one bind:this directive, all other attrs static.
+    let mut bind_this_expr: Option<Expression> = None;
+    let mut static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::BindDirective(bd) if bd.name == "this" => {
+                if bind_this_expr.is_some() {
+                    return None;
+                }
+                bind_this_expr = Some(bd.expression.clone());
+            }
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => static_attrs.push(attr),
+                AttributeValue::Many(parts) => {
+                    if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return None;
+                    }
+                    static_attrs.push(attr);
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    let bind_this_target = bind_this_expr?;
+    // Body must be fully static (no expressions / blocks).
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(child) => {
+                if !is_element_fully_static(child) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    // Build template HTML with static body.
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&el.name);
+    for attr in &static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => html.push_str("&quot;"),
+                                '&' => html.push_str("&amp;"),
+                                _ => html.push(c),
+                            }
+                        }
+                    }
+                }
+                html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    html.push('>');
+    let mut needs = false;
+    serialize_fragment_to_html(&el.fragment, &mut html, &mut needs)?;
+    html.push_str("</");
+    html.push_str(&el.name);
+    html.push('>');
+
+    // Variable name: if the bind:this target's identifier matches the
+    // element tag name, suffix with `_1` to avoid collision.
+    let target_name = match &bind_this_target {
+        Expression::Identifier(id) => id.name.clone(),
+        _ => return None,
+    };
+    let var_name = if target_name == el.name {
+        format!("{}_1", el.name)
+    } else {
+        el.name.clone()
+    };
+    let legacy_prop_names: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let is_legacy_prop = legacy_prop_names.contains(&target_name);
+
+    // bind_this setter / getter.
+    // Setter: `($$value) => target($$value)` or `($$value) => target = $$value`
+    // Getter: `() => target()` or `() => target`
+    let setter_body: Expression = if is_legacy_prop {
+        t::call(
+            t::id(&target_name),
+            vec![t::id("$$value")],
+        )
+    } else {
+        // Assignment expression for runes-mode state binding.
+        Expression::Assignment(Box::new(AssignmentExpression {
+            left: AssignmentTarget::Pattern(Pattern::Identifier(Identifier {
+                name: target_name.clone(),
+                span: Span::ZERO,
+            })),
+            operator: AssignmentOperator::Assign,
+            right: t::id("$$value"),
+            span: Span::ZERO,
+        }))
+    };
+    let setter_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$value")],
+        body: ArrowBody::Expression(setter_body),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let getter_body: Expression = if is_legacy_prop {
+        t::call(t::id(&target_name), Vec::new())
+    } else {
+        t::id(&target_name)
+    };
+    let getter_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(getter_body),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(
+                    svelte_js_ast::BooleanLiteral { value: false, span: Span::ZERO },
+                ))),
+            ],
+        )));
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "bind_this"),
+        vec![t::id(&var_name), setter_arrow, getter_arrow],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&var_name)],
+    )));
+    if !script.legacy_export_props.is_empty() {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    }
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props || !script.legacy_export_props.is_empty() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 /// Emit a program for the shape:
