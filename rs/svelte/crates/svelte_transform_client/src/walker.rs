@@ -1843,7 +1843,12 @@ fn emit_vanilla_branch_body(
             Some(body)
         }
         FragmentChild::RegularElement(el) => {
-            // Serialize the element subtree as static HTML — bail on dynamic.
+            // Detect text-anchor body shape (`<TAG>{EXPR}</TAG>` or similar
+            // with non-literal interpolation). Emits an additional
+            // `var text = $.child(TAG, true); $.reset(TAG); $.template_effect(...)`
+            // to wire up the reactive text-anchor.
+            let is_text_anchor = is_text_only_element(el)
+                && el.attributes.is_empty();
             let mut html = String::new();
             let mut needs_import_node = false;
             serialize_element_to_html(el, &mut html, &mut needs_import_node)?;
@@ -1864,6 +1869,52 @@ fn emit_vanilla_branch_body(
             };
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::var(&var_name, t::call(t::id(&root_name), Vec::new())));
+            if is_text_anchor {
+                // Build the inline text expression from the element body's
+                // mixed Text + ExpressionTag run.
+                let mut parts: Vec<TextPart> = Vec::new();
+                for c in &el.fragment.nodes {
+                    match c {
+                        FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                        FragmentChild::ExpressionTag(et) => {
+                            parts.push(TextPart::Expr(&et.expression))
+                        }
+                        _ => return None,
+                    }
+                }
+                let inline = build_inline_template(&parts, &HashSet::new());
+                body.push(t::var(
+                    text_name,
+                    t::call(
+                        t::member_id(t::id("$"), "child"),
+                        vec![
+                            t::id(&var_name),
+                            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                value: true,
+                                span: Span::ZERO,
+                            }))),
+                        ],
+                    ),
+                ));
+                body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(&var_name)],
+                )));
+                let set_text = t::call(
+                    t::member_id(t::id("$"), "set_text"),
+                    vec![t::id(text_name), inline],
+                );
+                let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(set_text),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "template_effect"),
+                    vec![effect_fn],
+                )));
+            }
             body.push(t::stmt(t::call(
                 t::member_id(t::id("$"), "append"),
                 vec![t::id("$$anchor"), t::id(&var_name)],
@@ -3676,11 +3727,8 @@ fn emit_top_level_multi_if_program(
                 slots.push(Slot::If(ib));
             }
             FragmentChild::EachBlock(eb) => {
-                // No key, no else, no async, simple identifier context.
-                if eb.key.is_some()
-                    || eb.fallback.is_some()
-                    || expr_top_await(&eb.expression)
-                {
+                // No key, no async, simple identifier context. Fallback OK.
+                if eb.key.is_some() || expr_top_await(&eb.expression) {
                     return None;
                 }
                 if !slots.is_empty() {
@@ -3973,16 +4021,59 @@ fn emit_top_level_multi_if_program(
                         span: Span::ZERO,
                     }))
                 };
-                let flag = if item_referenced { 1.0 } else { 0.0 };
+                // Flag bits: 1 = ITEM_REACTIVE, 16 = ITEM_IMMUTABLE.
+                // ITEM_IMMUTABLE is set in runes mode (when the iterable
+                // expression comes from `$props()` destructuring).
+                let is_runes_iter = matches!(
+                    &eb.expression,
+                    Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+                ) || expression_uses_props_destructured(
+                    &eb.expression,
+                    &script.props_destructured,
+                );
+                let mut flag = 0u32;
+                if item_referenced {
+                    flag |= 1;
+                }
+                if is_runes_iter {
+                    flag |= 16;
+                }
+                // Fallback arrow, if present.
+                let fallback_arrow: Option<Expression> = match &eb.fallback {
+                    Some(fb) => {
+                        let fb_text_name = format!("text_fb_{}", i);
+                        let fb_body = emit_vanilla_branch_body(
+                            fb,
+                            &fb_text_name,
+                            &mut root_decls,
+                            &mut root_idx,
+                            &mut elem_var_idx,
+                        )?;
+                        Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                            params: vec![t::pat_id("$$anchor")],
+                            body: ArrowBody::Block(Box::new(BlockStatement {
+                                body: fb_body,
+                                span: Span::ZERO,
+                            })),
+                            r#async: false,
+                            span: Span::ZERO,
+                        })))
+                    }
+                    None => None,
+                };
+                let mut each_args = vec![
+                    t::id(&cur_var),
+                    t::lit_number(flag as f64),
+                    each_collection,
+                    t::member_id(t::id("$"), "index"),
+                    item_arrow,
+                ];
+                if let Some(fb) = fallback_arrow {
+                    each_args.push(fb);
+                }
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id("$"), "each"),
-                    vec![
-                        t::id(&cur_var),
-                        t::lit_number(flag),
-                        each_collection,
-                        t::member_id(t::id("$"), "index"),
-                        item_arrow,
-                    ],
+                    each_args,
                 )));
             }
             Slot::LiteralAnchor(lit) => {
@@ -4592,6 +4683,26 @@ fn emit_single_element_wrapping_each_program(
     ));
     prog.push(export);
     Some(t::program(prog))
+}
+
+/// True iff the expression directly references any name in `names`
+/// (e.g. `items.foo` references `items`).
+fn expression_uses_props_destructured(
+    e: &Expression,
+    names: &HashSet<String>,
+) -> bool {
+    match e {
+        Expression::Identifier(id) => names.contains(&id.name),
+        Expression::Member(m) => expression_uses_props_destructured(&m.object, names),
+        Expression::Call(c) => {
+            expression_uses_props_destructured(&c.callee, names)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expression_uses_props_destructured(e, names),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Walk a fragment looking for any reference to a given identifier name.
