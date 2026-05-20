@@ -316,6 +316,177 @@ fn emit_svelte_head_program(
     Some(t::program(prog))
 }
 
+/// Emit a program for the `text-empty-2` shape — a single outer element
+/// containing a text-anchor inner element followed by a trailing
+/// ExpressionTag. Both interpolations become text anchors merged into a
+/// single template_effect block.
+fn emit_single_element_with_inner_and_trailing_expr_program(
+    outer: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if !outer.attributes.is_empty() {
+        return None;
+    }
+    if !script.legacy_export_props.is_empty()
+        || script.async_info.is_some()
+        || script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+    {
+        return None;
+    }
+    // Body children (ignore whitespace text + comments).
+    let non_ws: Vec<&FragmentChild> = outer
+        .fragment
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 2 {
+        return None;
+    }
+    let inner_el = match non_ws[0] {
+        FragmentChild::RegularElement(el) if !el.name.contains('-') => el,
+        _ => return None,
+    };
+    if !inner_el.attributes.is_empty() {
+        return None;
+    }
+    if !is_text_only_element(inner_el) {
+        return None;
+    }
+    let trailing_expr = match non_ws[1] {
+        FragmentChild::ExpressionTag(et) => &et.expression,
+        _ => return None,
+    };
+    // Build the inner inline text expression from the inner element's
+    // mixed Text + ExpressionTag run.
+    let mut inner_parts: Vec<TextPart> = Vec::new();
+    for c in &inner_el.fragment.nodes {
+        match c {
+            FragmentChild::Text(t) => inner_parts.push(TextPart::Static(t.data.clone())),
+            FragmentChild::ExpressionTag(et) => {
+                inner_parts.push(TextPart::Expr(&et.expression))
+            }
+            _ => return None,
+        }
+    }
+    let inner_inline = build_inline_template(&inner_parts, &HashSet::new());
+    let inner_inline = rewrite_props_destructured(&inner_inline, &script.props_destructured);
+    let trailing_inline = rewrite_props_destructured(trailing_expr, &script.props_destructured);
+
+    // HTML template: `<OUTER><INNER> </INNER> </OUTER>`.
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&outer.name);
+    html.push('>');
+    html.push('<');
+    html.push_str(&inner_el.name);
+    html.push_str("> </");
+    html.push_str(&inner_el.name);
+    html.push_str("> </");
+    html.push_str(&outer.name);
+    html.push('>');
+
+    let outer_var = sanitize_name(&outer.name);
+    let inner_var = format!("{}_1", sanitize_name(&inner_el.name));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::var(
+        &inner_var,
+        t::call(t::member_id(t::id("$"), "child"), vec![t::id(&outer_var)]),
+    ));
+    func_body.push(t::var(
+        "text",
+        t::call(
+            t::member_id(t::id("$"), "child"),
+            vec![
+                t::id(&inner_var),
+                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                    value: true,
+                    span: Span::ZERO,
+                }))),
+            ],
+        ),
+    ));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&inner_var)],
+    )));
+    func_body.push(t::var(
+        "text_1",
+        t::call(
+            t::member_id(t::id("$"), "sibling"),
+            vec![
+                t::id(&inner_var),
+                t::lit_number(1.0),
+                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                    value: true,
+                    span: Span::ZERO,
+                }))),
+            ],
+        ),
+    ));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id(&outer_var)],
+    )));
+    // Combined template_effect.
+    let set_text_inner = t::stmt(t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), inner_inline],
+    ));
+    let set_text_trailing = t::stmt(t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text_1"), trailing_inline],
+    ));
+    let eff_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![set_text_inner, set_text_trailing],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![eff_arrow],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&outer_var)],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], Vec::new())],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Emit a program for `<custom-element K=V>...</custom-element>` (tag with
 /// hyphen, all static attrs, empty body). Strips attrs from the HTML
 /// template + emits `$.set_custom_element_data(VAR, K, V)`. Wraps the
@@ -495,6 +666,31 @@ pub fn try_typed_client_walker_with(
                 &script,
             ) {
                 return Some(p);
+            }
+        }
+    }
+
+    // PRE-DETECT: single outer element wrapping `<inner>{X}</inner>{Y}`.
+    {
+        let non_ws: Vec<&FragmentChild> = root
+            .fragment
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        if non_ws.len() == 1 {
+            if let FragmentChild::RegularElement(outer) = non_ws[0] {
+                if let Some(p) = emit_single_element_with_inner_and_trailing_expr_program(
+                    outer,
+                    component_name,
+                    &script,
+                ) {
+                    return Some(p);
+                }
             }
         }
     }
