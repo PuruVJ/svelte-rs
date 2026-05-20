@@ -13330,11 +13330,40 @@ fn walk_element_interior(
                 _ => "node".to_string(),
             };
             var = allocate_named(&prefix, var_names);
+            // Inside `<pre>` / `<textarea>`: when the template kept a leading
+            // text node (i.e. source first child was Text with content beyond
+            // a single stripped \n), the first DOM child is that text — use
+            // `$.sibling($.child(parent))` instead of `$.child(parent)`.
+            let pre_has_leading_text =
+                (el.name == "pre" || el.name == "textarea") && {
+                    let first = el.fragment.nodes.first();
+                    let second = el.fragment.nodes.get(1);
+                    match (first, second) {
+                        (Some(FragmentChild::Text(t)), Some(FragmentChild::RegularElement(_))) => {
+                            // Upstream strips a leading text node ONLY when
+                            // it's exactly "\n". For any other leading text
+                            // (`"\n\n"`, `"\n\t"`, etc.) the text remains in
+                            // the DOM, so we navigate with sibling/child.
+                            t.data != "\n"
+                        }
+                        _ => false,
+                    }
+                };
             if i == 0 {
-                init = t::call(
-                    t::member_id(t::id("$"), "child"),
-                    vec![t::id(parent_var)],
-                );
+                if pre_has_leading_text {
+                    init = t::call(
+                        t::member_id(t::id("$"), "sibling"),
+                        vec![t::call(
+                            t::member_id(t::id("$"), "child"),
+                            vec![t::id(parent_var)],
+                        )],
+                    );
+                } else {
+                    init = t::call(
+                        t::member_id(t::id("$"), "child"),
+                        vec![t::id(parent_var)],
+                    );
+                }
             } else {
                 init = t::call(
                     t::member_id(t::id("$"), "sibling"),
@@ -13385,20 +13414,6 @@ fn walk_element_interior(
             }
             FragmentChild::RegularElement(child_el) => {
                 if is_text_only_element(child_el) {
-                    let text_var = allocate_named("text", var_names);
-                    body.push(t::var(
-                        &text_var,
-                        t::call(
-                            t::member_id(t::id("$"), "child"),
-                            vec![
-                                t::id(&var),
-                                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
-                                    value: true,
-                                    span: Span::ZERO,
-                                }))),
-                            ],
-                        ),
-                    ));
                     // Build inline expression from mixed Text + ExpressionTag
                     // children — preserves surrounding text in a template
                     // literal (e.g. `Count: {count}` → \`Count: ${count}\`).
@@ -13414,11 +13429,43 @@ fn walk_element_interior(
                     }
                     let inline = build_inline_template(&parts, &HashSet::new());
                     let inline = rewrite_props_destructured(&inline, &script.props_destructured);
-                    effects.push((text_var, inline));
-                    body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "reset"),
-                        vec![t::id(&var)],
-                    )));
+                    // Determine if the inline expression references any
+                    // reactive binding — if not, skip the text-anchor
+                    // allocation, template_effect push, and reset entirely.
+                    let mut reactive: HashSet<String> = HashSet::new();
+                    reactive.extend(script.state_bindings.iter().cloned());
+                    reactive.extend(script.proxy_bindings.iter().cloned());
+                    reactive.extend(script.derived_bindings.iter().cloned());
+                    reactive.extend(script.props_destructured.iter().cloned());
+                    reactive.extend(script.rest_props_bindings.iter().cloned());
+                    let legacy_prop_names_local: HashSet<String> = script
+                        .legacy_export_props
+                        .iter()
+                        .map(|(n, _)| n.clone())
+                        .collect();
+                    reactive.extend(legacy_prop_names_local.iter().cloned());
+                    let is_reactive_expr = expression_has_any_binding(&inline, &reactive);
+                    if is_reactive_expr {
+                        let text_var = allocate_named("text", var_names);
+                        body.push(t::var(
+                            &text_var,
+                            t::call(
+                                t::member_id(t::id("$"), "child"),
+                                vec![
+                                    t::id(&var),
+                                    Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                        value: true,
+                                        span: Span::ZERO,
+                                    }))),
+                                ],
+                            ),
+                        ));
+                        effects.push((text_var, inline));
+                        body.push(t::stmt(t::call(
+                            t::member_id(t::id("$"), "reset"),
+                            vec![t::id(&var)],
+                        )));
+                    }
                 } else {
                     // Recurse into the child.
                     walk_element_interior(child_el, &var, body, effects, var_names, counters, script);
@@ -13436,6 +13483,26 @@ fn walk_element_interior(
         prev_child_idx = Some(i);
     }
 
+    // Inside `<pre>` / `<textarea>`: when raw nodes after the last reactive
+    // child include any preserved text/element, emit `$.next()` to advance
+    // the hydration cursor past those nodes before the outer reset.
+    if el.name == "pre" || el.name == "textarea" {
+        let last_reactive_stripped = *reactive_idx.last().unwrap();
+        let last_reactive_raw = start + last_reactive_stripped;
+        let has_trailing = el.fragment.nodes.iter().skip(last_reactive_raw + 1).any(|n| {
+            match n {
+                FragmentChild::Text(t) => !t.data.is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            }
+        });
+        if has_trailing {
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "next"),
+                Vec::new(),
+            )));
+        }
+    }
     // Trailing static siblings after the last reactive child — emit $.next(N).
     let last_reactive = *reactive_idx.last().unwrap();
     let trailing_count = children.len() - 1 - last_reactive;
@@ -13754,12 +13821,134 @@ fn serialize_element_to_html(
         // <noscript> contents are intentionally empty in the client template —
         // hydration only matches the opening/closing tags, and the original
         // content lives in the server payload (where it matters).
+    } else if el.name == "pre" || el.name == "textarea" {
+        // Whitespace-preserving elements: emit child content verbatim,
+        // stripping at most ONE leading newline (HTML5 default behavior),
+        // and skipping the space-placeholder for nested text-anchor
+        // elements.
+        serialize_pre_fragment_to_html(&el.fragment, out, needs_import_node)?;
     } else if is_text_only {
         // Placeholder space for the text anchor.
         out.push(' ');
     } else {
         serialize_fragment_to_html(&el.fragment, out, needs_import_node)?;
     }
+    out.push_str("</");
+    out.push_str(&el.name);
+    out.push('>');
+    Some(())
+}
+
+/// Serialize the body of a `<pre>` / `<textarea>` element. Preserves
+/// whitespace verbatim. HTML5 strips ONE leading newline from `<pre>`
+/// content only when that leading newline is immediately followed by a
+/// non-text node (element). For text content, the newline is kept.
+/// Text-only nested elements (e.g. `<span>{x}</span>` inside `<pre>`)
+/// do NOT get the space-anchor placeholder.
+fn serialize_pre_fragment_to_html(
+    f: &svelte_ast::fragment::Fragment,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    // Upstream strips ONLY when the very first text node is exactly "\n"
+    // and immediately followed by a non-text node. Multi-newline leading
+    // whitespace is preserved verbatim.
+    let strip_leading_newline = f
+        .nodes
+        .first()
+        .map(|n| matches!(n, FragmentChild::Text(t) if t.data == "\n"))
+        .unwrap_or(false)
+        && f.nodes.get(1).map(|n| matches!(n, FragmentChild::RegularElement(_))).unwrap_or(false);
+    for (i, n) in f.nodes.iter().enumerate() {
+        match n {
+            FragmentChild::Text(t) => {
+                let mut data = t.data.clone();
+                if i == 0 && strip_leading_newline && data.starts_with('\n') {
+                    data.remove(0);
+                }
+                for ch in data.chars() {
+                    match ch {
+                        '`' => out.push_str("\\`"),
+                        '\\' => out.push_str("\\\\"),
+                        _ => out.push(ch),
+                    }
+                }
+            }
+            FragmentChild::Comment(c) => {
+                let trimmed = c.data.trim();
+                if trimmed.starts_with("svelte-ignore") {
+                    continue;
+                }
+                out.push_str("<!--");
+                out.push_str(&c.data);
+                out.push_str("-->");
+            }
+            FragmentChild::HtmlTag(_) => {
+                out.push_str("<!>");
+            }
+            FragmentChild::ExpressionTag(_) => {
+                // Inside <pre>, expression tags don't reserve a placeholder
+                // space — the existing SSR text is the anchor.
+            }
+            FragmentChild::RegularElement(el) => {
+                serialize_pre_element_to_html(el, out, needs_import_node)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+fn serialize_pre_element_to_html(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    let is_custom = el.name.contains('-');
+    if is_custom || el.name == "video" {
+        *needs_import_node = true;
+    }
+    out.push('<');
+    out.push_str(&el.name);
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
+            match &attr.value {
+                AttributeValue::Empty => {
+                    out.push(' ');
+                    out.push_str(&attr.name);
+                    out.push_str("=\"\"");
+                }
+                AttributeValue::Many(parts) => {
+                    if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        out.push(' ');
+                        out.push_str(&attr.name);
+                        out.push_str("=\"");
+                        for p in parts {
+                            if let AttributeValuePart::Text(t) = p {
+                                for c in t.data.chars() {
+                                    match c {
+                                        '"' => out.push_str("&quot;"),
+                                        '&' => out.push_str("&amp;"),
+                                        _ => out.push(c),
+                                    }
+                                }
+                            }
+                        }
+                        out.push('"');
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if is_void_client(&el.name) {
+        out.push_str("/>");
+        return Some(());
+    }
+    out.push('>');
+    // Children: NO space placeholder for text-only elements inside <pre>.
+    serialize_pre_fragment_to_html(&el.fragment, out, needs_import_node)?;
     out.push_str("</");
     out.push_str(&el.name);
     out.push('>');
