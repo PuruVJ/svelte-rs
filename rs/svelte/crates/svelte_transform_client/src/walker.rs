@@ -3744,7 +3744,6 @@ fn emit_top_level_multi_if_program(
 ) -> Option<Program> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
-        || !script.proxy_bindings.is_empty()
         || !script.derived_bindings.is_empty()
         || script.async_info.is_some()
     {
