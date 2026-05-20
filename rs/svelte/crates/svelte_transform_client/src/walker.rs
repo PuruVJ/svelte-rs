@@ -10417,28 +10417,34 @@ fn node_has_deep_reactive(n: &FragmentChild) -> bool {
 fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool {
     let is_custom = el.name.contains('-');
     for a in &el.attributes {
-        if let ElementAttribute::Attribute(attr) = a {
-            // Any attribute on a custom element triggers $.set_custom_element_data.
-            if is_custom {
-                return true;
-            }
-            match attr.name.as_str() {
-                "autofocus" => return true,
-                "muted" if el.name == "source" || el.name == "video" || el.name == "audio" => {
-                    return true
+        match a {
+            ElementAttribute::Attribute(attr) => {
+                // Any attribute on a custom element triggers $.set_custom_element_data.
+                if is_custom {
+                    return true;
                 }
-                "value" if el.name == "option" => return true,
-                // `dir` attribute on any element needs a `node.dir = node.dir`
-                // template_effect (Chromium hydration bug workaround per
-                // upstream RegularElement.js:463-468).
-                "dir" => return true,
-                // `<input>` with boolean `checked` or static `value` needs
-                // `$.remove_input_defaults(input)` during hydration so the
-                // server's defaultChecked/defaultValue don't override
-                // user input.
-                "checked" | "value" if el.name == "input" => return true,
-                _ => {}
+                match attr.name.as_str() {
+                    "autofocus" => return true,
+                    "muted" if el.name == "source" || el.name == "video" || el.name == "audio" => {
+                        return true
+                    }
+                    "value" if el.name == "option" => return true,
+                    // `dir` attribute on any element needs a `node.dir = node.dir`
+                    // template_effect (Chromium hydration bug workaround per
+                    // upstream RegularElement.js:463-468).
+                    "dir" => return true,
+                    // `<input>` with boolean `checked` or static `value` needs
+                    // `$.remove_input_defaults(input)` during hydration so the
+                    // server's defaultChecked/defaultValue don't override
+                    // user input.
+                    "checked" | "value" if el.name == "input" => return true,
+                    _ => {}
+                }
             }
+            // `bind:value`, `bind:checked` etc. on an input need
+            // `$.remove_input_defaults(input)` + `$.bind_value(input, ...)`.
+            ElementAttribute::BindDirective(_) => return true,
+            _ => {}
         }
     }
     false
@@ -12725,6 +12731,9 @@ fn emit_deep_static_walker_program(
     // Input variables that need `$.remove_input_defaults(input)` (boolean
     // `checked` / static `value` attributes during hydration).
     let mut input_defaults_resets: Vec<String> = Vec::new();
+    // `bind:value={...}` directives → `$.bind_value(var, target)` calls
+    // emitted after the trailing template_effect.
+    let mut bind_value_calls: Vec<(String, Expression)> = Vec::new();
 
     // If the first node is a non-Element (text/comment), emit a leading
     // `$.next();` to position the hydration cursor at it before reading
@@ -12851,15 +12860,20 @@ fn emit_deep_static_walker_program(
         prev_top_idx = Some(i);
         first_emitted = true;
 
-        // `<input>` with `checked` or static `value` attribute → emit
-        // `$.remove_input_defaults(input)` right after the var declaration
-        // (inline, NOT deferred to the trailing effects pile).
-        if el.name == "input"
-            && el.attributes.iter().any(|a| matches!(
-                a,
-                ElementAttribute::Attribute(attr) if attr.name == "checked" || attr.name == "value"
-            ))
-        {
+        // `<input>` with `checked` / static `value` attribute → emit
+        // `$.remove_input_defaults(input)` right after the var declaration.
+        // Also: `<input bind:value={...}>` triggers the same defaults reset.
+        let input_needs_defaults = el.name == "input"
+            && el.attributes.iter().any(|a| match a {
+                ElementAttribute::Attribute(attr) => {
+                    matches!(attr.name.as_str(), "checked" | "value")
+                }
+                ElementAttribute::BindDirective(bd) => {
+                    matches!(bd.name.as_str(), "value" | "checked" | "group" | "files")
+                }
+                _ => false,
+            });
+        if input_needs_defaults {
             body.push(t::stmt(t::call(
                 t::member_id(t::id("$"), "remove_input_defaults"),
                 vec![t::id(&var)],
@@ -12885,6 +12899,14 @@ fn emit_deep_static_walker_program(
             &mut counters,
             script,
         );
+        // Collect bind directives for trailing emission (after template_effect).
+        for a in &el.attributes {
+            if let ElementAttribute::BindDirective(bd) = a {
+                if bd.name == "value" {
+                    bind_value_calls.push((var.clone(), bd.expression.clone()));
+                }
+            }
+        }
         if has_reactive_inside {
             body.push(t::stmt(t::call(
                 t::member_id(t::id("$"), "reset"),
@@ -13019,6 +13041,31 @@ fn emit_deep_static_walker_program(
                 r#async: false,
                 span: Span::ZERO,
             }))],
+        )));
+    }
+
+    // `$.bind_value(var, target)` calls — emitted after template_effect,
+    // before the final append. For legacy props (accessor functions), the
+    // target is the bare accessor identifier; runtime knows to read/write
+    // via the same callable.
+    let legacy_prop_names_for_bind: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    for (var_name, target_expr) in &bind_value_calls {
+        let target_is_legacy_prop = matches!(
+            target_expr,
+            Expression::Identifier(id) if legacy_prop_names_for_bind.contains(&id.name)
+        );
+        let target = if target_is_legacy_prop {
+            target_expr.clone()
+        } else {
+            target_expr.clone()
+        };
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "bind_value"),
+            vec![t::id(var_name), target],
         )));
     }
 
