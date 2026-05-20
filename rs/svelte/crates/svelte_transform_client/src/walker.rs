@@ -308,15 +308,21 @@ pub fn try_typed_client_walker_with(
             })
             .copied()
             .collect();
+        // Multi-block predicate: all nodes are recognizable as slots,
+        // and at least one is a potential anchor (block/component/tag
+        // OR a non-fully-static RegularElement that becomes Dynamic/
+        // EventHandler/Spread/Html-wrap slot).
+        let has_anchor = non_ws.iter().any(|n| match n {
+            FragmentChild::IfBlock(_)
+            | FragmentChild::EachBlock(_)
+            | FragmentChild::ExpressionTag(_)
+            | FragmentChild::HtmlTag(_)
+            | FragmentChild::Component(_) => true,
+            FragmentChild::RegularElement(el) => !is_element_fully_static(el),
+            _ => false,
+        });
         if non_ws.len() >= 2
-            && non_ws.iter().any(|n| matches!(
-                n,
-                FragmentChild::IfBlock(_)
-                    | FragmentChild::EachBlock(_)
-                    | FragmentChild::ExpressionTag(_)
-                    | FragmentChild::HtmlTag(_)
-                    | FragmentChild::Component(_)
-            ))
+            && has_anchor
             && non_ws.iter().all(|n| matches!(
                 n,
                 FragmentChild::IfBlock(_)
@@ -3770,6 +3776,9 @@ fn emit_top_level_multi_if_program(
         /// static body. Emits `<TAG STATIC_ATTRS>body</TAG>` template +
         /// `var X = ...; $.template_effect(() => $.set_attribute(...))`.
         DynamicEl(&'a svelte_ast::elements::RegularElement),
+        /// Element with one or more spread attributes + static body. Emits
+        /// `var X = ...; $.attribute_effect(X, () => ({ ...spread }));`.
+        ElementWithSpread(&'a svelte_ast::elements::RegularElement),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3903,6 +3912,15 @@ fn emit_top_level_multi_if_program(
                     slots.push(Slot::DynamicEl(el));
                     continue;
                 }
+                // Detect element with spread attribute + static body.
+                if element_static_body_with_spread(el) {
+                    if !slots.is_empty() {
+                        gap_after.push(pending_gap);
+                    }
+                    pending_gap = false;
+                    slots.push(Slot::ElementWithSpread(el));
+                    continue;
+                }
                 if !is_element_fully_static(el) {
                     return None;
                 }
@@ -3930,6 +3948,7 @@ fn emit_top_level_multi_if_program(
                 | Slot::ElementWithHtml(_, _)
                 | Slot::ElementWithEvents(_)
                 | Slot::DynamicEl(_)
+                | Slot::ElementWithSpread(_)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -3963,7 +3982,8 @@ fn emit_top_level_multi_if_program(
             | Slot::Component(_)
             | Slot::ElementWithHtml(_, _)
             | Slot::ElementWithEvents(_)
-            | Slot::DynamicEl(_) => {
+            | Slot::DynamicEl(_)
+            | Slot::ElementWithSpread(_) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -4000,6 +4020,9 @@ fn emit_top_level_multi_if_program(
     // Event-directive emissions are collected here and appended AFTER all
     // anchor-block emissions, so events fire on elements already declared.
     let mut event_stmts: Vec<Statement> = Vec::new();
+    // Spread effects (`$.attribute_effect(...)`) are emitted BEFORE
+    // template_effect / event calls so upstream's ordering matches.
+    let mut spread_effects: Vec<Statement> = Vec::new();
     let mut anchor_count = 0usize;
     let mut if_count = 0usize;
     let mut prev_anchor_slot: Option<usize> = None;
@@ -4046,6 +4069,13 @@ fn emit_top_level_multi_if_program(
                 format!("{}_{}", el.name, cnt)
             }
         } else if let Slot::DynamicEl(el) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
+        } else if let Slot::ElementWithSpread(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
                 el.name.clone()
@@ -4327,6 +4357,41 @@ fn emit_top_level_multi_if_program(
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id("$"), "html"),
                     vec![t::id(&cur_var), arrow],
+                )));
+            }
+            Slot::ElementWithSpread(el) => {
+                // `$.attribute_effect(VAR, () => ({ ...spread }))`.
+                use svelte_ast::attributes::ElementAttribute;
+                let mut obj_props: Vec<ObjectMember> = Vec::new();
+                for a in &el.attributes {
+                    if let ElementAttribute::SpreadAttribute(s) = a {
+                        let rewritten = rewrite_props_destructured(
+                            &s.expression,
+                            &script.props_destructured,
+                        );
+                        obj_props.push(ObjectMember::Spread(Box::new(SpreadElement {
+                            argument: rewritten,
+                            span: Span::ZERO,
+                        })));
+                    }
+                }
+                let obj_expr = Expression::Object(Box::new(ObjectExpression {
+                    properties: obj_props,
+                    span: Span::ZERO,
+                }));
+                let paren = Expression::Paren(Box::new(ParenthesizedExpression {
+                    expression: obj_expr,
+                    span: Span::ZERO,
+                }));
+                let attr_effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(paren),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                spread_effects.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "attribute_effect"),
+                    vec![t::id(&cur_var), attr_effect_arrow],
                 )));
             }
             Slot::DynamicEl(el) => {
@@ -4648,6 +4713,9 @@ fn emit_top_level_multi_if_program(
     let first_var_name = first_anchor_var.unwrap_or_else(|| "node".to_string());
     func_body.push(t::var(&first_var_name, first_node_init));
     func_body.extend(block_stmts);
+    // Spread `$.attribute_effect` calls come BEFORE event/template_effect
+    // (matches upstream's emission order).
+    func_body.extend(spread_effects);
     // Event-directive registrations come after all anchor blocks.
     func_body.extend(event_stmts);
     // Trailing static slots: if any of them was originally a `<TAG>{EXPR}</TAG>`
@@ -4770,6 +4838,7 @@ fn emit_top_level_multi_if_program(
     // A space is inserted between consecutive slots iff the source had
     // whitespace text between them (so the DOM sibling count matches upstream).
     let mut html = String::with_capacity(16);
+    let mut needs_import_node = false;
     for (i, slot) in slots.iter().enumerate() {
         if i > 0 && gap_after[i - 1] {
             html.push(' ');
@@ -4779,8 +4848,7 @@ fn emit_top_level_multi_if_program(
                 html.push_str("<!>")
             }
             Slot::StaticEl(el) => {
-                let mut needs = false;
-                serialize_element_to_html(el, &mut html, &mut needs)?;
+                serialize_element_to_html(el, &mut html, &mut needs_import_node)?;
             }
             Slot::ElementWithHtml(el, _) => {
                 // Emit `<TAG STATIC_ATTRS></TAG>` (no body content).
@@ -4825,6 +4893,9 @@ fn emit_top_level_multi_if_program(
                 // body (OnDirective stripped automatically — we only
                 // iterate Attribute variants).
                 use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                if el.name.contains('-') || el.name == "video" {
+                    needs_import_node = true;
+                }
                 html.push('<');
                 html.push_str(&el.name);
                 for a in &el.attributes {
@@ -4863,10 +4934,63 @@ fn emit_top_level_multi_if_program(
                 html.push_str(&el.name);
                 html.push('>');
             }
+            Slot::ElementWithSpread(el) => {
+                // Static-attrs-only template body (spread stripped).
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                if el.name.contains('-') || el.name == "video" {
+                    needs_import_node = true;
+                }
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                                    html.push(' ');
+                                    html.push_str(&attr.name);
+                                    html.push_str("=\"");
+                                    for p in parts {
+                                        if let AttributeValuePart::Text(t) = p {
+                                            for c in t.data.chars() {
+                                                match c {
+                                                    '"' => html.push_str("&quot;"),
+                                                    '&' => html.push_str("&amp;"),
+                                                    _ => html.push(c),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    html.push('"');
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if is_void_client(&el.name) {
+                    html.push_str("/>");
+                } else {
+                    html.push('>');
+                    let mut needs = false;
+                    serialize_fragment_to_html(&el.fragment, &mut html, &mut needs).unwrap_or(());
+                    html.push_str("</");
+                    html.push_str(&el.name);
+                    html.push('>');
+                }
+            }
             Slot::DynamicEl(el) => {
                 // Static-attrs-only template body. Dynamic attrs stripped
                 // (set via $.template_effect at runtime).
                 use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                if el.name.contains('-') || el.name == "video" {
+                    needs_import_node = true;
+                }
                 html.push('<');
                 html.push_str(&el.name);
                 for a in &el.attributes {
@@ -4936,11 +5060,12 @@ fn emit_top_level_multi_if_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
     prog.extend(root_decls);
+    let flag = if needs_import_node { 3.0 } else { 1.0 };
     prog.push(t::var(
         "root",
         t::call(
             t::member_id(t::id("$"), "from_html"),
-            vec![t::template_raw(vec![html], vec![]), t::lit_number(1.0)],
+            vec![t::template_raw(vec![html], vec![]), t::lit_number(flag)],
         ),
     ));
     prog.push(export);
@@ -5356,6 +5481,38 @@ fn element_static_body_with_dyn_attrs(el: &svelte_ast::elements::RegularElement)
         }
     }
     if !has_dyn {
+        return false;
+    }
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// True iff the element has at least one SpreadAttribute + (optional)
+/// static attrs and a fully-static body. Used by `Slot::ElementWithSpread`.
+fn element_static_body_with_spread(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut has_spread = false;
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::SpreadAttribute(_) => has_spread = true,
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => {}
+                AttributeValue::Many(parts) => {
+                    if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    if !has_spread {
         return false;
     }
     for n in &el.fragment.nodes {

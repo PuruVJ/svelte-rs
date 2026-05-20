@@ -75,7 +75,14 @@ fn client_compile_matches_all_fixtures() {
         if cfg.contains("fragments: 'tree'") {
             opts.fragments = svelte_compiler::FragmentsStrategy::Tree;
         }
-        let result = compile(&source, &snake_to_pascal(&name), opts);
+        // Component name: derived from the source file's basename
+        // (so `main.svelte` → `Main`), matching upstream's behavior.
+        let pname = if src_basename == "main.svelte" {
+            "Main".to_string()
+        } else {
+            snake_to_pascal(&name)
+        };
+        let result = compile(&source, &pname, opts);
         match result {
             Ok(r) if r.js.trim() == expected.trim() => {
                 ok += 1;
