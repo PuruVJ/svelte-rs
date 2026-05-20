@@ -4990,6 +4990,7 @@ fn emit_top_level_multi_if_program(
                 // the body in that case.
                 let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
                 let body_emits_text = fragment_emits_text_var(&eb.body);
+                let body_emits_root = fragment_emits_root_template(&eb.body);
                 let body_text_name = if text_idx == 0 {
                     "text".to_string()
                 } else {
@@ -4997,6 +4998,13 @@ fn emit_top_level_multi_if_program(
                 };
                 if body_emits_text {
                     text_idx += 1;
+                }
+                // Upstream's visitor bumps root_idx per branch arrow even
+                // when the body doesn't materialize a `$.from_html` decl.
+                // Pre-bump here when the body won't emit one, so the next
+                // branch's root_N matches upstream's counter.
+                if !body_emits_root {
+                    root_idx += 1;
                 }
                 let mut inner_body = emit_vanilla_branch_body(
                     &eb.body,
@@ -5328,6 +5336,7 @@ fn emit_top_level_multi_if_program(
                 };
                 let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
                 let body_emits_text = fragment_emits_text_var(&eb.body);
+                let body_emits_root = fragment_emits_root_template(&eb.body);
                 let body_text_name = if text_idx == 0 {
                     "text".to_string()
                 } else {
@@ -5335,6 +5344,9 @@ fn emit_top_level_multi_if_program(
                 };
                 if body_emits_text {
                     text_idx += 1;
+                }
+                if !body_emits_root {
+                    root_idx += 1;
                 }
                 let mut inner_body = emit_vanilla_branch_body(
                     &eb.body,
@@ -6920,6 +6932,26 @@ fn fragment_emits_text_var(f: &svelte_ast::fragment::Fragment) -> bool {
         }
         _ => false,
     }
+}
+
+/// Approximates whether `emit_vanilla_branch_body` will allocate a
+/// `root_N` template for this fragment. Returns true when the body is a
+/// single RegularElement (which always materializes a `var root_N =
+/// \$.from_html(...)`).
+fn fragment_emits_root_template(f: &svelte_ast::fragment::Fragment) -> bool {
+    let non_ws: Vec<&FragmentChild> = f
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return false;
+    }
+    matches!(non_ws[0], FragmentChild::RegularElement(_))
 }
 
 fn node_uses_identifier(n: &FragmentChild, name: &str) -> bool {
