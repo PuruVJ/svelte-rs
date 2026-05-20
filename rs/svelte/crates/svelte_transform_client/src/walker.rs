@@ -1049,6 +1049,650 @@ fn emit_select_with_rich_options_static(
     Some(t::program(prog))
 }
 
+/// Emit a program for `<select>` with rich `<option>` content where the
+/// rich content includes reactive expressions, plus an optional trailing
+/// `<button onclick={...}>`. Used by option-rich-content-continues.
+/// Mirrors the upstream output:
+///   - option_content template includes reactive text placeholders
+///   - customizable_select callback navigates text anchors + emits
+///     template_effect with `\$.get(X)` for each reactive position
+///   - trailing button gets `\$.delegated('click', button, handler)` +
+///     module-level `\$.delegate(['click'])`
+fn emit_select_with_rich_reactive_and_trailing(
+    root_fragment: &svelte_ast::fragment::Fragment,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    // Collect top-level non-WS, non-comment children.
+    let core: Vec<&FragmentChild> = root_fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            FragmentChild::SvelteOptions(_) => false,
+            _ => true,
+        })
+        .collect();
+    if core.is_empty() || core.len() > 2 {
+        return None;
+    }
+    let select_el = match core[0] {
+        FragmentChild::RegularElement(el) if el.name == "select" && el.attributes.is_empty() => el,
+        _ => return None,
+    };
+    let trailing_el: Option<&svelte_ast::elements::RegularElement> = if core.len() == 2 {
+        match core[1] {
+            FragmentChild::RegularElement(el) => Some(el),
+            _ => return None,
+        }
+    } else {
+        None
+    };
+    // Collect option children.
+    let mut option_els: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
+    for n in &select_el.fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(el) if el.name == "option" => option_els.push(el),
+            _ => return None,
+        }
+    }
+    if option_els.is_empty() {
+        return None;
+    }
+    // Per-option: value attr + rich (mixed text+expr+elem) detection.
+    struct OptInfo<'a> {
+        value: Option<String>,
+        is_rich: bool,
+        children: &'a [FragmentChild],
+    }
+    let mut infos: Vec<OptInfo> = Vec::new();
+    for opt in &option_els {
+        let mut info = OptInfo { value: None, is_rich: false, children: &opt.fragment.nodes };
+        for a in &opt.attributes {
+            match a {
+                ElementAttribute::Attribute(attr) if attr.name == "value" => {
+                    let s = match &attr.value {
+                        AttributeValue::Many(parts) => {
+                            let mut s = String::new();
+                            for p in parts {
+                                let AttributeValuePart::Text(t) = p else { return None; };
+                                s.push_str(&t.data);
+                            }
+                            s
+                        }
+                        AttributeValue::Empty => String::new(),
+                        _ => return None,
+                    };
+                    info.value = Some(s);
+                }
+                _ => return None,
+            }
+        }
+        info.is_rich = opt.fragment.nodes.iter().any(|c| matches!(c, FragmentChild::RegularElement(_)));
+        infos.push(info);
+    }
+
+    // Build select HTML template.
+    let mut select_html = String::from("<select>");
+    for (i, opt) in option_els.iter().enumerate() {
+        if infos[i].is_rich {
+            select_html.push_str("<option><!></option>");
+        } else {
+            select_html.push_str("<option>");
+            for c in &opt.fragment.nodes {
+                if let FragmentChild::Text(t) = c {
+                    select_html.push_str(t.data.trim());
+                } else {
+                    return None;
+                }
+            }
+            select_html.push_str("</option>");
+        }
+    }
+    select_html.push_str("</select>");
+    // Append trailing (e.g. " <button></button>").
+    if let Some(el) = trailing_el {
+        select_html.push(' ');
+        select_html.push('<');
+        select_html.push_str(&el.name);
+        // Only emit static attributes in HTML; dynamic attrs handled at runtime.
+        for a in &el.attributes {
+            if let ElementAttribute::Attribute(attr) = a {
+                match &attr.value {
+                    AttributeValue::Empty => {
+                        select_html.push(' ');
+                        select_html.push_str(&attr.name);
+                        select_html.push_str("=\"\"");
+                    }
+                    AttributeValue::Many(parts) => {
+                        if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                            select_html.push(' ');
+                            select_html.push_str(&attr.name);
+                            select_html.push_str("=\"");
+                            for p in parts {
+                                if let AttributeValuePart::Text(t) = p {
+                                    select_html.push_str(&t.data);
+                                }
+                            }
+                            select_html.push('"');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if is_void_client(&el.name) {
+            select_html.push_str("/>");
+        } else {
+            select_html.push_str("></");
+            select_html.push_str(&el.name);
+            select_html.push('>');
+        }
+    }
+
+    // Build per-rich-option_content templates and their callback bodies.
+    struct RichOption<'a> {
+        option_idx: usize,
+        template_name: String,
+        template_html: String,
+        callback_body: Vec<Statement>,
+        _phantom: std::marker::PhantomData<&'a ()>,
+    }
+    let mut rich_options: Vec<RichOption> = Vec::new();
+    let mut rich_counter = 0usize;
+    for (oi, opt) in option_els.iter().enumerate() {
+        if !infos[oi].is_rich {
+            continue;
+        }
+        let template_name = if rich_counter == 0 {
+            "option_content".to_string()
+        } else {
+            format!("option_content_{}", rich_counter)
+        };
+        rich_counter += 1;
+        let fragment_var = if rich_options.is_empty() {
+            "fragment_1".to_string()
+        } else {
+            format!("fragment_{}", rich_options.len() + 1)
+        };
+        let anchor_var = if rich_options.is_empty() {
+            "anchor".to_string()
+        } else {
+            format!("anchor_{}", rich_options.len())
+        };
+
+        // Walk option's children to:
+        //   - Build template HTML
+        //   - Identify reactive text positions (text anchors)
+        let mut tpl = String::new();
+        // The callback body emits: var anchor = $.child(option_N); var
+        // fragment_1 = template(); ...nav + text_anchors...; $.template_effect(...); $.append(anchor, fragment_1)
+        let mut cb_body: Vec<Statement> = Vec::new();
+        cb_body.push(t::var(
+            &anchor_var,
+            t::call(
+                t::member_id(t::id("$"), "child"),
+                vec![t::id(&select_option_var(oi))],
+            ),
+        ));
+        cb_body.push(t::var(&fragment_var, t::call(t::id(&template_name), Vec::new())));
+
+        // Walk children: build template HTML + collect reactive set_text calls.
+        // We treat the option body as a multi-root template (flag 1).
+        // Each child is either:
+        //   - A static element (serialized)
+        //   - An element with text-anchor content (placeholder + text var)
+        //   - A bare ExpressionTag → trailing/leading space placeholder
+        //   - A static Text → kept verbatim
+        let mut set_text_calls: Vec<Statement> = Vec::new();
+        let mut elem_var_local: usize = 0;
+        let mut text_var_local: usize = 0;
+        let mut prev_elem_var: Option<String> = None;
+        let mut first_emitted = false;
+        let mut prev_was_text = false;
+        for (ci, c) in opt.fragment.nodes.iter().enumerate() {
+            let _ = ci;
+            match c {
+                FragmentChild::Text(t) => {
+                    tpl.push_str(&t.data);
+                    prev_was_text = true;
+                }
+                FragmentChild::ExpressionTag(et) => {
+                    // Space placeholder in template + sibling navigation —
+                    // unless preceding sibling was Text (the existing text
+                    // node serves as the anchor).
+                    if !prev_was_text {
+                        tpl.push(' ');
+                    }
+                    prev_was_text = false;
+                    let text_name = if text_var_local == 0 {
+                        "text".to_string()
+                    } else {
+                        format!("text_{}", text_var_local)
+                    };
+                    text_var_local += 1;
+                    let init = if let Some(prev) = &prev_elem_var {
+                        // sibling of last span etc.
+                        t::call(
+                            t::member_id(t::id("$"), "sibling"),
+                            vec![t::id(prev)],
+                        )
+                    } else {
+                        // First — first_child of fragment.
+                        t::call(
+                            t::member_id(t::id("$"), "first_child"),
+                            vec![t::id(&fragment_var)],
+                        )
+                    };
+                    cb_body.push(t::var(&text_name, init));
+                    prev_elem_var = Some(text_name.clone());
+                    first_emitted = true;
+                    // set_text(text_N, ` ${EXPR ?? ''}`) for sibling text (with prefix space)
+                    // OR set_text(text, EXPR) for inside element.
+                    // Build inline template that mirrors source surroundings.
+                    // Here we're a bare ExpressionTag → the text node will
+                    // hold ` ${EXPR ?? ''}`.
+                    let expr = rewrite_props_destructured(
+                        &et.expression,
+                        &script.props_destructured,
+                    );
+                    let mut expr = expr;
+                    rewrite_expr_for_state(&mut expr, &script.state_bindings);
+                    let mut quasi = String::new();
+                    quasi.push(' ');
+                    // Wrap as `EXPR ?? ''`.
+                    let coalesced = Expression::Logical(Box::new(LogicalExpression {
+                        left: expr,
+                        operator: LogicalOperator::Coalesce,
+                        right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: String::new(),
+                            raw: Some("''".to_string()),
+                            span: Span::ZERO,
+                        }))),
+                        span: Span::ZERO,
+                    }));
+                    let tpl_lit = Expression::Template(Box::new(TemplateLiteral {
+                        quasis: vec![
+                            TemplateElement {
+                                cooked: quasi.clone(),
+                                raw: quasi.clone(),
+                                tail: false,
+                                span: Span::ZERO,
+                            },
+                            TemplateElement {
+                                cooked: String::new(),
+                                raw: String::new(),
+                                tail: true,
+                                span: Span::ZERO,
+                            },
+                        ],
+                        expressions: vec![coalesced],
+                        span: Span::ZERO,
+                    }));
+                    set_text_calls.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "set_text"),
+                        vec![t::id(&text_name), tpl_lit],
+                    )));
+                }
+                FragmentChild::RegularElement(child_el) => {
+                    prev_was_text = false;
+                    // Serialize the element. If it's text-only with reactive
+                    // content, allocate a text anchor + reset.
+                    let is_text_anchor = is_text_only_element(child_el)
+                        && child_el.attributes.is_empty();
+                    if is_text_anchor {
+                        // Open tag + space placeholder.
+                        tpl.push('<');
+                        tpl.push_str(&child_el.name);
+                        tpl.push_str("> </");
+                        tpl.push_str(&child_el.name);
+                        tpl.push('>');
+                        let elem_name = if elem_var_local == 0 {
+                            child_el.name.clone()
+                        } else {
+                            format!("{}_{}", child_el.name, elem_var_local)
+                        };
+                        elem_var_local += 1;
+                        let init = if !first_emitted {
+                            t::call(
+                                t::member_id(t::id("$"), "first_child"),
+                                vec![t::id(&fragment_var)],
+                            )
+                        } else if let Some(prev) = &prev_elem_var {
+                            t::call(
+                                t::member_id(t::id("$"), "sibling"),
+                                vec![t::id(prev)],
+                            )
+                        } else {
+                            t::call(
+                                t::member_id(t::id("$"), "first_child"),
+                                vec![t::id(&fragment_var)],
+                            )
+                        };
+                        cb_body.push(t::var(&elem_name, init));
+                        first_emitted = true;
+                        // Text anchor inside the element.
+                        let text_name = if text_var_local == 0 {
+                            "text".to_string()
+                        } else {
+                            format!("text_{}", text_var_local)
+                        };
+                        text_var_local += 1;
+                        cb_body.push(t::var(
+                            &text_name,
+                            t::call(
+                                t::member_id(t::id("$"), "child"),
+                                vec![
+                                    t::id(&elem_name),
+                                    Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                                        value: true,
+                                        span: Span::ZERO,
+                                    }))),
+                                ],
+                            ),
+                        ));
+                        cb_body.push(t::stmt(t::call(
+                            t::member_id(t::id("$"), "reset"),
+                            vec![t::id(&elem_name)],
+                        )));
+                        // Build inline expression from element's children.
+                        let mut parts: Vec<TextPart> = Vec::new();
+                        for cc in &child_el.fragment.nodes {
+                            match cc {
+                                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                                FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
+                                _ => return None,
+                            }
+                        }
+                        let inline = build_inline_template(&parts, &script.state_bindings);
+                        let inline = rewrite_props_destructured(&inline, &script.props_destructured);
+                        set_text_calls.push(t::stmt(t::call(
+                            t::member_id(t::id("$"), "set_text"),
+                            vec![t::id(&text_name), inline],
+                        )));
+                        prev_elem_var = Some(elem_name);
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // Wrap set_text_calls in template_effect.
+        if !set_text_calls.is_empty() {
+            let eff_body = if set_text_calls.len() == 1 {
+                let stmt = set_text_calls.into_iter().next().unwrap();
+                let expr = if let Statement::Expression(e) = stmt {
+                    e.expression
+                } else {
+                    unreachable!()
+                };
+                ArrowBody::Expression(expr)
+            } else {
+                ArrowBody::Block(Box::new(BlockStatement {
+                    body: set_text_calls,
+                    span: Span::ZERO,
+                }))
+            };
+            cb_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "template_effect"),
+                vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: eff_body,
+                    r#async: false,
+                    span: Span::ZERO,
+                }))],
+            )));
+        }
+        cb_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id(&anchor_var), t::id(&fragment_var)],
+        )));
+        rich_options.push(RichOption {
+            option_idx: oi,
+            template_name,
+            template_html: tpl,
+            callback_body: cb_body,
+            _phantom: std::marker::PhantomData,
+        });
+    }
+
+    // Build function body.
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    // var fragment = root();
+    func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
+    // var select = $.first_child(fragment);
+    func_body.push(t::var(
+        "select",
+        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+    ));
+    // Walk options, allocate vars, emit customizable_select for rich + value assignments.
+    let mut prev_opt_var: Option<String> = None;
+    let mut delegated_events: Vec<(String, String, Expression)> = Vec::new(); // (event, var, handler)
+    for (oi, opt) in option_els.iter().enumerate() {
+        let var_name = select_option_var(oi);
+        let init = if oi == 0 {
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id("select")])
+        } else {
+            t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![t::id(prev_opt_var.as_ref().unwrap())],
+            )
+        };
+        func_body.push(t::var(&var_name, init));
+        if let Some(rich) = rich_options.iter().find(|r| r.option_idx == oi) {
+            let cb = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: rich.callback_body.clone(),
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            func_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "customizable_select"),
+                vec![t::id(&var_name), cb],
+            )));
+        }
+        // option.value = option.__value = 'X';
+        if let Some(val) = &infos[oi].value {
+            let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: val.clone(),
+                raw: Some(format!("'{}'", val.replace('\'', "\\'"))),
+                span: Span::ZERO,
+            })));
+            let inner_assign = Expression::Assignment(Box::new(AssignmentExpression {
+                left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
+                    object: t::id(&var_name),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "__value".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                operator: AssignmentOperator::Assign,
+                right: value_expr,
+                span: Span::ZERO,
+            }));
+            let outer_assign = Expression::Assignment(Box::new(AssignmentExpression {
+                left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
+                    object: t::id(&var_name),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "value".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                operator: AssignmentOperator::Assign,
+                right: inner_assign,
+                span: Span::ZERO,
+            }));
+            func_body.push(t::stmt(outer_assign));
+        }
+        prev_opt_var = Some(var_name);
+        let _ = opt;
+    }
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id("select")],
+    )));
+
+    // Trailing element (button) with onclick.
+    if let Some(tel) = trailing_el {
+        let tel_var = tel.name.clone();
+        func_body.push(t::var(
+            &tel_var,
+            t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![t::id("select"), t::lit_number(2.0)],
+            ),
+        ));
+        for a in &tel.attributes {
+            if let ElementAttribute::Attribute(attr) = a {
+                if let Some(stripped) = attr.name.strip_prefix("on") {
+                    if let AttributeValue::Single(tag) = &attr.value {
+                        let handler = rewrite_expr_for_state_helper(
+                            &tag.expression,
+                            &script.state_bindings,
+                        );
+                        delegated_events.push((
+                            stripped.to_string(),
+                            tel_var.clone(),
+                            handler,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for (ev, var, handler) in &delegated_events {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "delegated"),
+            vec![
+                t::literal_str(ev),
+                t::id(var),
+                handler.clone(),
+            ],
+        )));
+    }
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    // option_content_N templates.
+    for rich in &rich_options {
+        prog.push(t::var(
+            &rich.template_name,
+            t::call(
+                t::member_id(t::id("$"), "from_html"),
+                vec![
+                    t::template_raw(vec![rich.template_html.clone()], Vec::new()),
+                    t::lit_number(1.0),
+                ],
+            ),
+        ));
+    }
+    // var root = $.from_html(SELECT_HTML[, 1]);
+    let root_flag = if trailing_el.is_some() { 1.0 } else { 0.0 };
+    let root_args: Vec<Expression> = if root_flag != 0.0 {
+        vec![t::template_raw(vec![select_html], Vec::new()), t::lit_number(root_flag)]
+    } else {
+        vec![t::template_raw(vec![select_html], Vec::new())]
+    };
+    prog.push(t::var(
+        "root",
+        t::call(t::member_id(t::id("$"), "from_html"), root_args),
+    ));
+    prog.push(export);
+    // $.delegate(['click', ...]) trailer.
+    if !delegated_events.is_empty() {
+        let mut names: Vec<String> = delegated_events.iter().map(|(e, _, _)| e.clone()).collect();
+        names.sort();
+        names.dedup();
+        let arr = Expression::Array(Box::new(ArrayExpression {
+            elements: names
+                .into_iter()
+                .map(|n| ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
+                    StringLiteral { value: n, raw: None, span: Span::ZERO }
+                )))))
+                .collect(),
+            span: Span::ZERO,
+        }));
+        prog.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "delegate"),
+            vec![arr],
+        )));
+    }
+    Some(t::program(prog))
+}
+
+fn select_option_var(idx: usize) -> String {
+    if idx == 0 { "option".to_string() } else { format!("option_{}", idx) }
+}
+
+/// True iff the expression contains any CallExpression anywhere in its
+/// subtree. Used to decide whether `$.set(X, V)` needs the notify-flag
+/// third argument (mirrors upstream's `mutation` flag).
+fn expr_contains_call(e: &Expression) -> bool {
+    match e {
+        Expression::Call(_) => true,
+        Expression::New(_) => true,
+        Expression::Member(m) => expr_contains_call(&m.object) || match &m.property {
+            MemberProperty::Expression(e) => expr_contains_call(e),
+            _ => false,
+        },
+        Expression::Binary(b) => expr_contains_call(&b.left) || expr_contains_call(&b.right),
+        Expression::Logical(b) => expr_contains_call(&b.left) || expr_contains_call(&b.right),
+        Expression::Unary(u) => expr_contains_call(&u.argument),
+        Expression::Conditional(c) => {
+            expr_contains_call(&c.test)
+                || expr_contains_call(&c.consequent)
+                || expr_contains_call(&c.alternate)
+        }
+        Expression::Template(t) => t.expressions.iter().any(expr_contains_call),
+        Expression::Array(a) => a.elements.iter().any(|el| match el {
+            ArrayElement::Expression(e) => expr_contains_call(e),
+            ArrayElement::Spread(s) => expr_contains_call(&s.argument),
+            _ => false,
+        }),
+        Expression::Object(o) => o.properties.iter().any(|p| match p {
+            ObjectMember::Property(p) => expr_contains_call(&p.value),
+            ObjectMember::Spread(s) => expr_contains_call(&s.argument),
+        }),
+        _ => false,
+    }
+}
+
+fn rewrite_expr_for_state_helper(e: &Expression, state: &HashSet<String>) -> Expression {
+    let mut e2 = e.clone();
+    rewrite_expr_for_state(&mut e2, state);
+    e2
+}
+
 /// Emit a program for `<custom-element K=V>...</custom-element>` (tag with
 /// hyphen, all static attrs, empty body). Strips attrs from the HTML
 /// template + emits `$.set_custom_element_data(VAR, K, V)`. Wraps the
@@ -1280,6 +1924,7 @@ pub fn try_typed_client_walker_with(
             .filter(|n| match n {
                 FragmentChild::Text(t) => !t.data.trim().is_empty(),
                 FragmentChild::Comment(_) => false,
+                FragmentChild::SvelteOptions(_) => false,
                 _ => true,
             })
             .collect();
@@ -1304,6 +1949,30 @@ pub fn try_typed_client_walker_with(
                             return Some(p);
                         }
                     }
+                }
+            }
+        }
+        // Multi-root: `<select>` with rich options + trailing element with
+        // event handler (option-rich-content-continues / optgroup-rich-content).
+        if non_ws.len() == 2 {
+            let first_is_select_rich = matches!(non_ws[0],
+                FragmentChild::RegularElement(el) if el.name == "select"
+                    && el.fragment.nodes.iter().any(|n| matches!(
+                        n,
+                        FragmentChild::RegularElement(opt)
+                            if opt.name == "option"
+                                && opt.fragment.nodes.iter().any(|c| matches!(
+                                    c, FragmentChild::RegularElement(_)
+                                ))
+                    ))
+            );
+            if first_is_select_rich {
+                if let Some(p) = emit_select_with_rich_reactive_and_trailing(
+                    &root.fragment,
+                    component_name,
+                    &script,
+                ) {
+                    return Some(p);
                 }
             }
         }
@@ -18092,9 +18761,9 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
             }
             ArrowBody::Expression(body_expr) => {
                 // Special case: `() => X = V` where X is a state binding and
-                // the operator is plain `=`. The arrow body's expression
-                // value is observed (event handler return value), so emit
-                // `$.set(X, V, true)` with the notify flag.
+                // the operator is plain `=` AND V contains a CallExpression.
+                // Mirrors upstream's notify-flag emission for plain
+                // assignments whose RHS is a function-call result.
                 let mut handled = false;
                 if let E::Assignment(asgn) = body_expr {
                     if matches!(asgn.operator, AssignmentOperator::Assign) {
@@ -18108,7 +18777,9 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                             _ => None,
                         };
                         if let Some(name) = lhs_name {
-                            if state.contains(&name) {
+                            if state.contains(&name)
+                                && expr_contains_call(&asgn.right)
+                            {
                                 rewrite_expr_for_state(&mut asgn.right, state);
                                 let rhs = std::mem::replace(
                                     &mut asgn.right,
