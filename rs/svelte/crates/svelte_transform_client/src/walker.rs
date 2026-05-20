@@ -280,6 +280,105 @@ fn emit_svelte_head_program(
     Some(t::program(prog))
 }
 
+/// Emit a program for `<custom-element K=V>...</custom-element>` (tag with
+/// hyphen, all static attrs, empty body). Strips attrs from the HTML
+/// template + emits `$.set_custom_element_data(VAR, K, V)`. Wraps the
+/// component in legacy `$.push($$props, false) ... $.pop()` so that
+/// runtime hydration recognizes it as a Svelte 4-shape custom element.
+fn emit_single_static_custom_element_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    module_stmts: &[Statement],
+) -> Option<Program> {
+    // Collect static (name, value) pairs from the element attributes.
+    let mut props: Vec<(String, String)> = Vec::new();
+    for a in &el.attributes {
+        let ElementAttribute::Attribute(attr) = a else { return None; };
+        let value: String = match &attr.value {
+            AttributeValue::Empty => String::new(),
+            AttributeValue::Many(parts) => {
+                let mut s = String::new();
+                for p in parts {
+                    let AttributeValuePart::Text(t) = p else { return None; };
+                    s.push_str(&t.data);
+                }
+                s
+            }
+            _ => return None,
+        };
+        props.push((attr.name.clone(), value));
+    }
+
+    // HTML template with attrs stripped: `<TAG></TAG>`.
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&el.name);
+    html.push('>');
+    html.push_str("</");
+    html.push_str(&el.name);
+    html.push('>');
+
+    let var = sanitize_name(&el.name);
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "push"),
+        vec![
+            t::id("$$props"),
+            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                value: false,
+                span: Span::ZERO,
+            }))),
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "init"),
+        Vec::new(),
+    )));
+    func_body.push(t::var(&var, t::call(t::id("root"), Vec::new())));
+    for (k, v) in &props {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "set_custom_element_data"),
+            vec![
+                t::id(&var),
+                t::literal_str(k),
+                t::literal_str(v),
+            ],
+        )));
+    }
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&var)],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "pop"),
+        Vec::new(),
+    )));
+
+    let params = vec![t::pat_id("$$anchor"), t::pat_id("$$props")];
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    // Module-level statements (e.g. customElements.define(...)) before var root.
+    prog.extend(module_stmts.iter().cloned());
+    // `var root = $.from_html(\`HTML\`, 2);` — flag 2 = needs_import_node.
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![
+                t::template_raw(vec![html], Vec::new()),
+                t::lit_number(2.0),
+            ],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2-variant
 /// (XOR rather than add) base-36 encoded as u32. Mirrors
 /// `packages/svelte/src/utils.js`.
@@ -360,6 +459,48 @@ pub fn try_typed_client_walker_with(
                 &script,
             ) {
                 return Some(p);
+            }
+        }
+    }
+
+    // PRE-DETECT: single static custom-element (tag with hyphen) with optional
+    // module script (e.g. `customElements.define(...)`). Strips static attrs
+    // from HTML template + emits `$.set_custom_element_data(var, K, V)`.
+    {
+        let non_ws: Vec<&FragmentChild> = root
+            .fragment
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        if non_ws.len() == 1 {
+            if let FragmentChild::RegularElement(el) = non_ws[0] {
+                if el.name.contains('-')
+                    && el.fragment.nodes.is_empty()
+                    && root.instance.is_none()
+                    && el.attributes.iter().all(|a| matches!(
+                        a,
+                        ElementAttribute::Attribute(attr)
+                            if matches!(attr.value, AttributeValue::Many(_) | AttributeValue::Empty)
+                                && (match &attr.value {
+                                    AttributeValue::Many(parts) => parts.iter().all(|p|
+                                        matches!(p, AttributeValuePart::Text(_))),
+                                    _ => true,
+                                })
+                    ))
+                {
+                    if let Some(p) = emit_single_static_custom_element_program(
+                        el,
+                        component_name,
+                        &module_stmts,
+                    ) {
+                        return Some(p);
+                    }
+                }
             }
         }
     }
