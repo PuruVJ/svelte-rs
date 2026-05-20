@@ -1804,6 +1804,205 @@ fn emit_async_branch_body(
 /// `roots` accumulates module-level `var root_N = $.from_html(...)`
 /// declarations for the element case. `root_idx` is incremented as each
 /// new root is allocated.
+/// Emit a branch body for multiple top-level RegularElements (e.g.
+/// the consequent of `{#if true}<div id={x}/><div id={y}/>{/if}`). Each
+/// element must be either fully static or have only dyn attributes
+/// (no events, binds, slots, blocks).
+fn emit_multi_element_branch_body(
+    non_ws: &[&FragmentChild],
+    roots: &mut Vec<Statement>,
+    root_idx: &mut usize,
+    elem_var_idx: &mut usize,
+) -> Option<Vec<Statement>> {
+    emit_multi_element_branch_body_with_context(
+        non_ws,
+        roots,
+        root_idx,
+        elem_var_idx,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+}
+
+fn emit_multi_element_branch_body_with_context(
+    non_ws: &[&FragmentChild],
+    roots: &mut Vec<Statement>,
+    root_idx: &mut usize,
+    elem_var_idx: &mut usize,
+    props_destructured: &HashSet<String>,
+    legacy_prop_names: &HashSet<String>,
+) -> Option<Vec<Statement>> {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    // Build template HTML: `<EL ...></EL> <EL ...></EL>` (space-separated).
+    let mut template = String::new();
+    let mut elements: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
+    for n in non_ws {
+        if let FragmentChild::RegularElement(el) = n {
+            elements.push(el);
+        }
+    }
+    let mut needs_import_node = false;
+    for (i, el) in elements.iter().enumerate() {
+        if i > 0 {
+            template.push(' ');
+        }
+        if el.name.contains('-') || el.name == "video" {
+            needs_import_node = true;
+        }
+        template.push('<');
+        template.push_str(&el.name);
+        for a in &el.attributes {
+            if let ElementAttribute::Attribute(attr) = a {
+                match &attr.value {
+                    AttributeValue::Empty => {
+                        template.push(' ');
+                        template.push_str(&attr.name);
+                        template.push_str("=\"\"");
+                    }
+                    AttributeValue::Many(parts) => {
+                        if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                            template.push(' ');
+                            template.push_str(&attr.name);
+                            template.push_str("=\"");
+                            for p in parts {
+                                if let AttributeValuePart::Text(t) = p {
+                                    for c in t.data.chars() {
+                                        match c {
+                                            '"' => template.push_str("&quot;"),
+                                            '&' => template.push_str("&amp;"),
+                                            _ => template.push(c),
+                                        }
+                                    }
+                                }
+                            }
+                            template.push('"');
+                        }
+                        // Skip dynamic Many parts; they're handled at runtime.
+                    }
+                    AttributeValue::Single(_) => {
+                        // Dynamic — handled at runtime.
+                    }
+                }
+            }
+        }
+        if is_void_client(&el.name) {
+            template.push_str("/>");
+        } else {
+            template.push('>');
+            let mut needs2 = needs_import_node;
+            serialize_fragment_to_html(&el.fragment, &mut template, &mut needs2).unwrap_or(());
+            if needs2 {
+                needs_import_node = true;
+            }
+            template.push_str("</");
+            template.push_str(&el.name);
+            template.push('>');
+        }
+    }
+    *root_idx += 1;
+    let root_name = format!("root_{}", *root_idx);
+    let flag = if needs_import_node { 3.0 } else { 1.0 };
+    roots.push(t::var(
+        &root_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![template], vec![]), t::lit_number(flag)],
+        ),
+    ));
+
+    let mut body: Vec<Statement> = Vec::new();
+    // Always use `fragment_N` inside branch bodies (outer scope already
+    // owns `fragment`). N matches the root_idx.
+    let frag_var = format!("fragment_{}", *root_idx);
+    body.push(t::var(&frag_var, t::call(t::id(&root_name), Vec::new())));
+
+    // Allocate var names for each element + track dyn attrs. Inside a
+    // branch_body the outer scope already uses bare `<name>`, so suffix
+    // every element here as `<name>_N`.
+    let mut var_names: Vec<String> = Vec::new();
+    let mut dyn_attr_calls: Vec<Statement> = Vec::new();
+    for (i, el) in elements.iter().enumerate() {
+        *elem_var_idx += 1;
+        let var = format!("{}_{}", el.name, *elem_var_idx);
+        var_names.push(var.clone());
+        let init = if i == 0 {
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id(&frag_var)],
+            )
+        } else {
+            t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![t::id(&var_names[i - 1]), t::lit_number(2.0)],
+            )
+        };
+        body.push(t::var(&var, init));
+        // Collect dyn-attr template_effect statements.
+        for a in &el.attributes {
+            if let ElementAttribute::Attribute(attr) = a {
+                let expr = match &attr.value {
+                    AttributeValue::Single(tag) => tag.expression.clone(),
+                    AttributeValue::Many(parts) => {
+                        if parts.len() == 1 {
+                            match &parts[0] {
+                                AttributeValuePart::ExpressionTag(et) => et.expression.clone(),
+                                _ => continue,
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                };
+                let expr = rewrite_props_destructured(&expr, props_destructured);
+                let expr = rewrite_legacy_prop_reads(&expr, legacy_prop_names);
+                dyn_attr_calls.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "set_attribute"),
+                    vec![
+                        t::id(&var),
+                        Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: attr.name.clone(),
+                            raw: None,
+                            span: Span::ZERO,
+                        }))),
+                        expr,
+                    ],
+                )));
+            }
+        }
+    }
+    if !dyn_attr_calls.is_empty() {
+        let effect_arrow_body = if dyn_attr_calls.len() == 1 {
+            let stmt = dyn_attr_calls.into_iter().next().unwrap();
+            let expr = if let Statement::Expression(e) = stmt {
+                e.expression
+            } else {
+                unreachable!()
+            };
+            ArrowBody::Expression(expr)
+        } else {
+            ArrowBody::Block(Box::new(BlockStatement {
+                body: dyn_attr_calls,
+                span: Span::ZERO,
+            }))
+        };
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: effect_arrow_body,
+                r#async: false,
+                span: Span::ZERO,
+            }))],
+        )));
+    }
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&frag_var)],
+    )));
+    Some(body)
+}
+
 fn emit_vanilla_branch_body(
     fragment: &svelte_ast::fragment::Fragment,
     text_name: &str,
@@ -1811,15 +2010,48 @@ fn emit_vanilla_branch_body(
     root_idx: &mut usize,
     elem_var_idx: &mut usize,
 ) -> Option<Vec<Statement>> {
+    emit_vanilla_branch_body_with_context(
+        fragment, text_name, roots, root_idx, elem_var_idx,
+        &HashSet::new(), &HashSet::new(),
+    )
+}
+
+fn emit_vanilla_branch_body_with_context(
+    fragment: &svelte_ast::fragment::Fragment,
+    text_name: &str,
+    roots: &mut Vec<Statement>,
+    root_idx: &mut usize,
+    elem_var_idx: &mut usize,
+    props_destructured: &HashSet<String>,
+    legacy_prop_names: &HashSet<String>,
+) -> Option<Vec<Statement>> {
     let non_ws: Vec<&FragmentChild> = fragment
         .nodes
         .iter()
         .filter(|c| match c {
             FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
             _ => true,
         })
         .collect();
     if non_ws.len() != 1 {
+        // Multi-element body: support N>=2 RegularElements where each is
+        // either fully static or has only dyn attrs. Mirrors
+        // `element-attribute-removed` consequent.
+        if non_ws.len() >= 2
+            && non_ws.iter().all(|n| match n {
+                FragmentChild::RegularElement(el) => {
+                    is_element_fully_static(el)
+                        || element_static_body_with_dyn_attrs(el)
+                }
+                _ => false,
+            })
+        {
+            return emit_multi_element_branch_body_with_context(
+                &non_ws, roots, root_idx, elem_var_idx,
+                props_destructured, legacy_prop_names,
+            );
+        }
         return None;
     }
     match non_ws[0] {
@@ -4237,12 +4469,14 @@ fn emit_top_level_multi_if_program(
                 } else {
                     format!("text_{}", if_i)
                 };
-                let consequent_body = emit_vanilla_branch_body(
+                let consequent_body = emit_vanilla_branch_body_with_context(
                     &ib.consequent,
                     &consequent_text_name,
                     &mut root_decls,
                     &mut root_idx,
                     &mut elem_var_idx,
+                    &script.props_destructured,
+                    &legacy_prop_names,
                 )?;
                 let consequent_var = if if_i == 0 {
                     "consequent".to_string()
