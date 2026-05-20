@@ -1222,6 +1222,16 @@ pub fn try_typed_client_walker_with(
             if expr_top_await(&eb.expression) {
                 return emit_single_async_each_program(eb, component_name, &script);
             }
+            // preserveWhitespace on `<svelte:options>` routes to a dedicated
+            // emitter that keeps source whitespace + uses fragment/sibling
+            // navigation instead of the `$.comment()` shortcut.
+            if detect_preserve_whitespace(&root.fragment) {
+                if let Some(p) = emit_single_each_preserve_whitespace_program(
+                    &root.fragment, eb, component_name, &script,
+                ) {
+                    return Some(p);
+                }
+            }
             return emit_single_each_program(eb, component_name, &script);
         }
         if let FragmentChild::IfBlock(ib) = nodes[0] {
@@ -14939,6 +14949,265 @@ fn emit_single_svelte_element_program(
 // ---------------------------------------------------------------------------
 // Single top-level {#each} emission
 // ---------------------------------------------------------------------------
+
+/// Walk a fragment looking for `<svelte:options preserveWhitespace />` (or
+/// `preserveWhitespace={true}`). Returns true when found.
+fn detect_preserve_whitespace(f: &svelte_ast::fragment::Fragment) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for n in &f.nodes {
+        if let FragmentChild::SvelteOptions(o) = n {
+            for a in &o.attributes {
+                if let ElementAttribute::Attribute(attr) = a {
+                    if attr.name == "preserveWhitespace" {
+                        match &attr.value {
+                            AttributeValue::Empty => return true,
+                            AttributeValue::Many(parts) => {
+                                for p in parts {
+                                    if let AttributeValuePart::Text(t) = p {
+                                        if t.data == "true" {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                            AttributeValue::Single(tag) => {
+                                if let Expression::Literal(lit) = &tag.expression {
+                                    if let Literal::Boolean(b) = lit.as_ref() {
+                                        if b.value {
+                                            return true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Emit a top-level `{#each}` block when `<svelte:options preserveWhitespace />`
+/// is set. Differs from `emit_single_each_program` in that:
+/// - Templates retain source whitespace verbatim (no collapse / trim).
+/// - The outer template is a multi-root `\\n\\n<!>` (preserves leading
+///   newlines from source).
+/// - Navigation uses `$.next()` + sibling+first_child instead of the
+///   `$.comment()` shortcut.
+/// - The body emits a text-anchor + template_effect even for text-only
+///   bodies (the textContent shortcut is skipped).
+fn emit_single_each_preserve_whitespace_program(
+    root_fragment: &svelte_ast::fragment::Fragment,
+    eb: &svelte_ast::blocks::EachBlock,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Body must be a single wrapper element (e.g. `<div>{l}</div>`) for
+    // this narrow emitter. Other shapes bail.
+    let body_non_ws: Vec<&FragmentChild> = eb
+        .body
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if body_non_ws.len() != 1 {
+        return None;
+    }
+    let inner_el = match body_non_ws[0] {
+        FragmentChild::RegularElement(el) => el,
+        _ => return None,
+    };
+    if !inner_el.attributes.is_empty() || !is_text_only_element(inner_el) {
+        return None;
+    }
+    let item_name = match eb.context.as_ref() {
+        Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
+        _ => return None,
+    };
+
+    // Build inner template: leading whitespace + `<div> </div>` + trailing whitespace
+    // mirrored from the source body's Text + Element + Text shape.
+    let mut inner_template = String::new();
+    for n in &eb.body.nodes {
+        match n {
+            FragmentChild::Text(t) => inner_template.push_str(&t.data),
+            FragmentChild::RegularElement(el) if std::ptr::eq(el, inner_el) => {
+                inner_template.push('<');
+                inner_template.push_str(&el.name);
+                inner_template.push_str("> </");
+                inner_template.push_str(&el.name);
+                inner_template.push('>');
+            }
+            _ => {}
+        }
+    }
+
+    // Build outer template: leading text (whitespace) + `<!>` placeholder.
+    let mut outer_template = String::new();
+    let mut saw_each = false;
+    for n in &root_fragment.nodes {
+        match n {
+            FragmentChild::SvelteOptions(_) => {}
+            FragmentChild::Text(t) if !saw_each => outer_template.push_str(&t.data),
+            FragmentChild::EachBlock(_) => {
+                outer_template.push_str("<!>");
+                saw_each = true;
+            }
+            FragmentChild::Text(_) => {} // trailing text after each — discarded
+            _ => {}
+        }
+    }
+
+    // Build inner expression for the text-anchor.
+    let mut parts: Vec<TextPart> = Vec::new();
+    for c in &inner_el.fragment.nodes {
+        match c {
+            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+            FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
+            _ => return None,
+        }
+    }
+    let inline = build_inline_template(&parts, &script.state_bindings);
+
+    // root_1 template: inner each body
+    let mut hoisted: Vec<Statement> = Vec::new();
+    hoisted.push(t::var(
+        "root_1",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![inner_template], vec![]), t::lit_number(1.0)],
+        ),
+    ));
+    hoisted.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![outer_template], vec![]), t::lit_number(1.0)],
+        ),
+    ));
+
+    // Function body.
+    let mut body_stmts: Vec<Statement> = Vec::new();
+    body_stmts.extend(script.body.clone());
+    body_stmts.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), vec![])));
+    body_stmts.push(t::var("fragment", t::call(t::id("root"), vec![])));
+    body_stmts.push(t::var(
+        "node",
+        t::call(
+            t::member_id(t::id("$"), "sibling"),
+            vec![t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")])],
+        ),
+    ));
+
+    // Build the each-body arrow.
+    let is_runes_iter = matches!(
+        &eb.expression,
+        Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+    ) || expression_uses_props_destructured(
+        &eb.expression,
+        &script.props_destructured,
+    );
+    let item_referenced = is_runes_iter
+        && fragment_uses_identifier(&eb.body, &item_name);
+    let mut item_body: Vec<Statement> = Vec::new();
+    item_body.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), vec![])));
+    item_body.push(t::var("fragment_1", t::call(t::id("root_1"), vec![])));
+    item_body.push(t::var(
+        "div",
+        t::call(
+            t::member_id(t::id("$"), "sibling"),
+            vec![t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment_1")])],
+        ),
+    ));
+    item_body.push(t::var(
+        "text",
+        t::call(
+            t::member_id(t::id("$"), "child"),
+            vec![
+                t::id("div"),
+                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                    value: true,
+                    span: Span::ZERO,
+                }))),
+            ],
+        ),
+    ));
+    item_body.push(t::stmt(t::call(t::member_id(t::id("$"), "reset"), vec![t::id("div")])));
+    item_body.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), vec![])));
+    let inline = if item_referenced {
+        rewrite_get_for_each_var(&inline, &item_name)
+    } else {
+        inline
+    };
+    let set_text = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![t::id("text"), inline],
+    );
+    item_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![],
+            body: ArrowBody::Expression(set_text),
+            r#async: false,
+            span: Span::ZERO,
+        }))],
+    )));
+    item_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment_1")],
+    )));
+
+    let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: item_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // is_runes_iter — for literal 'abc' it's false; legacy iter is also false.
+    let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![],
+        body: ArrowBody::Expression(eb.expression.clone()),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "each"),
+        vec![
+            t::id("node"),
+            t::lit_number(0.0),
+            getter,
+            t::member_id(t::id("$"), "index"),
+            item_arrow,
+        ],
+    )));
+    body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let params = vec![t::pat_id("$$anchor")];
+    let export = t::export_default_function(component_name, params, body_stmts);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.extend(hoisted);
+    prog.push(export);
+    Some(t::program(prog))
+}
 
 fn emit_single_each_program(
     eb: &svelte_ast::blocks::EachBlock,
