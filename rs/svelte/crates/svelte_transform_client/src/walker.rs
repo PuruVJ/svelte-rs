@@ -3784,6 +3784,11 @@ fn emit_top_level_multi_if_program(
         /// `var X = ...; var node = $.child(X); $.slot(node, $$props,
         /// 'NAME', {}, null); $.reset(X);`.
         ElementWithSlot(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::elements::SlotElement),
+        /// `<TAG ATTRS>Hello {name}!</TAG>` — element with text-only body
+        /// (Text + ExpressionTag, at least one non-literal). Emits
+        /// `<TAG> </TAG>` template + body `var X = ...; var text = $.child(X);
+        /// $.reset(X);` and a template_effect for set_text.
+        TextAnchorEl(&'a svelte_ast::elements::RegularElement),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3911,6 +3916,16 @@ fn emit_top_level_multi_if_program(
                         continue;
                     }
                 }
+                // Detect element with text-anchor body (`<h1>Hello, {name}</h1>`)
+                // and static attrs. Mirrors `each-else`'s h1.
+                if is_element_static_attrs(el) && is_text_only_element(el) {
+                    if !slots.is_empty() {
+                        gap_after.push(pending_gap);
+                    }
+                    pending_gap = false;
+                    slots.push(Slot::TextAnchorEl(el));
+                    continue;
+                }
                 // Detect element with event directives but otherwise
                 // static body (event-handler fixture).
                 if element_static_body_with_events(el) {
@@ -3969,6 +3984,7 @@ fn emit_top_level_multi_if_program(
                 | Slot::DynamicEl(_)
                 | Slot::ElementWithSpread(_)
                 | Slot::ElementWithSlot(_, _)
+                | Slot::TextAnchorEl(_)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -4004,7 +4020,8 @@ fn emit_top_level_multi_if_program(
             | Slot::ElementWithEvents(_)
             | Slot::DynamicEl(_)
             | Slot::ElementWithSpread(_)
-            | Slot::ElementWithSlot(_, _) => {
+            | Slot::ElementWithSlot(_, _)
+            | Slot::TextAnchorEl(_) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -4044,6 +4061,9 @@ fn emit_top_level_multi_if_program(
     // Spread effects (`$.attribute_effect(...)`) are emitted BEFORE
     // template_effect / event calls so upstream's ordering matches.
     let mut spread_effects: Vec<Statement> = Vec::new();
+    // Text-anchor set_text effects (one per TextAnchorEl); combined into
+    // a single template_effect block at the end.
+    let mut text_set_effects: Vec<(String, Expression)> = Vec::new();
     let mut anchor_count = 0usize;
     let mut if_count = 0usize;
     let mut prev_anchor_slot: Option<usize> = None;
@@ -4104,6 +4124,13 @@ fn emit_top_level_multi_if_program(
                 format!("{}_{}", el.name, cnt)
             }
         } else if let Slot::ElementWithSlot(el, _) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
+        } else if let Slot::TextAnchorEl(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
                 el.name.clone()
@@ -4524,6 +4551,43 @@ fn emit_top_level_multi_if_program(
                     )));
                 }
             }
+            Slot::TextAnchorEl(el) => {
+                // `var text_N = $.child(X); $.reset(X);` + queue text_set effect.
+                let text_var = if text_idx == 0 {
+                    "text".to_string()
+                } else {
+                    format!("text_{}", text_idx)
+                };
+                text_idx += 1;
+                block_stmts.push(t::var(
+                    &text_var,
+                    t::call(
+                        t::member_id(t::id("$"), "child"),
+                        vec![t::id(&cur_var)],
+                    ),
+                ));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(&cur_var)],
+                )));
+                // Build the inline template from body parts.
+                let mut parts: Vec<TextPart> = Vec::new();
+                for child in &el.fragment.nodes {
+                    match child {
+                        FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                        FragmentChild::ExpressionTag(et) => {
+                            parts.push(TextPart::Expr(&et.expression))
+                        }
+                        _ => {}
+                    }
+                }
+                let inline = build_inline_template(&parts, &HashSet::new());
+                // Rewrite identifier references for legacy props (X → X())
+                // and runes destructured props (X → $$props.X).
+                let inline = rewrite_props_destructured(&inline, &script.props_destructured);
+                let inline = rewrite_legacy_prop_reads(&inline, &legacy_prop_names);
+                text_set_effects.push((text_var, inline));
+            }
             Slot::ElementWithSlot(_el, se) => {
                 // `var X = ...; var node_N = $.child(X); $.slot(node_N,
                 // $$props, 'NAME', {}, null); $.reset(X);`.
@@ -4795,6 +4859,45 @@ fn emit_top_level_multi_if_program(
     // Spread `$.attribute_effect` calls come BEFORE event/template_effect
     // (matches upstream's emission order).
     func_body.extend(spread_effects);
+    // Combined `$.template_effect(() => { $.set_text(t, EXPR); ... })`
+    // for all TextAnchorEl text-sets.
+    if text_set_effects.len() == 1 {
+        let (text_var, expr) = text_set_effects.into_iter().next().unwrap();
+        let arrow_body = ArrowBody::Expression(t::call(
+            t::member_id(t::id("$"), "set_text"),
+            vec![t::id(&text_var), expr],
+        ));
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: arrow_body,
+                r#async: false,
+                span: Span::ZERO,
+            }))],
+        )));
+    } else if text_set_effects.len() >= 2 {
+        let mut block_body: Vec<Statement> = Vec::new();
+        for (text_var, expr) in text_set_effects {
+            block_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "set_text"),
+                vec![t::id(&text_var), expr],
+            )));
+        }
+        let arrow_body = ArrowBody::Block(Box::new(BlockStatement {
+            body: block_body,
+            span: Span::ZERO,
+        }));
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: arrow_body,
+                r#async: false,
+                span: Span::ZERO,
+            }))],
+        )));
+    }
     // Event-directive registrations come after all anchor blocks.
     func_body.extend(event_stmts);
     // Trailing static slots: if any of them was originally a `<TAG>{EXPR}</TAG>`
@@ -4964,6 +5067,44 @@ fn emit_top_level_multi_if_program(
                     }
                 }
                 html.push_str("></");
+                html.push_str(&el.name);
+                html.push('>');
+            }
+            Slot::TextAnchorEl(el) => {
+                // Emit `<TAG STATIC_ATTRS> </TAG>` (single space = text anchor).
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"");
+                                for p in parts {
+                                    if let AttributeValuePart::Text(t) = p {
+                                        for c in t.data.chars() {
+                                            match c {
+                                                '"' => html.push_str("&quot;"),
+                                                '&' => html.push_str("&amp;"),
+                                                _ => html.push(c),
+                                            }
+                                        }
+                                    }
+                                }
+                                html.push('"');
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                html.push_str("> </");
                 html.push_str(&el.name);
                 html.push('>');
             }
