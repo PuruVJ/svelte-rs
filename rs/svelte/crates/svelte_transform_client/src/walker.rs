@@ -73,17 +73,32 @@ fn emit_svelte_head_program(
     {
         return None;
     }
-    // For now: only handle when body is exactly one fully-static element.
+    // For now: only handle when body is exactly one fully-static element
+    // or one bare Component (no props / no slot content).
     if others.len() != 1 {
         return None;
     }
-    let body_el = match others[0] {
-        FragmentChild::RegularElement(el) => el,
+    enum HeadBody<'a> {
+        Static(&'a svelte_ast::elements::RegularElement),
+        Component(&'a svelte_ast::elements::Component),
+    }
+    let head_body = match others[0] {
+        FragmentChild::RegularElement(el) if is_element_fully_static(el) => HeadBody::Static(el),
+        FragmentChild::Component(c)
+            if c.attributes.is_empty() && c.fragment.nodes.is_empty() =>
+        {
+            HeadBody::Component(c)
+        }
         _ => return None,
     };
-    if !is_element_fully_static(body_el) {
-        return None;
-    }
+    let body_el: Option<&svelte_ast::elements::RegularElement> = match head_body {
+        HeadBody::Static(el) => Some(el),
+        HeadBody::Component(_) => None,
+    };
+    let body_component: Option<&svelte_ast::elements::Component> = match head_body {
+        HeadBody::Static(_) => None,
+        HeadBody::Component(c) => Some(c),
+    };
     // Head body: serialize to template HTML. Currently only handle
     // a fragment of fully-static elements (e.g. 2 <meta> tags).
     // `<title>` elements are extracted out and emitted as
@@ -148,12 +163,15 @@ fn emit_svelte_head_program(
     }
     let head_flag = if head_non_ws.len() > 1 { 1.0 } else { 0.0 };
 
-    // Body template HTML.
+    // Body template HTML (only for static element body).
     let mut body_html = String::new();
     let mut body_needs = false;
-    serialize_element_to_html(body_el, &mut body_html, &mut body_needs)?;
-
-    let body_tag = sanitize_name(&body_el.name);
+    let body_tag: String = if let Some(el) = body_el {
+        serialize_element_to_html(el, &mut body_html, &mut body_needs)?;
+        sanitize_name(&el.name)
+    } else {
+        String::new()
+    };
 
     // Compute hash from filename.
     let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
@@ -230,7 +248,9 @@ fn emit_svelte_head_program(
 
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
-    func_body.push(t::var(&body_tag, t::call(t::id("root"), Vec::new())));
+    if body_el.is_some() {
+        func_body.push(t::var(&body_tag, t::call(t::id("root"), Vec::new())));
+    }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "head"),
         vec![
@@ -242,10 +262,24 @@ fn emit_svelte_head_program(
             head_arrow,
         ],
     )));
-    func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&body_tag)],
-    )));
+    if let Some(c) = body_component {
+        // Bare Component: `Comp($$anchor, {})`.
+        func_body.push(t::stmt(t::call(
+            t::id(&c.name),
+            vec![
+                t::id("$$anchor"),
+                Expression::Object(Box::new(ObjectExpression {
+                    properties: Vec::new(),
+                    span: Span::ZERO,
+                })),
+            ],
+        )));
+    } else {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id("$$anchor"), t::id(&body_tag)],
+        )));
+    }
 
     let params = vec![t::pat_id("$$anchor")];
     let export = t::export_default_function(component_name, params, func_body);
@@ -269,13 +303,15 @@ fn emit_svelte_head_program(
             t::call(t::member_id(t::id("$"), "from_html"), head_args),
         ));
     }
-    prog.push(t::var(
-        "root",
-        t::call(
-            t::member_id(t::id("$"), "from_html"),
-            vec![t::template_raw(vec![body_html], vec![])],
-        ),
-    ));
+    if body_el.is_some() {
+        prog.push(t::var(
+            "root",
+            t::call(
+                t::member_id(t::id("$"), "from_html"),
+                vec![t::template_raw(vec![body_html], vec![])],
+            ),
+        ));
+    }
     prog.push(export);
     Some(t::program(prog))
 }
