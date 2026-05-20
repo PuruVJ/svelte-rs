@@ -3706,6 +3706,10 @@ fn emit_top_level_multi_if_program(
         /// Static-body element with one or more event directives (`on:click`
         /// etc). Emits `<TAG>body</TAG>` template + `var X = ...; $.event(...);`.
         ElementWithEvents(&'a svelte_ast::elements::RegularElement),
+        /// Element with one or more dynamic attributes (`<div id={x}>`) and
+        /// static body. Emits `<TAG STATIC_ATTRS>body</TAG>` template +
+        /// `var X = ...; $.template_effect(() => $.set_attribute(...))`.
+        DynamicEl(&'a svelte_ast::elements::RegularElement),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3829,6 +3833,16 @@ fn emit_top_level_multi_if_program(
                     slots.push(Slot::ElementWithEvents(el));
                     continue;
                 }
+                // Detect element with dynamic attribute(s) + static body
+                // (element-attribute-removed fixture).
+                if element_static_body_with_dyn_attrs(el) {
+                    if !slots.is_empty() {
+                        gap_after.push(pending_gap);
+                    }
+                    pending_gap = false;
+                    slots.push(Slot::DynamicEl(el));
+                    continue;
+                }
                 if !is_element_fully_static(el) {
                     return None;
                 }
@@ -3855,6 +3869,7 @@ fn emit_top_level_multi_if_program(
                 | Slot::Component(_)
                 | Slot::ElementWithHtml(_, _)
                 | Slot::ElementWithEvents(_)
+                | Slot::DynamicEl(_)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -3887,7 +3902,8 @@ fn emit_top_level_multi_if_program(
             | Slot::Html(_)
             | Slot::Component(_)
             | Slot::ElementWithHtml(_, _)
-            | Slot::ElementWithEvents(_) => {
+            | Slot::ElementWithEvents(_)
+            | Slot::DynamicEl(_) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -3963,6 +3979,13 @@ fn emit_top_level_multi_if_program(
                 format!("{}_{}", el.name, cnt)
             }
         } else if let Slot::ElementWithEvents(el) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
+        } else if let Slot::DynamicEl(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
                 el.name.clone()
@@ -4244,6 +4267,73 @@ fn emit_top_level_multi_if_program(
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id("$"), "html"),
                     vec![t::id(&cur_var), arrow],
+                )));
+            }
+            Slot::DynamicEl(el) => {
+                // Collect dynamic attrs. Emit `$.template_effect(() => {
+                // $.set_attribute(VAR, NAME, EXPR); ... })` deferred to
+                // AFTER all anchor blocks (so reactivity fires after nav).
+                use svelte_ast::attributes::{AttributeValue, ElementAttribute};
+                let mut effect_stmts: Vec<Statement> = Vec::new();
+                for a in &el.attributes {
+                    let attr = match a {
+                        ElementAttribute::Attribute(attr) => attr,
+                        _ => continue,
+                    };
+                    let expr = match &attr.value {
+                        AttributeValue::Single(tag) => tag.expression.clone(),
+                        AttributeValue::Many(parts) => {
+                            if parts.len() == 1 {
+                                match &parts[0] {
+                                    svelte_ast::attributes::AttributeValuePart::ExpressionTag(et) => {
+                                        et.expression.clone()
+                                    }
+                                    _ => continue,
+                                }
+                            } else {
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    };
+                    let rewritten = rewrite_props_destructured(&expr, &script.props_destructured);
+                    let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
+                    effect_stmts.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "set_attribute"),
+                        vec![
+                            t::id(&cur_var),
+                            Expression::Literal(Box::new(Literal::String(StringLiteral {
+                                value: attr.name.clone(),
+                                raw: None,
+                                span: Span::ZERO,
+                            }))),
+                            rewritten,
+                        ],
+                    )));
+                }
+                let effect_body = if effect_stmts.len() == 1 {
+                    let stmt = effect_stmts.into_iter().next().unwrap();
+                    let expr = if let Statement::Expression(e) = stmt {
+                        e.expression
+                    } else {
+                        unreachable!()
+                    };
+                    ArrowBody::Expression(expr)
+                } else {
+                    ArrowBody::Block(Box::new(BlockStatement {
+                        body: effect_stmts,
+                        span: Span::ZERO,
+                    }))
+                };
+                let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: effect_body,
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                event_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "template_effect"),
+                    vec![effect_arrow],
                 )));
             }
             Slot::ElementWithEvents(el) => {
@@ -4713,6 +4803,55 @@ fn emit_top_level_multi_if_program(
                 html.push_str(&el.name);
                 html.push('>');
             }
+            Slot::DynamicEl(el) => {
+                // Static-attrs-only template body. Dynamic attrs stripped
+                // (set via $.template_effect at runtime).
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                                    html.push(' ');
+                                    html.push_str(&attr.name);
+                                    html.push_str("=\"");
+                                    for p in parts {
+                                        if let AttributeValuePart::Text(t) = p {
+                                            for c in t.data.chars() {
+                                                match c {
+                                                    '"' => html.push_str("&quot;"),
+                                                    '&' => html.push_str("&amp;"),
+                                                    _ => html.push(c),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    html.push('"');
+                                }
+                                // Skip dynamic.
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if is_void_client(&el.name) {
+                    html.push_str("/>");
+                } else {
+                    html.push('>');
+                    let mut needs = false;
+                    serialize_fragment_to_html(&el.fragment, &mut html, &mut needs).unwrap_or(());
+                    html.push_str("</");
+                    html.push_str(&el.name);
+                    html.push('>');
+                }
+            }
             Slot::StaticText(s) => html.push_str(s.trim()),
             // LiteralAnchor contributes a single space so a text node
             // exists at its DOM position. Runtime sets nodeValue.
@@ -5130,6 +5269,42 @@ fn expression_uses_props_destructured(
         }
         _ => false,
     }
+}
+
+/// True iff the element has at least one dynamic attribute (Single or
+/// Many with ExpressionTag part) + static body. Other attrs may be
+/// static. No directives (events, binds) allowed in this slot type —
+/// those route to ElementWithEvents / bind:this paths.
+fn element_static_body_with_dyn_attrs(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut has_dyn = false;
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => {}
+                AttributeValue::Single(_) => has_dyn = true,
+                AttributeValue::Many(parts) => {
+                    let any_expr = parts.iter().any(|p| matches!(p, AttributeValuePart::ExpressionTag(_)));
+                    if any_expr {
+                        has_dyn = true;
+                    } else if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return false;
+                    }
+                }
+            },
+            _ => return false,
+        }
+    }
+    if !has_dyn {
+        return false;
+    }
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// True iff the element has only static attributes plus at least one
