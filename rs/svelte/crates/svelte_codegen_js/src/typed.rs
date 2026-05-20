@@ -249,6 +249,13 @@ impl<'a> Emitter<'a> {
                 comments: self.comments,
                 comment_index: self.comment_index,
             };
+            // Flush any comments that appear before this statement's start.
+            // Emitted into the child so the indentation/margin logic below
+            // accounts for them as part of the same statement block.
+            let stmt_pos = stmt_start(stmt);
+            if stmt_pos != 0 {
+                child.flush_comments_until(stmt_pos, false);
+            }
             child.emit_statement(stmt);
             let child_multiline = !child.mappings.is_empty();
             let tag = stmt_type_tag(stmt);
@@ -1721,6 +1728,38 @@ fn stmt_type_tag(s: &Statement) -> u32 {
         Statement::Switch(_) => 24,
         Statement::With(_) => 25,
         Statement::Raw(_) => 26,
+    }
+}
+
+/// Start byte offset of a statement, or 0 if synthesized.
+fn stmt_start(s: &Statement) -> u32 {
+    match s {
+        Statement::Block(b) => b.span.start,
+        Statement::Break(b) => b.span.start,
+        Statement::Continue(b) => b.span.start,
+        Statement::Debugger(sp) => sp.start,
+        Statement::DoWhile(d) => d.span.start,
+        Statement::Empty(sp) => sp.start,
+        Statement::Expression(e) => e.span.start,
+        Statement::For(f) => f.span.start,
+        Statement::ForIn(f) => f.span.start,
+        Statement::ForOf(f) => f.span.start,
+        Statement::If(i) => i.span.start,
+        Statement::Labeled(l) => l.span.start,
+        Statement::Return(r) => r.span.start,
+        Statement::Switch(s) => s.span.start,
+        Statement::Throw(t) => t.span.start,
+        Statement::Try(t) => t.span.start,
+        Statement::While(w) => w.span.start,
+        Statement::With(w) => w.span.start,
+        Statement::Variable(v) => v.span.start,
+        Statement::Function(f) => f.span.start,
+        Statement::Class(c) => c.span.start,
+        Statement::Import(i) => i.span.start,
+        Statement::ExportNamed(e) => e.span.start,
+        Statement::ExportDefault(e) => e.span.start,
+        Statement::ExportAll(e) => e.span.start,
+        Statement::Raw(_) => 0,
     }
 }
 
