@@ -11,6 +11,7 @@ fn main() {
         svelte_compiler::Generate::Server
     });
     opts.module.experimental.async_ = true;
+    opts.module.filename = Some(path.clone());
     match svelte_compiler::compile(&src, &name, opts) {
         Ok(r) => println!("{}", r.js),
         Err(e) => println!("ERR: {:?}", e),

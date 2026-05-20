@@ -86,7 +86,9 @@ fn emit_svelte_head_program(
     }
     // Head body: serialize to template HTML. Currently only handle
     // a fragment of fully-static elements (e.g. 2 <meta> tags).
-    let head_non_ws: Vec<&FragmentChild> = head
+    // `<title>` elements are extracted out and emitted as
+    // `$.effect(() => { $.document.title = 'TEXT' })` instead.
+    let head_all: Vec<&FragmentChild> = head
         .fragment
         .nodes
         .iter()
@@ -96,7 +98,36 @@ fn emit_svelte_head_program(
             _ => true,
         })
         .collect();
-    if head_non_ws.is_empty() {
+    if head_all.is_empty() {
+        return None;
+    }
+    // Separate <title> from the rest.
+    let mut head_non_ws: Vec<&FragmentChild> = Vec::new();
+    let mut title_text: Option<String> = None;
+    for n in &head_all {
+        match n {
+            FragmentChild::TitleElement(te) => {
+                let mut text_buf = String::new();
+                let mut ok = true;
+                for child in &te.fragment.nodes {
+                    match child {
+                        FragmentChild::Text(t) => text_buf.push_str(&t.data),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok || title_text.is_some() {
+                    return None;
+                }
+                title_text = Some(text_buf);
+            }
+            FragmentChild::RegularElement(_) => head_non_ws.push(n),
+            _ => return None,
+        }
+    }
+    if head_non_ws.is_empty() && title_text.is_none() {
         return None;
     }
     if !head_non_ws.iter().all(|n| {
@@ -130,22 +161,63 @@ fn emit_svelte_head_program(
 
     // Head body emission: emit `var fragment = root_1(); $.next(N); $.append($$anchor, fragment);`
     let mut head_body: Vec<Statement> = Vec::new();
-    head_body.push(t::var("fragment", t::call(t::id("root_1"), Vec::new())));
-    // `$.next(N)` where N = (head_non_ws.len() - 1) * 2 if > 0, else 1.
-    // head-missing has 2 metas → N=2 → `$.next(2)`.
-    let next_arg = if head_non_ws.len() > 1 {
-        vec![t::lit_number(((head_non_ws.len() - 1) * 2) as f64)]
-    } else {
-        Vec::new()
-    };
-    head_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "next"),
-        next_arg,
-    )));
-    head_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
-    )));
+    if !head_non_ws.is_empty() {
+        head_body.push(t::var("fragment", t::call(t::id("root_1"), Vec::new())));
+    }
+    // `$.next(N)` where N = (head_non_ws.len() - 1) * 2 if > 1, else
+    // no-arg `$.next()`. head-missing has 2 metas → N=2 → `$.next(2)`.
+    if !head_non_ws.is_empty() {
+        let next_arg = if head_non_ws.len() > 1 {
+            vec![t::lit_number(((head_non_ws.len() - 1) * 2) as f64)]
+        } else {
+            Vec::new()
+        };
+        head_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            next_arg,
+        )));
+    }
+    // Title → `$.effect(() => { $.document.title = 'TEXT'; });`
+    if let Some(ref tx) = title_text {
+        let assign = t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
+            left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
+                object: t::member_id(t::id("$"), "document"),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "title".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            }))),
+            operator: AssignmentOperator::Assign,
+            right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: tx.clone(),
+                raw: Some(format!("'{}'", tx.replace('\'', "\\'"))),
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        })));
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![assign],
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        head_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "effect"),
+            vec![arrow],
+        )));
+    }
+    if !head_non_ws.is_empty() {
+        head_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id("$$anchor"), t::id("fragment")],
+        )));
+    }
     let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
         body: ArrowBody::Block(Box::new(BlockStatement {
@@ -186,15 +258,17 @@ fn emit_svelte_head_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.clone());
     // root_1 (head) and root (body).
-    let head_args: Vec<Expression> = if head_flag != 0.0 {
-        vec![t::template_raw(vec![head_html], vec![]), t::lit_number(head_flag)]
-    } else {
-        vec![t::template_raw(vec![head_html], vec![])]
-    };
-    prog.push(t::var(
-        "root_1",
-        t::call(t::member_id(t::id("$"), "from_html"), head_args),
-    ));
+    if !head_non_ws.is_empty() {
+        let head_args: Vec<Expression> = if head_flag != 0.0 {
+            vec![t::template_raw(vec![head_html], vec![]), t::lit_number(head_flag)]
+        } else {
+            vec![t::template_raw(vec![head_html], vec![])]
+        };
+        prog.push(t::var(
+            "root_1",
+            t::call(t::member_id(t::id("$"), "from_html"), head_args),
+        ));
+    }
     prog.push(t::var(
         "root",
         t::call(
@@ -234,9 +308,16 @@ pub fn try_typed_client_walker_with(
     component_name: &str,
     use_tree: bool,
 ) -> Option<Program> {
-    if root.css.is_some() || root.module.is_some() {
+    if root.css.is_some() {
         return None;
     }
+    // Capture module-level script statements (e.g. `<script module>`
+    // customElements.define) to inject after imports.
+    let module_stmts: Vec<Statement> = root
+        .module
+        .as_ref()
+        .map(|m| m.content.body.clone())
+        .unwrap_or_default();
 
     // Script analysis: collect statements to emit, plus any erased rune
     // bindings. The assignment scan also considers template expressions so
@@ -336,7 +417,10 @@ pub fn try_typed_client_walker_with(
     // after the import block of any typed-fast program.
     let inject_snippets = |opt: Option<Program>| -> Option<Program> {
         let mut p = opt?;
-        if snippet_decls.is_empty() && snippet_extra_roots.is_empty() {
+        if snippet_decls.is_empty()
+            && snippet_extra_roots.is_empty()
+            && module_stmts.is_empty()
+        {
             return Option::Some(p);
         }
         let mut insert_at = 0;
@@ -349,6 +433,8 @@ pub fn try_typed_client_walker_with(
         }
         let mut new_body: Vec<Statement> =
             p.body[..insert_at].to_vec();
+        // Module-level script (e.g. customElements.define) → after imports.
+        new_body.extend(module_stmts.iter().cloned());
         new_body.extend(snippet_decls.iter().cloned());
         new_body.extend(snippet_extra_roots.iter().cloned());
         new_body.extend(p.body[insert_at..].iter().cloned());
@@ -2153,7 +2239,7 @@ fn emit_multi_element_branch_body_with_context(
     let mut dyn_attr_calls: Vec<Statement> = Vec::new();
     for (i, el) in elements.iter().enumerate() {
         *elem_var_idx += 1;
-        let var = format!("{}_{}", el.name, *elem_var_idx);
+        let var = format!("{}_{}", sanitize_name(&el.name), *elem_var_idx);
         var_names.push(var.clone());
         let init = if i == 0 {
             t::call(
@@ -3094,7 +3180,7 @@ fn emit_single_element_wrapping_html_tag_program(
     html.push_str(&el.name);
     html.push('>');
 
-    let tag_var = el.name.clone();
+    let tag_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
@@ -3469,7 +3555,7 @@ fn emit_single_element_with_component_program(
     html.push_str(&el.name);
     html.push('>');
 
-    let tag_var = el.name.clone();
+    let tag_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
@@ -3642,7 +3728,7 @@ fn emit_single_element_with_inner_snippet_program(
         snippet_block.push(t::const_decl(&name, arrow));
     }
 
-    let tag_var = el.name.clone();
+    let tag_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
@@ -4072,7 +4158,7 @@ fn emit_single_element_wrapping_ifs_program(
     }
 
     // Top-level function body.
-    let tag_var = el.name.clone();
+    let tag_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
@@ -4568,7 +4654,8 @@ fn emit_top_level_multi_if_program(
     let mut text_idx = 0usize;
     let mut elem_named_counts: HashMap<String, usize> = HashMap::new();
     fn elem_named_count(name: &str, m: &mut HashMap<String, usize>) -> usize {
-        let cnt = m.entry(name.to_string()).or_insert(0);
+        let safe = sanitize_name(name);
+        let cnt = m.entry(safe).or_insert(0);
         let n = *cnt;
         *cnt += 1;
         n
@@ -4594,51 +4681,51 @@ fn emit_top_level_multi_if_program(
         } else if let Slot::ElementWithHtml(el, _) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else if let Slot::ElementWithEvents(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else if let Slot::DynamicEl(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else if let Slot::ElementWithSpread(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else if let Slot::ElementWithSlot(el, _) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else if let Slot::TextAnchorEl(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else if let Slot::ElementWithEach(el, _) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
-                el.name.clone()
+                sanitize_name(&el.name)
             } else {
-                format!("{}_{}", el.name, cnt)
+                format!("{}_{}", sanitize_name(&el.name), cnt)
             }
         } else {
             let n = if node_idx == 0 { "node".to_string() } else { format!("node_{}", node_idx) };
@@ -6812,7 +6899,7 @@ fn emit_single_element_with_spread_program(
         span: Span::ZERO,
     }));
 
-    let var_name = el.name.clone();
+    let var_name = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
@@ -7201,7 +7288,7 @@ fn emit_single_element_with_folded_prefix_program(
     html.push_str(&el.name);
     html.push('>');
 
-    let tag_var = el.name.clone();
+    let tag_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
@@ -7486,7 +7573,7 @@ fn emit_single_dynamic_element_program(
     };
 
     // Build function body.
-    let tag_var = el.name.clone();
+    let tag_var = sanitize_name(&el.name);
     let mut func_body: Vec<Statement> = Vec::new();
     // Legacy props prelude: `$.push($$props, false); let X = $.prop($$props, 'X', N [, INIT]);`
     if !script.legacy_export_props.is_empty() {
