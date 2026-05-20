@@ -239,6 +239,12 @@ fn collapse_ws(s: &str) -> String {
 
 fn append_static_attr(a: &svelte_ast::attributes::Attribute, html: &mut String) -> Option<()> {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
+    // `dir` attribute needs hydration `template_effect(() => el.dir = el.dir)`
+    // (Chromium fix). Force typed_fast to bail so deep_static_walker handles
+    // it instead.
+    if a.name == "dir" {
+        return None;
+    }
     match &a.value {
         AttributeValue::Empty => {
             // Serialize bare attrs as `name=""` to match upstream/server.

@@ -330,13 +330,15 @@ pub fn try_typed_client_walker_with(
     // RegularElements (with whitespace text/comment between), no blocks /
     // components / await. Reactive points are sparse inside subtrees and
     // need navigation via `$.sibling(N)` / `$.child(...)` / `$.next(N)` /
-    // `$.reset(...)`. Matches the skip-static-subtree fixture.
+    // `$.reset(...)`. Matches the skip-static-subtree fixture. Trailing
+    // text node is allowed (element-dir-attribute-sibling).
     if nodes.iter().all(|n| {
         matches!(
             n,
             FragmentChild::RegularElement(_)
                 | FragmentChild::HtmlTag(_)
                 | FragmentChild::Comment(_)
+                | FragmentChild::Text(_)
         )
     }) && nodes.len() >= 2
         && nodes
@@ -7328,6 +7330,10 @@ fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool 
                     return true
                 }
                 "value" if el.name == "option" => return true,
+                // `dir` attribute on any element needs a `node.dir = node.dir`
+                // template_effect (Chromium hydration bug workaround per
+                // upstream RegularElement.js:463-468).
+                "dir" => return true,
                 _ => {}
             }
         }
@@ -9610,6 +9616,9 @@ fn emit_deep_static_walker_program(
     let mut var_names: HashMap<String, usize> = HashMap::new();
     let mut body: Vec<Statement> = Vec::new();
     let mut effects: Vec<(String, Expression)> = Vec::new(); // (text_var, getter_expr)
+    // Element variables that need `template_effect(() => X.dir = X.dir)`
+    // (Chromium hydration fix for `dir` attribute).
+    let mut dir_self_assigns: Vec<String> = Vec::new();
 
     body.push(t::var(
         "fragment",
@@ -9675,6 +9684,14 @@ fn emit_deep_static_walker_program(
         prev_top_idx = Some(i);
         first_emitted = true;
 
+        // If this element has a `dir` attribute, schedule a
+        // `template_effect(() => X.dir = X.dir)` at the end.
+        if el.attributes.iter().any(|a| matches!(
+            a,
+            ElementAttribute::Attribute(attr) if attr.name == "dir"
+        )) {
+            dir_self_assigns.push(var.clone());
+        }
         // Walk the element's interior — emit reactive handlers and
         // navigation as needed.
         walk_element_interior(
@@ -9718,7 +9735,72 @@ fn emit_deep_static_walker_program(
                     vec![t::lit_number(((trailing - 1) * 2) as f64)],
                 )));
             }
+        } else {
+            // No trailing elements, but there may be trailing non-element
+            // nodes (text/comments) — emit `$.next();` to advance the
+            // hydration cursor past them.
+            let last_el_ptr = top_elements[last_idx] as *const _;
+            let mut after_last = false;
+            let mut has_trailing_nonelem = false;
+            for n in &root_fragment.nodes {
+                if let FragmentChild::RegularElement(el) = n {
+                    if el as *const _ == last_el_ptr {
+                        after_last = true;
+                        continue;
+                    }
+                }
+                if after_last {
+                    match n {
+                        FragmentChild::Text(t) if !t.data.trim().is_empty() => {
+                            has_trailing_nonelem = true;
+                            break;
+                        }
+                        FragmentChild::Comment(_) => {
+                            // Trailing comments also count.
+                            has_trailing_nonelem = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if has_trailing_nonelem {
+                body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "next"),
+                    Vec::new(),
+                )));
+            }
         }
+    }
+
+    // Dir-attribute self-assignment effects (Chromium hydration fix).
+    for var_name in &dir_self_assigns {
+        let dir_member = Expression::Member(Box::new(MemberExpression {
+            object: t::id(var_name),
+            property: MemberProperty::Identifier(Identifier {
+                name: "dir".to_string(),
+                span: Span::ZERO,
+            }),
+            computed: false,
+            optional: false,
+            span: Span::ZERO,
+        }));
+        let self_assign = Expression::Assignment(Box::new(AssignmentExpression {
+            left: AssignmentTarget::Expression(dir_member.clone()),
+            operator: AssignmentOperator::Assign,
+            right: dir_member,
+            span: Span::ZERO,
+        }));
+        let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(self_assign),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "template_effect"),
+            vec![effect_arrow],
+        )));
     }
 
     // Combined template_effect for text reactivity at the bottom.
@@ -10070,6 +10152,11 @@ fn apply_reactive_attrs(
                         }))),
                         span: Span::ZERO,
                     }))));
+                }
+                "dir" => {
+                    // Skip here — handled via a separate pass that pushes
+                    // the dir self-assignment to the trailing effects pile.
+                    // (Order matters: $.next() before $.template_effect.)
                 }
                 "value" if el.name == "option" => {
                     // `EL.value = EL.__value = 'X';`
