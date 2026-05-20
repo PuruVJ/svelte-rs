@@ -3916,9 +3916,17 @@ fn emit_top_level_multi_if_program(
                         continue;
                     }
                 }
-                // Detect element with text-anchor body (`<h1>Hello, {name}</h1>`)
-                // and static attrs. Mirrors `each-else`'s h1.
-                if is_element_static_attrs(el) && is_text_only_element(el) {
+                // Detect element with text-anchor body
+                // (`<h1>Hello, {name}</h1>`) and static attrs. Requires
+                // at least one non-whitespace Text node in body — a body
+                // of just one ExpressionTag uses `el.textContent = EXPR`
+                // via the deep_static_walker, not the text-anchor shape.
+                if is_element_static_attrs(el)
+                    && is_text_only_element(el)
+                    && el.fragment.nodes.iter().any(|n| {
+                        matches!(n, FragmentChild::Text(t) if !t.data.trim().is_empty())
+                    })
+                {
                     if !slots.is_empty() {
                         gap_after.push(pending_gap);
                     }
@@ -12592,10 +12600,90 @@ fn emit_single_svelte_element_program(
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
-    // Only handles `<svelte:element this={EXPR} />` with no children + no
-    // other attributes for now.
-    if !se.attributes.is_empty() || !se.fragment.nodes.is_empty() {
+    if !se.attributes.is_empty() {
         return None;
+    }
+    // Body-presence-aware tag wrap: empty body → raw expression
+    // (upstream passes identifiers directly); non-empty body → wrap in
+    // arrow `() => EXPR` so the runtime can resolve at hydration time.
+    let body_non_ws: Vec<&FragmentChild> = se
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    let tag_expr: Expression = if body_non_ws.is_empty() {
+        se.tag.clone()
+    } else {
+        Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: ArrowBody::Expression(se.tag.clone()),
+            r#async: false,
+            span: Span::ZERO,
+        }))
+    };
+    let mut element_args = vec![
+        t::id("node"),
+        tag_expr,
+        Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+            value: false,
+            span: Span::ZERO,
+        }))),
+    ];
+    if !body_non_ws.is_empty() {
+        // Currently only support single ExpressionTag-with-literal body
+        // (mirrors `script` fixture: `<svelte:element this={"script"}>{"{}"}</svelte:element>`).
+        if body_non_ws.len() != 1 {
+            return None;
+        }
+        let et = match body_non_ws[0] {
+            FragmentChild::ExpressionTag(et) => et,
+            _ => return None,
+        };
+        let lit = literal_to_template_string(&et.expression)?;
+        let mut render_body: Vec<Statement> = Vec::new();
+        render_body.push(t::var(
+            "text",
+            t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        ));
+        let nodevalue_assign = Expression::Assignment(Box::new(AssignmentExpression {
+            left: AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
+                object: t::id("text"),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "nodeValue".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            }))),
+            operator: AssignmentOperator::Assign,
+            right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: lit,
+                raw: None,
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        }));
+        render_body.push(t::stmt(nodevalue_assign));
+        render_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id("$$anchor"), t::id("text")],
+        )));
+        let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$element"), t::pat_id("$$anchor")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: render_body,
+                span: Span::ZERO,
+            })),
+            r#async: false,
+            span: Span::ZERO,
+        }));
+        element_args.push(render_arrow);
     }
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
@@ -12612,14 +12700,7 @@ fn emit_single_svelte_element_program(
     ));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "element"),
-        vec![
-            t::id("node"),
-            se.tag.clone(),
-            Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
-                value: false,
-                span: Span::ZERO,
-            }))),
-        ],
+        element_args,
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "append"),
