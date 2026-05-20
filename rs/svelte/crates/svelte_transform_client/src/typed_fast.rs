@@ -105,6 +105,17 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
     // Single non-WS root: use the element's name as the variable.
     if non_ws.len() == 1 {
         if let FragmentChild::RegularElement(el) = non_ws[0] {
+            // `<input>` with `checked` or `value` needs
+            // `$.remove_input_defaults(input)` hydration → bail.
+            if el.name == "input"
+                && el.attributes.iter().any(|a| matches!(
+                    a,
+                    svelte_ast::attributes::ElementAttribute::Attribute(attr)
+                        if attr.name == "checked" || attr.name == "value"
+                ))
+            {
+                return None;
+            }
             let mut html = String::with_capacity(32);
             html.push('<');
             html.push_str(&el.name);
@@ -149,6 +160,17 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
                 }
             }
             FragmentChild::RegularElement(el) => {
+                // `<input>` with `checked` or `value` → bail (deep_static
+                // handles `$.remove_input_defaults(input)`).
+                if el.name == "input"
+                    && el.attributes.iter().any(|a| matches!(
+                        a,
+                        svelte_ast::attributes::ElementAttribute::Attribute(attr)
+                            if attr.name == "checked" || attr.name == "value"
+                    ))
+                {
+                    return None;
+                }
                 if !el.attributes.is_empty() {
                     // Attributes — walk and only static-text-value ones supported.
                     html.push('<');
@@ -239,9 +261,8 @@ fn collapse_ws(s: &str) -> String {
 
 fn append_static_attr(a: &svelte_ast::attributes::Attribute, html: &mut String) -> Option<()> {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
-    // `dir` attribute needs hydration `template_effect(() => el.dir = el.dir)`
-    // (Chromium fix). Force typed_fast to bail so deep_static_walker handles
-    // it instead.
+    // `dir` attribute needs `template_effect(() => el.dir = el.dir)`
+    // (Chromium fix). Force typed_fast to bail.
     if a.name == "dir" {
         return None;
     }

@@ -7334,6 +7334,11 @@ fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool 
                 // template_effect (Chromium hydration bug workaround per
                 // upstream RegularElement.js:463-468).
                 "dir" => return true,
+                // `<input>` with boolean `checked` or static `value` needs
+                // `$.remove_input_defaults(input)` during hydration so the
+                // server's defaultChecked/defaultValue don't override
+                // user input.
+                "checked" | "value" if el.name == "input" => return true,
                 _ => {}
             }
         }
@@ -9619,7 +9624,29 @@ fn emit_deep_static_walker_program(
     // Element variables that need `template_effect(() => X.dir = X.dir)`
     // (Chromium hydration fix for `dir` attribute).
     let mut dir_self_assigns: Vec<String> = Vec::new();
+    // Input variables that need `$.remove_input_defaults(input)` (boolean
+    // `checked` / static `value` attributes during hydration).
+    let mut input_defaults_resets: Vec<String> = Vec::new();
 
+    // If the first node is a non-Element (text/comment), emit a leading
+    // `$.next();` to position the hydration cursor at it before reading
+    // the fragment.
+    let first_is_non_element = root_fragment
+        .nodes
+        .iter()
+        .find(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => true,
+            _ => true,
+        })
+        .map(|n| !matches!(n, FragmentChild::RegularElement(_)))
+        .unwrap_or(false);
+    if first_is_non_element {
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "next"),
+            Vec::new(),
+        )));
+    }
     body.push(t::var(
         "fragment",
         t::call(t::id("root"), Vec::new()),
@@ -9639,6 +9666,49 @@ fn emit_deep_static_walker_program(
         })
         .collect();
     let _top_count = top_elements.len();
+    // Compute DOM sibling position for each top element, accounting for
+    // any preceding non-whitespace text or comment nodes. Pure-whitespace
+    // text at the fragment boundary (or between elements) gets stripped
+    // by trim_pure_whitespace_text — but whitespace BETWEEN elements
+    // becomes a single space text node. Non-whitespace text creates an
+    // anchored text node.
+    let mut top_element_positions: Vec<usize> = vec![0; top_elements.len()];
+    {
+        let trimmed = trim_pure_whitespace_text(&root_fragment.nodes);
+        let mut pos = 0usize;
+        let mut pending_text = false;
+        let mut el_idx = 0usize;
+        for n in &trimmed {
+            match n {
+                FragmentChild::Text(t) => {
+                    // Non-whitespace text → contributes to a text-node anchor.
+                    // Pure whitespace BETWEEN elements is a "gap" creating a
+                    // single text node when followed by another element.
+                    let _ = t;
+                    if !pending_text {
+                        pending_text = true;
+                    }
+                }
+                FragmentChild::Comment(_) => {
+                    if !pending_text {
+                        pending_text = true;
+                    }
+                }
+                FragmentChild::RegularElement(_) => {
+                    if pending_text {
+                        pos += 1;
+                        pending_text = false;
+                    }
+                    if el_idx < top_element_positions.len() {
+                        top_element_positions[el_idx] = pos;
+                        el_idx += 1;
+                    }
+                    pos += 1;
+                }
+                _ => {}
+            }
+        }
+    }
 
     for (i, el) in top_elements.iter().enumerate() {
         let has_reactive_inside = fragment_has_deep_reactive(&el.fragment);
@@ -9648,32 +9718,31 @@ fn emit_deep_static_walker_program(
             // Skip purely static element. We don't emit anything for it.
             continue;
         }
-        // Allocate a variable name for this element. Each top element at
-        // index i corresponds to rendered sibling index i*2 (alternating
-        // element, text-space).
+        // Allocate a variable name. Compute the actual DOM sibling
+        // position via `top_element_positions[i]` (accounts for preceding
+        // text/comment runs that merge into text nodes).
         let var = allocate_named(&el.name, &mut var_names);
+        let this_pos = top_element_positions[i];
         let init = if !first_emitted {
-            if i == 0 {
-                t::call(
-                    t::member_id(t::id("$"), "first_child"),
-                    vec![t::id("fragment")],
-                )
+            let first_child = t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id("fragment")],
+            );
+            if this_pos == 0 {
+                first_child
+            } else if this_pos == 1 {
+                t::call(t::member_id(t::id("$"), "sibling"), vec![first_child])
             } else {
                 t::call(
                     t::member_id(t::id("$"), "sibling"),
-                    vec![
-                        t::call(
-                            t::member_id(t::id("$"), "first_child"),
-                            vec![t::id("fragment")],
-                        ),
-                        t::lit_number((i * 2) as f64),
-                    ],
+                    vec![first_child, t::lit_number(this_pos as f64)],
                 )
             }
         } else {
             let prev = prev_var.as_ref().expect("prev_var set");
             let prev_idx = prev_top_idx.expect("prev_top_idx set");
-            let offset = (i - prev_idx) * 2;
+            let prev_pos = top_element_positions[prev_idx];
+            let offset = this_pos - prev_pos;
             t::call(
                 t::member_id(t::id("$"), "sibling"),
                 vec![t::id(prev), t::lit_number(offset as f64)],
@@ -9684,6 +9753,21 @@ fn emit_deep_static_walker_program(
         prev_top_idx = Some(i);
         first_emitted = true;
 
+        // `<input>` with `checked` or static `value` attribute → emit
+        // `$.remove_input_defaults(input)` right after the var declaration
+        // (inline, NOT deferred to the trailing effects pile).
+        if el.name == "input"
+            && el.attributes.iter().any(|a| matches!(
+                a,
+                ElementAttribute::Attribute(attr) if attr.name == "checked" || attr.name == "value"
+            ))
+        {
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "remove_input_defaults"),
+                vec![t::id(&var)],
+            )));
+            input_defaults_resets.push(var.clone());
+        }
         // If this element has a `dir` attribute, schedule a
         // `template_effect(() => X.dir = X.dir)` at the end.
         if el.attributes.iter().any(|a| matches!(
@@ -10157,6 +10241,10 @@ fn apply_reactive_attrs(
                     // Skip here — handled via a separate pass that pushes
                     // the dir self-assignment to the trailing effects pile.
                     // (Order matters: $.next() before $.template_effect.)
+                }
+                "checked" | "value" if el.name == "input" => {
+                    // Handled via separate pass that emits
+                    // `$.remove_input_defaults(input)` once per input.
                 }
                 "value" if el.name == "option" => {
                     // `EL.value = EL.__value = 'X';`
