@@ -3779,6 +3779,11 @@ fn emit_top_level_multi_if_program(
         /// Element with one or more spread attributes + static body. Emits
         /// `var X = ...; $.attribute_effect(X, () => ({ ...spread }));`.
         ElementWithSpread(&'a svelte_ast::elements::RegularElement),
+        /// `<TAG ATTRS><slot/></TAG>` — static element wrapping a single
+        /// SlotElement. Emits `<TAG><!></TAG>` template + body with
+        /// `var X = ...; var node = $.child(X); $.slot(node, $$props,
+        /// 'NAME', {}, null); $.reset(X);`.
+        ElementWithSlot(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::elements::SlotElement),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3892,6 +3897,20 @@ fn emit_top_level_multi_if_program(
                         continue;
                     }
                 }
+                // Detect `<TAG ATTRS><slot/></TAG>` shape.
+                let slot_only_body = inner_non_ws.len() == 1
+                    && matches!(inner_non_ws[0], FragmentChild::SlotElement(_))
+                    && is_element_static_attrs(el);
+                if slot_only_body {
+                    if let FragmentChild::SlotElement(se) = inner_non_ws[0] {
+                        if !slots.is_empty() {
+                            gap_after.push(pending_gap);
+                        }
+                        pending_gap = false;
+                        slots.push(Slot::ElementWithSlot(el, se));
+                        continue;
+                    }
+                }
                 // Detect element with event directives but otherwise
                 // static body (event-handler fixture).
                 if element_static_body_with_events(el) {
@@ -3949,6 +3968,7 @@ fn emit_top_level_multi_if_program(
                 | Slot::ElementWithEvents(_)
                 | Slot::DynamicEl(_)
                 | Slot::ElementWithSpread(_)
+                | Slot::ElementWithSlot(_, _)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -3983,7 +4003,8 @@ fn emit_top_level_multi_if_program(
             | Slot::ElementWithHtml(_, _)
             | Slot::ElementWithEvents(_)
             | Slot::DynamicEl(_)
-            | Slot::ElementWithSpread(_) => {
+            | Slot::ElementWithSpread(_)
+            | Slot::ElementWithSlot(_, _) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -4076,6 +4097,13 @@ fn emit_top_level_multi_if_program(
                 format!("{}_{}", el.name, cnt)
             }
         } else if let Slot::ElementWithSpread(el) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
+        } else if let Slot::ElementWithSlot(el, _) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
                 el.name.clone()
@@ -4496,6 +4524,57 @@ fn emit_top_level_multi_if_program(
                     )));
                 }
             }
+            Slot::ElementWithSlot(_el, se) => {
+                // `var X = ...; var node_N = $.child(X); $.slot(node_N,
+                // $$props, 'NAME', {}, null); $.reset(X);`.
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                let mut slot_name = "default".to_string();
+                for a in &se.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        if attr.name == "name" {
+                            if let AttributeValue::Many(parts) = &attr.value {
+                                if parts.len() == 1 {
+                                    if let AttributeValuePart::Text(t) = &parts[0] {
+                                        slot_name = t.data.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Use a `node_2` style name to avoid collision with `node`
+                // (used inside the if-block consequent if present).
+                let slot_node_var = format!("node_{}", node_idx + 1);
+                node_idx += 1;
+                block_stmts.push(t::var(
+                    &slot_node_var,
+                    t::call(
+                        t::member_id(t::id("$"), "child"),
+                        vec![t::id(&cur_var)],
+                    ),
+                ));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "slot"),
+                    vec![
+                        t::id(&slot_node_var),
+                        t::id("$$props"),
+                        Expression::Literal(Box::new(Literal::String(StringLiteral {
+                            value: slot_name,
+                            raw: None,
+                            span: Span::ZERO,
+                        }))),
+                        Expression::Object(Box::new(ObjectExpression {
+                            properties: Vec::new(),
+                            span: Span::ZERO,
+                        })),
+                        Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                    ],
+                )));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(&cur_var)],
+                )));
+            }
             Slot::ElementWithHtml(el, ht) => {
                 // `var X = ...; $.html(X, () => EXPR, true); $.reset(X);`.
                 let inner = rewrite_props_destructured(
@@ -4885,6 +4964,44 @@ fn emit_top_level_multi_if_program(
                     }
                 }
                 html.push_str("></");
+                html.push_str(&el.name);
+                html.push('>');
+            }
+            Slot::ElementWithSlot(el, _) => {
+                // Emit `<TAG STATIC_ATTRS><!></TAG>` — `<!>` is the slot anchor.
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"");
+                                for p in parts {
+                                    if let AttributeValuePart::Text(t) = p {
+                                        for c in t.data.chars() {
+                                            match c {
+                                                '"' => html.push_str("&quot;"),
+                                                '&' => html.push_str("&amp;"),
+                                                _ => html.push(c),
+                                            }
+                                        }
+                                    }
+                                }
+                                html.push('"');
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                html.push_str("><!></");
                 html.push_str(&el.name);
                 html.push('>');
             }
