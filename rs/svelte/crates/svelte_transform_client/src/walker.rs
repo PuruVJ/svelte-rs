@@ -1970,6 +1970,61 @@ fn emit_vanilla_branch_body(
             }));
             Some(vec![t::stmt(render_call)])
         }
+        FragmentChild::SlotElement(se) => {
+            // `<slot [name="X"] />` → `$.slot(node, $$props, 'NAME', {props}, null)`.
+            // Variable naming uses `_1` suffix to avoid collision with outer
+            // `fragment` / `node` declared at the multi-block level.
+            let mut body: Vec<Statement> = Vec::new();
+            body.push(t::var(
+                "fragment_1",
+                t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+            ));
+            body.push(t::var(
+                "node_1",
+                t::call(
+                    t::member_id(t::id("$"), "first_child"),
+                    vec![t::id("fragment_1")],
+                ),
+            ));
+            // Extract slot name (default if no `name=` attr).
+            use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+            let mut slot_name = "default".to_string();
+            for a in &se.attributes {
+                if let ElementAttribute::Attribute(attr) = a {
+                    if attr.name == "name" {
+                        if let AttributeValue::Many(parts) = &attr.value {
+                            if parts.len() == 1 {
+                                if let AttributeValuePart::Text(t) = &parts[0] {
+                                    slot_name = t.data.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "slot"),
+                vec![
+                    t::id("node_1"),
+                    t::id("$$props"),
+                    Expression::Literal(Box::new(Literal::String(StringLiteral {
+                        value: slot_name,
+                        raw: None,
+                        span: Span::ZERO,
+                    }))),
+                    Expression::Object(Box::new(ObjectExpression {
+                        properties: Vec::new(),
+                        span: Span::ZERO,
+                    })),
+                    Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
+                ],
+            )));
+            body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "append"),
+                vec![t::id("$$anchor"), t::id("fragment_1")],
+            )));
+            Some(body)
+        }
         FragmentChild::HtmlTag(ht) => {
             // `{@html EXPR}` standalone → `$.comment()` + `$.html(...)`.
             // Uses `fragment_1` / `node_1` to avoid colliding with the
