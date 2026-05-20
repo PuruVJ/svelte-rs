@@ -116,6 +116,20 @@ fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
             {
                 return None;
             }
+            // `<select>` with rich `<option>` content needs the
+            // customizable_select handler — defer to the walker.
+            if el.name == "select"
+                && el.fragment.nodes.iter().any(|n| matches!(
+                    n,
+                    FragmentChild::RegularElement(opt)
+                        if opt.name == "option"
+                            && opt.fragment.nodes.iter().any(|c| matches!(
+                                c, FragmentChild::RegularElement(_)
+                            ))
+                ))
+            {
+                return None;
+            }
             let mut html = String::with_capacity(32);
             html.push('<');
             html.push_str(&el.name);

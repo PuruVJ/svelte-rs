@@ -487,6 +487,282 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     Some(t::program(prog))
 }
 
+/// Emit a program for the `option-rich-content-static` shape — a single
+/// top-level `<select>` whose `<option>` children carry static rich
+/// content (nested elements). Each rich-option's body is hoisted into an
+/// `option_content_N = $.from_html(...)` template and wired up via
+/// `$.customizable_select(option_N, () => { ... append fragment ... })`.
+/// All options receive `option_N.value = option_N.__value = 'X'`.
+fn emit_select_with_rich_options_static(
+    select_el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if !select_el.attributes.is_empty() {
+        return None;
+    }
+    // Collect <option> children (ignore whitespace text + comments).
+    let option_els: Vec<&svelte_ast::elements::RegularElement> = select_el
+        .fragment
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            FragmentChild::RegularElement(el) if el.name == "option" => Some(el),
+            _ => None,
+        })
+        .collect();
+    if option_els.is_empty() {
+        return None;
+    }
+    // Sanity: only allow text + RegularElement children, no other special.
+    for n in &select_el.fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(el) if el.name == "option" => {}
+            _ => return None,
+        }
+    }
+    // Per-option analysis: extract `value` attribute (static text) +
+    // determine if the body is rich (contains non-text children).
+    #[derive(Default)]
+    struct OptionInfo<'a> {
+        value: Option<String>,
+        rich_html: Option<String>,
+        children: &'a [FragmentChild],
+    }
+    let mut infos: Vec<OptionInfo> = Vec::new();
+    for opt in &option_els {
+        let mut info = OptionInfo::default();
+        for a in &opt.attributes {
+            match a {
+                ElementAttribute::Attribute(attr) if attr.name == "value" => {
+                    let s = match &attr.value {
+                        AttributeValue::Many(parts) => {
+                            let mut s = String::new();
+                            for p in parts {
+                                let AttributeValuePart::Text(t) = p else { return None; };
+                                s.push_str(&t.data);
+                            }
+                            s
+                        }
+                        AttributeValue::Empty => String::new(),
+                        _ => return None,
+                    };
+                    info.value = Some(s);
+                }
+                _ => return None,
+            }
+        }
+        // Determine if any child is a RegularElement (rich) — if so build HTML.
+        let has_rich = opt
+            .fragment
+            .nodes
+            .iter()
+            .any(|c| matches!(c, FragmentChild::RegularElement(_)));
+        if has_rich {
+            let mut html = String::new();
+            let mut needs = false;
+            for c in &opt.fragment.nodes {
+                match c {
+                    FragmentChild::Text(t) => {
+                        for ch in t.data.chars() {
+                            if ch == '`' {
+                                html.push_str("\\`");
+                            } else {
+                                html.push(ch);
+                            }
+                        }
+                    }
+                    FragmentChild::RegularElement(el) => {
+                        serialize_element_to_html(el, &mut html, &mut needs)?;
+                    }
+                    _ => return None,
+                }
+            }
+            info.rich_html = Some(html);
+        }
+        info.children = &opt.fragment.nodes;
+        infos.push(info);
+    }
+    // Build the select template HTML: rich options become `<option><!></option>`,
+    // plain text options keep their content.
+    let mut select_html = String::from("<select>");
+    for (i, opt) in option_els.iter().enumerate() {
+        if infos[i].rich_html.is_some() {
+            select_html.push_str("<option><!></option>");
+        } else {
+            select_html.push_str("<option>");
+            for c in &opt.fragment.nodes {
+                if let FragmentChild::Text(t) = c {
+                    select_html.push_str(t.data.trim());
+                } else {
+                    return None;
+                }
+            }
+            select_html.push_str("</option>");
+        }
+    }
+    select_html.push_str("</select>");
+
+    // Build the function body.
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var("select", t::call(t::id("root"), Vec::new())));
+    let mut rich_idx = 0usize;
+    for (i, info) in infos.iter().enumerate() {
+        let var_name = if i == 0 {
+            "option".to_string()
+        } else {
+            format!("option_{}", i)
+        };
+        let init = if i == 0 {
+            t::call(t::member_id(t::id("$"), "child"), vec![t::id("select")])
+        } else {
+            let prev = if i == 1 { "option".to_string() } else { format!("option_{}", i - 1) };
+            t::call(t::member_id(t::id("$"), "sibling"), vec![t::id(&prev)])
+        };
+        func_body.push(t::var(&var_name, init));
+        if info.rich_html.is_some() {
+            let template_name = if rich_idx == 0 {
+                "option_content".to_string()
+            } else {
+                format!("option_content_{}", rich_idx)
+            };
+            let fragment_name = if rich_idx == 0 {
+                "fragment".to_string()
+            } else {
+                format!("fragment_{}", rich_idx)
+            };
+            let anchor_name = if rich_idx == 0 {
+                "anchor".to_string()
+            } else {
+                format!("anchor_{}", rich_idx)
+            };
+            rich_idx += 1;
+            // customizable_select(option, () => { var anchor = $.child(option); var fragment = template(); $.next(); $.append(anchor, fragment); });
+            let arrow_body = vec![
+                t::var(
+                    &anchor_name,
+                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(&var_name)]),
+                ),
+                t::var(&fragment_name, t::call(t::id(&template_name), Vec::new())),
+                t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+                t::stmt(t::call(
+                    t::member_id(t::id("$"), "append"),
+                    vec![t::id(&anchor_name), t::id(&fragment_name)],
+                )),
+            ];
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: arrow_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            func_body.push(t::stmt(t::call(
+                t::member_id(t::id("$"), "customizable_select"),
+                vec![t::id(&var_name), arrow],
+            )));
+        }
+        // option_N.value = option_N.__value = 'X';
+        if let Some(value) = &info.value {
+            let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: value.clone(),
+                raw: Some(format!("'{}'", value.replace('\'', "\\'"))),
+                span: Span::ZERO,
+            })));
+            let inner_assign = Expression::Assignment(Box::new(AssignmentExpression {
+                left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
+                    object: t::id(&var_name),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "__value".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                operator: AssignmentOperator::Assign,
+                right: value_expr,
+                span: Span::ZERO,
+            }));
+            let outer_assign = Expression::Assignment(Box::new(AssignmentExpression {
+                left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
+                    object: t::id(&var_name),
+                    property: MemberProperty::Identifier(Identifier {
+                        name: "value".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    computed: false,
+                    optional: false,
+                    span: Span::ZERO,
+                }))),
+                operator: AssignmentOperator::Assign,
+                right: inner_assign,
+                span: Span::ZERO,
+            }));
+            func_body.push(t::stmt(outer_assign));
+        }
+    }
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "reset"),
+        vec![t::id("select")],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("select")],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    // option_content_N templates for rich options.
+    let mut rich_idx = 0usize;
+    for info in &infos {
+        if let Some(html) = &info.rich_html {
+            let template_name = if rich_idx == 0 {
+                "option_content".to_string()
+            } else {
+                format!("option_content_{}", rich_idx)
+            };
+            rich_idx += 1;
+            prog.push(t::var(
+                &template_name,
+                t::call(
+                    t::member_id(t::id("$"), "from_html"),
+                    vec![
+                        t::template_raw(vec![html.clone()], Vec::new()),
+                        t::lit_number(1.0),
+                    ],
+                ),
+            ));
+        }
+    }
+    // var root = $.from_html(SELECT_HTML);
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![select_html], Vec::new())],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Emit a program for `<custom-element K=V>...</custom-element>` (tag with
 /// hyphen, all static attrs, empty body). Strips attrs from the HTML
 /// template + emits `$.set_custom_element_data(VAR, K, V)`. Wraps the
@@ -690,6 +966,45 @@ pub fn try_typed_client_walker_with(
                     &script,
                 ) {
                     return Some(p);
+                }
+            }
+        }
+    }
+
+    // PRE-DETECT: single top-level `<select>` with `<option>` children
+    // carrying static rich content (option-rich-content-static shape).
+    {
+        let non_ws: Vec<&FragmentChild> = root
+            .fragment
+            .nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        if non_ws.len() == 1 {
+            if let FragmentChild::RegularElement(el) = non_ws[0] {
+                if el.name == "select" {
+                    // Must contain at least one option with rich body.
+                    let has_rich_option = el.fragment.nodes.iter().any(|n| matches!(
+                        n,
+                        FragmentChild::RegularElement(opt)
+                            if opt.name == "option"
+                                && opt.fragment.nodes.iter().any(|c| matches!(
+                                    c, FragmentChild::RegularElement(_)
+                                ))
+                    ));
+                    if has_rich_option {
+                        if let Some(p) = emit_select_with_rich_options_static(
+                            el,
+                            component_name,
+                            &script,
+                        ) {
+                            return Some(p);
+                        }
+                    }
                 }
             }
         }
