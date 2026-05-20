@@ -2544,10 +2544,14 @@ fn emit_single_element_wrapping_html_tag_program(
             _ => return None,
         }
     }
-    // SVG namespace requires `$.from_svg`; bail for now.
-    if el.name == "svg" || el.name == "math" {
-        return None;
-    }
+    // SVG / MathML namespaces use `$.from_svg` / `$.from_mathml` builders.
+    let from_fn = if el.name == "svg" {
+        "from_svg"
+    } else if el.name == "math" {
+        "from_mathml"
+    } else {
+        "from_html"
+    };
     // Body: exactly one HtmlTag.
     let non_ws: Vec<&FragmentChild> = el
         .fragment
@@ -2705,7 +2709,7 @@ fn emit_single_element_wrapping_html_tag_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id("$"), from_fn),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
