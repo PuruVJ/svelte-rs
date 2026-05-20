@@ -1049,6 +1049,359 @@ fn emit_select_with_rich_options_static(
     Some(t::program(prog))
 }
 
+/// Emit a program for the `boundary-pending-attribute` shape — top-level
+/// `{#snippet pending()}...{/snippet}` + `<svelte:boundary {pending}>
+/// {@const X = await EXPR}{X}</svelte:boundary>`. Mirrors upstream's
+/// async-boundary output:
+///   - `import 'svelte/internal/flags/async'`
+///   - Snippet hoisted as `const pending = (\$\$anchor) => { ... };`
+///   - `\$.boundary(node, { get pending() { return pending; } }, ($$anchor) => {
+///       let data;
+///       var promises = \$.run([async () => data = (await \$.save(\$.async_derived(...)))()]);
+///       \$.next();
+///       var text_1 = \$.text();
+///       \$.template_effect(() => \$.set_text(text_1, \$.get(data)), void 0, void 0, [promises[0]]);
+///       \$.append(\$\$anchor, text_1);
+///     })`
+fn emit_boundary_pending_attribute_program(
+    snippet: &svelte_ast::blocks::SnippetBlock,
+    boundary: &svelte_ast::elements::SvelteBoundary,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    use svelte_ast::attributes::{AttributeValue, ElementAttribute};
+    // Snippet must be named `pending` (or any single identifier — we
+    // wire by name).
+    let snippet_name = snippet.expression.name.clone();
+    // Boundary must have a single `{prop}` shorthand attribute matching
+    // the snippet name, and a body containing [ConstTag(await), ExpressionTag(name)].
+    let mut has_pending_attr = false;
+    for a in &boundary.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            if attr.name == snippet_name {
+                // Must be shorthand (Single ExpressionTag referencing the same name).
+                if let AttributeValue::Single(tag) = &attr.value {
+                    if let Expression::Identifier(id) = &tag.expression {
+                        if id.name == snippet_name {
+                            has_pending_attr = true;
+                        }
+                    }
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    if !has_pending_attr {
+        return None;
+    }
+    // Body must be: [ConstTag, ExpressionTag(ref)] (with whitespace text allowed).
+    let body_non_ws: Vec<&FragmentChild> = boundary
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if body_non_ws.len() != 2 {
+        return None;
+    }
+    let const_tag = match body_non_ws[0] {
+        FragmentChild::ConstTag(ct) => ct,
+        _ => return None,
+    };
+    let expr_tag = match body_non_ws[1] {
+        FragmentChild::ExpressionTag(et) => et,
+        _ => return None,
+    };
+    // Const tag must be `data = await EXPR`.
+    if const_tag.declaration.declarations.len() != 1 {
+        return None;
+    }
+    let decl = &const_tag.declaration.declarations[0];
+    let const_name = match &decl.id {
+        Pattern::Identifier(id) => id.name.clone(),
+        _ => return None,
+    };
+    let init = match decl.init.as_ref() {
+        Some(e) => e,
+        None => return None,
+    };
+    // Init must be `await EXPR`.
+    let await_inner = match init {
+        Expression::Await(a) => &a.argument,
+        _ => return None,
+    };
+
+    // Expression tag must reference the const name.
+    match &expr_tag.expression {
+        Expression::Identifier(id) if id.name == const_name => {}
+        _ => return None,
+    }
+
+    // Build snippet body. The snippet has `loading...` text.
+    let snippet_body_non_ws: Vec<&FragmentChild> = snippet
+        .body
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if snippet_body_non_ws.len() != 1 {
+        return None;
+    }
+    let snippet_text = match snippet_body_non_ws[0] {
+        FragmentChild::Text(t) => t.data.trim().to_string(),
+        _ => return None,
+    };
+
+    // const SNIPPET = ($$anchor) => { $.next(); var text = $.text('TEXT'); $.append($$anchor, text); };
+    let snippet_arrow_body = vec![
+        t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+        t::var(
+            "text",
+            t::call(
+                t::member_id(t::id("$"), "text"),
+                vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
+                    value: snippet_text.clone(),
+                    raw: Some(format!("'{}'", snippet_text.replace('\'', "\\'"))),
+                    span: Span::ZERO,
+                })))],
+            ),
+        ),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "append"),
+            vec![t::id("$$anchor"), t::id("text")],
+        )),
+    ];
+    let snippet_const = Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Const,
+        declarations: vec![VariableDeclarator {
+            id: Pattern::Identifier(Identifier {
+                name: snippet_name.clone(),
+                span: Span::ZERO,
+            }),
+            init: Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: vec![t::pat_id("$$anchor")],
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: snippet_arrow_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        }],
+        span: Span::ZERO,
+    }));
+
+    // Boundary body: builds the runtime async machinery.
+    //   let data;
+    //   var promises = $.run([
+    //       async () => data = (await $.save($.async_derived(async () => (await $.save(EXPR))())))()
+    //   ]);
+    //   $.next();
+    //   var text_1 = $.text();
+    //   $.template_effect(() => $.set_text(text_1, $.get(data)), void 0, void 0, [promises[0]]);
+    //   $.append($$anchor, text_1);
+    let inner_save = t::call(
+        t::member_id(t::id("$"), "save"),
+        vec![await_inner.clone()],
+    );
+    let inner_async_derived_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(t::call(
+            Expression::Await(Box::new(AwaitExpression {
+                argument: inner_save,
+                span: Span::ZERO,
+            })),
+            Vec::new(),
+        )),
+        r#async: true,
+        span: Span::ZERO,
+    }));
+    let async_derived_call = t::call(
+        t::member_id(t::id("$"), "async_derived"),
+        vec![inner_async_derived_arrow],
+    );
+    let outer_save = t::call(
+        t::member_id(t::id("$"), "save"),
+        vec![async_derived_call],
+    );
+    let outer_assign_rhs = t::call(
+        Expression::Await(Box::new(AwaitExpression {
+            argument: outer_save,
+            span: Span::ZERO,
+        })),
+        Vec::new(),
+    );
+    let assign_data = Expression::Assignment(Box::new(AssignmentExpression {
+        left: AssignmentTarget::Pattern(Pattern::Identifier(Identifier {
+            name: const_name.clone(),
+            span: Span::ZERO,
+        })),
+        operator: AssignmentOperator::Assign,
+        right: outer_assign_rhs,
+        span: Span::ZERO,
+    }));
+    let run_async_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(assign_data),
+        r#async: true,
+        span: Span::ZERO,
+    }));
+    let mut boundary_body: Vec<Statement> = Vec::new();
+    boundary_body.push(Statement::Variable(Box::new(VariableDeclaration {
+        kind: VariableKind::Let,
+        declarations: vec![VariableDeclarator {
+            id: Pattern::Identifier(Identifier {
+                name: const_name.clone(),
+                span: Span::ZERO,
+            }),
+            init: None,
+            span: Span::ZERO,
+        }],
+        span: Span::ZERO,
+    })));
+    boundary_body.push(t::var(
+        "promises",
+        t::call(
+            t::member_id(t::id("$"), "run"),
+            vec![Expression::Array(Box::new(ArrayExpression {
+                elements: vec![ArrayElement::Expression(run_async_arrow)],
+                span: Span::ZERO,
+            }))],
+        ),
+    ));
+    boundary_body.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())));
+    boundary_body.push(t::var(
+        "text_1",
+        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+    ));
+    // $.template_effect with 4 args: callback, void 0, void 0, [promises[0]]
+    let void_zero = || Expression::Unary(Box::new(UnaryExpression {
+        operator: UnaryOperator::Void,
+        argument: t::lit_number(0.0),
+        prefix: true,
+        span: Span::ZERO,
+    }));
+    let set_text_call = t::call(
+        t::member_id(t::id("$"), "set_text"),
+        vec![
+            t::id("text_1"),
+            t::call(t::member_id(t::id("$"), "get"), vec![t::id(&const_name)]),
+        ],
+    );
+    let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(set_text_call),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    let promises_zero = Expression::Member(Box::new(MemberExpression {
+        object: t::id("promises"),
+        property: MemberProperty::Expression(t::lit_number(0.0)),
+        computed: true,
+        optional: false,
+        span: Span::ZERO,
+    }));
+    boundary_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![
+            effect_arrow,
+            void_zero(),
+            void_zero(),
+            Expression::Array(Box::new(ArrayExpression {
+                elements: vec![ArrayElement::Expression(promises_zero)],
+                span: Span::ZERO,
+            })),
+        ],
+    )));
+    boundary_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("text_1")],
+    )));
+
+    let boundary_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: boundary_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // Props object with getter accessor for the snippet prop.
+    let getter_body = vec![Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+        argument: Some(t::id(&snippet_name)),
+        span: Span::ZERO,
+    }))];
+    let getter_method = ObjectMember::Property(Box::new(Property {
+        key: PropertyKey::Identifier(Identifier {
+            name: snippet_name.clone(),
+            span: Span::ZERO,
+        }),
+        value: Expression::Function(Box::new(FunctionExpression {
+            id: None,
+            params: Vec::new(),
+            body: BlockStatement {
+                body: getter_body,
+                span: Span::ZERO,
+            },
+            r#async: false,
+            generator: false,
+            span: Span::ZERO,
+        })),
+        kind: PropertyKind::Get,
+        computed: false,
+        shorthand: false,
+        method: false,
+        span: Span::ZERO,
+    }));
+    let props_obj = Expression::Object(Box::new(ObjectExpression {
+        properties: vec![getter_method],
+        span: Span::ZERO,
+    }));
+
+    // Main function body.
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var("fragment", t::call(t::member_id(t::id("$"), "comment"), Vec::new())));
+    func_body.push(t::var(
+        "node",
+        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+    ));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "boundary"),
+        vec![t::id("node"), props_obj, boundary_arrow],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let params = vec![t::pat_id("$$anchor")];
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    prog.push(t::import_side_effect("svelte/internal/flags/async"));
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(snippet_const);
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Emit a program for `<select>` containing `<optgroup>` children with
 /// rich content + optional trailing element with on:event. Mirrors the
 /// upstream output where rich-optgroup wraps in `\$.customizable_select`
@@ -3070,6 +3423,45 @@ pub fn try_typed_client_walker_with(
                     &root.fragment,
                     component_name,
                     &script,
+                ) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // PRE-DETECT: top-level Snippet + SvelteBoundary with snippet-as-prop
+    // (boundary-pending-attribute shape).
+    {
+        let mut snippet_node: Option<&svelte_ast::blocks::SnippetBlock> = None;
+        let mut boundary_node: Option<&svelte_ast::elements::SvelteBoundary> = None;
+        let mut others_count = 0usize;
+        for n in &root.fragment.nodes {
+            match n {
+                FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+                FragmentChild::Comment(_) => {}
+                FragmentChild::SvelteOptions(_) => {}
+                FragmentChild::SnippetBlock(sb) => {
+                    if snippet_node.is_some() {
+                        others_count += 1;
+                    } else {
+                        snippet_node = Some(sb);
+                    }
+                }
+                FragmentChild::SvelteBoundary(b) => {
+                    if boundary_node.is_some() {
+                        others_count += 1;
+                    } else {
+                        boundary_node = Some(b);
+                    }
+                }
+                _ => others_count += 1,
+            }
+        }
+        if others_count == 0 {
+            if let (Some(sb), Some(b)) = (snippet_node, boundary_node) {
+                if let Some(p) = emit_boundary_pending_attribute_program(
+                    sb, b, component_name, &script,
                 ) {
                     return Some(p);
                 }
