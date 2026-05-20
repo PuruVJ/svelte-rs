@@ -13042,12 +13042,14 @@ fn emit_deep_static_walker_program(
     );
 
     let mut params = vec![t::pat_id("$$anchor")];
-    let needs_legacy_wrap = !script.legacy_mutable_bindings.is_empty();
+    let has_legacy_props = !script.legacy_export_props.is_empty();
+    let has_legacy_mutable = !script.legacy_mutable_bindings.is_empty();
+    let needs_legacy_wrap = has_legacy_props || has_legacy_mutable;
     if script.uses_props || needs_legacy_wrap {
         params.push(t::pat_id("$$props"));
     }
     // Splice script body before the template body, plus legacy push/init/pop
-    // wrap when there are legacy mutable bindings.
+    // wrap when there are legacy mutable bindings or export-let props.
     let mut func_body: Vec<Statement> = Vec::new();
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
@@ -13061,17 +13063,47 @@ fn emit_deep_static_walker_program(
             ],
         )));
     }
+    // Legacy export prop accessors: `let X = $.prop($$props, 'X', N [, INIT]);`
+    // + `var $$exports = { get X() { ... }, set X($$value) { ... } };`
+    if has_legacy_props {
+        for (name, init) in &script.legacy_export_props {
+            let mut args = vec![
+                t::id("$$props"),
+                t::literal_str(name),
+                t::lit_number(12.0),
+            ];
+            if let Some(default) = init {
+                args.push(default.clone());
+            }
+            func_body.push(t::let_decl(
+                name,
+                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+            ));
+        }
+        func_body.push(t::var(
+            "$$exports",
+            build_legacy_exports_object(&script.legacy_export_props),
+        ));
+    }
     func_body.extend(script.body.clone());
-    if needs_legacy_wrap {
+    // `$.init()` is emitted only when the component holds legacy mutable
+    // bindings (mutable_source) — legacy export props alone don't need it.
+    if has_legacy_mutable {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id("$"), "init"),
             Vec::new(),
         )));
     }
     func_body.extend(body);
-    if needs_legacy_wrap {
-        // Replace the trailing `$.append($$anchor, fragment)` with `$.pop()`
-        // append followed by pop. Actually simpler: append before pop.
+    if has_legacy_props {
+        func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
+            argument: Some(t::call(
+                t::member_id(t::id("$"), "pop"),
+                vec![t::id("$$exports")],
+            )),
+            span: Span::ZERO,
+        })));
+    } else if has_legacy_mutable {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id("$"), "pop"),
             Vec::new(),
@@ -13177,6 +13209,12 @@ fn walk_element_interior(
             }
             let inline = build_inline_template(&parts, &script.state_bindings);
             let inline = rewrite_props_destructured(&inline, &script.props_destructured);
+            let legacy_prop_names: HashSet<String> = script
+                .legacy_export_props
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect();
+            let inline = rewrite_legacy_prop_reads(&inline, &legacy_prop_names);
             effects.push((text_var, inline));
             return;
         }
