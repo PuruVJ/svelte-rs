@@ -2595,6 +2595,7 @@ fn emit_vanilla_branch_body_with_context(
                     }
                 }
                 let inline = build_inline_template(&parts, &HashSet::new());
+                let inline = rewrite_legacy_prop_reads(&inline, legacy_prop_names);
                 body.push(t::var(
                     text_name,
                     t::call(
@@ -4993,13 +4994,32 @@ fn emit_top_level_multi_if_program(
                 } else {
                     format!("text_{}", i)
                 };
-                let inner_body = emit_vanilla_branch_body(
+                let mut inner_body = emit_vanilla_branch_body(
                     &eb.body,
                     &body_text_name,
                     &mut root_decls,
                     &mut root_idx,
                     &mut elem_var_idx,
                 )?;
+                // Each consequent body anchored at text/expression position
+                // needs `$.next()` at the head. Mirrors `emit_single_each_program`'s
+                // text-only branch.
+                let body_is_text_anchored = eb.body.nodes.iter().any(|c| matches!(
+                    c,
+                    FragmentChild::Text(t) if !t.data.trim().is_empty()
+                )) || eb.body.nodes.iter().all(|c| matches!(
+                    c,
+                    FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)
+                ));
+                let body_has_element = eb.body.nodes.iter().any(|c| matches!(
+                    c, FragmentChild::RegularElement(_)
+                ));
+                if body_is_text_anchored && !body_has_element {
+                    inner_body.insert(0, t::stmt(t::call(
+                        t::member_id(t::id("$"), "next"),
+                        Vec::new(),
+                    )));
+                }
                 // Wrap iter-var refs in `$.get(VAR)` if item is reactive.
                 let inner_body = if item_referenced {
                     inner_body
@@ -5058,12 +5078,14 @@ fn emit_top_level_multi_if_program(
                 let fallback_arrow: Option<Expression> = match &eb.fallback {
                     Some(fb) => {
                         let fb_text_name = format!("text_fb_{}", i);
-                        let fb_body = emit_vanilla_branch_body(
+                        let fb_body = emit_vanilla_branch_body_with_context(
                             fb,
                             &fb_text_name,
                             &mut root_decls,
                             &mut root_idx,
                             &mut elem_var_idx,
+                            &script.props_destructured,
+                            &legacy_prop_names,
                         )?;
                         Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: vec![t::pat_id("$$anchor")],
@@ -5299,13 +5321,28 @@ fn emit_top_level_multi_if_program(
                     format!("text_{}", text_idx)
                 };
                 text_idx += 1;
-                let inner_body = emit_vanilla_branch_body(
+                let mut inner_body = emit_vanilla_branch_body(
                     &eb.body,
                     &body_text_name,
                     &mut root_decls,
                     &mut root_idx,
                     &mut elem_var_idx,
                 )?;
+                // Each consequent body anchored at text/expression position
+                // needs `$.next()` at the head.
+                let body_has_element = eb.body.nodes.iter().any(|c| matches!(
+                    c, FragmentChild::RegularElement(_)
+                ));
+                let body_is_text_anchored = eb.body.nodes.iter().all(|c| matches!(
+                    c,
+                    FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)
+                ));
+                if body_is_text_anchored && !body_has_element {
+                    inner_body.insert(0, t::stmt(t::call(
+                        t::member_id(t::id("$"), "next"),
+                        Vec::new(),
+                    )));
+                }
                 let inner_body = if item_referenced {
                     inner_body
                         .into_iter()
@@ -5361,12 +5398,14 @@ fn emit_top_level_multi_if_program(
                     Some(fb) => {
                         let fb_text_name = format!("text_fb_{}", text_idx);
                         text_idx += 1;
-                        let fb_body = emit_vanilla_branch_body(
+                        let fb_body = emit_vanilla_branch_body_with_context(
                             fb,
                             &fb_text_name,
                             &mut root_decls,
                             &mut root_idx,
                             &mut elem_var_idx,
+                            &script.props_destructured,
+                            &legacy_prop_names,
                         )?;
                         Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: vec![t::pat_id("$$anchor")],
