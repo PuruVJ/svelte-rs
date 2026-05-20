@@ -13042,10 +13042,42 @@ fn emit_deep_static_walker_program(
     );
 
     let mut params = vec![t::pat_id("$$anchor")];
-    if script.uses_props {
+    let needs_legacy_wrap = !script.legacy_mutable_bindings.is_empty();
+    if script.uses_props || needs_legacy_wrap {
         params.push(t::pat_id("$$props"));
     }
-    let export = t::export_default_function(component_name, params, body);
+    // Splice script body before the template body, plus legacy push/init/pop
+    // wrap when there are legacy mutable bindings.
+    let mut func_body: Vec<Statement> = Vec::new();
+    if needs_legacy_wrap {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "push"),
+            vec![
+                t::id("$$props"),
+                Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                    value: false,
+                    span: Span::ZERO,
+                }))),
+            ],
+        )));
+    }
+    func_body.extend(script.body.clone());
+    if needs_legacy_wrap {
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "init"),
+            Vec::new(),
+        )));
+    }
+    func_body.extend(body);
+    if needs_legacy_wrap {
+        // Replace the trailing `$.append($$anchor, fragment)` with `$.pop()`
+        // append followed by pop. Actually simpler: append before pop.
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "pop"),
+            Vec::new(),
+        )));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
@@ -13114,6 +13146,41 @@ fn walk_element_interior(
 ) {
     // First, handle direct attributes on `el` (autofocus, muted, value, custom-element-data).
     apply_reactive_attrs(el, parent_var, body, script);
+
+    // Text-only element with mixed text + expression children (e.g.
+    // `<p>Count: {count}</p>`): emit a single text-anchor via `$.child(el)`
+    // + an inline template combining all parts. Skip the per-child reactive
+    // walk. The `true` arg is omitted because the element body has static
+    // text — the existing SSR text node IS the anchor.
+    if is_text_only_element(el) && el.attributes.is_empty() {
+        let has_static_text = el.fragment.nodes.iter().any(|c| matches!(
+            c, FragmentChild::Text(t) if !t.data.trim().is_empty()
+        ));
+        if has_static_text {
+            let text_var = allocate_named("text", var_names);
+            body.push(t::var(
+                &text_var,
+                t::call(
+                    t::member_id(t::id("$"), "child"),
+                    vec![t::id(parent_var)],
+                ),
+            ));
+            let mut parts: Vec<TextPart> = Vec::new();
+            for c in &el.fragment.nodes {
+                match c {
+                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                    FragmentChild::ExpressionTag(et) => {
+                        parts.push(TextPart::Expr(&et.expression))
+                    }
+                    _ => return,
+                }
+            }
+            let inline = build_inline_template(&parts, &script.state_bindings);
+            let inline = rewrite_props_destructured(&inline, &script.props_destructured);
+            effects.push((text_var, inline));
+            return;
+        }
+    }
 
     // Find the indices of reactive children in el's fragment, using the
     // STRIPPED children (leading + trailing whitespace text nodes / comments
@@ -13237,10 +13304,22 @@ fn walk_element_interior(
                             ],
                         ),
                     ));
-                    if let Some(expr) = single_expression_in_element(child_el) {
-                        let rewritten = rewrite_props_destructured(expr, &script.props_destructured);
-                        effects.push((text_var, rewritten));
+                    // Build inline expression from mixed Text + ExpressionTag
+                    // children — preserves surrounding text in a template
+                    // literal (e.g. `Count: {count}` → \`Count: ${count}\`).
+                    let mut parts: Vec<TextPart> = Vec::new();
+                    for c in &child_el.fragment.nodes {
+                        match c {
+                            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                            FragmentChild::ExpressionTag(et) => {
+                                parts.push(TextPart::Expr(&et.expression))
+                            }
+                            _ => {}
+                        }
                     }
+                    let inline = build_inline_template(&parts, &HashSet::new());
+                    let inline = rewrite_props_destructured(&inline, &script.props_destructured);
+                    effects.push((text_var, inline));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id("$"), "reset"),
                         vec![t::id(&var)],
@@ -15282,6 +15361,10 @@ struct ScriptInfo {
     /// `let X = $.prop($$props, 'X', N [, INIT])` + `$$exports` accessor
     /// shape themselves.
     legacy_export_props: Vec<(String, Option<Expression>)>,
+    /// Legacy-mode plain `let X = INIT` declarations where X is reassigned
+    /// anywhere. Init wrapped in `$.mutable_source(...)`. Reads + writes
+    /// flow through the same state_bindings rewriting as `$state` runes.
+    legacy_mutable_bindings: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -15316,6 +15399,7 @@ fn analyze_script(
             derived_bindings: HashSet::new(),
             props_destructured: HashSet::new(),
             legacy_export_props: Vec::new(),
+            legacy_mutable_bindings: HashSet::new(),
         });
     };
 
@@ -15376,6 +15460,87 @@ fn analyze_script(
     let mut legacy_export_props: Vec<(String, Option<Expression>)> = Vec::new();
     if has_class_with_runes {
         uses_runes = true;
+    }
+
+    // Pre-detect legacy mutable bindings: plain `let X = INIT` where X is
+    // reassigned anywhere AND we're not in runes mode AND X isn't already
+    // a $state / $derived / export-let / $props binding. Init wrapped in
+    // `$.mutable_source(...)`; reads/writes routed through state_bindings.
+    //
+    // We check the export-let case heuristically by scanning the body
+    // ahead; the destructured-props / rest-props sets get populated in
+    // the upcoming loop, so we exclude those names here too.
+    let mut legacy_mutable_bindings: HashSet<String> = HashSet::new();
+    // Probe upcoming `export let X` and `let { X } = $props()` names so
+    // they don't accidentally get marked mutable.
+    let mut export_let_names: HashSet<String> = HashSet::new();
+    let mut probe_props_destructured: HashSet<String> = HashSet::new();
+    for s in body {
+        if let Statement::ExportNamed(ex) = s {
+            if ex.source.is_none() && ex.specifiers.is_empty() {
+                if let Some(Statement::Variable(v)) = &ex.declaration {
+                    if matches!(v.kind, VariableKind::Let) {
+                        for d in &v.declarations {
+                            if let Pattern::Identifier(id) = &d.id {
+                                export_let_names.insert(id.name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let (Pattern::Object(obj), Some(init)) = (&d.id, &d.init) {
+                    if is_props_call(init) {
+                        for m in &obj.properties {
+                            if let ObjectPatternMember::Property(p) = m {
+                                if let PropertyKey::Identifier(id) = &p.key {
+                                    probe_props_destructured.insert(id.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let could_be_runes = !state_bindings.is_empty()
+        || !proxy_bindings.is_empty()
+        || !derived_bindings.is_empty()
+        || !probe_props_destructured.is_empty()
+        || has_class_with_runes;
+    if !could_be_runes {
+        for s in body {
+            if let Statement::Variable(v) = s {
+                if !matches!(v.kind, VariableKind::Let) {
+                    continue;
+                }
+                for d in &v.declarations {
+                    if let (Pattern::Identifier(id), Some(_init)) = (&d.id, &d.init) {
+                        if export_let_names.contains(&id.name) {
+                            continue;
+                        }
+                        if state_bindings.contains(&id.name)
+                            || proxy_bindings.contains(&id.name)
+                            || derived_bindings.contains(&id.name)
+                            || probe_props_destructured.contains(&id.name)
+                        {
+                            continue;
+                        }
+                        if !assigned.contains(&id.name) {
+                            continue;
+                        }
+                        legacy_mutable_bindings.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Add legacy mutable bindings to state_bindings so reads/writes inside
+    // function bodies get rewritten via the existing infrastructure.
+    for n in &legacy_mutable_bindings {
+        state_bindings.insert(n.clone());
     }
     for s in body {
         match s {
@@ -15545,6 +15710,38 @@ fn analyze_script(
         // `$$props.browser`) in script statements so they match the
         // template-side transformation.
         let s = rewrite_stmt_props_destructured(&s, &props_destructured);
+        // Wrap legacy mutable inits: `let X = INIT` →
+        // `let X = $.mutable_source(INIT)` when X is in legacy_mutable_bindings.
+        let s = if !legacy_mutable_bindings.is_empty() {
+            if let Statement::Variable(v) = &s {
+                if matches!(v.kind, VariableKind::Let) {
+                    let mut new_decls = Vec::with_capacity(v.declarations.len());
+                    for d in &v.declarations {
+                        let mut new_d = d.clone();
+                        if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                            if legacy_mutable_bindings.contains(&id.name) {
+                                new_d.init = Some(t::call(
+                                    t::member_id(t::id("$"), "mutable_source"),
+                                    vec![init.clone()],
+                                ));
+                            }
+                        }
+                        new_decls.push(new_d);
+                    }
+                    Statement::Variable(Box::new(VariableDeclaration {
+                        kind: v.kind,
+                        declarations: new_decls,
+                        span: v.span,
+                    }))
+                } else {
+                    s
+                }
+            } else {
+                s
+            }
+        } else {
+            s
+        };
         if let Statement::Variable(v) = &s {
             if v.declarations.len() > 1
                 && v.declarations.iter().all(|d| d.init.is_some())
@@ -15576,6 +15773,7 @@ fn analyze_script(
         derived_bindings,
         props_destructured,
         legacy_export_props,
+        legacy_mutable_bindings,
     })
 }
 
@@ -16398,7 +16596,15 @@ fn rewrite_top_stmt(
             rewrite_class_body_client(&mut c2);
             Some(Statement::Class(Box::new(c2)))
         }
-        Statement::Expression(_) => Some(s.clone()),
+        Statement::Expression(e) => {
+            // Rewrite reads/writes inside expression statements so legacy
+            // mutable bindings (added to state_bindings) get proper
+            // `$.get(X)` / `$.set(X, V)` / `$.update(X)` calls. Includes
+            // descent into Arrow / Function callback bodies.
+            let mut e2 = (**e).clone();
+            rewrite_expr_for_state(&mut e2.expression, state_bindings);
+            Some(Statement::Expression(Box::new(e2)))
+        }
         _ => None,
     }
 }
