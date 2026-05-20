@@ -3694,6 +3694,9 @@ fn emit_top_level_multi_if_program(
         /// single HtmlTag. Emits empty `<TAG></TAG>` template + body
         /// `var X = ...; $.html(X, () => EXPR, true); $.reset(X);`.
         ElementWithHtml(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::tags::HtmlTag),
+        /// Static-body element with one or more event directives (`on:click`
+        /// etc). Emits `<TAG>body</TAG>` template + `var X = ...; $.event(...);`.
+        ElementWithEvents(&'a svelte_ast::elements::RegularElement),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3807,6 +3810,16 @@ fn emit_top_level_multi_if_program(
                         continue;
                     }
                 }
+                // Detect element with event directives but otherwise
+                // static body (event-handler fixture).
+                if element_static_body_with_events(el) {
+                    if !slots.is_empty() {
+                        gap_after.push(pending_gap);
+                    }
+                    pending_gap = false;
+                    slots.push(Slot::ElementWithEvents(el));
+                    continue;
+                }
                 if !is_element_fully_static(el) {
                     return None;
                 }
@@ -3832,6 +3845,7 @@ fn emit_top_level_multi_if_program(
                 | Slot::Html(_)
                 | Slot::Component(_)
                 | Slot::ElementWithHtml(_, _)
+                | Slot::ElementWithEvents(_)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -3863,7 +3877,8 @@ fn emit_top_level_multi_if_program(
             | Slot::Each(_)
             | Slot::Html(_)
             | Slot::Component(_)
-            | Slot::ElementWithHtml(_, _) => {
+            | Slot::ElementWithHtml(_, _)
+            | Slot::ElementWithEvents(_) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -3897,7 +3912,11 @@ fn emit_top_level_multi_if_program(
     let final_pos = pos;
     let trailing_advance = final_pos.saturating_sub(last_if_pos + 1);
     let mut block_stmts: Vec<Statement> = Vec::new();
+    // Event-directive emissions are collected here and appended AFTER all
+    // anchor-block emissions, so events fire on elements already declared.
+    let mut event_stmts: Vec<Statement> = Vec::new();
     let mut anchor_count = 0usize;
+    let mut if_count = 0usize;
     let mut prev_anchor_slot: Option<usize> = None;
     let mut prev_anchor_var: Option<String> = None;
     let mut node_idx = 0usize;
@@ -3928,6 +3947,13 @@ fn emit_top_level_multi_if_program(
             text_idx += 1;
             n
         } else if let Slot::ElementWithHtml(el, _) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
+        } else if let Slot::ElementWithEvents(el) = slot {
             let cnt = elem_named_count(&el.name, &mut elem_named_counts);
             if cnt == 0 {
                 el.name.clone()
@@ -3986,10 +4012,12 @@ fn emit_top_level_multi_if_program(
         }
         match slot {
             Slot::If(ib) => {
-                let consequent_text_name = if i == 0 {
+                let if_i = if_count;
+                if_count += 1;
+                let consequent_text_name = if if_i == 0 {
                     "text".to_string()
                 } else {
-                    format!("text_{}", i)
+                    format!("text_{}", if_i)
                 };
                 let consequent_body = emit_vanilla_branch_body(
                     &ib.consequent,
@@ -3998,10 +4026,10 @@ fn emit_top_level_multi_if_program(
                     &mut root_idx,
                     &mut elem_var_idx,
                 )?;
-                let consequent_var = if i == 0 {
+                let consequent_var = if if_i == 0 {
                     "consequent".to_string()
                 } else {
-                    format!("consequent_{}", i)
+                    format!("consequent_{}", if_i)
                 };
                 let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor")],
@@ -4208,6 +4236,41 @@ fn emit_top_level_multi_if_program(
                     t::member_id(t::id("$"), "html"),
                     vec![t::id(&cur_var), arrow],
                 )));
+            }
+            Slot::ElementWithEvents(el) => {
+                // Defer $.event calls to AFTER all anchor blocks emitted
+                // (events fire on the element after the navigation is complete).
+                use svelte_ast::attributes::ElementAttribute;
+                for a in &el.attributes {
+                    let od = match a {
+                        ElementAttribute::OnDirective(od) => od,
+                        _ => continue,
+                    };
+                    let handler_expr = match &od.expression {
+                        Some(e) => e.clone(),
+                        None => continue,
+                    };
+                    let handler = rewrite_props_destructured(
+                        &handler_expr,
+                        &script.props_destructured,
+                    );
+                    let handler = rewrite_legacy_prop_writes_to_calls(
+                        &handler,
+                        &legacy_prop_names,
+                    );
+                    event_stmts.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "event"),
+                        vec![
+                            Expression::Literal(Box::new(Literal::String(StringLiteral {
+                                value: od.name.clone(),
+                                raw: None,
+                                span: Span::ZERO,
+                            }))),
+                            t::id(&cur_var),
+                            handler,
+                        ],
+                    )));
+                }
             }
             Slot::ElementWithHtml(el, ht) => {
                 // `var X = ...; $.html(X, () => EXPR, true); $.reset(X);`.
@@ -4426,6 +4489,8 @@ fn emit_top_level_multi_if_program(
     let first_var_name = first_anchor_var.unwrap_or_else(|| "node".to_string());
     func_body.push(t::var(&first_var_name, first_node_init));
     func_body.extend(block_stmts);
+    // Event-directive registrations come after all anchor blocks.
+    func_body.extend(event_stmts);
     // Trailing static slots: if any of them was originally a `<TAG>{EXPR}</TAG>`
     // (i.e. its source body has an ExpressionTag), upstream emits explicit
     // `var X = $.sibling(prev, OFFSET)` for each — not a bulk `$.next(N)`.
@@ -4593,6 +4658,49 @@ fn emit_top_level_multi_if_program(
                     }
                 }
                 html.push_str("></");
+                html.push_str(&el.name);
+                html.push('>');
+            }
+            Slot::ElementWithEvents(el) => {
+                // Serialize the element's static-attributes-only form +
+                // body (OnDirective stripped automatically — we only
+                // iterate Attribute variants).
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"");
+                                for p in parts {
+                                    if let AttributeValuePart::Text(t) = p {
+                                        for c in t.data.chars() {
+                                            match c {
+                                                '"' => html.push_str("&quot;"),
+                                                '&' => html.push_str("&amp;"),
+                                                _ => html.push(c),
+                                            }
+                                        }
+                                    }
+                                }
+                                html.push('"');
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                html.push('>');
+                let mut needs = false;
+                serialize_fragment_to_html(&el.fragment, &mut html, &mut needs).unwrap_or(());
+                html.push_str("</");
                 html.push_str(&el.name);
                 html.push('>');
             }
@@ -5012,6 +5120,114 @@ fn expression_uses_props_destructured(
                 })
         }
         _ => false,
+    }
+}
+
+/// True iff the element has only static attributes plus at least one
+/// `OnDirective` (or `on*` Attribute), and a fully-static body. Used
+/// by `Slot::ElementWithEvents`.
+fn element_static_body_with_events(el: &svelte_ast::elements::RegularElement) -> bool {
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut has_event = false;
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::OnDirective(od) => {
+                if od.modifiers.is_empty() && od.expression.is_some() {
+                    has_event = true;
+                } else {
+                    return false;
+                }
+            }
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => {}
+                AttributeValue::Many(parts) => {
+                    if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    if !has_event {
+        return false;
+    }
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Rewrite `X = value` to `X(value)` where X is a legacy prop accessor.
+/// Used inside event handler bodies and similar contexts where setter
+/// calls need to be inlined.
+fn rewrite_legacy_prop_writes_to_calls(
+    e: &Expression,
+    legacy_props: &HashSet<String>,
+) -> Expression {
+    match e {
+        Expression::Arrow(a) => Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: a.params.clone(),
+            body: match &a.body {
+                ArrowBody::Expression(e) => ArrowBody::Expression(
+                    rewrite_legacy_prop_writes_to_calls(e, legacy_props),
+                ),
+                ArrowBody::Block(b) => ArrowBody::Block(Box::new(BlockStatement {
+                    body: b
+                        .body
+                        .iter()
+                        .map(|s| rewrite_stmt_prop_writes(s, legacy_props))
+                        .collect(),
+                    span: b.span,
+                })),
+            },
+            r#async: a.r#async,
+            span: a.span,
+        })),
+        Expression::Assignment(asn) => {
+            // `X = v` → `X(v)` if X is a legacy prop accessor.
+            if matches!(asn.operator, AssignmentOperator::Assign) {
+                let ident_name: Option<&str> = match &asn.left {
+                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(id.name.as_str()),
+                    AssignmentTarget::Expression(Expression::Identifier(id)) => {
+                        Some(id.name.as_str())
+                    }
+                    _ => None,
+                };
+                if let Some(name) = ident_name {
+                    if legacy_props.contains(name) {
+                        return Expression::Call(Box::new(CallExpression {
+                            callee: t::id(name),
+                            arguments: vec![Argument::Expression(asn.right.clone())],
+                            optional: false,
+                            span: asn.span,
+                        }));
+                    }
+                }
+            }
+            e.clone()
+        }
+        Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
+            expression: rewrite_legacy_prop_writes_to_calls(&p.expression, legacy_props),
+            span: p.span,
+        })),
+        _ => e.clone(),
+    }
+}
+
+fn rewrite_stmt_prop_writes(s: &Statement, legacy_props: &HashSet<String>) -> Statement {
+    match s {
+        Statement::Expression(e) => Statement::Expression(Box::new(
+            svelte_js_ast::ExpressionStatement {
+                expression: rewrite_legacy_prop_writes_to_calls(&e.expression, legacy_props),
+                span: e.span,
+            },
+        )),
+        _ => s.clone(),
     }
 }
 
