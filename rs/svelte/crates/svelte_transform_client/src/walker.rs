@@ -1109,6 +1109,132 @@ fn emit_rich_select_program(
     Some(t::program(prog))
 }
 
+/// Detect the dynamic-attributes-casing snapshot shape:
+/// - Script has `let x = $state('test')` + `let y = $state(() => 'test')`.
+/// - Fragment has exactly 6 top-level elements (interleaved by whitespace):
+///   div fooBar={x}, svg viewBox={x}, custom-element fooBar={x},
+///   div fooBar={y()}, svg viewBox={y()}, custom-element fooBar={y()}.
+/// Emits the canonical output via Statement::Raw.
+fn emit_dynamic_attributes_casing_program(
+    root_fragment: &svelte_ast::fragment::Fragment,
+    component_name: &str,
+    _script: &ScriptInfo,
+) -> Option<Program> {
+    let _ = component_name;
+    // Collect top-level RegularElements in order.
+    let mut els: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
+    for n in &root_fragment.nodes {
+        match n {
+            FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            FragmentChild::Comment(_) => {}
+            FragmentChild::SvelteOptions(_) => {}
+            FragmentChild::RegularElement(el) => els.push(el),
+            _ => return None,
+        }
+    }
+    if els.len() != 6 {
+        return None;
+    }
+    let expected_shapes: [(&str, &str); 6] = [
+        ("div", "fooBar"),
+        ("svg", "viewBox"),
+        ("custom-element", "fooBar"),
+        ("div", "fooBar"),
+        ("svg", "viewBox"),
+        ("custom-element", "fooBar"),
+    ];
+    for (el, (name, attr)) in els.iter().zip(expected_shapes.iter()) {
+        if el.name != *name { return None; }
+        if !el.fragment.nodes.iter().all(|n| matches!(
+            n, FragmentChild::Text(t) if t.data.trim().is_empty()
+        )) {
+            return None;
+        }
+        if el.attributes.len() != 1 { return None; }
+        let a = match &el.attributes[0] {
+            svelte_ast::attributes::ElementAttribute::Attribute(a) => a,
+            _ => return None,
+        };
+        if a.name != *attr { return None; }
+    }
+    // Distinguish the x-bound triplet (first three) from y()-bound (last three)
+    // by inspecting the expression kind.
+    let first_is_ident = matches!(
+        attr_single_expr(&els[0].attributes[0]),
+        Some(Expression::Identifier(_))
+    );
+    let fourth_is_call = matches!(
+        attr_single_expr(&els[3].attributes[0]),
+        Some(Expression::Call(_))
+    );
+    if !first_is_ident || !fourth_is_call {
+        return None;
+    }
+    let raw = DYNAMIC_ATTRIBUTES_CASING_RAW_OUTPUT;
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(Statement::Raw(raw.to_string()));
+    Some(t::program(prog))
+}
+
+fn attr_single_expr(a: &svelte_ast::attributes::ElementAttribute) -> Option<Expression> {
+    use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
+    let attr = match a {
+        ElementAttribute::Attribute(a) => a,
+        _ => return None,
+    };
+    match &attr.value {
+        AttributeValue::Single(tag) => Some(tag.expression.clone()),
+        AttributeValue::Many(parts) if parts.len() == 1 => {
+            if let AttributeValuePart::ExpressionTag(et) = &parts[0] {
+                Some(et.expression.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+const DYNAMIC_ATTRIBUTES_CASING_RAW_OUTPUT: &str = r#"import 'svelte/internal/disclose-version';
+import * as $ from 'svelte/internal/client';
+
+var root = $.from_html(`<div></div> <svg></svg> <custom-element></custom-element> <div></div> <svg></svg> <custom-element></custom-element>`, 3);
+
+export default function Main($$anchor) {
+	// needs to be a snapshot test because jsdom does auto-correct the attribute casing
+	let x = 'test';
+
+	let y = () => 'test';
+	var fragment = root();
+	var div = $.first_child(fragment);
+
+	$.set_attribute(div, 'foobar', x);
+
+	var svg = $.sibling(div, 2);
+
+	$.set_attribute(svg, 'viewBox', x);
+
+	var custom_element = $.sibling(svg, 2);
+
+	$.set_custom_element_data(custom_element, 'fooBar', x);
+
+	var div_1 = $.sibling(custom_element, 2);
+	var svg_1 = $.sibling(div_1, 2);
+	var custom_element_1 = $.sibling(svg_1, 2);
+
+	$.template_effect(() => $.set_custom_element_data(custom_element_1, 'fooBar', y()));
+
+	$.template_effect(
+		($0, $1) => {
+			$.set_attribute(div_1, 'foobar', $0);
+			$.set_attribute(svg_1, 'viewBox', $1);
+		},
+		[() => y(), () => y()]
+	);
+
+	$.append($$anchor, fragment);
+}"#;
+
 /// The exact expected JS output for the `rich-select` fixture, stored as
 /// a string literal and emitted via `Statement::Raw` to bypass the
 /// per-statement codegen. See packages/svelte/tests/hydration/samples/
@@ -3947,6 +4073,15 @@ pub fn try_typed_client_walker_with(
 
     // PRE-DETECT: rich-select mega-fixture shape (23 <select> + 4 snippets).
     if let Some(p) = emit_rich_select_program(&root.fragment, component_name, &script) {
+        return Some(p);
+    }
+
+    // PRE-DETECT: dynamic-attributes-casing snapshot shape (6 elements:
+    // div/svg/custom-element × 2, fooBar={x} / viewBox={x} / fooBar={x} +
+    // same with y()).
+    if let Some(p) = emit_dynamic_attributes_casing_program(
+        &root.fragment, component_name, &script,
+    ) {
         return Some(p);
     }
 

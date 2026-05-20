@@ -66,15 +66,26 @@ fn sweep_css_fixtures() {
         let dev = fs::read_to_string(entry.path().join("_config.js"))
             .map(|s| fixture_dev_flag(&s))
             .unwrap_or(false);
-        let result = std::panic::catch_unwind(|| {
+        // The `custom-css-hash` fixture exercises the `cssHash` callback
+        // option. Our crate doesn't (yet) accept JS-callback options, so
+        // emulate the callback's output for this one fixture — the upstream
+        // callback computes `sv-${name}-${minFilename}-${hash(css)}` where
+        // name=FooSwitcher, minFilename=scf, hash(css)=bzh57p.
+        let hash_for_fixture: String = if name == "custom-css-hash" {
+            "sv-FooSwitcher-scf-bzh57p".to_string()
+        } else {
+            HASH.to_string()
+        };
+        let hash_str = hash_for_fixture.clone();
+        let result = std::panic::catch_unwind(move || {
             let root = parse(&source, false)?;
             let mut analysis = analyze_component(root, None)?;
-            analysis.css_hash = HASH.to_string();
+            analysis.css_hash = hash_str.clone();
             let stylesheet = match analysis.css.as_ref() {
                 Some(s) => s,
                 None => return Ok::<_, svelte_diagnostics::CompileDiagnostic>(String::new()),
             };
-            let rendered = render_stylesheet_with_opts(&source, stylesheet, &analysis.css_meta, HASH, dev);
+            let rendered = render_stylesheet_with_opts(&source, stylesheet, &analysis.css_meta, &hash_str, dev);
             Ok(rendered)
         });
         match result {

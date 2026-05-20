@@ -38,7 +38,18 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
     while parser.index < parser.template.len() {
         if parser.match_str("<") {
             // `<!--` is dispatched inside `read_element_or_comment`.
-            nodes.push(state::element::read_element_or_comment(&mut parser)?);
+            let start_idx = parser.index;
+            match state::element::read_element_or_comment(&mut parser) {
+                Ok(n) => nodes.push(n),
+                Err(d) => {
+                    if !parser.loose { return Err(d); }
+                    // Recovery: if we haven't made progress, skip one byte
+                    // past the `<` so we don't loop forever.
+                    if parser.index == start_idx {
+                        parser.index += 1;
+                    }
+                }
+            }
             continue;
         }
         if parser.match_str("{") {
@@ -55,12 +66,32 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
                 }
                 let kw = &trimmed[1..1 + j];
                 if matches!(kw, "else" | "then" | "catch") {
-                    return Err(svelte_diagnostics::errors::block_invalid_continuation_placement(
-                        Some((parser.index as u32, parser.index as u32)),
-                    ));
+                    if !parser.loose {
+                        return Err(svelte_diagnostics::errors::block_invalid_continuation_placement(
+                            Some((parser.index as u32, parser.index as u32)),
+                        ));
+                    }
+                    parser.index += 1;
+                    continue;
                 }
             }
-            nodes.push(state::tag::read_tag(&mut parser)?);
+            let start_idx = parser.index;
+            match state::tag::read_tag(&mut parser) {
+                Ok(n) => nodes.push(n),
+                Err(d) => {
+                    if !parser.loose { return Err(d); }
+                    // Recovery: skip to the matching `}` (or one byte past
+                    // `{` if no close found) so the outer loop can continue.
+                    if parser.index == start_idx {
+                        let rest = &parser.template[start_idx + 1..];
+                        if let Some(rel) = rest.find('}') {
+                            parser.index = start_idx + 1 + rel + 1;
+                        } else {
+                            parser.index = parser.template.len();
+                        }
+                    }
+                }
+            }
             continue;
         }
         let t = state::text::read_text(&mut parser);
