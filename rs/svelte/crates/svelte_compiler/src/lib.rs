@@ -86,7 +86,12 @@ pub fn compile(
             if let Some(p) = fast {
                 p
             } else if let Some(p) =
-                svelte_transform_client::try_typed_client_walker_with(&root, component_name, use_tree)
+                svelte_transform_client::try_typed_client_walker_with_filename(
+                    &root,
+                    component_name,
+                    use_tree,
+                    options.module.filename.as_deref(),
+                )
             {
                 p
             } else if let Some(p) =

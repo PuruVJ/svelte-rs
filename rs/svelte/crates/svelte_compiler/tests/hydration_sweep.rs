@@ -65,6 +65,13 @@ fn hydration_client_sweep() {
         };
         let mut opts = CompileOptions::default();
         opts.module.generate = Some(Generate::Client);
+        // Match upstream's `compile_directory`: filename is the path
+        // relative to the repo root (e.g.
+        // `packages/svelte/tests/hydration/samples/head-missing/main.svelte`).
+        // This is what `$.head(HASH, ...)` hashes for svelte:head blocks.
+        opts.module.filename = Some(format!(
+            "packages/svelte/tests/hydration/samples/{name}/main.svelte"
+        ));
         // Hydration fixtures all live in `main.svelte` — upstream derives
         // the component name from the filename, so the exported function
         // is always `Main`.

@@ -30,6 +30,205 @@ pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Prog
     try_typed_client_walker_with(root, component_name, false)
 }
 
+pub fn try_typed_client_walker_with_filename(
+    root: &Root,
+    component_name: &str,
+    use_tree: bool,
+    filename: Option<&str>,
+) -> Option<Program> {
+    set_walker_filename(filename);
+    let r = try_typed_client_walker_with(root, component_name, use_tree);
+    set_walker_filename(None);
+    r
+}
+
+thread_local! {
+    static CURRENT_FILENAME: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+fn set_walker_filename(f: Option<&str>) {
+    CURRENT_FILENAME.with(|c| {
+        *c.borrow_mut() = f.map(|s| s.to_string());
+    });
+}
+
+fn current_walker_filename() -> Option<String> {
+    CURRENT_FILENAME.with(|c| c.borrow().clone())
+}
+
+/// Emit a program for `<svelte:head>...</svelte:head>` followed by a
+/// simple body (single static element). Mirrors `head-missing`.
+fn emit_svelte_head_program(
+    head: &svelte_ast::elements::SvelteHead,
+    others: &[&FragmentChild],
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+        || !script.legacy_export_props.is_empty()
+    {
+        return None;
+    }
+    // For now: only handle when body is exactly one fully-static element.
+    if others.len() != 1 {
+        return None;
+    }
+    let body_el = match others[0] {
+        FragmentChild::RegularElement(el) => el,
+        _ => return None,
+    };
+    if !is_element_fully_static(body_el) {
+        return None;
+    }
+    // Head body: serialize to template HTML. Currently only handle
+    // a fragment of fully-static elements (e.g. 2 <meta> tags).
+    let head_non_ws: Vec<&FragmentChild> = head
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if head_non_ws.is_empty() {
+        return None;
+    }
+    if !head_non_ws.iter().all(|n| {
+        matches!(n, FragmentChild::RegularElement(el) if is_element_fully_static(el))
+    }) {
+        return None;
+    }
+    // Build head template HTML: each element + single space between.
+    let mut head_html = String::new();
+    let mut needs_import_node = false;
+    for (i, n) in head_non_ws.iter().enumerate() {
+        if i > 0 {
+            head_html.push(' ');
+        }
+        if let FragmentChild::RegularElement(el) = n {
+            serialize_element_to_html(el, &mut head_html, &mut needs_import_node)?;
+        }
+    }
+    let head_flag = if head_non_ws.len() > 1 { 1.0 } else { 0.0 };
+
+    // Body template HTML.
+    let mut body_html = String::new();
+    let mut body_needs = false;
+    serialize_element_to_html(body_el, &mut body_html, &mut body_needs)?;
+
+    let body_tag = body_el.name.clone();
+
+    // Compute hash from filename.
+    let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
+    let hash_val = svelte_filename_hash(&filename);
+
+    // Head body emission: emit `var fragment = root_1(); $.next(N); $.append($$anchor, fragment);`
+    let mut head_body: Vec<Statement> = Vec::new();
+    head_body.push(t::var("fragment", t::call(t::id("root_1"), Vec::new())));
+    // `$.next(N)` where N = (head_non_ws.len() - 1) * 2 if > 0, else 1.
+    // head-missing has 2 metas → N=2 → `$.next(2)`.
+    let next_arg = if head_non_ws.len() > 1 {
+        vec![t::lit_number(((head_non_ws.len() - 1) * 2) as f64)]
+    } else {
+        Vec::new()
+    };
+    head_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "next"),
+        next_arg,
+    )));
+    head_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+    let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: head_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&body_tag, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "head"),
+        vec![
+            Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: hash_val,
+                raw: None,
+                span: Span::ZERO,
+            }))),
+            head_arrow,
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&body_tag)],
+    )));
+
+    let params = vec![t::pat_id("$$anchor")];
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    // root_1 (head) and root (body).
+    let head_args: Vec<Expression> = if head_flag != 0.0 {
+        vec![t::template_raw(vec![head_html], vec![]), t::lit_number(head_flag)]
+    } else {
+        vec![t::template_raw(vec![head_html], vec![])]
+    };
+    prog.push(t::var(
+        "root_1",
+        t::call(t::member_id(t::id("$"), "from_html"), head_args),
+    ));
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![body_html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
+/// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2-variant
+/// (XOR rather than add) base-36 encoded as u32. Mirrors
+/// `packages/svelte/src/utils.js`.
+fn svelte_filename_hash(s: &str) -> String {
+    let s: String = s.chars().filter(|c| *c != '\r').collect();
+    let mut h: i64 = 5381;
+    for c in s.chars().rev() {
+        h = ((h << 5) - h) ^ (c as i64);
+        h &= 0xFFFFFFFF;
+    }
+    let mut n = h as u32;
+    if n == 0 {
+        return "0".into();
+    }
+    let chars: Vec<char> = "0123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
+    let mut out = String::new();
+    while n > 0 {
+        out.insert(0, chars[(n % 36) as usize]);
+        n /= 36;
+    }
+    out
+}
+
 pub fn try_typed_client_walker_with(
     root: &Root,
     component_name: &str,
@@ -52,6 +251,37 @@ pub fn try_typed_client_walker_with(
     // without script constants, expressions like `{40 + 2}` may fold.
     let mut fragment = root.fragment.clone();
     fold_fragment_with_consts(&mut fragment, &script.constants);
+
+    // PRE-DETECT: top-level `<svelte:head>` + simple remainder shape.
+    {
+        let mut head_node: Option<&svelte_ast::elements::SvelteHead> = None;
+        let mut others: Vec<&FragmentChild> = Vec::new();
+        for n in &root.fragment.nodes {
+            match n {
+                FragmentChild::SvelteHead(sh) => {
+                    if head_node.is_some() {
+                        head_node = None; // multiple — bail out of this fast path
+                        others.clear();
+                        break;
+                    }
+                    head_node = Some(sh);
+                }
+                FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+                FragmentChild::Comment(_) => {}
+                _ => others.push(n),
+            }
+        }
+        if let Some(sh) = head_node {
+            if let Some(p) = emit_svelte_head_program(
+                sh,
+                &others,
+                component_name,
+                &script,
+            ) {
+                return Some(p);
+            }
+        }
+    }
 
     // PRE-DETECT: select-with-rich-content uses snippet bodies that contain
     // `<option>...</option>` (not plain Text), so the regular

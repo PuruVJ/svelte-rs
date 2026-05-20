@@ -14,6 +14,7 @@ mod walker;
 pub use typed_fast::try_typed_client;
 pub use walker::try_typed_client_walker;
 pub use walker::try_typed_client_walker_with;
+pub use walker::try_typed_client_walker_with_filename;
 pub use walker::fold_in_fragment as walker_fold_in_fragment;
 
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
