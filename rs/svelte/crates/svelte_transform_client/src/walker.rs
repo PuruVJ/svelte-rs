@@ -285,6 +285,11 @@ pub fn try_typed_client_walker_with(
             {
                 return inject_snippets(Some(p));
             }
+            if let Some(p) =
+                emit_single_element_with_spread_program(el, component_name, &script)
+            {
+                return inject_snippets(Some(p));
+            }
         }
     }
 
@@ -5611,6 +5616,165 @@ fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
         })),
         e => e.clone(),
     }
+}
+
+/// Emit a program for the shape:
+///
+///   <TAG {...spread} >body</TAG>
+///
+/// — single element with one or more spread attributes (and optional
+/// static attrs), static body. Mirrors `removes-undefined-attributes`.
+fn emit_single_element_with_spread_program(
+    el: &svelte_ast::elements::RegularElement,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    if script.has_class_with_runes
+        || !script.state_bindings.is_empty()
+        || !script.proxy_bindings.is_empty()
+        || !script.derived_bindings.is_empty()
+        || script.async_info.is_some()
+        || !script.legacy_export_props.is_empty()
+    {
+        return None;
+    }
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    let mut spread_exprs: Vec<Expression> = Vec::new();
+    let mut static_attrs: Vec<&svelte_ast::attributes::Attribute> = Vec::new();
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::SpreadAttribute(s) => spread_exprs.push(s.expression.clone()),
+            ElementAttribute::Attribute(attr) => match &attr.value {
+                AttributeValue::Empty => static_attrs.push(attr),
+                AttributeValue::Many(parts) => {
+                    if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                        return None;
+                    }
+                    static_attrs.push(attr);
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    if spread_exprs.is_empty() {
+        return None;
+    }
+    // Body must be static.
+    for n in &el.fragment.nodes {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(child) => {
+                if !is_element_fully_static(child) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    // Build template HTML.
+    let mut html = String::new();
+    html.push('<');
+    html.push_str(&el.name);
+    for attr in &static_attrs {
+        match &attr.value {
+            AttributeValue::Empty => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"\"");
+            }
+            AttributeValue::Many(parts) => {
+                html.push(' ');
+                html.push_str(&attr.name);
+                html.push_str("=\"");
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        for c in t.data.chars() {
+                            match c {
+                                '"' => html.push_str("&quot;"),
+                                '&' => html.push_str("&amp;"),
+                                _ => html.push(c),
+                            }
+                        }
+                    }
+                }
+                html.push('"');
+            }
+            _ => return None,
+        }
+    }
+    if is_void_client(&el.name) {
+        html.push_str("/>");
+    } else {
+        html.push('>');
+        let mut needs = false;
+        serialize_fragment_to_html(&el.fragment, &mut html, &mut needs)?;
+        html.push_str("</");
+        html.push_str(&el.name);
+        html.push('>');
+    }
+
+    // `$.attribute_effect(VAR, () => ({ ...e1, ...e2 }))`.
+    let mut obj_props: Vec<ObjectMember> = Vec::new();
+    for expr in spread_exprs {
+        let rewritten = rewrite_props_destructured(&expr, &script.props_destructured);
+        obj_props.push(ObjectMember::Spread(Box::new(SpreadElement {
+            argument: rewritten,
+            span: Span::ZERO,
+        })));
+    }
+    let obj_expr = Expression::Object(Box::new(ObjectExpression {
+        properties: obj_props,
+        span: Span::ZERO,
+    }));
+    // Wrap in parens for `() => ({ ... })` form.
+    let paren_obj = Expression::Paren(Box::new(ParenthesizedExpression {
+        expression: obj_expr,
+        span: Span::ZERO,
+    }));
+    let attr_effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(paren_obj),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    let var_name = el.name.clone();
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "attribute_effect"),
+        vec![t::id(&var_name), attr_effect_arrow],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&var_name)],
+    )));
+
+    let mut params = vec![t::pat_id("$$anchor")];
+    if script.uses_props {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    prog.push(t::var(
+        "root",
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![html], vec![])],
+        ),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 /// Emit a program for the shape:
@@ -11101,10 +11265,81 @@ fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expres
                 expression: go(&p.expression, names),
                 span: p.span,
             })),
+            Expression::Object(o) => Expression::Object(Box::new(ObjectExpression {
+                properties: o
+                    .properties
+                    .iter()
+                    .map(|m| match m {
+                        ObjectMember::Property(p) => ObjectMember::Property(Box::new(Property {
+                            key: p.key.clone(),
+                            value: go(&p.value, names),
+                            kind: p.kind,
+                            computed: p.computed,
+                            shorthand: p.shorthand,
+                            method: p.method,
+                            span: p.span,
+                        })),
+                        ObjectMember::Spread(s) => ObjectMember::Spread(Box::new(SpreadElement {
+                            argument: go(&s.argument, names),
+                            span: s.span,
+                        })),
+                    })
+                    .collect(),
+                span: o.span,
+            })),
+            Expression::Array(a) => Expression::Array(Box::new(ArrayExpression {
+                elements: a
+                    .elements
+                    .iter()
+                    .map(|el| match el {
+                        ArrayElement::Expression(e) => ArrayElement::Expression(go(e, names)),
+                        ArrayElement::Spread(s) => ArrayElement::Spread(Box::new(SpreadElement {
+                            argument: go(&s.argument, names),
+                            span: s.span,
+                        })),
+                        ArrayElement::Elision => ArrayElement::Elision,
+                    })
+                    .collect(),
+                span: a.span,
+            })),
             e => e.clone(),
         }
     }
     go(e, names)
+}
+
+/// Rewrite props_destructured references in a Statement (recursively
+/// into expression positions). Used to clean up script-body statements
+/// like `const attrs = { x: browser ? ... : ... };`.
+fn rewrite_stmt_props_destructured(s: &Statement, names: &HashSet<String>) -> Statement {
+    if names.is_empty() {
+        return s.clone();
+    }
+    match s {
+        Statement::Variable(v) => Statement::Variable(Box::new(VariableDeclaration {
+            kind: v.kind,
+            declarations: v
+                .declarations
+                .iter()
+                .map(|d| VariableDeclarator {
+                    id: d.id.clone(),
+                    init: d
+                        .init
+                        .as_ref()
+                        .map(|e| rewrite_props_destructured(e, names)),
+                    span: d.span,
+                })
+                .collect(),
+            span: v.span,
+        })),
+        Statement::Expression(e) => {
+            Statement::Expression(Box::new(svelte_js_ast::ExpressionStatement {
+                expression: rewrite_props_destructured(&e.expression, names),
+                span: e.span,
+            }))
+        }
+        _ => s.clone(),
+    }
 }
 
 /// Rewrite each free `X` identifier in `e` to a call `X()` when `X` is in
@@ -12678,6 +12913,10 @@ fn analyze_script(
     // `var yes1, yes2, no1, no2;` (no inits) stay combined.
     let mut body_out: Vec<Statement> = Vec::with_capacity(body_out_raw.len());
     for s in body_out_raw {
+        // Rewrite destructured-props identifier reads (`browser` →
+        // `$$props.browser`) in script statements so they match the
+        // template-side transformation.
+        let s = rewrite_stmt_props_destructured(&s, &props_destructured);
         if let Statement::Variable(v) = &s {
             if v.declarations.len() > 1
                 && v.declarations.iter().all(|d| d.init.is_some())
