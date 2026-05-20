@@ -3007,6 +3007,181 @@ fn emit_multi_element_branch_body_with_context(
     Some(body)
 }
 
+/// Emit each-block consequent body for N>=2 top-level text-anchor elements.
+/// Each element is `<TAG>{EXPR}</TAG>` (text-anchor). Builds the multi-root
+/// template, walks elements via $.first_child / $.sibling, allocates one
+/// text-anchor var per element, and combines all set_text calls into a
+/// single $.template_effect block.
+fn emit_multi_element_each_body(
+    non_ws: &[&FragmentChild],
+    roots: &mut Vec<Statement>,
+    root_idx: &mut usize,
+    elem_var_idx: &mut usize,
+    text_idx: &mut usize,
+    frag_idx: &mut usize,
+    item_name: &str,
+    item_referenced: bool,
+    props_destructured: &HashSet<String>,
+    legacy_prop_names: &HashSet<String>,
+) -> Option<Vec<Statement>> {
+    use svelte_ast::attributes::ElementAttribute;
+    let mut elements: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
+    for n in non_ws {
+        if let FragmentChild::RegularElement(el) = n {
+            if !el.attributes.is_empty() {
+                return None;
+            }
+            if !is_text_only_element(el) {
+                return None;
+            }
+            elements.push(el);
+        } else {
+            return None;
+        }
+    }
+    // Build template HTML: `<EL> </EL> <EL> </EL>` (space placeholders).
+    let mut template = String::new();
+    let mut needs_import_node = false;
+    for (i, el) in elements.iter().enumerate() {
+        if i > 0 {
+            template.push(' ');
+        }
+        if el.name.contains('-') || el.name == "video" {
+            needs_import_node = true;
+        }
+        template.push('<');
+        template.push_str(&el.name);
+        template.push_str("> </");
+        template.push_str(&el.name);
+        template.push('>');
+    }
+    *root_idx += 1;
+    let root_name = format!("root_{}", *root_idx);
+    let flag = if needs_import_node { 3.0 } else { 1.0 };
+    roots.push(t::var(
+        &root_name,
+        t::call(
+            t::member_id(t::id("$"), "from_html"),
+            vec![t::template_raw(vec![template], vec![]), t::lit_number(flag)],
+        ),
+    ));
+
+    let mut body: Vec<Statement> = Vec::new();
+    *frag_idx += 1;
+    let frag_var = format!("fragment_{}", *frag_idx);
+    body.push(t::var(&frag_var, t::call(t::id(&root_name), Vec::new())));
+
+    let mut elem_vars: Vec<String> = Vec::new();
+    let mut text_vars_with_expr: Vec<(String, Expression)> = Vec::new();
+
+    for (i, el) in elements.iter().enumerate() {
+        *elem_var_idx += 1;
+        let safe = sanitize_name(&el.name);
+        let el_var = if *elem_var_idx == 1 {
+            safe
+        } else {
+            format!("{}_{}", safe, *elem_var_idx - 1)
+        };
+        elem_vars.push(el_var.clone());
+        let init = if i == 0 {
+            t::call(
+                t::member_id(t::id("$"), "first_child"),
+                vec![t::id(&frag_var)],
+            )
+        } else {
+            t::call(
+                t::member_id(t::id("$"), "sibling"),
+                vec![t::id(&elem_vars[i - 1]), t::lit_number(2.0)],
+            )
+        };
+        body.push(t::var(&el_var, init));
+
+        // Build inline expression for the text anchor.
+        let mut parts: Vec<TextPart> = Vec::new();
+        for c in &el.fragment.nodes {
+            match c {
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::ExpressionTag(et) => {
+                    parts.push(TextPart::Expr(&et.expression))
+                }
+                _ => return None,
+            }
+        }
+        let inline = build_inline_template(&parts, &HashSet::new());
+        let inline = rewrite_props_destructured(&inline, props_destructured);
+        let inline = rewrite_legacy_prop_reads(&inline, legacy_prop_names);
+        let inline = if item_referenced {
+            rewrite_get_for_each_var(&inline, item_name)
+        } else {
+            inline
+        };
+
+        let text_name = if *text_idx == 0 {
+            "text".to_string()
+        } else {
+            format!("text_{}", text_idx)
+        };
+        *text_idx += 1;
+        body.push(t::var(
+            &text_name,
+            t::call(
+                t::member_id(t::id("$"), "child"),
+                vec![
+                    t::id(&el_var),
+                    Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                        value: true,
+                        span: Span::ZERO,
+                    }))),
+                ],
+            ),
+        ));
+        body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "reset"),
+            vec![t::id(&el_var)],
+        )));
+        text_vars_with_expr.push((text_name, inline));
+    }
+
+    // Combined template_effect.
+    let set_text_stmts: Vec<Statement> = text_vars_with_expr
+        .into_iter()
+        .map(|(name, expr)| {
+            t::stmt(t::call(
+                t::member_id(t::id("$"), "set_text"),
+                vec![t::id(&name), expr],
+            ))
+        })
+        .collect();
+    let eff_body = if set_text_stmts.len() == 1 {
+        let stmt = set_text_stmts.into_iter().next().unwrap();
+        let expr = if let Statement::Expression(e) = stmt {
+            e.expression
+        } else {
+            unreachable!()
+        };
+        ArrowBody::Expression(expr)
+    } else {
+        ArrowBody::Block(Box::new(BlockStatement {
+            body: set_text_stmts,
+            span: Span::ZERO,
+        }))
+    };
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "template_effect"),
+        vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: Vec::new(),
+            body: eff_body,
+            r#async: false,
+            span: Span::ZERO,
+        }))],
+    )));
+    body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id(&frag_var)],
+    )));
+    Some(body)
+}
+
 fn emit_vanilla_branch_body(
     fragment: &svelte_ast::fragment::Fragment,
     text_name: &str,
@@ -5077,8 +5252,8 @@ fn emit_top_level_multi_if_program(
                 slots.push(Slot::If(ib));
             }
             FragmentChild::EachBlock(eb) => {
-                // No key, no async, simple identifier context. Fallback OK.
-                if eb.key.is_some() || expr_top_await(&eb.expression) {
+                // No async, simple identifier context. Fallback / key OK.
+                if expr_top_await(&eb.expression) {
                     return None;
                 }
                 if !slots.is_empty() {
@@ -5154,7 +5329,7 @@ fn emit_top_level_multi_if_program(
                     && is_element_static_attrs(el);
                 if each_only_body {
                     if let FragmentChild::EachBlock(eb) = inner_non_ws[0] {
-                        if eb.key.is_none() && !expr_top_await(&eb.expression) {
+                        if !expr_top_await(&eb.expression) {
                             if !slots.is_empty() {
                                 gap_after.push(pending_gap);
                             }
@@ -5342,6 +5517,7 @@ fn emit_top_level_multi_if_program(
     let mut prev_anchor_var: Option<String> = None;
     let mut node_idx = 0usize;
     let mut text_idx = 0usize;
+    let mut frag_idx = 0usize;
     let mut elem_named_counts: HashMap<String, usize> = HashMap::new();
     fn elem_named_count(name: &str, m: &mut HashMap<String, usize>) -> usize {
         let safe = sanitize_name(name);
@@ -5532,61 +5708,97 @@ fn emit_top_level_multi_if_program(
                     Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
                     _ => return None,
                 };
-                // ITEM_REACTIVE flag (bit 0) on iff the body references
-                // the iter var. Wrap iter-var refs in $.get(VAR) inside
-                // the body in that case.
-                let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
-                let body_emits_text = fragment_emits_text_var(&eb.body);
-                let body_emits_root = fragment_emits_root_template(&eb.body);
-                let body_text_name = if text_idx == 0 {
-                    "text".to_string()
-                } else {
-                    format!("text_{}", text_idx)
+                // Keyed-by-self check: `{#each X as item (item)}` ⇒ item is
+                // stable, no ITEM_REACTIVE needed. Other keys (or none) ⇒
+                // ITEM_REACTIVE if the body reads item.
+                let key_is_self_ident = match &eb.key {
+                    Some(Expression::Identifier(id)) if id.name == item_name => true,
+                    _ => false,
                 };
-                if body_emits_text {
-                    text_idx += 1;
-                }
-                // Upstream's visitor bumps root_idx per branch arrow even
-                // when the body doesn't materialize a `$.from_html` decl.
-                // Pre-bump here when the body won't emit one, so the next
-                // branch's root_N matches upstream's counter.
-                if !body_emits_root {
-                    root_idx += 1;
-                }
-                let mut inner_body = emit_vanilla_branch_body(
-                    &eb.body,
-                    &body_text_name,
-                    &mut root_decls,
-                    &mut root_idx,
-                    &mut elem_var_idx,
-                )?;
-                // Each consequent body anchored at text/expression position
-                // needs `$.next()` at the head. Mirrors `emit_single_each_program`'s
-                // text-only branch.
-                let body_is_text_anchored = eb.body.nodes.iter().any(|c| matches!(
-                    c,
-                    FragmentChild::Text(t) if !t.data.trim().is_empty()
-                )) || eb.body.nodes.iter().all(|c| matches!(
-                    c,
-                    FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)
-                ));
-                let body_has_element = eb.body.nodes.iter().any(|c| matches!(
-                    c, FragmentChild::RegularElement(_)
-                ));
-                if body_is_text_anchored && !body_has_element {
-                    inner_body.insert(0, t::stmt(t::call(
-                        t::member_id(t::id("$"), "next"),
-                        Vec::new(),
-                    )));
-                }
-                // Wrap iter-var refs in `$.get(VAR)` if item is reactive.
-                let inner_body = if item_referenced {
-                    inner_body
-                        .into_iter()
-                        .map(|s| rewrite_stmt_get_for_each_var(&s, &item_name))
-                        .collect()
+                // ITEM_REACTIVE flag (bit 0) on iff the body references
+                // the iter var AND the key isn't the item identifier itself.
+                let item_referenced = !key_is_self_ident
+                    && fragment_uses_identifier(&eb.body, &item_name);
+                // Multi-element each-body path (N≥2 top-level text-anchor
+                // elements) emits its own root_N + fragment_N + per-element
+                // text vars + combined template_effect.
+                let multi_text_count = multi_element_each_text_count(&eb.body);
+                let inner_body = if let Some(_n) = multi_text_count {
+                    let multi_non_ws: Vec<&FragmentChild> = eb
+                        .body
+                        .nodes
+                        .iter()
+                        .filter(|c| match c {
+                            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                            FragmentChild::Comment(_) => false,
+                            _ => true,
+                        })
+                        .collect();
+                    emit_multi_element_each_body(
+                        &multi_non_ws,
+                        &mut root_decls,
+                        &mut root_idx,
+                        &mut elem_var_idx,
+                        &mut text_idx,
+                        &mut frag_idx,
+                        &item_name,
+                        item_referenced,
+                        &script.props_destructured,
+                        &legacy_prop_names,
+                    )?
                 } else {
-                    inner_body
+                    let body_emits_text = fragment_emits_text_var(&eb.body);
+                    let body_emits_root = fragment_emits_root_template(&eb.body);
+                    let body_text_name = if text_idx == 0 {
+                        "text".to_string()
+                    } else {
+                        format!("text_{}", text_idx)
+                    };
+                    if body_emits_text {
+                        text_idx += 1;
+                    }
+                    // Upstream's visitor bumps root_idx per branch arrow even
+                    // when the body doesn't materialize a `$.from_html` decl.
+                    // Pre-bump here when the body won't emit one, so the next
+                    // branch's root_N matches upstream's counter.
+                    if !body_emits_root {
+                        root_idx += 1;
+                    }
+                    let mut inner_body = emit_vanilla_branch_body(
+                        &eb.body,
+                        &body_text_name,
+                        &mut root_decls,
+                        &mut root_idx,
+                        &mut elem_var_idx,
+                    )?;
+                    // Each consequent body anchored at text/expression position
+                    // needs `$.next()` at the head. Mirrors `emit_single_each_program`'s
+                    // text-only branch.
+                    let body_is_text_anchored = eb.body.nodes.iter().any(|c| matches!(
+                        c,
+                        FragmentChild::Text(t) if !t.data.trim().is_empty()
+                    )) || eb.body.nodes.iter().all(|c| matches!(
+                        c,
+                        FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)
+                    ));
+                    let body_has_element = eb.body.nodes.iter().any(|c| matches!(
+                        c, FragmentChild::RegularElement(_)
+                    ));
+                    if body_is_text_anchored && !body_has_element {
+                        inner_body.insert(0, t::stmt(t::call(
+                            t::member_id(t::id("$"), "next"),
+                            Vec::new(),
+                        )));
+                    }
+                    // Wrap iter-var refs in `$.get(VAR)` if item is reactive.
+                    if item_referenced {
+                        inner_body
+                            .into_iter()
+                            .map(|s| rewrite_stmt_get_for_each_var(&s, &item_name))
+                            .collect()
+                    } else {
+                        inner_body
+                    }
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
@@ -5666,11 +5878,21 @@ fn emit_top_level_multi_if_program(
                     }
                     None => None,
                 };
+                // Key function: `$.index` for unkeyed, `(item) => KEY` otherwise.
+                let key_fn: Expression = match &eb.key {
+                    None => t::member_id(t::id("$"), "index"),
+                    Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: vec![t::pat_id(&item_name)],
+                        body: ArrowBody::Expression(k.clone()),
+                        r#async: false,
+                        span: Span::ZERO,
+                    })),
+                };
                 let mut each_args = vec![
                     t::id(&cur_var),
                     t::lit_number(flag as f64),
                     each_collection,
-                    t::member_id(t::id("$"), "index"),
+                    key_fn,
                     item_arrow,
                 ];
                 if let Some(fb) = fallback_arrow {
@@ -5881,49 +6103,80 @@ fn emit_top_level_multi_if_program(
                     Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
                     _ => return None,
                 };
-                let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
-                let body_emits_text = fragment_emits_text_var(&eb.body);
-                let body_emits_root = fragment_emits_root_template(&eb.body);
-                let body_text_name = if text_idx == 0 {
-                    "text".to_string()
-                } else {
-                    format!("text_{}", text_idx)
+                let key_is_self_ident = match &eb.key {
+                    Some(Expression::Identifier(id)) if id.name == item_name => true,
+                    _ => false,
                 };
-                if body_emits_text {
-                    text_idx += 1;
-                }
-                if !body_emits_root {
-                    root_idx += 1;
-                }
-                let mut inner_body = emit_vanilla_branch_body(
-                    &eb.body,
-                    &body_text_name,
-                    &mut root_decls,
-                    &mut root_idx,
-                    &mut elem_var_idx,
-                )?;
-                // Each consequent body anchored at text/expression position
-                // needs `$.next()` at the head.
-                let body_has_element = eb.body.nodes.iter().any(|c| matches!(
-                    c, FragmentChild::RegularElement(_)
-                ));
-                let body_is_text_anchored = eb.body.nodes.iter().all(|c| matches!(
-                    c,
-                    FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)
-                ));
-                if body_is_text_anchored && !body_has_element {
-                    inner_body.insert(0, t::stmt(t::call(
-                        t::member_id(t::id("$"), "next"),
-                        Vec::new(),
-                    )));
-                }
-                let inner_body = if item_referenced {
-                    inner_body
-                        .into_iter()
-                        .map(|s| rewrite_stmt_get_for_each_var(&s, &item_name))
-                        .collect()
+                let item_referenced = !key_is_self_ident
+                    && fragment_uses_identifier(&eb.body, &item_name);
+                let multi_text_count = multi_element_each_text_count(&eb.body);
+                let inner_body = if let Some(_n) = multi_text_count {
+                    let multi_non_ws: Vec<&FragmentChild> = eb
+                        .body
+                        .nodes
+                        .iter()
+                        .filter(|c| match c {
+                            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                            FragmentChild::Comment(_) => false,
+                            _ => true,
+                        })
+                        .collect();
+                    emit_multi_element_each_body(
+                        &multi_non_ws,
+                        &mut root_decls,
+                        &mut root_idx,
+                        &mut elem_var_idx,
+                        &mut text_idx,
+                        &mut frag_idx,
+                        &item_name,
+                        item_referenced,
+                        &script.props_destructured,
+                        &legacy_prop_names,
+                    )?
                 } else {
-                    inner_body
+                    let body_emits_text = fragment_emits_text_var(&eb.body);
+                    let body_emits_root = fragment_emits_root_template(&eb.body);
+                    let body_text_name = if text_idx == 0 {
+                        "text".to_string()
+                    } else {
+                        format!("text_{}", text_idx)
+                    };
+                    if body_emits_text {
+                        text_idx += 1;
+                    }
+                    if !body_emits_root {
+                        root_idx += 1;
+                    }
+                    let mut inner_body = emit_vanilla_branch_body(
+                        &eb.body,
+                        &body_text_name,
+                        &mut root_decls,
+                        &mut root_idx,
+                        &mut elem_var_idx,
+                    )?;
+                    // Each consequent body anchored at text/expression position
+                    // needs `$.next()` at the head.
+                    let body_has_element = eb.body.nodes.iter().any(|c| matches!(
+                        c, FragmentChild::RegularElement(_)
+                    ));
+                    let body_is_text_anchored = eb.body.nodes.iter().all(|c| matches!(
+                        c,
+                        FragmentChild::Text(_) | FragmentChild::ExpressionTag(_)
+                    ));
+                    if body_is_text_anchored && !body_has_element {
+                        inner_body.insert(0, t::stmt(t::call(
+                            t::member_id(t::id("$"), "next"),
+                            Vec::new(),
+                        )));
+                    }
+                    if item_referenced {
+                        inner_body
+                            .into_iter()
+                            .map(|s| rewrite_stmt_get_for_each_var(&s, &item_name))
+                            .collect()
+                    } else {
+                        inner_body
+                    }
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
@@ -6000,11 +6253,20 @@ fn emit_top_level_multi_if_program(
                     }
                     None => None,
                 };
+                let key_fn: Expression = match &eb.key {
+                    None => t::member_id(t::id("$"), "index"),
+                    Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: vec![t::pat_id(&item_name)],
+                        body: ArrowBody::Expression(k.clone()),
+                        r#async: false,
+                        span: Span::ZERO,
+                    })),
+                };
                 let mut each_args = vec![
                     t::id(&cur_var),
                     t::lit_number(flag as f64),
                     each_collection,
-                    t::member_id(t::id("$"), "index"),
+                    key_fn,
                     item_arrow,
                 ];
                 if let Some(fb) = fallback_arrow {
@@ -6893,8 +7155,8 @@ fn emit_single_element_wrapping_each_program(
         FragmentChild::EachBlock(e) => e,
         _ => return None,
     };
-    // Constraint: no `:else`, no key, simple item identifier.
-    if eb.fallback.is_some() || eb.key.is_some() {
+    // Constraint: no `:else`, simple item identifier.
+    if eb.fallback.is_some() {
         return None;
     }
     if expr_top_await(&eb.expression) {
@@ -6903,6 +7165,10 @@ fn emit_single_element_wrapping_each_program(
     let item_name = match eb.context.as_ref() {
         Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
         _ => return None,
+    };
+    let key_is_self_ident = match &eb.key {
+        Some(Expression::Identifier(id)) if id.name == item_name => true,
+        _ => false,
     };
 
     // Inner body: must be a single fully-static element with text-only body
@@ -7052,8 +7318,42 @@ fn emit_single_element_wrapping_each_program(
         t::member_id(t::id("$"), "reset"),
         vec![t::id(&inner_var)],
     )));
+    // Detect iter source category. ITEM_IMMUTABLE (16) is set when the
+    // iterable comes from `$props()` destructuring. ITEM_REACTIVE (1) is
+    // set when iter is reactive (either $props or legacy prop) AND the
+    // key isn't the item identifier itself.
+    let is_runes_iter = matches!(
+        &eb.expression,
+        Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+    ) || expression_uses_props_destructured(
+        &eb.expression,
+        &script.props_destructured,
+    );
+    let legacy_prop_names_for_iter: HashSet<String> = script
+        .legacy_export_props
+        .iter()
+        .map(|(n, _)| n.clone())
+        .collect();
+    let is_legacy_iter = match &eb.expression {
+        Expression::Identifier(id) => legacy_prop_names_for_iter.contains(&id.name),
+        Expression::Member(m) => match &m.object {
+            Expression::Identifier(id) => legacy_prop_names_for_iter.contains(&id.name),
+            _ => false,
+        },
+        Expression::Call(c) => match &c.callee {
+            Expression::Identifier(id) => legacy_prop_names_for_iter.contains(&id.name),
+            _ => false,
+        },
+        _ => false,
+    };
+    let iter_is_reactive = is_runes_iter || is_legacy_iter;
+    let item_needs_get = iter_is_reactive && !key_is_self_ident;
     // Rewrite inner_expr: replace bare `item_name` references with `$.get(item_name)`.
-    let rewritten_inner = rewrite_get_for_each_var(&inner_expr, &item_name);
+    let rewritten_inner = if item_needs_get {
+        rewrite_get_for_each_var(&inner_expr, &item_name)
+    } else {
+        rewrite_props_destructured(&inner_expr, &script.props_destructured)
+    };
     let set_text = t::call(
         t::member_id(t::id("$"), "set_text"),
         vec![t::id("text"), rewritten_inner],
@@ -7150,14 +7450,31 @@ fn emit_single_element_wrapping_each_program(
         }))
     };
     let outer_var = sanitize_name(&el.name);
-    // Flags = 5 (unkeyed + mutable_source bound to item).
+    // Flags = 4 (IS_CONTROLLED) base, + 1 (ITEM_REACTIVE) when item is
+    // wrapped in $.get, + 16 (ITEM_IMMUTABLE) when iter is from $props.
+    let mut flag = 4u32;
+    if item_needs_get {
+        flag |= 1;
+    }
+    if is_runes_iter {
+        flag |= 16;
+    }
+    let key_fn: Expression = match &eb.key {
+        None => t::member_id(t::id("$"), "index"),
+        Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id(&item_name)],
+            body: ArrowBody::Expression(k.clone()),
+            r#async: false,
+            span: Span::ZERO,
+        })),
+    };
     let each_call = t::stmt(t::call(
         t::member_id(t::id("$"), "each"),
         vec![
             t::id(&outer_var),
-            t::lit_number(5.0),
+            t::lit_number(flag as f64),
             each_collection,
-            t::member_id(t::id("$"), "index"),
+            key_fn,
             item_arrow,
         ],
     ));
@@ -7479,6 +7796,42 @@ fn fragment_emits_text_var(f: &svelte_ast::fragment::Fragment) -> bool {
         }
         _ => false,
     }
+}
+
+/// Counts how many `text_N` vars `emit_multi_element_each_body` will
+/// allocate for the given each-body fragment. Each top-level text-anchor
+/// RegularElement contributes one text var. Returns None if the fragment
+/// can't be handled as a multi-element each body.
+fn multi_element_each_text_count(
+    f: &svelte_ast::fragment::Fragment,
+) -> Option<usize> {
+    let non_ws: Vec<&FragmentChild> = f
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() < 2 {
+        return None;
+    }
+    let mut count = 0usize;
+    for n in &non_ws {
+        if let FragmentChild::RegularElement(el) = n {
+            if is_text_only_element(el) && el.attributes.is_empty() {
+                count += 1;
+            } else if !is_element_fully_static(el)
+                && !element_static_body_with_dyn_attrs(el)
+            {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(count)
 }
 
 /// Approximates whether `emit_vanilla_branch_body` will allocate a
@@ -14529,6 +14882,45 @@ fn emit_single_each_program(
         } else {
             return None;
         }
+    } else if let Some(_n) = multi_element_each_text_count(&eb.body) {
+        // Multi-element each body (N≥2 text-anchor RegularElements).
+        let item_name = match eb.context.as_ref() {
+            Some(svelte_js_ast::Pattern::Identifier(id)) => id.name.clone(),
+            _ => return None,
+        };
+        let key_is_self_ident = match &eb.key {
+            Some(Expression::Identifier(id)) if id.name == item_name => true,
+            _ => false,
+        };
+        let item_referenced = !key_is_self_ident
+            && fragment_uses_identifier(&eb.body, &item_name);
+        let multi_non_ws: Vec<&FragmentChild> = eb
+            .body
+            .nodes
+            .iter()
+            .filter(|c| match c {
+                FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                FragmentChild::Comment(_) => false,
+                _ => true,
+            })
+            .collect();
+        let mut root_idx_local: usize = 0;
+        let mut elem_var_idx: usize = 0;
+        let mut text_idx_local: usize = 0;
+        let mut frag_idx_local: usize = 0;
+        let stmts = emit_multi_element_each_body(
+            &multi_non_ws,
+            &mut hoisted,
+            &mut root_idx_local,
+            &mut elem_var_idx,
+            &mut text_idx_local,
+            &mut frag_idx_local,
+            &item_name,
+            item_referenced,
+            &script.props_destructured,
+            &HashSet::new(),
+        )?;
+        body_stmts.extend(stmts);
     } else {
         // Text-only body: `$.next(); var text = $.text(); $.template_effect(...); $.append($$anchor, text);`
         let mut parts: Vec<TextPart> = Vec::new();
@@ -14616,19 +15008,64 @@ fn emit_single_each_program(
         t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
     ));
 
-    // `$.each(node, 0, () => EXPR, $.index, body_arrow)`
+    // `$.each(node, FLAG, () => EXPR, KEY_FN, body_arrow)`
+    let getter_expr = rewrite_props_destructured(
+        &eb.expression,
+        &script.props_destructured,
+    );
     let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
-        body: ArrowBody::Expression(eb.expression.clone()),
+        body: ArrowBody::Expression(getter_expr),
         r#async: false,
         span: Span::ZERO,
     }));
-    let key_fn = t::member_id(t::id("$"), "index");
+    // Determine flags. ITEM_IMMUTABLE (16) when iterable comes from
+    // $props() destructuring. ITEM_REACTIVE (1) when body reads the iter
+    // var and key isn't the item identifier itself.
+    let item_name_opt = match eb.context.as_ref() {
+        Some(svelte_js_ast::Pattern::Identifier(id)) => Some(id.name.clone()),
+        _ => None,
+    };
+    let key_is_self_ident = match (&eb.key, &item_name_opt) {
+        (Some(Expression::Identifier(id)), Some(name)) if id.name == *name => true,
+        _ => false,
+    };
+    let is_runes_iter = matches!(
+        &eb.expression,
+        Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+    ) || expression_uses_props_destructured(
+        &eb.expression,
+        &script.props_destructured,
+    );
+    let item_referenced_top = is_runes_iter
+        && item_name_opt
+            .as_ref()
+            .map(|n| !key_is_self_ident && fragment_uses_identifier(&eb.body, n))
+            .unwrap_or(false);
+    let mut flag = 0u32;
+    if item_referenced_top {
+        flag |= 1;
+    }
+    if is_runes_iter {
+        flag |= 16;
+    }
+    let key_fn: Expression = match &eb.key {
+        None => t::member_id(t::id("$"), "index"),
+        Some(k) => {
+            let pname = item_name_opt.clone().unwrap_or_else(|| "$$item".into());
+            Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: vec![t::pat_id(&pname)],
+                body: ArrowBody::Expression(k.clone()),
+                r#async: false,
+                span: Span::ZERO,
+            }))
+        }
+    };
     func_body.push(t::stmt(t::call(
         t::member_id(t::id("$"), "each"),
         vec![
             t::id("node"),
-            t::lit_number(0.0),
+            t::lit_number(flag as f64),
             getter,
             key_fn,
             body_arrow,
