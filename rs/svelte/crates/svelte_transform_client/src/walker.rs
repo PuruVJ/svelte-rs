@@ -5998,8 +5998,21 @@ fn emit_top_level_multi_if_program(
                 // Collect dynamic attrs. Emit `$.template_effect(() => {
                 // $.set_attribute(VAR, NAME, EXPR); ... })` deferred to
                 // AFTER all anchor blocks (so reactivity fires after nav).
+                //
+                // When all attr values reference no reactive bindings, skip
+                // the template_effect wrap entirely and emit per-attr calls
+                // directly between the var-decl and the next slot — mirrors
+                // upstream's non-reactive optimization.
                 use svelte_ast::attributes::{AttributeValue, ElementAttribute};
-                let mut effect_stmts: Vec<Statement> = Vec::new();
+                let mut reactive_bindings: HashSet<String> = HashSet::new();
+                reactive_bindings.extend(script.state_bindings.iter().cloned());
+                reactive_bindings.extend(script.proxy_bindings.iter().cloned());
+                reactive_bindings.extend(script.derived_bindings.iter().cloned());
+                reactive_bindings.extend(script.props_destructured.iter().cloned());
+                reactive_bindings.extend(script.rest_props_bindings.iter().cloned());
+                reactive_bindings.extend(legacy_prop_names.iter().cloned());
+                let mut attr_pairs: Vec<(String, Expression)> = Vec::new();
+                let mut any_reactive = false;
                 for a in &el.attributes {
                     let attr = match a {
                         ElementAttribute::Attribute(attr) => attr,
@@ -6023,43 +6036,78 @@ fn emit_top_level_multi_if_program(
                     };
                     let rewritten = rewrite_props_destructured(&expr, &script.props_destructured);
                     let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
-                    effect_stmts.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "set_attribute"),
-                        vec![
-                            t::id(&cur_var),
-                            Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                value: attr.name.clone(),
-                                raw: None,
-                                span: Span::ZERO,
-                            }))),
-                            rewritten,
-                        ],
-                    )));
+                    if expression_has_any_binding(&rewritten, &reactive_bindings) {
+                        any_reactive = true;
+                    }
+                    attr_pairs.push((attr.name.clone(), rewritten));
                 }
-                let effect_body = if effect_stmts.len() == 1 {
-                    let stmt = effect_stmts.into_iter().next().unwrap();
-                    let expr = if let Statement::Expression(e) = stmt {
-                        e.expression
+                let is_custom = el.name.contains('-');
+                let attr_call_for = |name: &str, expr: Expression| -> Statement {
+                    if !is_custom && name == "class" {
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "set_class"),
+                            vec![
+                                t::id(&cur_var),
+                                t::lit_number(1.0),
+                                expr,
+                            ],
+                        ))
+                    } else if is_custom {
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "set_custom_element_data"),
+                            vec![
+                                t::id(&cur_var),
+                                t::literal_str(name),
+                                expr,
+                            ],
+                        ))
                     } else {
-                        unreachable!()
-                    };
-                    ArrowBody::Expression(expr)
-                } else {
-                    ArrowBody::Block(Box::new(BlockStatement {
-                        body: effect_stmts,
-                        span: Span::ZERO,
-                    }))
+                        t::stmt(t::call(
+                            t::member_id(t::id("$"), "set_attribute"),
+                            vec![
+                                t::id(&cur_var),
+                                t::literal_str(name),
+                                expr,
+                            ],
+                        ))
+                    }
                 };
-                let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: Vec::new(),
-                    body: effect_body,
-                    r#async: false,
-                    span: Span::ZERO,
-                }));
-                event_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "template_effect"),
-                    vec![effect_arrow],
-                )));
+                if any_reactive {
+                    let effect_stmts: Vec<Statement> = attr_pairs
+                        .into_iter()
+                        .map(|(name, expr)| attr_call_for(&name, expr))
+                        .collect();
+                    let effect_body = if effect_stmts.len() == 1 {
+                        let stmt = effect_stmts.into_iter().next().unwrap();
+                        let expr = if let Statement::Expression(e) = stmt {
+                            e.expression
+                        } else {
+                            unreachable!()
+                        };
+                        ArrowBody::Expression(expr)
+                    } else {
+                        ArrowBody::Block(Box::new(BlockStatement {
+                            body: effect_stmts,
+                            span: Span::ZERO,
+                        }))
+                    };
+                    let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: effect_body,
+                        r#async: false,
+                        span: Span::ZERO,
+                    }));
+                    event_stmts.push(t::stmt(t::call(
+                        t::member_id(t::id("$"), "template_effect"),
+                        vec![effect_arrow],
+                    )));
+                } else {
+                    // Direct calls — no reactive deps means values only need
+                    // setting once at init.
+                    for (name, expr) in attr_pairs {
+                        block_stmts.push(attr_call_for(&name, expr));
+                    }
+                }
             }
             Slot::ElementWithEvents(el) => {
                 // Defer $.event calls to AFTER all anchor blocks emitted
@@ -7586,6 +7634,54 @@ fn expression_uses_props_destructured(
                     _ => false,
                 })
         }
+        _ => false,
+    }
+}
+
+/// True iff the expression references any identifier in the supplied
+/// set of reactive bindings, OR accesses `$$props`. The latter covers
+/// post-rewrite expressions where destructured prop reads have already
+/// been turned into `$$props.NAME` member accesses.
+fn expression_has_any_binding(
+    e: &Expression,
+    names: &HashSet<String>,
+) -> bool {
+    match e {
+        Expression::Identifier(id) => {
+            id.name == "$$props" || names.contains(&id.name)
+        }
+        Expression::Member(m) => expression_has_any_binding(&m.object, names),
+        Expression::Call(c) => {
+            expression_has_any_binding(&c.callee, names)
+                || c.arguments.iter().any(|a| match a {
+                    Argument::Expression(e) => expression_has_any_binding(e, names),
+                    _ => false,
+                })
+        }
+        Expression::Binary(b) => {
+            expression_has_any_binding(&b.left, names)
+                || expression_has_any_binding(&b.right, names)
+        }
+        Expression::Logical(b) => {
+            expression_has_any_binding(&b.left, names)
+                || expression_has_any_binding(&b.right, names)
+        }
+        Expression::Unary(u) => expression_has_any_binding(&u.argument, names),
+        Expression::Conditional(c) => {
+            expression_has_any_binding(&c.test, names)
+                || expression_has_any_binding(&c.consequent, names)
+                || expression_has_any_binding(&c.alternate, names)
+        }
+        Expression::Template(t) => t.expressions.iter().any(|e| expression_has_any_binding(e, names)),
+        Expression::Array(a) => a.elements.iter().any(|el| match el {
+            ArrayElement::Expression(e) => expression_has_any_binding(e, names),
+            ArrayElement::Spread(s) => expression_has_any_binding(&s.argument, names),
+            _ => false,
+        }),
+        Expression::Object(o) => o.properties.iter().any(|p| match p {
+            ObjectMember::Property(p) => expression_has_any_binding(&p.value, names),
+            ObjectMember::Spread(s) => expression_has_any_binding(&s.argument, names),
+        }),
         _ => false,
     }
 }
