@@ -303,6 +303,7 @@ pub fn try_typed_client_walker_with(
                     | FragmentChild::EachBlock(_)
                     | FragmentChild::ExpressionTag(_)
                     | FragmentChild::HtmlTag(_)
+                    | FragmentChild::Component(_)
             ))
             && non_ws.iter().all(|n| matches!(
                 n,
@@ -312,6 +313,7 @@ pub fn try_typed_client_walker_with(
                     | FragmentChild::Text(_)
                     | FragmentChild::ExpressionTag(_)
                     | FragmentChild::HtmlTag(_)
+                    | FragmentChild::Component(_)
             ))
         {
             if let Some(p) = emit_top_level_multi_if_program(
@@ -3685,6 +3687,13 @@ fn emit_top_level_multi_if_program(
         LiteralAnchor(String),
         /// `{@html EXPR}` HtmlTag. Becomes a `<!>` anchor + `$.html(node, () => EXPR)`.
         Html(&'a svelte_ast::tags::HtmlTag),
+        /// Bare `<Component {...attrs} />`. Becomes a `<!>` anchor +
+        /// `Component(node, {...props})` body.
+        Component(&'a svelte_ast::elements::Component),
+        /// `<TAG ATTRS>{@html EXPR}</TAG>` — static element wrapping a
+        /// single HtmlTag. Emits empty `<TAG></TAG>` template + body
+        /// `var X = ...; $.html(X, () => EXPR, true); $.reset(X);`.
+        ElementWithHtml(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::tags::HtmlTag),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -3756,7 +3765,48 @@ fn emit_top_level_multi_if_program(
                 pending_gap = false;
                 slots.push(Slot::Html(ht));
             }
+            FragmentChild::Component(c) => {
+                // Bare Component with no children body. Attribute spreads
+                // OK; complex slot bodies bail.
+                if !c.fragment.nodes.is_empty()
+                    && c.fragment
+                        .nodes
+                        .iter()
+                        .any(|n| !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()))
+                {
+                    return None;
+                }
+                if !slots.is_empty() {
+                    gap_after.push(pending_gap);
+                }
+                pending_gap = false;
+                slots.push(Slot::Component(c));
+            }
             FragmentChild::RegularElement(el) => {
+                // Detect `<TAG ATTRS>{@html EXPR}</TAG>` shape.
+                let inner_non_ws: Vec<&FragmentChild> = el
+                    .fragment
+                    .nodes
+                    .iter()
+                    .filter(|n| match n {
+                        FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                        FragmentChild::Comment(_) => false,
+                        _ => true,
+                    })
+                    .collect();
+                let html_only_body = inner_non_ws.len() == 1
+                    && matches!(inner_non_ws[0], FragmentChild::HtmlTag(_))
+                    && is_element_static_attrs(el);
+                if html_only_body {
+                    if let FragmentChild::HtmlTag(ht) = inner_non_ws[0] {
+                        if !slots.is_empty() {
+                            gap_after.push(pending_gap);
+                        }
+                        pending_gap = false;
+                        slots.push(Slot::ElementWithHtml(el, ht));
+                        continue;
+                    }
+                }
                 if !is_element_fully_static(el) {
                     return None;
                 }
@@ -3776,7 +3826,12 @@ fn emit_top_level_multi_if_program(
     let is_anchor_slot = |s: &Slot| {
         matches!(
             s,
-            Slot::If(_) | Slot::Each(_) | Slot::LiteralAnchor(_) | Slot::Html(_)
+            Slot::If(_)
+                | Slot::Each(_)
+                | Slot::LiteralAnchor(_)
+                | Slot::Html(_)
+                | Slot::Component(_)
+                | Slot::ElementWithHtml(_, _)
         )
     };
     if !slots.iter().any(is_anchor_slot) {
@@ -3803,7 +3858,12 @@ fn emit_top_level_multi_if_program(
     for (i, slot) in slots.iter().enumerate() {
         let preceding_gap = i > 0 && gap_after[i - 1];
         match slot {
-            Slot::StaticEl(_) | Slot::If(_) | Slot::Each(_) | Slot::Html(_) => {
+            Slot::StaticEl(_)
+            | Slot::If(_)
+            | Slot::Each(_)
+            | Slot::Html(_)
+            | Slot::Component(_)
+            | Slot::ElementWithHtml(_, _) => {
                 if pending_text || preceding_gap {
                     pos += 1;
                     pending_text = false;
@@ -3842,6 +3902,13 @@ fn emit_top_level_multi_if_program(
     let mut prev_anchor_var: Option<String> = None;
     let mut node_idx = 0usize;
     let mut text_idx = 0usize;
+    let mut elem_named_counts: HashMap<String, usize> = HashMap::new();
+    fn elem_named_count(name: &str, m: &mut HashMap<String, usize>) -> usize {
+        let cnt = m.entry(name.to_string()).or_insert(0);
+        let n = *cnt;
+        *cnt += 1;
+        n
+    }
     // First anchor variable name (returned to caller for the
     // `var X = first_child(...)` initializer).
     let mut first_anchor_var: Option<String> = None;
@@ -3851,12 +3918,22 @@ fn emit_top_level_multi_if_program(
         }
         let i = anchor_count;
         anchor_count += 1;
-        // Choose var name per slot type. LiteralAnchor → text/text_N, others → node/node_N.
+        // Choose var name per slot type:
+        //  - LiteralAnchor → text/text_N
+        //  - ElementWithHtml → <el_name>/<el_name>_N
+        //  - others → node/node_N
         let is_literal = matches!(slot, Slot::LiteralAnchor(_));
         let cur_var = if is_literal {
             let n = if text_idx == 0 { "text".to_string() } else { format!("text_{}", text_idx) };
             text_idx += 1;
             n
+        } else if let Slot::ElementWithHtml(el, _) = slot {
+            let cnt = elem_named_count(&el.name, &mut elem_named_counts);
+            if cnt == 0 {
+                el.name.clone()
+            } else {
+                format!("{}_{}", el.name, cnt)
+            }
         } else {
             let n = if node_idx == 0 { "node".to_string() } else { format!("node_{}", node_idx) };
             node_idx += 1;
@@ -4132,6 +4209,117 @@ fn emit_top_level_multi_if_program(
                     vec![t::id(&cur_var), arrow],
                 )));
             }
+            Slot::ElementWithHtml(el, ht) => {
+                // `var X = ...; $.html(X, () => EXPR, true); $.reset(X);`.
+                let inner = rewrite_props_destructured(
+                    &ht.expression,
+                    &script.props_destructured,
+                );
+                let inner = rewrite_legacy_prop_reads(&inner, &legacy_prop_names);
+                let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(inner),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "html"),
+                    vec![
+                        t::id(&cur_var),
+                        arrow,
+                        Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
+                            value: true,
+                            span: Span::ZERO,
+                        }))),
+                    ],
+                )));
+                block_stmts.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "reset"),
+                    vec![t::id(&cur_var)],
+                )));
+                let _ = el;
+            }
+            Slot::Component(c) => {
+                // Bare Component(node, { props }).
+                use svelte_ast::attributes::{
+                    AttributeValue, AttributeValuePart, ElementAttribute,
+                };
+                let mut props: Vec<ObjectMember> = Vec::new();
+                for a in &c.attributes {
+                    match a {
+                        ElementAttribute::Attribute(attr) => {
+                            let value: Expression = match &attr.value {
+                                AttributeValue::Empty => Expression::Literal(Box::new(
+                                    Literal::Boolean(BooleanLiteral {
+                                        value: true,
+                                        span: Span::ZERO,
+                                    }),
+                                )),
+                                AttributeValue::Single(tag) => {
+                                    let v = rewrite_props_destructured(
+                                        &tag.expression,
+                                        &script.props_destructured,
+                                    );
+                                    rewrite_legacy_prop_reads(&v, &legacy_prop_names)
+                                }
+                                AttributeValue::Many(parts) => {
+                                    if parts.len() == 1 {
+                                        match &parts[0] {
+                                            AttributeValuePart::Text(t) => Expression::Literal(
+                                                Box::new(Literal::String(StringLiteral {
+                                                    value: t.data.clone(),
+                                                    raw: None,
+                                                    span: Span::ZERO,
+                                                })),
+                                            ),
+                                            AttributeValuePart::ExpressionTag(e) => {
+                                                let v = rewrite_props_destructured(
+                                                    &e.expression,
+                                                    &script.props_destructured,
+                                                );
+                                                rewrite_legacy_prop_reads(&v, &legacy_prop_names)
+                                            }
+                                        }
+                                    } else {
+                                        return None;
+                                    }
+                                }
+                            };
+                            let shorthand =
+                                matches!(&value, Expression::Identifier(id) if id.name == attr.name);
+                            props.push(ObjectMember::Property(Box::new(Property {
+                                key: PropertyKey::Identifier(Identifier {
+                                    name: attr.name.clone(),
+                                    span: Span::ZERO,
+                                }),
+                                value,
+                                kind: PropertyKind::Init,
+                                computed: false,
+                                shorthand,
+                                method: false,
+                                span: Span::ZERO,
+                            })));
+                        }
+                        ElementAttribute::SpreadAttribute(s) => {
+                            props.push(ObjectMember::Spread(Box::new(SpreadElement {
+                                argument: s.expression.clone(),
+                                span: Span::ZERO,
+                            })));
+                        }
+                        _ => return None,
+                    }
+                }
+                block_stmts.push(t::stmt(t::call(
+                    t::id(&c.name),
+                    vec![
+                        t::id(&cur_var),
+                        Expression::Object(Box::new(ObjectExpression {
+                            properties: props,
+                            span: Span::ZERO,
+                        })),
+                    ],
+                )));
+            }
             _ => unreachable!(),
         }
         prev_anchor_slot = Some(slot_i);
@@ -4238,9 +4426,91 @@ fn emit_top_level_multi_if_program(
     let first_var_name = first_anchor_var.unwrap_or_else(|| "node".to_string());
     func_body.push(t::var(&first_var_name, first_node_init));
     func_body.extend(block_stmts);
-    // Trailing positions after the last anchor: emit $.next(N) to
-    // advance to the trailing static area.
-    if trailing_advance > 0 {
+    // Trailing static slots: if any of them was originally a `<TAG>{EXPR}</TAG>`
+    // (i.e. its source body has an ExpressionTag), upstream emits explicit
+    // `var X = $.sibling(prev, OFFSET)` for each — not a bulk `$.next(N)`.
+    // Otherwise emit `$.next(N)` for the bulk advance.
+    let trailing_slots: Vec<(usize, &Slot)> = slots
+        .iter()
+        .enumerate()
+        .skip(last_anchor_slot + 1)
+        .collect();
+    let trailing_has_expr = trailing_slots.iter().any(|(_, s)| matches!(
+        s,
+        Slot::StaticEl(el) if el.fragment.nodes.iter().any(|n| matches!(n, FragmentChild::ExpressionTag(_)))
+    ));
+    if trailing_has_expr {
+        // Emit per-element navigation for trailing StaticEl slots that have
+        // an ExpressionTag in their body. Other trailing slots (void
+        // elements, comment-only static) are skipped — their positions
+        // get absorbed into the offset calc.
+        let mut prev_var = prev_anchor_var.clone().unwrap_or_else(|| "node".to_string());
+        let mut prev_pos = positions[last_anchor_slot];
+        let mut trailing_el_idx = 0usize;
+        for (slot_i, slot) in &trailing_slots {
+            if let Slot::StaticEl(el) = slot {
+                let has_expr = el
+                    .fragment
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n, FragmentChild::ExpressionTag(_)));
+                if !has_expr {
+                    continue;
+                }
+                trailing_el_idx += 1;
+                let var = if trailing_el_idx == 1 {
+                    el.name.clone()
+                } else {
+                    format!("{}_{}", el.name, trailing_el_idx - 1)
+                };
+                let this_pos = positions[*slot_i];
+                let offset = this_pos - prev_pos;
+                let nav_args: Vec<Expression> = if offset == 1 {
+                    vec![t::id(&prev_var)]
+                } else {
+                    vec![t::id(&prev_var), t::lit_number(offset as f64)]
+                };
+                func_body.push(t::var(
+                    &var,
+                    t::call(t::member_id(t::id("$"), "sibling"), nav_args),
+                ));
+                // If the body's ExpressionTag folds to a non-empty literal,
+                // emit `<var>.textContent = 'LITERAL';`.
+                let folded: Option<String> = el.fragment.nodes.iter().find_map(|n| match n {
+                    FragmentChild::ExpressionTag(et) => literal_to_template_string(&et.expression),
+                    _ => None,
+                });
+                if let Some(text) = folded {
+                    if !text.is_empty() {
+                        let assign = Expression::Assignment(Box::new(AssignmentExpression {
+                            left: AssignmentTarget::Expression(Expression::Member(Box::new(
+                                MemberExpression {
+                                    object: t::id(&var),
+                                    property: MemberProperty::Identifier(Identifier {
+                                        name: "textContent".to_string(),
+                                        span: Span::ZERO,
+                                    }),
+                                    computed: false,
+                                    optional: false,
+                                    span: Span::ZERO,
+                                },
+                            ))),
+                            operator: AssignmentOperator::Assign,
+                            right: Expression::Literal(Box::new(Literal::String(StringLiteral {
+                                value: text,
+                                raw: None,
+                                span: Span::ZERO,
+                            }))),
+                            span: Span::ZERO,
+                        }));
+                        func_body.push(t::stmt(assign));
+                    }
+                }
+                prev_var = var;
+                prev_pos = this_pos;
+            }
+        }
+    } else if trailing_advance > 0 {
         let arg = if trailing_advance == 1 {
             Vec::new()
         } else {
@@ -4281,10 +4551,50 @@ fn emit_top_level_multi_if_program(
             html.push(' ');
         }
         match slot {
-            Slot::If(_) | Slot::Each(_) | Slot::Html(_) => html.push_str("<!>"),
+            Slot::If(_) | Slot::Each(_) | Slot::Html(_) | Slot::Component(_) => {
+                html.push_str("<!>")
+            }
             Slot::StaticEl(el) => {
                 let mut needs = false;
                 serialize_element_to_html(el, &mut html, &mut needs)?;
+            }
+            Slot::ElementWithHtml(el, _) => {
+                // Emit `<TAG STATIC_ATTRS></TAG>` (no body content).
+                use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+                html.push('<');
+                html.push_str(&el.name);
+                for a in &el.attributes {
+                    if let ElementAttribute::Attribute(attr) = a {
+                        match &attr.value {
+                            AttributeValue::Empty => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"\"");
+                            }
+                            AttributeValue::Many(parts) => {
+                                html.push(' ');
+                                html.push_str(&attr.name);
+                                html.push_str("=\"");
+                                for p in parts {
+                                    if let AttributeValuePart::Text(t) = p {
+                                        for c in t.data.chars() {
+                                            match c {
+                                                '"' => html.push_str("&quot;"),
+                                                '&' => html.push_str("&amp;"),
+                                                _ => html.push(c),
+                                            }
+                                        }
+                                    }
+                                }
+                                html.push('"');
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                html.push_str("></");
+                html.push_str(&el.name);
+                html.push('>');
             }
             Slot::StaticText(s) => html.push_str(s.trim()),
             // LiteralAnchor contributes a single space so a text node
@@ -9697,21 +10007,13 @@ fn serialize_fragment_to_html(
                 out.push_str("<!>");
                 last_was_text_with_space = false;
             }
-            FragmentChild::ExpressionTag(et) => {
-                // If the expression is literal-foldable, emit the literal
-                // value as text. Otherwise treat as placeholder anchor.
-                if let Some(lit) = literal_to_template_string(&et.expression) {
-                    if !lit.is_empty() {
-                        out.push_str(&lit);
-                        last_was_text_with_space = lit.ends_with(' ');
-                    }
-                    // Empty literal → emit nothing.
-                } else {
-                    // Inside an element this is a placeholder. At fragment top
-                    // level it would be a text anchor.
-                    out.push(' ');
-                    last_was_text_with_space = true;
-                }
+            FragmentChild::ExpressionTag(_) => {
+                // Both literal-foldable and non-literal expressions inside
+                // an element body emit nothing in the template. The text
+                // value (if reactive) is set via template_effect at runtime;
+                // literal values are statically known but upstream still
+                // emits an empty template position.
+                let _ = last_was_text_with_space;
             }
             FragmentChild::RegularElement(el) => {
                 serialize_element_to_html(el, out, needs_import_node)?;
