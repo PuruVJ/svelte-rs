@@ -4989,11 +4989,15 @@ fn emit_top_level_multi_if_program(
                 // the iter var. Wrap iter-var refs in $.get(VAR) inside
                 // the body in that case.
                 let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
-                let body_text_name = if i == 0 {
+                let body_emits_text = fragment_emits_text_var(&eb.body);
+                let body_text_name = if text_idx == 0 {
                     "text".to_string()
                 } else {
-                    format!("text_{}", i)
+                    format!("text_{}", text_idx)
                 };
+                if body_emits_text {
+                    text_idx += 1;
+                }
                 let mut inner_body = emit_vanilla_branch_body(
                     &eb.body,
                     &body_text_name,
@@ -5077,7 +5081,15 @@ fn emit_top_level_multi_if_program(
                 // Fallback arrow, if present.
                 let fallback_arrow: Option<Expression> = match &eb.fallback {
                     Some(fb) => {
-                        let fb_text_name = format!("text_fb_{}", i);
+                        let fb_emits_text = fragment_emits_text_var(fb);
+                        let fb_text_name = if text_idx == 0 {
+                            "text".to_string()
+                        } else {
+                            format!("text_{}", text_idx)
+                        };
+                        if fb_emits_text {
+                            text_idx += 1;
+                        }
                         let fb_body = emit_vanilla_branch_body_with_context(
                             fb,
                             &fb_text_name,
@@ -5315,12 +5327,15 @@ fn emit_top_level_multi_if_program(
                     _ => return None,
                 };
                 let item_referenced = fragment_uses_identifier(&eb.body, &item_name);
+                let body_emits_text = fragment_emits_text_var(&eb.body);
                 let body_text_name = if text_idx == 0 {
                     "text".to_string()
                 } else {
                     format!("text_{}", text_idx)
                 };
-                text_idx += 1;
+                if body_emits_text {
+                    text_idx += 1;
+                }
                 let mut inner_body = emit_vanilla_branch_body(
                     &eb.body,
                     &body_text_name,
@@ -5396,8 +5411,15 @@ fn emit_top_level_multi_if_program(
                 }
                 let fallback_arrow: Option<Expression> = match &eb.fallback {
                     Some(fb) => {
-                        let fb_text_name = format!("text_fb_{}", text_idx);
-                        text_idx += 1;
+                        let fb_emits_text = fragment_emits_text_var(fb);
+                        let fb_text_name = if text_idx == 0 {
+                            "text".to_string()
+                        } else {
+                            format!("text_{}", text_idx)
+                        };
+                        if fb_emits_text {
+                            text_idx += 1;
+                        }
                         let fb_body = emit_vanilla_branch_body_with_context(
                             fb,
                             &fb_text_name,
@@ -6871,6 +6893,33 @@ fn rewrite_stmt_prop_writes(s: &Statement, legacy_props: &HashSet<String>) -> St
 /// Walk a fragment looking for any reference to a given identifier name.
 fn fragment_uses_identifier(f: &svelte_ast::fragment::Fragment, name: &str) -> bool {
     f.nodes.iter().any(|n| node_uses_identifier(n, name))
+}
+
+/// Approximates whether `emit_vanilla_branch_body` will allocate a `text`
+/// variable for this fragment. Returns true for:
+/// - top-level Text or ExpressionTag (always extracted)
+/// - text-only RegularElement with at least one non-literal ExpressionTag
+fn fragment_emits_text_var(f: &svelte_ast::fragment::Fragment) -> bool {
+    let non_ws: Vec<&FragmentChild> = f
+        .nodes
+        .iter()
+        .filter(|c| match c {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if non_ws.len() != 1 {
+        return false;
+    }
+    match non_ws[0] {
+        FragmentChild::Text(_) => true,
+        FragmentChild::ExpressionTag(_) => true,
+        FragmentChild::RegularElement(el) => {
+            is_text_only_element(el) && el.attributes.is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn node_uses_identifier(n: &FragmentChild, name: &str) -> bool {
