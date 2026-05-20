@@ -316,6 +316,292 @@ fn emit_svelte_head_program(
     Some(t::program(prog))
 }
 
+/// Emit a program for the `head-html-and-component` shape:
+/// `<svelte:head>{#if LITERAL}{@html EXPR}<meta />[<Component />]*{/if}</svelte:head>
+///  <Component />` (top-level bare Component).
+fn emit_head_if_block_program(
+    head: &svelte_ast::elements::SvelteHead,
+    body_component: &svelte_ast::elements::Component,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Option<Program> {
+    // Head body must be a single IfBlock (no else) with a literal test
+    // and consequent containing [@html, <meta>, <Component>].
+    let head_non_ws: Vec<&FragmentChild> = head
+        .fragment
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if head_non_ws.len() != 1 {
+        return None;
+    }
+    let ib = match head_non_ws[0] {
+        FragmentChild::IfBlock(ib) => ib,
+        _ => return None,
+    };
+    if ib.alternate.is_some() {
+        return None;
+    }
+    // Literal test only (e.g. `true`).
+    let test_is_literal = matches!(&ib.test, Expression::Literal(_));
+    if !test_is_literal {
+        return None;
+    }
+    // Consequent: extract [@html, <meta>+, <Component>+] in any order.
+    let cons_non_ws: Vec<&FragmentChild> = ib
+        .consequent
+        .nodes
+        .iter()
+        .filter(|n| match n {
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::Comment(_) => false,
+            _ => true,
+        })
+        .collect();
+    if cons_non_ws.is_empty() {
+        return None;
+    }
+    // Allow @html, RegularElement (e.g. meta), Component only.
+    for n in &cons_non_ws {
+        match n {
+            FragmentChild::HtmlTag(_)
+            | FragmentChild::RegularElement(_)
+            | FragmentChild::Component(_) => {}
+            _ => return None,
+        }
+    }
+    // Build consequent template:  `<!>` for HtmlTag/Component, serialize
+    // static RegularElements verbatim. Space between siblings.
+    let mut cons_template = String::new();
+    let mut needs_import_node = false;
+    for (i, n) in cons_non_ws.iter().enumerate() {
+        if i > 0 {
+            cons_template.push(' ');
+        }
+        match n {
+            FragmentChild::HtmlTag(_) => cons_template.push_str("<!>"),
+            FragmentChild::Component(_) => cons_template.push_str("<!>"),
+            FragmentChild::RegularElement(el) => {
+                if !is_element_fully_static(el) {
+                    return None;
+                }
+                serialize_element_to_html(el, &mut cons_template, &mut needs_import_node)?;
+            }
+            _ => return None,
+        }
+    }
+    let cons_flag = if cons_non_ws.len() > 1 { 1.0 } else { 0.0 };
+
+    // Compute hash from filename.
+    let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
+    let hash_val = svelte_filename_hash(&filename);
+
+    // Build consequent arrow body.
+    let mut cons_body: Vec<Statement> = Vec::new();
+    cons_body.push(t::var("fragment_1", t::call(t::id("root_2"), Vec::new())));
+    let mut prev_node_var: Option<String> = None;
+    let mut prev_slot_pos: usize = 0;
+    let mut node_idx = 1usize;
+    for (i, n) in cons_non_ws.iter().enumerate() {
+        match n {
+            FragmentChild::HtmlTag(ht) => {
+                let var_name = if node_idx == 1 {
+                    "node_1".to_string()
+                } else {
+                    format!("node_{}", node_idx)
+                };
+                node_idx += 1;
+                let init = if let Some(prev) = &prev_node_var {
+                    // sibling offset: positions are 0, 2, 4 for `<!> X <!>` (3 positions, 4 step = 2 elements between)
+                    let offset = ((i - prev_slot_pos) * 2) as f64;
+                    t::call(
+                        t::member_id(t::id("$"), "sibling"),
+                        vec![t::id(prev), t::lit_number(offset)],
+                    )
+                } else {
+                    t::call(
+                        t::member_id(t::id("$"), "first_child"),
+                        vec![t::id("fragment_1")],
+                    )
+                };
+                cons_body.push(t::var(&var_name, init));
+                let html_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(ht.expression.clone()),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                cons_body.push(t::stmt(t::call(
+                    t::member_id(t::id("$"), "html"),
+                    vec![t::id(&var_name), html_arrow],
+                )));
+                prev_node_var = Some(var_name);
+                prev_slot_pos = i;
+            }
+            FragmentChild::Component(c) => {
+                let var_name = if node_idx == 1 {
+                    "node_1".to_string()
+                } else {
+                    format!("node_{}", node_idx)
+                };
+                node_idx += 1;
+                let init = if let Some(prev) = &prev_node_var {
+                    let offset = ((i - prev_slot_pos) * 2) as f64;
+                    t::call(
+                        t::member_id(t::id("$"), "sibling"),
+                        vec![t::id(prev), t::lit_number(offset)],
+                    )
+                } else {
+                    t::call(
+                        t::member_id(t::id("$"), "first_child"),
+                        vec![t::id("fragment_1")],
+                    )
+                };
+                cons_body.push(t::var(&var_name, init));
+                cons_body.push(t::stmt(t::call(
+                    t::id(&c.name),
+                    vec![
+                        t::id(&var_name),
+                        Expression::Object(Box::new(ObjectExpression {
+                            properties: Vec::new(),
+                            span: Span::ZERO,
+                        })),
+                    ],
+                )));
+                prev_node_var = Some(var_name);
+                prev_slot_pos = i;
+            }
+            FragmentChild::RegularElement(_) => {
+                // Static element in the template — no var needed.
+            }
+            _ => return None,
+        }
+    }
+    cons_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment_1")],
+    )));
+
+    let cons_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: cons_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // The `$.if(node, ($$render) => { if (TEST) $$render(consequent); })`.
+    let render_arg = t::id("$$render");
+    let test_expr = ib.test.clone();
+    let if_inner_stmt = Statement::If(Box::new(IfStatement {
+        test: test_expr,
+        consequent: Statement::Expression(Box::new(svelte_js_ast::ExpressionStatement {
+            expression: t::call(render_arg.clone(), vec![t::id("consequent")]),
+            span: Span::ZERO,
+        })),
+        alternate: None,
+        span: Span::ZERO,
+    }));
+    let if_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$render")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: vec![if_inner_stmt],
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    let if_block_stmts: Vec<Statement> = vec![
+        t::var("consequent", cons_arrow),
+        t::stmt(t::call(
+            t::member_id(t::id("$"), "if"),
+            vec![t::id("node"), if_arrow],
+        )),
+    ];
+
+    // Head body: var fragment = $.comment(); var node = $.first_child(fragment); { ... }; $.append($$anchor, fragment)
+    let mut head_body_stmts: Vec<Statement> = Vec::new();
+    head_body_stmts.push(t::var("fragment", t::call(t::member_id(t::id("$"), "comment"), Vec::new())));
+    head_body_stmts.push(t::var(
+        "node",
+        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+    ));
+    head_body_stmts.push(Statement::Block(Box::new(BlockStatement {
+        body: if_block_stmts,
+        span: Span::ZERO,
+    })));
+    head_body_stmts.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "append"),
+        vec![t::id("$$anchor"), t::id("fragment")],
+    )));
+
+    let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$anchor")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: head_body_stmts,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    // Outer func body: $.head(HASH, head_arrow); BodyComponent($$anchor, {});
+    let mut func_body: Vec<Statement> = Vec::new();
+    func_body.extend(script.body.clone());
+    func_body.push(t::stmt(t::call(
+        t::member_id(t::id("$"), "head"),
+        vec![
+            Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: hash_val,
+                raw: None,
+                span: Span::ZERO,
+            }))),
+            head_arrow,
+        ],
+    )));
+    func_body.push(t::stmt(t::call(
+        t::id(&body_component.name),
+        vec![
+            t::id("$$anchor"),
+            Expression::Object(Box::new(ObjectExpression {
+                properties: Vec::new(),
+                span: Span::ZERO,
+            })),
+        ],
+    )));
+
+    let params = vec![t::pat_id("$$anchor")];
+    let export = t::export_default_function(component_name, params, func_body);
+
+    let mut prog: Vec<Statement> = Vec::new();
+    prog.push(t::import_side_effect("svelte/internal/disclose-version"));
+    if script.emit_legacy_flag {
+        prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
+    }
+    prog.push(t::import_namespace("$", "svelte/internal/client"));
+    prog.extend(script.imports.clone());
+    // root_2 = consequent template.
+    let cons_args: Vec<Expression> = if cons_flag != 0.0 {
+        vec![t::template_raw(vec![cons_template], vec![]), t::lit_number(cons_flag)]
+    } else {
+        vec![t::template_raw(vec![cons_template], vec![])]
+    };
+    prog.push(t::var(
+        "root_2",
+        t::call(t::member_id(t::id("$"), "from_html"), cons_args),
+    ));
+    prog.push(export);
+    Some(t::program(prog))
+}
+
 /// Emit a program for the `text-empty-2` shape — a single outer element
 /// containing a text-anchor inner element followed by a trailing
 /// ExpressionTag. Both interpolations become text anchors merged into a
@@ -942,6 +1228,19 @@ pub fn try_typed_client_walker_with(
                 &script,
             ) {
                 return Some(p);
+            }
+            // Specialized: head body contains an if-block + body is a bare
+            // Component. Used by head-html-and-component.
+            if others.len() == 1 {
+                if let FragmentChild::Component(c) = others[0] {
+                    if c.attributes.is_empty() && c.fragment.nodes.is_empty() {
+                        if let Some(p) = emit_head_if_block_program(
+                            sh, c, component_name, &script,
+                        ) {
+                            return Some(p);
+                        }
+                    }
+                }
             }
         }
     }
