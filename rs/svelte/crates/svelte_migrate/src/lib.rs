@@ -89,6 +89,8 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_svelte_self_no_filename(source, &mut str, &parsed.fragment, opts.filename.as_deref());
     migrate_svelte_element_static_this(source, &mut str, &parsed.fragment);
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
+    migrate_simple_on_events(source, &mut str, &parsed.fragment);
+    migrate_simple_state(source, &mut str, &parsed);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
@@ -367,6 +369,26 @@ fn collect_identifiers_in_expr(expr: &Expression, out: &mut std::collections::Ha
 
 /// `export let X = …` + `$$props` referenced anywhere. Upstream only errors
 /// when at least one named prop has an init OR is `updated` (bind:/assignment).
+fn is_custom_element(root: &Root) -> bool {
+    let mut found = false;
+    walk_fragment(&root.fragment, &mut |child| {
+        if found {
+            return;
+        }
+        if let FragmentChild::SvelteOptions(opts) = child {
+            for a in &opts.attributes {
+                if let ElementAttribute::Attribute(attr) = a {
+                    if attr.name == "customElement" {
+                        found = true;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    found
+}
+
 fn detect_props_and_dollar_props(root: &Root, source: &str) -> Option<String> {
     let instance = root.instance.as_ref()?;
 
@@ -561,7 +583,14 @@ fn detect_export_non_identifier(root: &Root) -> Option<String> {
 ///   - non-identifier name (`<slot name="dashed-name">` → `dashed_name`)
 ///   - identifier collision with a top-level binding (`<slot name="body">`
 ///     + `let body;` → `body_1`)
+///
+/// Skipped entirely when `<svelte:options customElement="...">` is set —
+/// custom elements keep their `<slot>`s intact.
 fn detect_slot_rename(root: &Root) -> Option<String> {
+    // Skip if this is a customElement.
+    if is_custom_element(root) {
+        return None;
+    }
     // Collect top-level identifier names from the instance script.
     let mut top_level: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(instance) = &root.instance {
@@ -1537,6 +1566,245 @@ fn is_reserved_word(s: &str) -> bool {
             | "static"
             | "await"
     )
+}
+
+// ---------------------------------------------------------------------------
+// Simple `on:event={fn}` → `onevent={fn}` migration on RegularElement /
+// SvelteElement etc. Only handles the no-modifier, single-occurrence case
+// with an explicit handler expression. More complex cases (modifiers,
+// bubbling, multiple handlers per event) require the full `svelte/legacy`
+// import insertion + handlers() merging and are deferred.
+// ---------------------------------------------------------------------------
+
+fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment) {
+    walk_fragment(frag, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => &e.attributes,
+            FragmentChild::SvelteElement(e) => &e.attributes,
+            FragmentChild::SvelteBody(e)
+            | FragmentChild::SvelteWindow(e)
+            | FragmentChild::SvelteDocument(e)
+            | FragmentChild::SvelteHead(e) => &e.attributes,
+            _ => return,
+        };
+        // First pass: bucket OnDirective by event name; only migrate buckets
+        // with exactly one entry, no modifiers, with an explicit expression.
+        let mut by_event: std::collections::HashMap<String, Vec<&svelte_ast::attributes::OnDirective>> = Default::default();
+        for a in attrs {
+            if let ElementAttribute::OnDirective(od) = a {
+                by_event.entry(od.name.clone()).or_default().push(od);
+            }
+        }
+        for (_name, list) in by_event {
+            if list.len() != 1 {
+                continue;
+            }
+            let od = list[0];
+            if !od.modifiers.is_empty() {
+                continue;
+            }
+            let Some(expr) = &od.expression else {
+                continue;
+            };
+            // Replace `on:NAME` with `onNAME` (5+name bytes → 2+name bytes).
+            // The directive's start..start+3+namelen covers `on:NAME`, so we
+            // overwrite that with `on${NAME}`.
+            let start = od.start as usize;
+            let bytes = source.as_bytes();
+            // Find `on:` then NAME at `od.start`. Confirm.
+            if start + 3 >= bytes.len() || &bytes[start..start + 3] != b"on:" {
+                continue;
+            }
+            // Find the colon position to remove it.
+            // Overwrite just `on:NAME` portion to `onNAME`.
+            let name_len = od.name.len();
+            let kw_end = start + 3 + name_len;
+            // Sanity check: bytes after kw_end must be `=` or end-of-directive.
+            // We use `od.end` as the boundary.
+            // Replace `on:NAME` with `onNAME`.
+            let _ = kw_end;
+            let _ = expr;
+            // The simplest replacement: overwrite the colon at start+2 with empty.
+            str.remove(start + 2, start + 3);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Simple state migration: `let X = expr;` or `let X;` (non-prop) where X is
+// reassigned somewhere → wrap with `$state(...)`.
+// ---------------------------------------------------------------------------
+
+fn migrate_simple_state(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(instance) = &root.instance else {
+        return;
+    };
+
+    // Detect props (`export let X`) — skip these.
+    let mut exported_props: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &instance.content.body {
+        if let Statement::ExportNamed(en) = stmt {
+            if let Some(Statement::Variable(v)) = en.declaration.as_ref() {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        exported_props.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Detect $: targets (would become derived) — skip these.
+    let mut derived_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &instance.content.body {
+        if let Statement::Labeled(l) = stmt {
+            if l.label.name == "$" {
+                if let Statement::Expression(es) = &l.body {
+                    if let Expression::Assignment(asn) = &es.expression {
+                        if let svelte_js_ast::AssignmentTarget::Expression(
+                            Expression::Identifier(id),
+                        ) = &asn.left
+                        {
+                            derived_targets.insert(id.name.clone());
+                        }
+                        if let svelte_js_ast::AssignmentTarget::Pattern(p) = &asn.left {
+                            collect_pattern_names(p, &mut derived_targets);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect reassignment targets from script.
+    let mut reassigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &instance.content.body {
+        collect_assignment_targets(stmt, &mut reassigned);
+    }
+    // Collect bind: targets + event-handler reassignments from template.
+    walk_fragment(&root.fragment, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => Some(&e.attributes),
+            FragmentChild::Component(e) => Some(&e.attributes),
+            FragmentChild::SvelteComponent(e) => Some(&e.attributes),
+            FragmentChild::SvelteElement(e) => Some(&e.attributes),
+            FragmentChild::SvelteBody(e)
+            | FragmentChild::SvelteBoundary(e)
+            | FragmentChild::SvelteDocument(e)
+            | FragmentChild::SvelteFragment(e)
+            | FragmentChild::SvelteHead(e)
+            | FragmentChild::SvelteOptions(e)
+            | FragmentChild::SvelteSelf(e)
+            | FragmentChild::SvelteWindow(e) => Some(&e.attributes),
+            _ => None,
+        };
+        if let Some(attrs) = attrs {
+            for a in attrs {
+                match a {
+                    ElementAttribute::BindDirective(b) => {
+                        if let Some(name) = bind_target_identifier(&b.expression) {
+                            reassigned.insert(name);
+                        }
+                    }
+                    ElementAttribute::OnDirective(od) => {
+                        if let Some(expr) = &od.expression {
+                            collect_assignment_targets_expr(expr, &mut reassigned);
+                        }
+                    }
+                    ElementAttribute::Attribute(attr) => {
+                        // Attribute values may contain ExpressionTags with
+                        // handler-shaped expressions (`onclick={() => …}`).
+                        match &attr.value {
+                            AttributeValue::Single(t) => {
+                                collect_assignment_targets_expr(&t.expression, &mut reassigned);
+                            }
+                            AttributeValue::Many(parts) => {
+                                for p in parts {
+                                    if let AttributeValuePart::ExpressionTag(t) = p {
+                                        collect_assignment_targets_expr(
+                                            &t.expression,
+                                            &mut reassigned,
+                                        );
+                                    }
+                                }
+                            }
+                            AttributeValue::Empty => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    // Now visit each top-level `let X` or `let X = INIT`:
+    //   - skip if X is a prop, or a derived target, or has no reassignment.
+    //   - wrap init in `$state(...)` (or insert `= $state()` if no init).
+    for stmt in &instance.content.body {
+        if let Statement::Variable(v) = stmt {
+            // Only `let` declarations.
+            if !matches!(v.kind, svelte_js_ast::VariableKind::Let) {
+                continue;
+            }
+            for d in &v.declarations {
+                let Pattern::Identifier(id) = &d.id else {
+                    continue;
+                };
+                if exported_props.contains(&id.name) {
+                    continue;
+                }
+                if derived_targets.contains(&id.name) {
+                    continue;
+                }
+                if !reassigned.contains(&id.name) {
+                    continue;
+                }
+                // Also skip if there's a `let state` conflict — that'd be the
+                // impossible-migrate case we already caught.
+                if id.name == "state" {
+                    continue;
+                }
+
+                // Wrap init or insert `= $state()` after id.
+                // Find the end of the identifier (or its type annotation if
+                // any) — we don't have type annotation info in the AST yet,
+                // so we use the textual approach: locate identifier in source.
+                if let Some(init) = &d.init {
+                    let (es, ee) = expr_span(init);
+                    // Prepend `$state(` before init, append `)` after.
+                    // Handle sequence-expression parenthesis case like upstream.
+                    let s = es as usize;
+                    let e = ee as usize;
+                    // Find `=` between id and init: it's right before `s`
+                    // typically.
+                    // Just wrap at init bounds.
+                    str.prepend_left(s, "$state(");
+                    str.append_right(e, ")");
+                } else {
+                    // Insert `= $state()` right after the identifier (or
+                    // its TS type annotation). Since we don't have type
+                    // annotation in AST, do a textual scan from `id.span.end`
+                    // up to `;` or `,` or `\n`.
+                    let id_end = id.span.end as usize;
+                    let bytes = source.as_bytes();
+                    let mut p = id_end;
+                    // Skip TS type annotation if present (`: TYPE`).
+                    // Look for the next `;`, `,`, `=`, or `\n` — whichever
+                    // marks the end of the declarator. If we see `=`, that
+                    // means there's actually an init we missed (shouldn't
+                    // happen). Otherwise, we insert before `;`/`,`/`\n`.
+                    while p < bytes.len() {
+                        let b = bytes[p];
+                        if b == b';' || b == b',' || b == b'\n' {
+                            break;
+                        }
+                        p += 1;
+                    }
+                    str.append_left(p, " = $state()");
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
