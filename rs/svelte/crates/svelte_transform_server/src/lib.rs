@@ -442,8 +442,29 @@ fn extract_and_lower_snippets(
                 }
                 _ => body_needs_marker(&sb.body),
             };
-            let body_stmts: Vec<Statement> =
-                lower_fragment_with_marker(&sb.body, needs_marker)?;
+            // Detect const-with-await in snippet body → route to const-
+            // await lowerer.
+            let empty_blockers: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let body_stmts: Vec<Statement> = if fragment_has_const_with_await_or_blocker(
+                &sb.body, &empty_blockers,
+            ) {
+                let idx = SIBLING_PROMISES_COUNTER.with(|cc| {
+                    let i = cc.get();
+                    cc.set(i + 1);
+                    i
+                });
+                let promises_var = if idx == 0 {
+                    "promises".to_string()
+                } else {
+                    format!("promises_{idx}")
+                };
+                lower_fragment_with_const_await_with(
+                    &sb.body, &empty_blockers, &promises_var,
+                )?
+            } else {
+                lower_fragment_with_marker(&sb.body, needs_marker)?
+            };
             let mut params = vec![t::pat_id("$$renderer")];
             for p in &sb.parameters {
                 params.push(p.clone());
@@ -2071,7 +2092,28 @@ fn lower_svelte_boundary_server(
     body_fragment.nodes = remaining;
 
     // 3. Build the body statements once (used by both wrap and no-wrap paths).
-    let body_stmts = lower_fragment_server(&body_fragment)?;
+    // Detect const-with-await in boundary body → route to const-await lowerer.
+    let empty_blockers: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let body_stmts = if fragment_has_const_with_await_or_blocker(
+        &body_fragment, &empty_blockers,
+    ) {
+        let idx = SIBLING_PROMISES_COUNTER.with(|cc| {
+            let i = cc.get();
+            cc.set(i + 1);
+            i
+        });
+        let promises_var = if idx == 0 {
+            "promises".to_string()
+        } else {
+            format!("promises_{idx}")
+        };
+        lower_fragment_with_const_await_with(
+            &body_fragment, &empty_blockers, &promises_var,
+        )?
+    } else {
+        lower_fragment_server(&body_fragment)?
+    };
 
     // 3a. When `pending` is present (snippet or attribute), the boundary
     //     lowers to an `if (pending) { snippet path } else { body path }`
@@ -5467,8 +5509,29 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty())
     });
     if has_body {
-        let body_stmts =
-            lower_fragment_with_marker(&c.fragment, body_needs_marker(&c.fragment))?;
+        // Detect `{@const X = await ...}` in the children fragment → route
+        // to const-await lowerer with a fresh promises_N name.
+        let empty_blockers: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let body_stmts = if fragment_has_const_with_await_or_blocker(
+            &c.fragment, &empty_blockers,
+        ) {
+            let idx = SIBLING_PROMISES_COUNTER.with(|cc| {
+                let i = cc.get();
+                cc.set(i + 1);
+                i
+            });
+            let promises_var = if idx == 0 {
+                "promises".to_string()
+            } else {
+                format!("promises_{idx}")
+            };
+            lower_fragment_with_const_await_with(
+                &c.fragment, &empty_blockers, &promises_var,
+            )?
+        } else {
+            lower_fragment_with_marker(&c.fragment, body_needs_marker(&c.fragment))?
+        };
         let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
             body: ArrowBody::Block(Box::new(BlockStatement {
