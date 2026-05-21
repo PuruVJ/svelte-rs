@@ -83,11 +83,32 @@ fn static_html(fragment: &Fragment) -> Option<String> {
     if fragment_contains_option_element(fragment) {
         return None;
     }
+    // Trim leading + trailing pure-WS Text at the fragment boundary, then
+    // append children. Matches upstream's clean_nodes whitespace trim.
+    let mut start = 0;
+    let mut end = fragment.nodes.len();
+    while start < end {
+        if matches!(&fragment.nodes[start], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    while end > start {
+        if matches!(&fragment.nodes[end - 1], FragmentChild::Text(t) if t.data.trim().is_empty()) {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
     let mut out = String::with_capacity(64);
-    for c in &fragment.nodes {
+    for c in &fragment.nodes[start..end] {
         append_static(c, &mut out)?;
     }
-    Some(out)
+    // Also trim any leading whitespace from the first text and trailing
+    // whitespace from the last, then return.
+    let trimmed = out.trim_matches(|c: char| c == ' ').to_string();
+    Some(trimmed)
 }
 
 /// True if any descendant of `fragment` is a `<select>` or `<option>` element —
@@ -110,8 +131,10 @@ fn node_contains_option_element(n: &FragmentChild) -> bool {
 fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {
     match child {
         FragmentChild::Text(t) => {
-            // Escape backticks since the output is template-literal-wrapped.
-            for ch in t.data.chars() {
+            // Collapse whitespace runs to a single space (matching upstream's
+            // HTML-text collapse rules) and escape template-literal specials.
+            let collapsed = collapse_ws(&t.data);
+            for ch in collapsed.chars() {
                 match ch {
                     '`' => out.push_str("\\`"),
                     '\\' => out.push_str("\\\\"),
@@ -140,6 +163,23 @@ fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {
         }
         _ => None,
     }
+}
+
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(c);
+            in_ws = false;
+        }
+    }
+    out
 }
 
 fn is_void(name: &str) -> bool {

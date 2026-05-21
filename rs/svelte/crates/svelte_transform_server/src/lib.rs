@@ -1968,6 +1968,11 @@ fn lower_head_fragment(
     let nodes = trim_boundary_text(nodes);
     let mut last_was_component = false;
     let mut after_dropped_comment = false;
+    // Tracks whether the previous emitted node was a `$$renderer.title(...)`
+    // call (or similar side-statement) — when set, the leading whitespace of
+    // the next Text should be trimmed so the next `push` doesn't start with
+    // ` `. Mirrors upstream's clean_nodes whitespace handling.
+    let mut trim_leading_ws = false;
     for n in nodes.iter() {
         if last_was_component {
             if !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()) {
@@ -1987,6 +1992,20 @@ fn lower_head_fragment(
         if let FragmentChild::Comment(_) = n {
             after_dropped_comment = true;
             continue;
+        }
+        if trim_leading_ws {
+            if let FragmentChild::Text(t) = n {
+                let trimmed = t.data.trim_start();
+                if trimmed.is_empty() {
+                    trim_leading_ws = false;
+                    continue;
+                }
+                let escaped = escape_text(&collapse_ws(trimmed));
+                buf.push_str(&escaped);
+                trim_leading_ws = false;
+                continue;
+            }
+            trim_leading_ws = false;
         }
         // `<title>` (parsed as TitleElement variant) → separate
         // `$$renderer.title(($$renderer) => { ... })` call.
@@ -2017,6 +2036,7 @@ fn lower_head_fragment(
                 vec![arrow],
             )));
             last_was_component = false;
+            trim_leading_ws = true;
             continue;
         }
         // Non-inline (Components, blocks) inside <svelte:head> follow the
@@ -2076,6 +2096,10 @@ fn lower_fragment_with_marker(
     let nodes = trim_boundary_whitespace(&f.nodes);
     let nodes = trim_boundary_text(nodes);
     let mut emitted_static_push = false;
+    // Set to true after emitting a non-template side-statement
+    // (`$.head(...)`, `$$renderer.title(...)`, etc.) so the next Text's
+    // leading whitespace gets trimmed.
+    let mut trim_leading_ws = false;
     let mut last_was_component = false;
     // True when the previous node was a Comment whose leading whitespace
     // pairs with the following text's leading whitespace — strip the lead
@@ -2107,6 +2131,20 @@ fn lower_fragment_with_marker(
         if let FragmentChild::Comment(_) = n {
             after_dropped_comment = true;
             continue;
+        }
+        if trim_leading_ws {
+            if let FragmentChild::Text(t) = n {
+                let trimmed = t.data.trim_start();
+                if trimmed.is_empty() {
+                    trim_leading_ws = false;
+                    continue;
+                }
+                let escaped = escape_text(&collapse_ws(trimmed));
+                buf.push_str(&escaped);
+                trim_leading_ws = false;
+                continue;
+            }
+            trim_leading_ws = false;
         }
         // `<option>` ANYWHERE (even outside `<select>`) becomes
         // `$$renderer.option(...)` — mirrors upstream's `is_option_special`
@@ -2204,6 +2242,7 @@ fn lower_fragment_with_marker(
                 FragmentChild::SvelteHead(sh) => {
                     out.push(lower_svelte_head_server(sh)?);
                     last_was_component = false;
+                    trim_leading_ws = true;
                 }
                 FragmentChild::SvelteOptions(_) => {
                     // `<svelte:options ...>` is compile-time metadata —
@@ -3774,9 +3813,99 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                 // `<select bind:value={x}>` drops the bind too — the select
                 // lowerer handles it via the `{ value: ... }` first arg.
                 let is_select_value_bind = el.name == "select";
+                // `<input type="checkbox|radio" bind:group={X}>` synthesizes
+                // `checked={X === value}` (radio) or `checked={X.includes(value)}` (checkbox).
+                let group_bind: Option<&svelte_ast::attributes::BindDirective> = el
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        ElementAttribute::BindDirective(b) if b.name == "group" => Some(b),
+                        _ => None,
+                    });
+                let value_expr: Option<Expression> = if group_bind.is_some() {
+                    el.attributes.iter().find_map(|a| match a {
+                        ElementAttribute::Attribute(attr) if attr.name == "value" => {
+                            match &attr.value {
+                                AttributeValue::Single(t) => Some(t.expression.clone()),
+                                AttributeValue::Many(parts) if parts.len() == 1 => {
+                                    match &parts[0] {
+                                        AttributeValuePart::Text(t) => Some(Expression::Literal(
+                                            Box::new(Literal::String(StringLiteral {
+                                                value: t.data.clone(),
+                                                raw: Some(format!(
+                                                    "'{}'",
+                                                    t.data.replace('\'', "\\'")
+                                                )),
+                                                span: Span::ZERO,
+                                            })),
+                                        )),
+                                        AttributeValuePart::ExpressionTag(e) => {
+                                            Some(e.expression.clone())
+                                        }
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                let is_checkbox = el.attributes.iter().any(|a| {
+                    matches!(a, ElementAttribute::Attribute(attr)
+                        if attr.name == "type" && attr_value_is_text(&attr.value, "checkbox"))
+                });
                 for attr in &el.attributes {
                     if let ElementAttribute::BindDirective(b) = attr {
                         if b.name == "value" && (is_file_input || is_select_value_bind) {
+                            continue;
+                        }
+                        if b.name == "group" {
+                            // Emit synthesized `checked={...}` AT THIS
+                            // POSITION (the bind:group position), so the
+                            // surrounding attribute order matches upstream.
+                            if let Some(value) = value_expr.clone() {
+                                let checked_expr = if is_checkbox {
+                                    Expression::Call(Box::new(CallExpression {
+                                        callee: Expression::Member(Box::new(MemberExpression {
+                                            object: b.expression.clone(),
+                                            property: MemberProperty::Identifier(Identifier {
+                                                name: "includes".to_string(),
+                                                span: Span::ZERO,
+                                            }),
+                                            computed: false,
+                                            optional: false,
+                                            span: Span::ZERO,
+                                        })),
+                                        arguments: vec![Argument::Expression(value)],
+                                        optional: false,
+                                        span: Span::ZERO,
+                                    }))
+                                } else {
+                                    Expression::Binary(Box::new(BinaryExpression {
+                                        operator: BinaryOperator::StrictEq,
+                                        left: b.expression.clone(),
+                                        right: value,
+                                        span: Span::ZERO,
+                                    }))
+                                };
+                                buf.push_expr(Expression::Call(Box::new(CallExpression {
+                                    callee: t::member_id(t::id("$"), "attr"),
+                                    arguments: vec![
+                                        Argument::Expression(string_lit("checked")),
+                                        Argument::Expression(checked_expr),
+                                        Argument::Expression(Expression::Literal(Box::new(
+                                            Literal::Boolean(BooleanLiteral {
+                                                value: true,
+                                                span: Span::ZERO,
+                                            }),
+                                        ))),
+                                    ],
+                                    optional: false,
+                                    span: Span::ZERO,
+                                })));
+                            }
                             continue;
                         }
                     }
@@ -4404,17 +4533,77 @@ impl TemplateBuf {
     }
 }
 
-/// `<svelte:element this={tag}>` → `$.element($$renderer, tag);` (server form,
-/// drops attribute content for now).
+/// `<svelte:element this={tag}>BODY</svelte:element>` →
+/// `$.element($$renderer, tag, attrs, () => { ...body... });`
+/// `attrs` is `void 0` when there are no attributes; the body arrow is
+/// omitted when the body is empty.
 fn lower_svelte_element_server(
     el: &svelte_ast::elements::SvelteElement,
 ) -> Option<Statement> {
+    let mut args = vec![
+        Argument::Expression(t::id("$$renderer")),
+        Argument::Expression(el.tag.clone()),
+    ];
+
+    // Has any non-WS body content?
+    let has_body = el.fragment.nodes.iter().any(|n| match n {
+        FragmentChild::Text(t) => !t.data.trim().is_empty(),
+        FragmentChild::Comment(_) => false,
+        _ => true,
+    });
+
+    if has_body {
+        // Build the attrs object from regular attrs/spreads (skipping
+        // directives the server doesn't emit). When empty, pass `void 0`.
+        let mut props: Vec<ObjectMember> = Vec::new();
+        for a in &el.attributes {
+            match a {
+                ElementAttribute::Attribute(attr) => {
+                    if is_event_handler_name(&attr.name) {
+                        continue;
+                    }
+                    if let Some(p) = attribute_to_object_member(attr) {
+                        props.push(p);
+                    }
+                }
+                ElementAttribute::SpreadAttribute(s) => {
+                    props.push(ObjectMember::Spread(Box::new(SpreadElement {
+                        argument: s.expression.clone(),
+                        span: Span::ZERO,
+                    })));
+                }
+                _ => {}
+            }
+        }
+        if props.is_empty() {
+            args.push(Argument::Expression(void_zero_expr()));
+        } else {
+            args.push(Argument::Expression(Expression::Object(Box::new(
+                ObjectExpression {
+                    properties: props,
+                    span: Span::ZERO,
+                },
+            ))));
+        }
+        // Body arrow: lower the fragment without a leading marker —
+        // `$.element` already handles the wrap, no need for is_text_first.
+        let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
+        args.push(Argument::Expression(Expression::Arrow(Box::new(
+            ArrowFunctionExpression {
+                params: Vec::new(),
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: body_stmts,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            },
+        ))));
+    }
+
     Some(t::stmt(Expression::Call(Box::new(CallExpression {
         callee: t::member_id(t::id("$"), "element"),
-        arguments: vec![
-            Argument::Expression(t::id("$$renderer")),
-            Argument::Expression(el.tag.clone()),
-        ],
+        arguments: args,
         optional: false,
         span: Span::ZERO,
     }))))

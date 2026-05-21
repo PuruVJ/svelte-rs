@@ -1928,16 +1928,16 @@ fn try_rewrite_rune_call(e: &Expression, ctx: &mut Ctx) -> Option<Expression> {
     let Expression::Call(c) = e else { return None };
     let keypath = global_keypath(&c.callee)?;
     match keypath.as_str() {
-        // $state(x) / $state.raw(x) → x  (no-arg → undefined)
+        // $state(x) / $state.raw(x) → x  (no-arg → `void 0`)
         "$state" | "$state.raw" | "$state.eager" => {
-            Some(first_arg_or_undefined(&c.arguments))
+            Some(first_arg_or_void(&c.arguments))
         }
         // $derived(EXPR) → $.derived(() => EXPR)
         // $derived.by(fn) → $.derived(fn) (the .by form takes a function directly)
         "$derived" => Some(wrap_derived_arrow(&c.arguments)),
         "$derived.by" => Some(wrap_derived_call(&c.arguments)),
-        // $bindable(default) → default  (no-arg → undefined)
-        "$bindable" => Some(first_arg_or_undefined(&c.arguments)),
+        // $bindable(default) → default  (no-arg → `void 0`)
+        "$bindable" => Some(first_arg_or_void(&c.arguments)),
         // $effect(...) / $inspect(...) / $host() → undefined
         "$effect" | "$effect.pre" | "$effect.root" | "$effect.tracking" | "$effect.pending"
         | "$inspect" | "$inspect.trace" | "$host" => Some(undefined_expr()),
@@ -1998,6 +1998,15 @@ fn first_arg_or_undefined(args: &[Argument]) -> Expression {
         Argument::Expression(e) => Some(e.clone()),
         _ => None,
     }).unwrap_or_else(undefined_expr)
+}
+
+/// Like `first_arg_or_undefined` but uses `void 0` for the no-arg case.
+/// Mirrors upstream's `b.void0` for `$state()` / `$bindable()`.
+fn first_arg_or_void(args: &[Argument]) -> Expression {
+    args.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e.clone()),
+        _ => None,
+    }).unwrap_or_else(void_zero)
 }
 
 fn undefined_expr() -> Expression {
