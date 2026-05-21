@@ -1655,6 +1655,61 @@ impl<'a> Emitter<'a> {
                     self.write("{}");
                     return;
                 }
+                // Multi-line wrap when any property has an Assignment
+                // default whose right-hand side is a Binary expression
+                // (the long-string-concat case `"a" + "b" + "c"`) or
+                // contains a long string literal — mirrors upstream esrap's
+                // fits-on-line wrap.
+                fn property_needs_wrap(m: &ObjectPatternMember) -> bool {
+                    let ObjectPatternMember::Property(p) = m else {
+                        return false;
+                    };
+                    let Pattern::Assignment(a) = &p.value else {
+                        return false;
+                    };
+                    match &a.right {
+                        Expression::Binary(_) => true,
+                        Expression::Literal(lit) => {
+                            if let Literal::String(s) = lit.as_ref() {
+                                s.value.len() > 40
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    }
+                }
+                let wrap = o.properties.iter().any(property_needs_wrap);
+                if wrap {
+                    self.write("{");
+                    self.indent_in();
+                    self.newline();
+                    for (i, m) in o.properties.iter().enumerate() {
+                        if i > 0 {
+                            self.write(",");
+                            self.newline();
+                        }
+                        match m {
+                            ObjectPatternMember::Property(p) => {
+                                if p.shorthand {
+                                    self.emit_pattern(&p.value);
+                                } else {
+                                    self.emit_property_key(&p.key, p.computed);
+                                    self.write(": ");
+                                    self.emit_pattern(&p.value);
+                                }
+                            }
+                            ObjectPatternMember::Rest(r) => {
+                                self.write("...");
+                                self.emit_pattern(&r.argument);
+                            }
+                        }
+                    }
+                    self.indent_out();
+                    self.newline();
+                    self.write("}");
+                    return;
+                }
                 self.write("{ ");
                 for (i, m) in o.properties.iter().enumerate() {
                     if i > 0 {
