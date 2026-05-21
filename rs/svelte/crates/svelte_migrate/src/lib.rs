@@ -48,8 +48,6 @@ pub struct MigrateResult {
 /// Best-effort migration of Svelte 4 source towards Svelte 5 runes,
 /// event attributes, and render tags. Returns the migrated source.
 pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
-    let _ = opts;
-
     // 1. Parse the source. On hard failure → prepend the @migration-task
     //    comment + return source unchanged. Mirrors upstream's catch-all
     //    around `parse(source)`.
@@ -80,6 +78,11 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     // 3. Apply surface-level edits.
     let mut str = MagicString::new(source.to_string());
     strip_accessors_in_svelte_options(source, &mut str);
+    migrate_script_module_context(source, &mut str, &parsed);
+    migrate_self_closing_elements(source, &mut str, &parsed.fragment);
+    migrate_svelte_self_no_filename(source, &mut str, &parsed.fragment, opts.filename.as_deref());
+    migrate_comments(source, &mut str, &parsed);
+    migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
     MigrateResult {
         code: str.to_string(),
@@ -901,6 +904,584 @@ fn find_word(span: &str, word: &str) -> Option<usize> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// `<script context="module">` → `<script module>`
+// ---------------------------------------------------------------------------
+
+fn migrate_script_module_context(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(module) = &root.module else {
+        return;
+    };
+    for a in &module.attributes {
+        if a.name == "context" {
+            let _ = source;
+            str.update(a.start as usize, a.end as usize, "module");
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Self-closing element: `<div />` → `<div></div>` (non-void, non-svg)
+// ---------------------------------------------------------------------------
+
+fn migrate_self_closing_elements(source: &str, str: &mut MagicString, frag: &Fragment) {
+    walk_fragment(frag, &mut |child| {
+        if let FragmentChild::RegularElement(el) = child {
+            let bytes = source.as_bytes();
+            let end = el.end as usize;
+            if end < 2 {
+                return;
+            }
+            // The element is self-closing if `source[end-2..end] == "/>"`.
+            if bytes[end - 2] != b'/' || bytes[end - 1] != b'>' {
+                return;
+            }
+            // Strip namespace prefix when checking void/svg.
+            let node_name = strip_namespace_prefix(&el.name);
+            if is_void(&node_name) || is_svg(&node_name) {
+                return;
+            }
+            // Remove the `/` plus preceding spaces.
+            let mut trimmed = end - 2;
+            while trimmed > 0 && bytes[trimmed - 1] == b' ' {
+                trimmed -= 1;
+            }
+            // Mirrors upstream: `str.remove(trimmed_position, node.end - 1)`.
+            str.remove(trimmed, end - 1);
+            // Append the closing tag: `</NAME>`.
+            str.append_left(end, format!("</{}>", el.name));
+        }
+    });
+}
+
+fn strip_namespace_prefix(name: &str) -> String {
+    // Upstream's `node.name.replace(/[a-zA-Z-]*:/g, '')`.
+    let mut out = String::with_capacity(name.len());
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Look ahead for a `:` after [a-zA-Z-]*.
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'-') {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b':' {
+            // Drop the prefix.
+            i += 1;
+            continue;
+        }
+        // Else: emit the chars we skipped.
+        out.push_str(&name[start..i]);
+        if i < bytes.len() {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn is_void(name: &str) -> bool {
+    svelte_parse::utils::element_names::is_void(name)
+}
+
+fn is_svg(name: &str) -> bool {
+    // Mirrors `packages/svelte/src/utils.js:is_svg(name)`.
+    matches!(
+        name,
+        "altGlyph"
+            | "altGlyphDef"
+            | "altGlyphItem"
+            | "animate"
+            | "animateColor"
+            | "animateMotion"
+            | "animateTransform"
+            | "circle"
+            | "clipPath"
+            | "color-profile"
+            | "cursor"
+            | "defs"
+            | "desc"
+            | "discard"
+            | "ellipse"
+            | "feBlend"
+            | "feColorMatrix"
+            | "feComponentTransfer"
+            | "feComposite"
+            | "feConvolveMatrix"
+            | "feDiffuseLighting"
+            | "feDisplacementMap"
+            | "feDistantLight"
+            | "feDropShadow"
+            | "feFlood"
+            | "feFuncA"
+            | "feFuncB"
+            | "feFuncG"
+            | "feFuncR"
+            | "feGaussianBlur"
+            | "feImage"
+            | "feMerge"
+            | "feMergeNode"
+            | "feMorphology"
+            | "feOffset"
+            | "fePointLight"
+            | "feSpecularLighting"
+            | "feSpotLight"
+            | "feTile"
+            | "feTurbulence"
+            | "filter"
+            | "font"
+            | "font-face"
+            | "font-face-format"
+            | "font-face-name"
+            | "font-face-src"
+            | "font-face-uri"
+            | "foreignObject"
+            | "g"
+            | "glyph"
+            | "glyphRef"
+            | "hatch"
+            | "hatchpath"
+            | "hkern"
+            | "image"
+            | "line"
+            | "linearGradient"
+            | "marker"
+            | "mask"
+            | "mesh"
+            | "meshgradient"
+            | "meshpatch"
+            | "meshrow"
+            | "metadata"
+            | "missing-glyph"
+            | "mpath"
+            | "path"
+            | "pattern"
+            | "polygon"
+            | "polyline"
+            | "radialGradient"
+            | "rect"
+            | "set"
+            | "solidcolor"
+            | "stop"
+            | "svg"
+            | "switch"
+            | "symbol"
+            | "text"
+            | "textPath"
+            | "tref"
+            | "tspan"
+            | "unknown"
+            | "use"
+            | "view"
+            | "vkern"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// `<svelte:self />` → prepend `<!-- @migration-task ... -->` when filename
+// is missing. Mirrors upstream's SvelteSelf branch when `!state.filename`.
+// ---------------------------------------------------------------------------
+
+fn migrate_svelte_self_no_filename(
+    source: &str,
+    str: &mut MagicString,
+    frag: &Fragment,
+    filename: Option<&str>,
+) {
+    if filename.is_some() {
+        return;
+    }
+    walk_fragment(frag, &mut |child| {
+        if let FragmentChild::SvelteSelf(node) = child {
+            // Determine indent based on the node's text (upstream guess_indent
+            // applies to the snippet — but the simplest correct approach for
+            // single-line `<svelte:self />` is to use a tab+(leading spaces).
+            let start = node.start as usize;
+            let bytes = source.as_bytes();
+            let mut line_start = start;
+            while line_start > 0 && bytes[line_start - 1] != b'\n' {
+                line_start -= 1;
+            }
+            let indent = &source[line_start..start];
+            str.prepend_right(
+                start,
+                format!(
+                    "<!-- @migration-task: svelte:self is deprecated, import this Svelte file into itself instead -->\n{}",
+                    indent
+                ),
+            );
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// HTML `<!-- svelte-ignore ... -->` migration.
+// ---------------------------------------------------------------------------
+
+fn migrate_comments(source: &str, str: &mut MagicString, root: &Root) {
+    walk_fragment(&root.fragment, &mut |child| {
+        if let FragmentChild::Comment(c) = child {
+            let migrated = migrate_svelte_ignore_text(&c.data);
+            if migrated != c.data {
+                let inner_start = c.start as usize + "<!--".len();
+                let inner_end = c.end as usize - "-->".len();
+                str.update(inner_start, inner_end, &migrated);
+            }
+        }
+    });
+    // Script-internal JS line/block comments. The `value` is the content
+    // (without `//` or `/* */`). For line comments, the upstream walker
+    // overwrites `start + '//'.length .. end` with the migrated value.
+    let bytes = source.as_bytes();
+    for c in &root.comments {
+        let mut start = c.start as usize;
+        let end = c.end as usize;
+        if end > bytes.len() {
+            continue;
+        }
+        // Some upstream parsers return positions that lead the actual `//`
+        // marker by leading whitespace. Snap `start` forward to the first
+        // `//` or `/*` between `start..end`.
+        while start + 2 <= end {
+            let head = &source[start..start + 2];
+            if head == "//" || head == "/*" {
+                break;
+            }
+            start += 1;
+        }
+        if start + 2 > end {
+            continue;
+        }
+        let head = &source[start..start + 2];
+        if head == "//" {
+            let inner = &source[start + 2..end];
+            let migrated = migrate_svelte_ignore_text(inner);
+            if migrated != inner {
+                str.update(start + 2, end, &migrated);
+            }
+        } else if head == "/*" {
+            if end >= start + 4 {
+                let inner = &source[start + 2..end - 2];
+                let migrated = migrate_svelte_ignore_text(inner);
+                if migrated != inner {
+                    str.update(start + 2, end - 2, &migrated);
+                }
+            }
+        }
+    }
+}
+
+const SVELTE_IGNORE_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "non-top-level-reactive-declaration",
+        "reactive_declaration_invalid_placement",
+    ),
+    (
+        "module-script-reactive-declaration",
+        "reactive_declaration_module_script",
+    ),
+    ("empty-block", "block_empty"),
+    ("avoid-is", "attribute_avoid_is"),
+    ("invalid-html-attribute", "attribute_invalid_property_name"),
+    ("a11y-structure", "a11y_figcaption_parent"),
+    ("illegal-attribute-character", "attribute_illegal_colon"),
+    ("invalid-rest-eachblock-binding", "bind_invalid_each_rest"),
+    ("unused-export-let", "export_let_unused"),
+];
+
+/// Port of `migrate_svelte_ignore` in `packages/svelte/src/compiler/utils/extract_svelte_ignore.js`.
+fn migrate_svelte_ignore_text(text: &str) -> String {
+    // Match `^\s*svelte-ignore\s`.
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n') {
+        i += 1;
+    }
+    let needle = b"svelte-ignore";
+    if i + needle.len() >= bytes.len() {
+        return text.to_string();
+    }
+    if &bytes[i..i + needle.len()] != needle {
+        return text.to_string();
+    }
+    let after = i + needle.len();
+    if !matches!(bytes[after], b' ' | b'\t' | b'\n') {
+        return text.to_string();
+    }
+    let prefix_len = after + 1;
+    let prefix = &text[..prefix_len];
+    let rest = &text[prefix_len..];
+
+    // Replace each `\w+-\w+(-\w+)*` in rest. Word chars = ASCII alphanumeric
+    // or `_`. Hyphenated pattern: at least one `-`.
+    let rest_bytes = rest.as_bytes();
+    let mut out = String::new();
+    out.push_str(prefix);
+    let mut j = 0;
+    while j < rest_bytes.len() {
+        // Try to match a hyphenated word starting at j.
+        let m_start = j;
+        // Read word chars.
+        while j < rest_bytes.len() && is_ident_char(rest_bytes[j]) {
+            j += 1;
+        }
+        if j > m_start && j < rest_bytes.len() && rest_bytes[j] == b'-' {
+            // Continue: at least one hyphen — match `\w+-\w+(-\w+)*`.
+            let mut k = j;
+            let mut valid = false;
+            while k < rest_bytes.len() && rest_bytes[k] == b'-' {
+                k += 1;
+                // Must have at least one word char after.
+                let chunk_start = k;
+                while k < rest_bytes.len() && is_ident_char(rest_bytes[k]) {
+                    k += 1;
+                }
+                if k > chunk_start {
+                    valid = true;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                let code = &rest[m_start..k];
+                // Find the replacement.
+                let replacement = SVELTE_IGNORE_REPLACEMENTS
+                    .iter()
+                    .find(|(k, _)| *k == code)
+                    .map(|(_, v)| (*v).to_string())
+                    .unwrap_or_else(|| code.replace('-', "_"));
+                // If there's another `\w+-\w+` later in rest, append comma.
+                let following = &rest[k..];
+                let has_following_hyphenated = has_hyphenated_word(following);
+                out.push_str(&replacement);
+                if has_following_hyphenated {
+                    out.push(',');
+                }
+                j = k;
+                continue;
+            }
+        }
+        // Otherwise emit chars verbatim up to current j.
+        if j == m_start {
+            // No advance — emit one byte.
+            out.push(rest_bytes[j] as char);
+            j += 1;
+        } else {
+            out.push_str(&rest[m_start..j]);
+        }
+    }
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn has_hyphenated_word(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find a word.
+        let start = i;
+        while i < bytes.len() && is_ident_char(bytes[i]) {
+            i += 1;
+        }
+        if i > start && i < bytes.len() && bytes[i] == b'-' {
+            // Need at least one word char after hyphen.
+            let mut k = i + 1;
+            let kstart = k;
+            while k < bytes.len() && is_ident_char(bytes[k]) {
+                k += 1;
+            }
+            if k > kstart {
+                return true;
+            }
+            i = k;
+        } else if i == start {
+            i += 1;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Block whitespace trim — `{  @html "x"  }` → `{@html "x"}` etc.
+// Mirrors upstream's `trim_block(state, start, end)`.
+// ---------------------------------------------------------------------------
+
+fn migrate_block_whitespace(source: &str, str: &mut MagicString, frag: &Fragment) {
+    walk_fragment(frag, &mut |child| {
+        match child {
+            FragmentChild::HtmlTag(t) => {
+                trim_block(source, str, t.start as usize, t.end as usize);
+            }
+            FragmentChild::ConstTag(t) => {
+                trim_block(source, str, t.start as usize, t.end as usize);
+            }
+            FragmentChild::IfBlock(b) => {
+                // Trim the opening `{#if expr}`. Upstream finds the closing
+                // `}` from `node.test.end`. We use the expression position
+                // directly. The block's full `start..end` covers the entire
+                // block — we only trim the opener.
+                let start = b.start as usize;
+                let end = find_first_close_brace(source, expression_end(&b.test) as usize);
+                if end > start {
+                    trim_block(source, str, start, end);
+                }
+                // {:else if …}: scan the consequent fragment's end and the
+                // alternate's start to find any intermediate `{:else if …}`
+                // openers. Upstream walks the IfBlock visitor which fires
+                // recursively for else-if (since they're nested IfBlocks
+                // with `elseif: true`).
+                // No action needed beyond the recursive walk.
+            }
+            FragmentChild::KeyBlock(b) => {
+                let start = b.start as usize;
+                let end = find_first_close_brace(source, expression_end(&b.expression) as usize);
+                if end > start {
+                    trim_block(source, str, start, end);
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                let start = b.start as usize;
+                // The opener spans `{#await expr}` or `{#await expr then val}`
+                // or `{#await expr catch err}` — we need to find the first
+                // `}` after either expression.end OR value.end (when there's
+                // no pending block).
+                let last_kw_end = if b.pending.is_some() {
+                    expression_end(&b.expression) as usize
+                } else if let Some(v) = &b.value {
+                    pattern_end(v) as usize
+                } else {
+                    expression_end(&b.expression) as usize
+                };
+                let end = find_first_close_brace(source, last_kw_end);
+                if end > start {
+                    trim_block(source, str, start, end);
+                }
+                // {:then VALUE} sub-block (when there's a pending fragment).
+                if b.pending.is_some() {
+                    if let Some(v) = &b.value {
+                        let vstart = pattern_start(v) as usize;
+                        let open = source[..vstart].rfind('{').unwrap_or(vstart);
+                        let close = find_first_close_brace(source, pattern_end(v) as usize);
+                        if close > open {
+                            trim_block(source, str, open, close);
+                        }
+                    }
+                }
+                // {:catch ERROR}
+                if b.catch_.is_some() {
+                    if let Some(e) = &b.error {
+                        let estart = pattern_start(e) as usize;
+                        let open = source[..estart].rfind('{').unwrap_or(estart);
+                        let close = find_first_close_brace(source, pattern_end(e) as usize);
+                        if close > open {
+                            trim_block(source, str, open, close);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    });
+    // {:else if EXPR} openers — handled when the IfBlock has an alternate
+    // that is itself an IfBlock with `elseif: true`. The fragment walk's
+    // recursion already enters that nested IfBlock and trims its opener.
+    // BUT — we also need to trim any extra padding inside the simple
+    // `{:else}` and the `{/if}`, `{/await}`, `{/key}` closers. Upstream
+    // doesn't touch those (they're invariant). So nothing to do here.
+}
+
+fn expression_end(expr: &Expression) -> u32 {
+    expr_span(expr).1
+}
+
+fn expr_span(expr: &Expression) -> (u32, u32) {
+    use svelte_js_ast::Expression as E;
+    match expr {
+        E::Identifier(id) => (id.span.start, id.span.end),
+        E::Literal(l) => match l.as_ref() {
+            svelte_js_ast::Literal::String(s) => (s.span.start, s.span.end),
+            svelte_js_ast::Literal::Number(n) => (n.span.start, n.span.end),
+            svelte_js_ast::Literal::Boolean(b) => (b.span.start, b.span.end),
+            svelte_js_ast::Literal::Null(s) => (s.start, s.end),
+            svelte_js_ast::Literal::Regex(r) => (r.span.start, r.span.end),
+            svelte_js_ast::Literal::BigInt(b) => (b.span.start, b.span.end),
+        },
+        E::Template(t) => (t.span.start, t.span.end),
+        E::Array(a) => (a.span.start, a.span.end),
+        E::Object(o) => (o.span.start, o.span.end),
+        E::Arrow(a) => (a.span.start, a.span.end),
+        E::Function(f) => (f.span.start, f.span.end),
+        E::Class(c) => (c.span.start, c.span.end),
+        E::Member(m) => (m.span.start, m.span.end),
+        E::Call(c) => (c.span.start, c.span.end),
+        E::New(n) => (n.span.start, n.span.end),
+        E::Binary(b) => (b.span.start, b.span.end),
+        E::Logical(l) => (l.span.start, l.span.end),
+        E::Assignment(a) => (a.span.start, a.span.end),
+        E::Update(u) => (u.span.start, u.span.end),
+        E::Unary(u) => (u.span.start, u.span.end),
+        E::Conditional(c) => (c.span.start, c.span.end),
+        E::Sequence(s) => (s.span.start, s.span.end),
+        E::Spread(s) => (s.span.start, s.span.end),
+        E::This(s) => (s.start, s.end),
+        E::Super(s) => (s.start, s.end),
+        E::Yield(y) => (y.span.start, y.span.end),
+        E::Await(a) => (a.span.start, a.span.end),
+        E::Tagged(t) => (t.span.start, t.span.end),
+        E::Paren(p) => (p.span.start, p.span.end),
+        E::Meta(m) => (m.span.start, m.span.end),
+        E::Raw(_) => (0, 0),
+    }
+}
+
+fn pattern_start(p: &Pattern) -> u32 {
+    pattern_span(p).0
+}
+
+fn pattern_end(p: &Pattern) -> u32 {
+    pattern_span(p).1
+}
+
+fn pattern_span(p: &Pattern) -> (u32, u32) {
+    match p {
+        Pattern::Identifier(id) => (id.span.start, id.span.end),
+        Pattern::Array(a) => (a.span.start, a.span.end),
+        Pattern::Object(o) => (o.span.start, o.span.end),
+        Pattern::Rest(r) => (r.span.start, r.span.end),
+        Pattern::Assignment(a) => (a.span.start, a.span.end),
+        Pattern::Member(m) => (m.span.start, m.span.end),
+    }
+}
+
+fn find_first_close_brace(source: &str, from: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = from;
+    while i < bytes.len() {
+        if bytes[i] == b'}' {
+            return i + 1;
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+fn trim_block(source: &str, str: &mut MagicString, start: usize, end: usize) {
+    // Slice between `{` and `}` (exclusive).
+    if end < 2 || start >= source.len() || end > source.len() {
+        return;
+    }
+    let inner = &source[start + 1..end - 1];
+    let trimmed = inner.trim();
+    if trimmed.len() != inner.len() {
+        str.update(start + 1, end - 1, trimmed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,4 +1499,5 @@ mod tests {
         let r = migrate(src, MigrateOptions::default());
         assert_eq!(r.code, "<div>hi</div>");
     }
+
 }

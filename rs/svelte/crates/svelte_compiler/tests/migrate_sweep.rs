@@ -45,12 +45,22 @@ fn migrate_matches_all_fixtures() {
         //   input = readFile(input.svelte).replace(/\s+$/, '').replace(/\r/g, '')
         let input = source.trim_end().replace('\r', "");
 
+        // Some fixtures carry a `_config.js` controlling `skip_filename` and
+        // `use_ts`. Parse those flags textually — we don't need to evaluate
+        // JS.
+        let (skip_filename, use_ts) = read_config_flags(&entry.path());
+        let filename = if skip_filename {
+            None
+        } else {
+            Some("output.svelte".to_string())
+        };
+
         let result = std::panic::catch_unwind(|| {
             migrate(
                 &input,
                 MigrateOptions {
-                    filename: Some("output.svelte".to_string()),
-                    use_ts: false,
+                    filename,
+                    use_ts,
                 },
             )
             .code
@@ -85,6 +95,16 @@ fn migrate_matches_all_fixtures() {
     println!(
         "\nMIGRATE SUMMARY: {ok} ok / {diff} diff / {err} err / {panicked} panic / {skipped} skipped"
     );
+}
+
+fn read_config_flags(dir: &std::path::Path) -> (bool, bool) {
+    let config_path = dir.join("_config.js");
+    let Ok(text) = fs::read_to_string(&config_path) else {
+        return (false, false);
+    };
+    let skip_filename = text.contains("skip_filename: true");
+    let use_ts = text.contains("use_ts: true");
+    (skip_filename, use_ts)
 }
 
 fn first_diff_line<'a>(a: &'a str, b: &'a str) -> Option<(usize, String, String)> {
