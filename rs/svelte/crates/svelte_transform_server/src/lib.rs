@@ -62,6 +62,7 @@ pub fn try_typed_server_component_with_opts(
     preserve_comments: bool,
 ) -> Option<Program> {
     PRESERVE_COMMENTS.with(|c| c.set(preserve_comments));
+    BODY_VAR_COUNTER.with(|c| c.set(0));
     // `<script module>` content is hoisted above the export default
     // function. Statements are pulled in source order; imports flow to
     // `script_imports` so they're emitted with the regular instance imports.
@@ -1771,6 +1772,11 @@ thread_local! {
     static PRESERVE_COMMENTS: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    /// Counter for `$$body` / `$$body_1` / ... name allocation for
+    /// content-editable bind:innerText/textContent/innerHTML + textarea.
+    static BODY_VAR_COUNTER: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2 variant
@@ -2202,6 +2208,30 @@ fn lower_fragment_with_marker(
                 continue;
             }
         }
+        // `bind:innerText` / `bind:textContent` / `bind:innerHTML` on a
+        // RegularElement lowers to the same `$$body` extraction pattern
+        // as `<textarea>` — with `$.escape` for the first two, raw value
+        // for innerHTML.
+        if let FragmentChild::RegularElement(el) = n {
+            let bind_body: Option<(&str, Expression)> = el.attributes.iter().find_map(|a| match a {
+                ElementAttribute::BindDirective(b)
+                    if matches!(b.name.as_str(), "innerText" | "textContent" | "innerHTML") =>
+                {
+                    Some((b.name.as_str(), b.expression.clone()))
+                }
+                _ => None,
+            });
+            if let Some((name, expr)) = bind_body {
+                // Open tag goes into buf (flushed before the inner stmts).
+                // After the body extraction stmts, the close tag is pushed
+                // back into buf so adjacent WS/elements can join with it.
+                lower_content_editable_bind_inline(
+                    el, name, expr, &mut buf, &mut out,
+                )?;
+                last_was_component = false;
+                continue;
+            }
+        }
         // `<textarea>` with a `value=` attr OR a non-empty body uses the
         // `$$body = $.escape(...)` pattern. Otherwise it stays inline
         // (just `<textarea attrs></textarea>`).
@@ -2220,11 +2250,7 @@ fn lower_fragment_with_marker(
                     _ => true,
                 });
                 if has_value || has_body {
-                    if let Some(stmt) = buf.flush() {
-                        emitted_static_push = true;
-                        out.push(stmt);
-                    }
-                    out.extend(lower_textarea_server(el)?);
+                    lower_textarea_server_inline(el, &mut buf, &mut out)?;
                     last_was_component = false;
                     continue;
                 }
@@ -2347,6 +2373,210 @@ fn lower_fragment_with_marker(
     Some(out)
 }
 
+/// Lower an element with `bind:innerText` / `bind:textContent` /
+/// `bind:innerHTML` inline: open tag flows into `buf`, body-extraction
+/// stmts go to `out`, then close tag is pushed back to `buf` so adjacent
+/// content can fuse with it on the next push.
+fn lower_content_editable_bind_inline(
+    el: &svelte_ast::elements::RegularElement,
+    bind_name: &str,
+    bind_expr: Expression,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+) -> Option<()> {
+    // Open tag (current buf gets the open tag string appended).
+    buf.push_str("<");
+    buf.push_str(&el.name);
+    for attr in &el.attributes {
+        if let ElementAttribute::BindDirective(b) = attr {
+            if matches!(b.name.as_str(), "innerText" | "textContent" | "innerHTML") {
+                continue;
+            }
+        }
+        append_element_attribute_server(attr, buf)?;
+    }
+    buf.push_str(">");
+    // Flush the open-tag push.
+    if let Some(stmt) = buf.flush() {
+        out.push(stmt);
+    }
+
+    let body_source: Expression = if bind_name == "innerHTML" {
+        bind_expr
+    } else {
+        Expression::Call(Box::new(CallExpression {
+            callee: t::member_id(t::id("$"), "escape"),
+            arguments: vec![Argument::Expression(bind_expr)],
+            optional: false,
+            span: Span::ZERO,
+        }))
+    };
+
+    if bind_name == "innerHTML" {
+        // innerHTML pushes the raw expression conditionally — no $$body const.
+        out.push(Statement::If(Box::new(IfStatement {
+            test: body_source.clone(),
+            consequent: Statement::Block(Box::new(BlockStatement {
+                body: vec![t::stmt(t::call(
+                    t::member_id(t::id("$$renderer"), "push"),
+                    vec![t::template_raw(
+                        vec![String::new(), String::new()],
+                        vec![body_source],
+                    )],
+                ))],
+                span: Span::ZERO,
+            })),
+            alternate: Some(Statement::Block(Box::new(BlockStatement {
+                body: Vec::new(),
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        })));
+    } else {
+        let idx = BODY_VAR_COUNTER.with(|c| {
+            let i = c.get();
+            c.set(i + 1);
+            i
+        });
+        let body_var = if idx == 0 { "$$body".to_string() } else { format!("$$body_{idx}") };
+        out.push(t::const_decl(&body_var, body_source));
+        out.push(Statement::If(Box::new(IfStatement {
+            test: t::id(&body_var),
+            consequent: Statement::Block(Box::new(BlockStatement {
+                body: vec![t::stmt(t::call(
+                    t::member_id(t::id("$$renderer"), "push"),
+                    vec![t::template_raw(
+                        vec![String::new(), String::new()],
+                        vec![t::id(&body_var)],
+                    )],
+                ))],
+                span: Span::ZERO,
+            })),
+            alternate: Some(Statement::Block(Box::new(BlockStatement {
+                body: Vec::new(),
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        })));
+    }
+
+    // Close tag goes back into buf so the next iteration's content fuses
+    // with it (`</div> <div ...>` shows up as one push instead of three).
+    buf.push_str(&format!("</{}>", el.name));
+    Some(())
+}
+
+/// Inline version of `lower_textarea_server` that flushes the open tag
+/// to `buf`/`out`, emits the body extraction stmts to `out`, then pushes
+/// `</textarea>` back into `buf` so adjacent content can fuse with it.
+fn lower_textarea_server_inline(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+) -> Option<()> {
+    // Push open tag into buf, capture value expr.
+    buf.push_str("<textarea");
+    let mut value_expr: Option<Expression> = None;
+    for attr in &el.attributes {
+        match attr {
+            ElementAttribute::Attribute(a) if a.name == "value" => {
+                value_expr = match &a.value {
+                    AttributeValue::Single(t) => Some(t.expression.clone()),
+                    AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
+                        AttributeValuePart::ExpressionTag(t) => Some(t.expression.clone()),
+                        AttributeValuePart::Text(t) => Some(string_lit(&t.data)),
+                    },
+                    _ => None,
+                };
+            }
+            ElementAttribute::BindDirective(b) if b.name == "value" => {
+                value_expr = Some(b.expression.clone());
+            }
+            _ => {
+                append_element_attribute_server(attr, buf)?;
+            }
+        }
+    }
+    buf.push_str(">");
+    if let Some(stmt) = buf.flush() {
+        out.push(stmt);
+    }
+
+    // Determine body source.
+    let body_source: Expression = if let Some(v) = value_expr {
+        v
+    } else {
+        let mut quasis: Vec<String> = Vec::new();
+        let mut exprs: Vec<Expression> = Vec::new();
+        let mut pending = String::new();
+        let mut first_text = true;
+        for child in &el.fragment.nodes {
+            match child {
+                FragmentChild::Text(t) => {
+                    let data = if first_text {
+                        first_text = false;
+                        t.data.strip_prefix('\n').unwrap_or(&t.data)
+                    } else {
+                        &t.data
+                    };
+                    pending.push_str(data);
+                }
+                FragmentChild::ExpressionTag(tag) => {
+                    first_text = false;
+                    quasis.push(std::mem::take(&mut pending));
+                    exprs.push(Expression::Call(Box::new(CallExpression {
+                        callee: t::member_id(t::id("$"), "stringify"),
+                        arguments: vec![Argument::Expression(tag.expression.clone())],
+                        optional: false,
+                        span: Span::ZERO,
+                    })));
+                }
+                FragmentChild::Comment(_) => {}
+                _ => return None,
+            }
+        }
+        quasis.push(pending);
+        t::template_raw(quasis, exprs)
+    };
+
+    let escape_call = Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$"), "escape"),
+        arguments: vec![Argument::Expression(body_source)],
+        optional: false,
+        span: Span::ZERO,
+    }));
+
+    let idx = BODY_VAR_COUNTER.with(|c| {
+        let i = c.get();
+        c.set(i + 1);
+        i
+    });
+    let body_var = if idx == 0 { "$$body".to_string() } else { format!("$$body_{idx}") };
+
+    out.push(t::const_decl(&body_var, escape_call));
+    out.push(Statement::If(Box::new(IfStatement {
+        test: t::id(&body_var),
+        consequent: Statement::Block(Box::new(BlockStatement {
+            body: vec![t::stmt(t::call(
+                t::member_id(t::id("$$renderer"), "push"),
+                vec![t::template_raw(
+                    vec![String::new(), String::new()],
+                    vec![t::id(&body_var)],
+                )],
+            ))],
+            span: Span::ZERO,
+        })),
+        alternate: Some(Statement::Block(Box::new(BlockStatement {
+            body: Vec::new(),
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    })));
+    // Close tag goes back into buf so adjacent content fuses.
+    buf.push_str("</textarea>");
+    Some(())
+}
+
 /// Lower `<textarea value={expr}>` or `<textarea>BODY</textarea>` to:
 ///   $$renderer.push(`<textarea${attrs}>`);
 ///   const $$body = $.escape(VALUE_OR_BODY);
@@ -2432,23 +2662,28 @@ fn lower_textarea_server(
         span: Span::ZERO,
     }));
 
+    let idx = BODY_VAR_COUNTER.with(|c| {
+        let i = c.get();
+        c.set(i + 1);
+        i
+    });
+    let body_var = if idx == 0 { "$$body".to_string() } else { format!("$$body_{idx}") };
+
     let mut out: Vec<Statement> = Vec::new();
     // Open tag push.
     if let Some(s) = open_buf.flush() {
         out.push(s);
     }
-    // `const $$body = $.escape(...);`
-    out.push(t::const_decl("$$body", escape_call));
-    // `if ($$body) { push(\`${$$body}\`); } else {}`
+    out.push(t::const_decl(&body_var, escape_call));
     let push_body = t::stmt(t::call(
         t::member_id(t::id("$$renderer"), "push"),
         vec![t::template_raw(
             vec![String::new(), String::new()],
-            vec![t::id("$$body")],
+            vec![t::id(&body_var)],
         )],
     ));
     out.push(Statement::If(Box::new(IfStatement {
-        test: t::id("$$body"),
+        test: t::id(&body_var),
         consequent: Statement::Block(Box::new(BlockStatement {
             body: vec![push_body],
             span: Span::ZERO,
@@ -2459,7 +2694,6 @@ fn lower_textarea_server(
         }))),
         span: Span::ZERO,
     })));
-    // Close tag push.
     out.push(push_template("</textarea>"));
     Some(out)
 }
