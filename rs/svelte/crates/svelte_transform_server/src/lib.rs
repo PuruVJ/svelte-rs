@@ -11,7 +11,7 @@
 mod script;
 mod typed_fast;
 
-pub use typed_fast::try_typed_server;
+pub use typed_fast::{try_typed_server, try_typed_server_with};
 
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 use svelte_ast::fragment::FragmentChild;
@@ -19,11 +19,20 @@ use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
+/// Backwards-compatible entry — defaults `experimental_async = false`.
+pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<Program> {
+    try_typed_server_component_with(root, component_name, false)
+}
+
 /// Second-tier typed entry point. Currently handles:
 /// - "instance script (imports + optionally rune-erasable statements) + simple template"
 /// - "single <Component bind:this={x}/>"
 /// - "<svelte:element this={tag}>"
-pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_server_component_with(
+    root: &Root,
+    component_name: &str,
+    experimental_async: bool,
+) -> Option<Program> {
     if root.css.is_some() || root.module.is_some() {
         return None;
     }
@@ -154,7 +163,7 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     let template_has_async = fragment_has_async(&root.fragment);
 
     let mut top: Vec<Statement> = Vec::with_capacity(3 + script_imports.len());
-    if async_info.is_some() || template_has_async {
+    if experimental_async || async_info.is_some() || template_has_async {
         top.push(t::import_side_effect("svelte/internal/flags/async"));
     }
     top.push(t::import_namespace("$", "svelte/internal/server"));
@@ -1112,6 +1121,22 @@ fn attr_has_async(a: &svelte_ast::attributes::ElementAttribute) -> bool {
         },
         ElementAttribute::SpreadAttribute(s) => expr_has_await_top(&s.expression),
         ElementAttribute::BindDirective(b) => expr_has_await_top(&b.expression),
+        ElementAttribute::ClassDirective(c) => expr_has_await_top(&c.expression),
+        ElementAttribute::StyleDirective(s) => match &s.value {
+            AttributeValue::Single(tag) => expr_has_await_top(&tag.expression),
+            AttributeValue::Many(parts) => parts.iter().any(|p| {
+                matches!(p, AttributeValuePart::ExpressionTag(t) if expr_has_await_top(&t.expression))
+            }),
+            _ => false,
+        },
+        ElementAttribute::OnDirective(o) => o
+            .expression
+            .as_ref()
+            .map_or(false, expr_has_await_top),
+        ElementAttribute::UseDirective(u) => u
+            .expression
+            .as_ref()
+            .map_or(false, expr_has_await_top),
         _ => false,
     }
 }
@@ -1284,6 +1309,17 @@ fn lower_fragment_with_marker(
         if let FragmentChild::RegularElement(el) = n {
             if has_option_child(el) {
                 emit_select_inline(el, &mut buf, &mut out)?;
+                last_was_component = false;
+                continue;
+            }
+        }
+        // RegularElement wrapping a non-inlineable descendant (Component,
+        // EachBlock, etc.) needs to be lowered before we attempt the
+        // template-buf path — otherwise the inline path writes the open
+        // tag and then bails halfway through.
+        if let FragmentChild::RegularElement(el) = n {
+            if element_contains_non_inline(el) {
+                lower_element_with_non_inline_children(el, &mut buf, &mut out)?;
                 last_was_component = false;
                 continue;
             }
@@ -2635,6 +2671,103 @@ fn push_string(s: &str) -> Statement {
 
 /// Append a fragment child to the template literal buffer. Returns `None`
 /// if the node can't be expressed inline (Component, block, etc.).
+/// Does this element contain any descendant that can't be inlined into a
+/// single template-literal push? Components, blocks, await-tags etc all
+/// require their own statement.
+fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement) -> bool {
+    fn node_is_non_inline(n: &FragmentChild) -> bool {
+        match n {
+            FragmentChild::Component(_)
+            | FragmentChild::SvelteElement(_)
+            | FragmentChild::EachBlock(_)
+            | FragmentChild::IfBlock(_)
+            | FragmentChild::AwaitBlock(_)
+            | FragmentChild::KeyBlock(_)
+            | FragmentChild::RenderTag(_)
+            | FragmentChild::SvelteHead(_)
+            | FragmentChild::SvelteBoundary(_) => true,
+            FragmentChild::RegularElement(child) => {
+                child.fragment.nodes.iter().any(node_is_non_inline)
+            }
+            _ => false,
+        }
+    }
+    el.fragment.nodes.iter().any(node_is_non_inline)
+}
+
+/// Lower a RegularElement whose interior contains at least one
+/// non-inlineable child. Writes the open tag into `buf`, then walks each
+/// child: inlineable ones flow into `buf`, non-inlineable ones flush `buf`
+/// and emit their own statement (the same dispatch as the top-level loop).
+/// Finishes by writing the close tag.
+fn lower_element_with_non_inline_children(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+    out: &mut Vec<Statement>,
+) -> Option<()> {
+    // Open tag (with attributes).
+    buf.push_str("<");
+    buf.push_str(&el.name);
+    for attr in &el.attributes {
+        append_element_attribute_server(attr, buf)?;
+    }
+    if is_void(&el.name) {
+        buf.push_str("/>");
+        return Some(());
+    }
+    buf.push_str(">");
+
+    let children = trim_boundary_whitespace(&el.fragment.nodes);
+    let children = trim_boundary_text(&children);
+    let mut last_was_component = false;
+    for n in children.iter() {
+        if last_was_component {
+            if !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()) {
+                buf.push_str("<!---->");
+                last_was_component = false;
+            }
+        }
+        if append_node_to_template(n, buf).is_none() {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            match n {
+                FragmentChild::Component(c) => {
+                    out.push(lower_component_server(c)?);
+                    last_was_component = true;
+                }
+                FragmentChild::SvelteElement(child) => {
+                    out.push(lower_svelte_element_server(child)?);
+                }
+                FragmentChild::EachBlock(eb) => {
+                    out.extend(lower_each_block_server(eb)?);
+                }
+                FragmentChild::AwaitBlock(ab) => {
+                    out.extend(lower_await_block_server(ab)?);
+                    buf.push_str("<!--]-->");
+                }
+                FragmentChild::IfBlock(ib) => {
+                    out.extend(lower_if_block_server(ib)?);
+                    buf.push_str("<!--]-->");
+                }
+                FragmentChild::RegularElement(child) if element_contains_non_inline(child) => {
+                    lower_element_with_non_inline_children(child, buf, out)?;
+                }
+                _ => return None,
+            }
+        } else {
+            last_was_component = false;
+        }
+    }
+    if last_was_component {
+        buf.push_str("<!---->");
+    }
+    buf.push_str("</");
+    buf.push_str(&el.name);
+    buf.push_str(">");
+    Some(())
+}
+
 fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<()> {
     match n {
         FragmentChild::Text(t) => {
@@ -3255,7 +3388,11 @@ fn single_non_ws_node(f: &svelte_ast::fragment::Fragment) -> Option<&FragmentChi
 fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment) -> bool {
     fn is_static(n: &FragmentChild) -> bool {
         match n {
-            FragmentChild::Text(_) | FragmentChild::Comment(_) => true,
+            FragmentChild::Text(_) => true,
+            // Comments are dropped server-side but require whitespace
+            // collapse against neighbouring Text nodes — that logic lives
+            // in the full walker, not in typed_fast. Defer to the walker.
+            FragmentChild::Comment(_) => false,
             FragmentChild::RegularElement(el) => {
                 // `<option>` and `<select>` are NOT static even with no
                 // attributes — they need `$$renderer.option(...)` /

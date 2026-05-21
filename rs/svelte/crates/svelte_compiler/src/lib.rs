@@ -56,10 +56,15 @@ pub fn compile(
     // none exists). Coverage is being grown fixture-by-fixture.
     let typed = match options.module.generate {
         Some(Generate::Server) => {
-            if let Some(p) = svelte_transform_server::try_typed_server(&root, component_name) {
+            let exp_async = options.module.experimental.async_;
+            if let Some(p) = svelte_transform_server::try_typed_server_with(
+                &root, component_name, exp_async,
+            ) {
                 p
             } else if let Some(p) =
-                svelte_transform_server::try_typed_server_component(&root, component_name)
+                svelte_transform_server::try_typed_server_component_with(
+                    &root, component_name, exp_async,
+                )
             {
                 p
             } else {

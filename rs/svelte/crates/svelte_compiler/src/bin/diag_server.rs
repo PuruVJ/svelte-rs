@@ -12,7 +12,11 @@ fn main() {
     if cfg.contains("async: true") {
         opts.module.experimental.async_ = true;
     }
-    match compile(&source, "Diag", opts) {
+    // The SSR test driver always sets experimental.async = true.
+    if path.contains("server-side-rendering") {
+        opts.module.experimental.async_ = true;
+    }
+    match compile(&source, "Main", opts) {
         Ok(r) => println!("=== OK ===\n{}", r.js),
         Err(e) => println!("=== ERR ===\n{:?}", e),
     }

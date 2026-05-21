@@ -27,26 +27,56 @@ use std::path::PathBuf;
 use svelte_compiler::{compile, CompileOptions, Generate};
 
 fn collect_imports(js: &str) -> HashSet<String> {
+    // Multi-line imports (`import {\n  ...\n} from 'src';`) and
+    // single-line forms (`import * as $ from 'src';`, `import 'src';`)
+    // are both captured here. The strategy: find each `from '...'` or
+    // `from "..."` occurrence, plus each side-effect `import '...'` /
+    // `import "..."` on its own line.
     let mut imports = HashSet::new();
+
+    // Side-effect imports: `import 'src';` (no `from`).
     for line in js.lines() {
         let trimmed = line.trim_start();
         if !trimmed.starts_with("import ") {
             continue;
         }
-        // Extract the source string after `from `.
-        // Forms: `import X from 'src';`, `import * as $ from 'src';`,
-        //        `import 'src';` (side-effect).
-        let after_from = match trimmed.rsplit_once(" from ") {
-            Some((_, rhs)) => rhs,
-            // Side-effect form: `import 'src';` — source is right after `import`.
-            None => trimmed.trim_start_matches("import ").trim(),
-        };
-        let s = after_from.trim().trim_end_matches(';');
-        let s = s.trim_matches(|c| c == '\'' || c == '"');
-        if !s.is_empty() {
-            imports.insert(s.to_string());
+        let rest = trimmed.trim_start_matches("import ").trim_start();
+        if rest.starts_with('\'') || rest.starts_with('"') {
+            // Side-effect form: the first quote opens the source.
+            let q = rest.chars().next().unwrap();
+            if let Some(end) = rest[1..].find(q) {
+                imports.insert(rest[1..1 + end].to_string());
+            }
         }
     }
+
+    // `from '...'` / `from "..."` — covers all named/namespace/default forms.
+    let mut i = 0;
+    let bytes = js.as_bytes();
+    while i + 5 < bytes.len() {
+        if &bytes[i..i + 5] == b"from " {
+            // Skip whitespace after `from `.
+            let mut j = i + 5;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && (bytes[j] == b'\'' || bytes[j] == b'"') {
+                let q = bytes[j];
+                let start = j + 1;
+                let mut k = start;
+                while k < bytes.len() && bytes[k] != q {
+                    k += 1;
+                }
+                if k < bytes.len() {
+                    imports.insert(String::from_utf8_lossy(&bytes[start..k]).to_string());
+                }
+                i = k + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
     imports
 }
 
@@ -87,12 +117,14 @@ fn ssr_smoke_all_fixtures() {
         let config_path = entry.path().join("_config.js");
         let cfg = fs::read_to_string(&config_path).unwrap_or_default();
 
+        let _ = cfg;
         let result = std::panic::catch_unwind(|| {
+            // Upstream's SSR test driver sets `experimental.async = true` for
+            // every fixture, so every expected output emits the `flags/async`
+            // import. Mirror that here.
             let mut opts = CompileOptions::default();
             opts.module.generate = Some(Generate::Server);
-            if cfg.contains("async: true") {
-                opts.module.experimental.async_ = true;
-            }
+            opts.module.experimental.async_ = true;
             compile(&source, "Main", opts)
         });
 

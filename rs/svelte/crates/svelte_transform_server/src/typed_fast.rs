@@ -21,6 +21,14 @@ use svelte_transform_shared::builders_typed as t;
 /// shapes that need the legacy/Value path (any script, dynamic content,
 /// CSS scoping hooks, etc).
 pub fn try_typed_server(root: &Root, component_name: &str) -> Option<Program> {
+    try_typed_server_with(root, component_name, false)
+}
+
+pub fn try_typed_server_with(
+    root: &Root,
+    component_name: &str,
+    experimental_async: bool,
+) -> Option<Program> {
     if root.instance.is_some() || root.module.is_some() {
         return None;
     }
@@ -57,7 +65,13 @@ pub fn try_typed_server(root: &Root, component_name: &str) -> Option<Program> {
         span: Span::ZERO,
     }));
 
-    Some(t::program(vec![import, export]))
+    let mut prog: Vec<Statement> = Vec::with_capacity(3);
+    if experimental_async {
+        prog.push(t::import_side_effect("svelte/internal/flags/async"));
+    }
+    prog.push(import);
+    prog.push(export);
+    Some(t::program(prog))
 }
 
 /// Walk a fragment and return its content as one HTML string if and only
