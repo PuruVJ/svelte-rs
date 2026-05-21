@@ -92,6 +92,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
     migrate_simple_state(source, &mut str, &parsed);
     migrate_simple_derivations(source, &mut str, &parsed);
+    migrate_unused_beforeafter_imports(source, &mut str, &parsed);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
@@ -1629,6 +1630,145 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
             str.remove(start + 2, start + 3);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Remove unused `beforeUpdate` / `afterUpdate` specifiers from svelte imports.
+// If all specifiers in `import { beforeUpdate, afterUpdate } from "svelte"`
+// are removed, drop the entire import statement.
+// ---------------------------------------------------------------------------
+
+fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(instance) = &root.instance else {
+        return;
+    };
+
+    // Collect all referenced identifiers (excluding the import itself).
+    let mut refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &instance.content.body {
+        if matches!(stmt, Statement::Import(_)) {
+            continue;
+        }
+        collect_identifiers_in_statement(stmt, &mut refs);
+    }
+    // Also handler/attribute references in template.
+    walk_fragment(&root.fragment, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => Some(&e.attributes),
+            FragmentChild::Component(e) => Some(&e.attributes),
+            FragmentChild::SvelteComponent(e) => Some(&e.attributes),
+            FragmentChild::SvelteElement(e) => Some(&e.attributes),
+            _ => None,
+        };
+        if let Some(attrs) = attrs {
+            for a in attrs {
+                match a {
+                    ElementAttribute::OnDirective(od) => {
+                        if let Some(expr) = &od.expression {
+                            collect_identifiers_in_expr(expr, &mut refs);
+                        }
+                    }
+                    ElementAttribute::Attribute(attr) => match &attr.value {
+                        AttributeValue::Single(t) => collect_identifiers_in_expr(&t.expression, &mut refs),
+                        AttributeValue::Many(parts) => {
+                            for p in parts {
+                                if let AttributeValuePart::ExpressionTag(t) = p {
+                                    collect_identifiers_in_expr(&t.expression, &mut refs);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        // Expression tags in body.
+        if let FragmentChild::ExpressionTag(t) = child {
+            collect_identifiers_in_expr(&t.expression, &mut refs);
+        }
+    });
+
+    let bytes = source.as_bytes();
+    for stmt in &instance.content.body {
+        let Statement::Import(imp) = stmt else {
+            continue;
+        };
+        if imp.source.value != "svelte" {
+            continue;
+        }
+        // Filter named specifiers. If the import only has named specifiers
+        // and ALL of them are removable, we can remove the whole statement.
+        let mut named_total = 0;
+        let mut removable: Vec<&svelte_js_ast::ImportSpecifier> = Vec::new();
+        for s in &imp.specifiers {
+            if let ImportSpecifierKind::Named(n) = s {
+                named_total += 1;
+                let imported_name = match &n.imported {
+                    ModuleExportName::Identifier(id) => &id.name,
+                    ModuleExportName::String(sl) => &sl.value,
+                };
+                if (imported_name == "beforeUpdate" || imported_name == "afterUpdate")
+                    && !refs.contains(&n.local.name)
+                {
+                    removable.push(n);
+                }
+            }
+        }
+        if removable.is_empty() {
+            continue;
+        }
+        // If we'd remove ALL named specifiers (and there are no Default/Namespace
+        // specifiers), remove the entire import statement.
+        let other_specifiers = imp
+            .specifiers
+            .iter()
+            .filter(|s| !matches!(s, ImportSpecifierKind::Named(_)))
+            .count();
+        if removable.len() == named_total && other_specifiers == 0 {
+            // Remove the import statement only (preserve the line's leading
+            // indent and trailing newline — upstream's `str.remove(start, end)`
+            // doesn't touch the surrounding whitespace).
+            let s = imp.span.start as usize;
+            let e = imp.span.end as usize;
+            str.remove(s, e);
+            continue;
+        }
+        // Otherwise, remove individual named specifiers + a following comma
+        // (or preceding comma if it's the last).
+        for spec in removable {
+            // The specifier span covers `LOCAL` (or `imported as LOCAL`).
+            let s = spec.span.start as usize;
+            let mut e = spec.span.end as usize;
+            // If there's a following `,`, eat it + trailing whitespace.
+            // Look at the source between spec.end and the `}` of the import.
+            // We approximate the `}` position by looking forward.
+            let mut k = e;
+            while k < bytes.len() && bytes[k] != b',' && bytes[k] != b'}' {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b',' {
+                e = k + 1;
+                // Eat whitespace after comma.
+                while e < bytes.len() && (bytes[e] == b' ' || bytes[e] == b'\t') {
+                    e += 1;
+                }
+                str.remove(s, e);
+            } else {
+                // No trailing comma — try to eat a leading comma + whitespace.
+                let mut p = s;
+                while p > 0 && (bytes[p - 1] == b' ' || bytes[p - 1] == b'\t') {
+                    p -= 1;
+                }
+                if p > 0 && bytes[p - 1] == b',' {
+                    p -= 1;
+                    str.remove(p, e);
+                } else {
+                    str.remove(s, e);
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
