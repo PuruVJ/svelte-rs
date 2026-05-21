@@ -118,6 +118,14 @@ fn ssr_smoke_all_fixtures() {
         let cfg = fs::read_to_string(&config_path).unwrap_or_default();
 
         let _ = cfg;
+        // Upstream defaults `rootDir` to `process.cwd()`, which for vitest
+        // is the repo root; the absolute filename then has the rootDir
+        // prefix stripped, yielding `packages/svelte/tests/.../main.svelte`.
+        // We construct that relative path directly so the head-hash matches.
+        let fname = format!(
+            "packages/svelte/tests/server-side-rendering/samples/{}/main.svelte",
+            name
+        );
         let result = std::panic::catch_unwind(|| {
             // Upstream's SSR test driver sets `experimental.async = true` for
             // every fixture, so every expected output emits the `flags/async`
@@ -125,6 +133,7 @@ fn ssr_smoke_all_fixtures() {
             let mut opts = CompileOptions::default();
             opts.module.generate = Some(Generate::Server);
             opts.module.experimental.async_ = true;
+            opts.module.filename = Some(fname.clone());
             compile(&source, "Main", opts)
         });
 

@@ -57,13 +57,14 @@ pub fn compile(
     let typed = match options.module.generate {
         Some(Generate::Server) => {
             let exp_async = options.module.experimental.async_;
+            let filename = options.module.filename.as_deref();
             if let Some(p) = svelte_transform_server::try_typed_server_with(
                 &root, component_name, exp_async,
             ) {
                 p
             } else if let Some(p) =
-                svelte_transform_server::try_typed_server_component_with(
-                    &root, component_name, exp_async,
+                svelte_transform_server::try_typed_server_component_with_filename(
+                    &root, component_name, exp_async, filename,
                 )
             {
                 p

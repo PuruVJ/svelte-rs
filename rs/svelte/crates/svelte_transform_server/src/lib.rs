@@ -13,6 +13,9 @@ mod typed_fast;
 
 pub use typed_fast::{try_typed_server, try_typed_server_with};
 
+// Re-export the filename-aware entry too (declared in this file).
+pub use self::try_typed_server_component_with_filename as try_typed_server_component_with_filename_pub;
+
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 use svelte_ast::fragment::FragmentChild;
 use svelte_ast::root::Root;
@@ -21,17 +24,27 @@ use svelte_transform_shared::builders_typed as t;
 
 /// Backwards-compatible entry — defaults `experimental_async = false`.
 pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<Program> {
-    try_typed_server_component_with(root, component_name, false)
+    try_typed_server_component_with_filename(root, component_name, false, None)
+}
+
+/// Compatibility shim — defaults filename to None.
+pub fn try_typed_server_component_with(
+    root: &Root,
+    component_name: &str,
+    experimental_async: bool,
+) -> Option<Program> {
+    try_typed_server_component_with_filename(root, component_name, experimental_async, None)
 }
 
 /// Second-tier typed entry point. Currently handles:
 /// - "instance script (imports + optionally rune-erasable statements) + simple template"
 /// - "single <Component bind:this={x}/>"
 /// - "<svelte:element this={tag}>"
-pub fn try_typed_server_component_with(
+pub fn try_typed_server_component_with_filename(
     root: &Root,
     component_name: &str,
     experimental_async: bool,
+    filename: Option<&str>,
 ) -> Option<Program> {
     if root.css.is_some() || root.module.is_some() {
         return None;
@@ -44,6 +57,10 @@ pub fn try_typed_server_component_with(
 
     // Reset the per-component each-array counter for `<select>` lowering.
     SELECT_EACH_COUNTER.with(|c| c.set(0));
+    // Thread filename into the lowering pass for `$.head(HASH, ...)`.
+    HEAD_FILENAME.with(|c| {
+        *c.borrow_mut() = filename.map(|s| s.to_string());
+    });
 
     // Process the instance script: rewrite runes, split imports vs rest.
     let mut script_imports: Vec<Statement> = Vec::new();
@@ -81,6 +98,19 @@ pub fn try_typed_server_component_with(
             async_info = Some(ai);
         } else {
             script_rest = rest;
+        }
+    }
+
+    // Upstream's MemberExpression analyzer sets `needs_context = true` for
+    // any non-safe MemberExpression in template position. A MemberExpression
+    // is "non-safe" when its root identifier resolves to a prop / bindable
+    // prop / rest prop / import. We track legacy `export let X` names; any
+    // template-position `X.foo` reference triggers the component wrap.
+    if !legacy_export_props.is_empty() {
+        let prop_names: std::collections::HashSet<String> =
+            legacy_export_props.iter().cloned().collect();
+        if fragment_has_unsafe_prop_member(&root.fragment, &prop_names) {
+            needs_component_wrap = true;
         }
     }
 
@@ -368,6 +398,151 @@ fn lower_fragment_server_async(
 /// Mirrors upstream's `is_safe_identifier` check inside CallExpression visitor.
 fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(node_has_unsafe_call)
+}
+
+/// Mirrors upstream MemberExpression visitor: returns true if any
+/// template-position expression contains a MemberExpression whose root
+/// Identifier matches one of the given names (which we treat as
+/// prop-kind bindings).
+fn fragment_has_unsafe_prop_member(
+    f: &svelte_ast::fragment::Fragment,
+    props: &std::collections::HashSet<String>,
+) -> bool {
+    f.nodes.iter().any(|n| node_has_unsafe_prop_member(n, props))
+}
+
+fn node_has_unsafe_prop_member(
+    n: &FragmentChild,
+    props: &std::collections::HashSet<String>,
+) -> bool {
+    match n {
+        FragmentChild::ExpressionTag(t) => expr_root_member_in(&t.expression, props),
+        FragmentChild::HtmlTag(t) => expr_root_member_in(&t.expression, props),
+        FragmentChild::ConstTag(ct) => ct
+            .declaration
+            .declarations
+            .iter()
+            .any(|d| d.init.as_ref().map_or(false, |e| expr_root_member_in(e, props))),
+        FragmentChild::RegularElement(el) => {
+            el.attributes.iter().any(|a| attr_has_unsafe_prop_member(a, props))
+                || fragment_has_unsafe_prop_member(&el.fragment, props)
+        }
+        FragmentChild::Component(c) => {
+            c.attributes.iter().any(|a| attr_has_unsafe_prop_member(a, props))
+                || fragment_has_unsafe_prop_member(&c.fragment, props)
+        }
+        FragmentChild::SvelteElement(el) => {
+            expr_root_member_in(&el.tag, props)
+                || el.attributes.iter().any(|a| attr_has_unsafe_prop_member(a, props))
+                || fragment_has_unsafe_prop_member(&el.fragment, props)
+        }
+        FragmentChild::EachBlock(eb) => {
+            expr_root_member_in(&eb.expression, props)
+                || fragment_has_unsafe_prop_member(&eb.body, props)
+                || eb.fallback.as_ref().map_or(false, |f| fragment_has_unsafe_prop_member(f, props))
+        }
+        FragmentChild::IfBlock(ib) => {
+            expr_root_member_in(&ib.test, props)
+                || fragment_has_unsafe_prop_member(&ib.consequent, props)
+                || ib.alternate.as_ref().map_or(false, |f| fragment_has_unsafe_prop_member(f, props))
+        }
+        FragmentChild::AwaitBlock(ab) => {
+            expr_root_member_in(&ab.expression, props)
+                || ab.pending.as_ref().map_or(false, |f| fragment_has_unsafe_prop_member(f, props))
+                || ab.then.as_ref().map_or(false, |f| fragment_has_unsafe_prop_member(f, props))
+                || ab.catch_.as_ref().map_or(false, |f| fragment_has_unsafe_prop_member(f, props))
+        }
+        FragmentChild::KeyBlock(kb) => {
+            expr_root_member_in(&kb.expression, props)
+                || fragment_has_unsafe_prop_member(&kb.fragment, props)
+        }
+        _ => false,
+    }
+}
+
+fn attr_has_unsafe_prop_member(
+    a: &ElementAttribute,
+    props: &std::collections::HashSet<String>,
+) -> bool {
+    match a {
+        ElementAttribute::Attribute(attr) => match &attr.value {
+            AttributeValue::Single(tag) => expr_root_member_in(&tag.expression, props),
+            AttributeValue::Many(parts) => parts.iter().any(|p| match p {
+                AttributeValuePart::ExpressionTag(e) => expr_root_member_in(&e.expression, props),
+                _ => false,
+            }),
+            _ => false,
+        },
+        ElementAttribute::SpreadAttribute(s) => expr_root_member_in(&s.expression, props),
+        ElementAttribute::BindDirective(b) => expr_root_member_in(&b.expression, props),
+        ElementAttribute::ClassDirective(c) => expr_root_member_in(&c.expression, props),
+        ElementAttribute::StyleDirective(s) => match &s.value {
+            AttributeValue::Single(tag) => expr_root_member_in(&tag.expression, props),
+            AttributeValue::Many(parts) => parts.iter().any(|p| match p {
+                AttributeValuePart::ExpressionTag(e) => expr_root_member_in(&e.expression, props),
+                _ => false,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// True if `expr` contains a MemberExpression whose root Identifier is in
+/// `names`. A MemberExpression's "root" is the deepest `.object` chain;
+/// `is_safe_identifier` upstream walks `.object` until non-Member, then
+/// checks the Identifier's binding kind.
+fn expr_root_member_in(
+    expr: &Expression,
+    names: &std::collections::HashSet<String>,
+) -> bool {
+    match expr {
+        Expression::Member(m) => {
+            // Walk to the root.
+            let mut cur: &Expression = &m.object;
+            loop {
+                match cur {
+                    Expression::Member(inner) => cur = &inner.object,
+                    Expression::Identifier(id) => return names.contains(&id.name),
+                    _ => return false,
+                }
+            }
+        }
+        Expression::Call(c) => {
+            expr_root_member_in(&c.callee, names)
+                || c.arguments.iter().any(|a| match a {
+                    svelte_js_ast::Argument::Expression(e) => expr_root_member_in(e, names),
+                    svelte_js_ast::Argument::Spread(s) => expr_root_member_in(&s.argument, names),
+                })
+        }
+        Expression::Binary(b) => {
+            expr_root_member_in(&b.left, names) || expr_root_member_in(&b.right, names)
+        }
+        Expression::Logical(l) => {
+            expr_root_member_in(&l.left, names) || expr_root_member_in(&l.right, names)
+        }
+        Expression::Unary(u) => expr_root_member_in(&u.argument, names),
+        Expression::Conditional(c) => {
+            expr_root_member_in(&c.test, names)
+                || expr_root_member_in(&c.consequent, names)
+                || expr_root_member_in(&c.alternate, names)
+        }
+        Expression::Paren(p) => expr_root_member_in(&p.expression, names),
+        Expression::Template(t) => t.expressions.iter().any(|e| expr_root_member_in(e, names)),
+        Expression::Array(a) => a.elements.iter().any(|el| match el {
+            ArrayElement::Expression(e) => expr_root_member_in(e, names),
+            ArrayElement::Spread(s) => expr_root_member_in(&s.argument, names),
+            ArrayElement::Elision => false,
+        }),
+        Expression::Object(o) => o.properties.iter().any(|p| match p {
+            ObjectMember::Property(p) => expr_root_member_in(&p.value, names),
+            ObjectMember::Spread(s) => expr_root_member_in(&s.argument, names),
+        }),
+        Expression::Await(a) => expr_root_member_in(&a.argument, names),
+        Expression::Spread(s) => expr_root_member_in(&s.argument, names),
+        Expression::Sequence(s) => s.expressions.iter().any(|e| expr_root_member_in(e, names)),
+        _ => false,
+    }
 }
 
 fn node_has_unsafe_call(n: &FragmentChild) -> bool {
@@ -1273,6 +1448,177 @@ thread_local! {
     /// Shared each-array counter spanning every `<select>` in the current
     /// component lowering. Reset at the top of `try_typed_server_component`.
     static SELECT_EACH_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    /// Filename for the current component compile, used to seed the
+    /// `$.head(HASH, ...)` hash. Set by `try_typed_server_component_with_filename`.
+    static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2 variant
+/// (XOR rather than add) base-36 encoded as u32. Mirrors
+/// `packages/svelte/src/utils.js`.
+fn svelte_filename_hash(s: &str) -> String {
+    let s: String = s.chars().filter(|c| *c != '\r').collect();
+    let mut h: i64 = 5381;
+    for c in s.chars().rev() {
+        h = ((h << 5) - h) ^ (c as i64);
+        h &= 0xFFFFFFFF;
+    }
+    let mut n = h as u32;
+    if n == 0 {
+        return "0".into();
+    }
+    let chars: Vec<char> = "0123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
+    let mut out = String::new();
+    while n > 0 {
+        out.insert(0, chars[(n % 36) as usize]);
+        n /= 36;
+    }
+    out
+}
+
+/// Lower `<svelte:head>...` into `$.head(HASH, $$renderer, ($$renderer) => { BODY })`.
+/// `<title>` children inside the head become `$$renderer.title(($$renderer) => { ... })`.
+fn lower_svelte_head_server(
+    sh: &svelte_ast::elements::SvelteHead,
+) -> Option<Statement> {
+    // Compute hash from filename if set, else default to upstream's "(unknown)".
+    let filename: String = HEAD_FILENAME.with(|c| {
+        c.borrow().clone().unwrap_or_else(|| "(unknown)".to_string())
+    });
+    let hash = svelte_filename_hash(&filename);
+
+    // Lower the head fragment body. We mirror lower_fragment_with_marker
+    // logic, but with one extra rule: `<title>` children become a
+    // `$$renderer.title(($$renderer) => { $$renderer.push(\`<title>...</title>\`); })`
+    // call.
+    let body = lower_head_fragment(&sh.fragment)?;
+
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    Some(t::stmt(t::call(
+        t::member_id(t::id("$"), "head"),
+        vec![
+            Expression::Literal(Box::new(Literal::String(StringLiteral {
+                value: hash.clone(),
+                raw: Some(format!("'{hash}'")),
+                span: Span::ZERO,
+            }))),
+            t::id("$$renderer"),
+            arrow,
+        ],
+    )))
+}
+
+fn lower_head_fragment(
+    f: &svelte_ast::fragment::Fragment,
+) -> Option<Vec<Statement>> {
+    let mut out: Vec<Statement> = Vec::new();
+    let mut buf = TemplateBuf::new();
+    let nodes = trim_boundary_whitespace(&f.nodes);
+    let nodes = trim_boundary_text(nodes);
+    let mut last_was_component = false;
+    let mut after_dropped_comment = false;
+    for n in nodes.iter() {
+        if last_was_component {
+            if !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()) {
+                buf.push_str("<!---->");
+                last_was_component = false;
+            }
+        }
+        if after_dropped_comment {
+            if let FragmentChild::Text(t) = n {
+                let escaped = escape_text(&collapse_ws(&t.data));
+                buf.push_str_after_comment(&escaped);
+                after_dropped_comment = false;
+                continue;
+            }
+            after_dropped_comment = false;
+        }
+        if let FragmentChild::Comment(_) = n {
+            after_dropped_comment = true;
+            continue;
+        }
+        // `<title>` (parsed as TitleElement variant) → separate
+        // `$$renderer.title(($$renderer) => { ... })` call.
+        if let FragmentChild::TitleElement(el) = n {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            let mut inner_buf = TemplateBuf::new();
+            inner_buf.push_str("<title>");
+            let kids = trim_boundary_whitespace(&el.fragment.nodes);
+            let kids = trim_boundary_text(kids);
+            for k in kids.iter() {
+                append_node_to_template(k, &mut inner_buf)?;
+            }
+            inner_buf.push_str("</title>");
+            let inner_body = inner_buf.flush().into_iter().collect::<Vec<_>>();
+            let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params: vec![t::pat_id("$$renderer")],
+                body: ArrowBody::Block(Box::new(BlockStatement {
+                    body: inner_body,
+                    span: Span::ZERO,
+                })),
+                r#async: false,
+                span: Span::ZERO,
+            }));
+            out.push(t::stmt(t::call(
+                t::member_id(t::id("$$renderer"), "title"),
+                vec![arrow],
+            )));
+            last_was_component = false;
+            continue;
+        }
+        // Non-inline (Components, blocks) inside <svelte:head> follow the
+        // same flush + emit pattern as the top-level loop.
+        if let FragmentChild::RegularElement(el) = n {
+            if element_contains_non_inline(el) {
+                lower_element_with_non_inline_children(el, &mut buf, &mut out)?;
+                last_was_component = false;
+                continue;
+            }
+        }
+        if append_node_to_template(n, &mut buf).is_none() {
+            if let Some(stmt) = buf.flush() {
+                out.push(stmt);
+            }
+            match n {
+                FragmentChild::Component(c) => {
+                    out.push(lower_component_server(c)?);
+                    last_was_component = true;
+                }
+                FragmentChild::SvelteElement(el) => {
+                    out.push(lower_svelte_element_server(el)?);
+                }
+                FragmentChild::EachBlock(eb) => {
+                    out.extend(lower_each_block_server(eb)?);
+                }
+                FragmentChild::IfBlock(ib) => {
+                    out.extend(lower_if_block_server(ib)?);
+                    buf.push_str("<!--]-->");
+                }
+                _ => return None,
+            }
+        } else {
+            last_was_component = false;
+        }
+    }
+    if last_was_component {
+        buf.push_str("<!---->");
+    }
+    if let Some(stmt) = buf.flush() {
+        out.push(stmt);
+    }
+    Some(out)
 }
 
 /// Lower a fragment with an optional leading `<!---->` marker (prepended
@@ -1396,6 +1742,10 @@ fn lower_fragment_with_marker(
                         declarations: ct.declaration.declarations.clone(),
                         span: Span::ZERO,
                     })));
+                    last_was_component = false;
+                }
+                FragmentChild::SvelteHead(sh) => {
+                    out.push(lower_svelte_head_server(sh)?);
                     last_was_component = false;
                 }
                 _ => return None,
@@ -3408,7 +3758,6 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
         }))),
         AttributeValue::Single(tag) => tag.expression.clone(),
         AttributeValue::Many(parts) => {
-            // For now, only support single-part Text or single-part Expression.
             if parts.len() == 1 {
                 match &parts[0] {
                     AttributeValuePart::Text(t) => {
@@ -3421,8 +3770,36 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
                     AttributeValuePart::ExpressionTag(e) => e.expression.clone(),
                 }
             } else {
-                // TODO: concatenated parts → template literal.
-                return None;
+                // Concatenated parts → template literal with `$.stringify`
+                // interpolations.
+                let mut quasis: Vec<String> = Vec::with_capacity(parts.len() + 1);
+                let mut exprs: Vec<Expression> = Vec::with_capacity(parts.len());
+                let mut pending: String = String::new();
+                let mut expecting_quasi = true;
+                for p in parts {
+                    match p {
+                        AttributeValuePart::Text(t) => {
+                            pending.push_str(&t.data);
+                            expecting_quasi = false;
+                        }
+                        AttributeValuePart::ExpressionTag(tag) => {
+                            if expecting_quasi {
+                                quasis.push(std::mem::take(&mut pending));
+                            } else {
+                                quasis.push(std::mem::take(&mut pending));
+                                expecting_quasi = true;
+                            }
+                            exprs.push(Expression::Call(Box::new(CallExpression {
+                                callee: t::member_id(t::id("$"), "stringify"),
+                                arguments: vec![Argument::Expression(tag.expression.clone())],
+                                optional: false,
+                                span: Span::ZERO,
+                            })));
+                        }
+                    }
+                }
+                quasis.push(pending);
+                t::template_raw(quasis, exprs)
             }
         }
     };
