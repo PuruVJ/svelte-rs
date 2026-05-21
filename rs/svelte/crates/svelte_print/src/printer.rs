@@ -83,6 +83,11 @@ struct Printer {
     out: String,
     indent: String,
     indent_unit: String,
+    /// Mirrors esrap's `Context.multiline` — set when `newline()` /
+    /// `line()` / margin-emitter explicitly broke a line. Content that
+    /// contains `\n` characters via `write` does NOT trigger this (e.g.
+    /// a multi-line comment's data).
+    multiline: bool,
 }
 
 impl Printer {
@@ -91,6 +96,7 @@ impl Printer {
             out: String::with_capacity(1024),
             indent: String::new(),
             indent_unit: opts.indent.unwrap_or_else(|| "\t".to_string()),
+            multiline: false,
         }
     }
 
@@ -101,6 +107,7 @@ impl Printer {
     fn newline(&mut self) {
         self.out.push('\n');
         self.out.push_str(&self.indent);
+        self.multiline = true;
     }
 
     /// Drop any trailing whitespace then push a single `\n` — used between
@@ -111,6 +118,7 @@ impl Printer {
         }
         self.out.push('\n');
         self.out.push_str(&self.indent);
+        self.multiline = true;
     }
 
     fn blank_line(&mut self) {
@@ -225,17 +233,17 @@ impl Printer {
     fn emit_fragment(&mut self, f: &Fragment, _inline: bool) {
         let sequences = clean_and_sequence(&f.nodes);
 
-        // Render each sequence into a probe string so we can measure
-        // multiline state + total width.
+        // Render each sequence into a probe so we can measure multiline
+        // state + width. Multiline reflects only explicit newline() calls
+        // during the probe (matches esrap's Context.multiline).
         let mut rendered: Vec<(String, bool)> = Vec::with_capacity(sequences.len());
         let mut width = 0usize;
         let mut any_multiline = false;
         for seq in &sequences {
-            let probe = self.render_sequence_to_string(seq);
-            let multiline = probe.contains('\n');
-            width += measure_width(&probe);
-            any_multiline |= multiline;
-            rendered.push((probe, multiline));
+            let (probe, ml) = self.render_sequence(seq);
+            width += probe.chars().count();
+            any_multiline |= ml;
+            rendered.push((probe, ml));
         }
         let multiline = any_multiline || width > LINE_BREAK_THRESHOLD;
 
@@ -253,20 +261,24 @@ impl Printer {
                 }
             }
             self.write(&rendered[i].0);
+            if rendered[i].1 {
+                self.multiline = true;
+            }
         }
     }
 
-    fn render_sequence_to_string(&self, seq: &[FragmentChild]) -> String {
+    fn render_sequence(&self, seq: &[FragmentChild]) -> (String, bool) {
         // Render the sequence in a sub-printer that inherits current indent.
         let mut sub = Printer {
             out: String::with_capacity(64),
             indent: self.indent.clone(),
             indent_unit: self.indent_unit.clone(),
+            multiline: false,
         };
         for n in seq {
             sub.emit_node(n);
         }
-        sub.out
+        (sub.out, sub.multiline)
     }
 
     fn last_was_newline(&self) -> bool {
@@ -389,9 +401,9 @@ impl Printer {
     }
 
     fn emit_svelte_element(&mut self, el: &SvelteElement) {
-        // SvelteElement has its own self-close path in upstream — same
-        // shape as SvelteComponent. Empty body → `<svelte:element this={X} />`;
-        // body → `<svelte:element this={X} ...>body</svelte:element>`.
+        // SvelteElement: self-close when empty body; otherwise always use
+        // block-style body (upstream calls `block(context, fragment)`
+        // without the `allow_inline` flag — see print/index.js:858).
         let mut attrs: Vec<ElementAttribute> = Vec::with_capacity(el.attributes.len() + 1);
         attrs.push(ElementAttribute::Attribute(Attribute {
             start: 0,
@@ -405,9 +417,33 @@ impl Printer {
             }),
         }));
         attrs.extend(el.attributes.iter().cloned());
-        let has_body = !el.fragment.nodes.is_empty();
-        // is_void = true forces self-close on empty body.
-        self.emit_element_open("svelte:element", &attrs, &el.fragment, !has_body);
+        if el.fragment.nodes.is_empty() {
+            self.emit_element_open("svelte:element", &attrs, &el.fragment, true);
+            return;
+        }
+        // Open tag (attrs may wrap).
+        let attr_strs: Vec<String> = attrs.iter().map(|a| self.attribute_to_string(a)).collect();
+        let inline_len = "svelte:element".len() + 2
+            + attr_strs.iter().map(|s| s.len() + 1).sum::<usize>();
+        let wrap_attrs = inline_len > LINE_BREAK_THRESHOLD && !attr_strs.is_empty();
+        self.write("<svelte:element");
+        if wrap_attrs {
+            self.indent_in();
+            for s in &attr_strs {
+                self.newline();
+                self.write(s);
+            }
+            self.indent_out();
+            self.newline();
+        } else {
+            for s in &attr_strs {
+                self.write(" ");
+                self.write(s);
+            }
+        }
+        self.write(">");
+        self.emit_block_body(&el.fragment);
+        self.write("</svelte:element>");
     }
 
     fn emit_svelte_component(&mut self, el: &SvelteComponent) {
@@ -453,6 +489,7 @@ impl Printer {
             && inline_len > LINE_BREAK_THRESHOLD
             && !attr_strs.is_empty();
 
+        let is_doctype = name.eq_ignore_ascii_case("!doctype");
         self.write("<");
         self.write(name);
         if wrap_attrs {
@@ -468,6 +505,11 @@ impl Printer {
                 self.write(" ");
                 self.write(s);
             }
+        }
+        // Doctype: just close with `>`, no body / close tag.
+        if is_doctype {
+            self.write(">");
+            return;
         }
         // Empty body — self-close (`<X />` or `<X attrs />`) ONLY for
         // void HTML, Components, `svelte:options`, namespaced (`Foo.Bar`),
@@ -507,9 +549,7 @@ impl Printer {
         self.indent_in();
         let mut rendered: Vec<(String, bool)> = Vec::with_capacity(sequences.len());
         for seq in &sequences {
-            let probe = self.render_sequence_to_string(seq);
-            let multiline = probe.contains('\n');
-            rendered.push((probe, multiline));
+            rendered.push(self.render_sequence(seq));
         }
         for (i, (s, m)) in rendered.iter().enumerate() {
             let prev_multiline = if i > 0 { rendered[i - 1].1 } else { false };
@@ -542,11 +582,10 @@ impl Printer {
         let mut width = 0usize;
         let mut any_multiline = false;
         for seq in &sequences {
-            let probe = self.render_sequence_to_string(seq);
-            let multiline = probe.contains('\n');
-            width += measure_width(&probe);
-            any_multiline |= multiline;
-            rendered.push((probe, multiline));
+            let (probe, ml) = self.render_sequence(seq);
+            width += probe.chars().count();
+            any_multiline |= ml;
+            rendered.push((probe, ml));
         }
         let multiline = any_multiline || width > LINE_BREAK_THRESHOLD;
         self.indent_out();
