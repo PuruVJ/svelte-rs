@@ -223,9 +223,16 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             // a single expression. Otherwise block.
             let s = current_sync.remove(0);
             if let Statement::Expression(es) = s {
+                // `await EXPR;` (top-level) unwraps to just `EXPR` — the
+                // `$$renderer.run` handler awaits each thunk internally,
+                // so the thunk body should be the awaited expression.
+                let body_expr = match es.expression {
+                    Expression::Await(a) => a.argument,
+                    other => other,
+                };
                 groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
-                    body: ArrowBody::Expression(es.expression),
+                    body: ArrowBody::Expression(body_expr),
                     r#async: false,
                     span: Span::ZERO,
                 })));
