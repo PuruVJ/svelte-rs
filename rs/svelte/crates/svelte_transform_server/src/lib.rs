@@ -256,6 +256,16 @@ pub fn try_typed_server_component_full(
     // do-while `$$settled` wrap pattern.
     let needs_bind_wrap = fragment_has_component_bind(&fragment);
 
+    // is_standalone: top-level fragment trims to exactly one RenderTag.
+    // Mirrors upstream's clean_nodes is_standalone flag, which suppresses
+    // the trailing `<!---->` anchor for the lone render tag.
+    let top_is_standalone = {
+        let trimmed = trim_boundary_text(&trim_boundary_whitespace(&fragment.nodes));
+        trimmed.len() == 1
+            && matches!(trimmed[0], FragmentChild::RenderTag(_))
+    };
+    IS_STANDALONE.with(|s| s.set(top_is_standalone));
+
     let template_body = if let Some(ai) = &async_info {
         lower_fragment_server_async(
             &fragment,
@@ -266,6 +276,10 @@ pub fn try_typed_server_component_full(
     } else {
         lower_fragment_server(&fragment)?
     };
+
+    // After lowering the top-level fragment, clear so nested arrow bodies
+    // (option, select callbacks) don't inherit the standalone flag.
+    IS_STANDALONE.with(|s| s.set(false));
 
     if needs_bind_wrap {
         // Script bindings stay at the outer function-body level; only the
@@ -2012,6 +2026,11 @@ thread_local! {
     /// Counter for each-block `each_array` names — first is `each_array`,
     /// then `each_array_1`, `each_array_2`, ... Reset per component.
     static EACH_ARRAY_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    /// Set by the top-level component lowerer when the trimmed top fragment
+    /// is exactly a single RenderTag (or Component) — mirrors upstream's
+    /// `is_standalone` flag, which suppresses the trailing `<!---->` anchor
+    /// for the lone render tag. Reset per component to false.
+    static IS_STANDALONE: std::cell::Cell<bool> = std::cell::Cell::new(false);
     /// Filename for the current component compile, used to seed the
     /// `$.head(HASH, ...)` hash. Set by `try_typed_server_component_with_filename`.
     static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
@@ -2703,9 +2722,42 @@ fn lower_fragment_with_marker(
                 }
                 FragmentChild::RenderTag(rt) => {
                     out.push(lower_render_tag_for_select(rt)?);
-                    // `{@render snippet()}` at top level (outside select)
-                    // emits a trailing `<!---->` anchor on the next push.
-                    buf.push_str("<!---->");
+                    // `{@render snippet()}` emits a trailing `<!---->` anchor
+                    // unless this fragment is "standalone" — i.e. its trimmed
+                    // contents are exactly a single RenderTag. Standalone
+                    // detection is performed by the caller (top-level Main)
+                    // and threaded in via the IS_STANDALONE thread-local;
+                    // otherwise the anchor is always emitted on the next push.
+                    if !IS_STANDALONE.with(|s| s.get()) {
+                        buf.push_str("<!---->");
+                    }
+                    last_was_component = false;
+                }
+                FragmentChild::HtmlTag(tag) => {
+                    // `{@html await EXPR}` → wrap in `child_block(async …)`
+                    // with the `await EXPR` rewritten to `(await $.save(EXPR))()`.
+                    let inner = wrap_async_test(&tag.expression);
+                    let html_call = t::call(
+                        t::member_id(t::id("$"), "html"),
+                        vec![inner],
+                    );
+                    let push_call = t::stmt(t::call(
+                        t::member_id(t::id("$$renderer"), "push"),
+                        vec![html_call],
+                    ));
+                    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: vec![t::pat_id("$$renderer")],
+                        body: ArrowBody::Block(Box::new(BlockStatement {
+                            body: vec![push_call],
+                            span: Span::ZERO,
+                        })),
+                        r#async: true,
+                        span: Span::ZERO,
+                    }));
+                    out.push(t::stmt(t::call(
+                        t::member_id(t::id("$$renderer"), "child_block"),
+                        vec![arrow],
+                    )));
                     last_was_component = false;
                 }
                 _ => return None,
@@ -4657,6 +4709,8 @@ fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement) -> boo
             | FragmentChild::RenderTag(_)
             | FragmentChild::SvelteHead(_)
             | FragmentChild::SvelteBoundary(_) => true,
+            // `{@html await EXPR}` splits into child_block — non-inline.
+            FragmentChild::HtmlTag(t) => expr_has_await_top(&t.expression),
             FragmentChild::RegularElement(child) => {
                 child.fragment.nodes.iter().any(node_is_non_inline)
             }
@@ -4730,6 +4784,30 @@ fn lower_element_with_non_inline_children(
                 FragmentChild::RegularElement(child) if element_contains_non_inline(child) => {
                     lower_element_with_non_inline_children(child, buf, out)?;
                 }
+                FragmentChild::HtmlTag(tag) if expr_has_await_top(&tag.expression) => {
+                    let inner = wrap_async_test(&tag.expression);
+                    let html_call = t::call(
+                        t::member_id(t::id("$"), "html"),
+                        vec![inner],
+                    );
+                    let push_call = t::stmt(t::call(
+                        t::member_id(t::id("$$renderer"), "push"),
+                        vec![html_call],
+                    ));
+                    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: vec![t::pat_id("$$renderer")],
+                        body: ArrowBody::Block(Box::new(BlockStatement {
+                            body: vec![push_call],
+                            span: Span::ZERO,
+                        })),
+                        r#async: true,
+                        span: Span::ZERO,
+                    }));
+                    out.push(t::stmt(t::call(
+                        t::member_id(t::id("$$renderer"), "child_block"),
+                        vec![arrow],
+                    )));
+                }
                 _ => return None,
             }
         } else {
@@ -4766,6 +4844,11 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             Some(())
         }
         FragmentChild::HtmlTag(tag) => {
+            // `{@html await EXPR}` cannot be inlined — splitting into
+            // `child_block(async ...)` happens in the outer lowerer.
+            if expr_has_await_top(&tag.expression) {
+                return None;
+            }
             // `{@html EXPR}` → `${$.html(EXPR)}` (no escaping).
             buf.push_expr(Expression::Call(Box::new(CallExpression {
                 callee: t::member_id(t::id("$"), "html"),
