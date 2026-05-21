@@ -1034,6 +1034,7 @@ dependencies = [
  "svelte_ast",
  "svelte_codegen_js",
  "svelte_diagnostics",
+ "svelte_js_ast",
  "svelte_magic_string",
  "svelte_parse",
 ]
