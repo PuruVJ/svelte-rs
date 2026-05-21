@@ -2202,18 +2202,32 @@ fn lower_fragment_with_marker(
                 continue;
             }
         }
-        // `<textarea>` has a unique server lowering: the `value=` attr or
-        // the body content gets extracted to `const $$body = $.escape(...)`
-        // and conditionally pushed as the element's inner text.
+        // `<textarea>` with a `value=` attr OR a non-empty body uses the
+        // `$$body = $.escape(...)` pattern. Otherwise it stays inline
+        // (just `<textarea attrs></textarea>`).
         if let FragmentChild::RegularElement(el) = n {
             if el.name == "textarea" {
-                if let Some(stmt) = buf.flush() {
-                    emitted_static_push = true;
-                    out.push(stmt);
+                let has_value = el.attributes.iter().any(|a| matches!(
+                    a,
+                    ElementAttribute::Attribute(attr) if attr.name == "value"
+                ) || matches!(
+                    a,
+                    ElementAttribute::BindDirective(b) if b.name == "value"
+                ));
+                let has_body = el.fragment.nodes.iter().any(|c| match c {
+                    FragmentChild::Text(t) => !t.data.trim().is_empty(),
+                    FragmentChild::Comment(_) => false,
+                    _ => true,
+                });
+                if has_value || has_body {
+                    if let Some(stmt) = buf.flush() {
+                        emitted_static_push = true;
+                        out.push(stmt);
+                    }
+                    out.extend(lower_textarea_server(el)?);
+                    last_was_component = false;
+                    continue;
                 }
-                out.extend(lower_textarea_server(el)?);
-                last_was_component = false;
-                continue;
             }
         }
         // `<select value=X ...>` or `<select bind:value={x}>` → wrap shape
