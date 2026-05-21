@@ -2797,10 +2797,18 @@ fn lower_fragment_with_marker(
                     last_was_component = false;
                 }
                 FragmentChild::ExpressionTag(tag) if expr_has_await_top(&tag.expression) => {
-                    let rewritten = wrap_async_test(&tag.expression);
+                    // `{await IDENT}` stays raw; anything richer (`await
+                    // CALL()`, `(await X) && Y`, …) routes through
+                    // `wrap_async_test` so each inner await becomes
+                    // `(await $.save(...))()`.
+                    let inner = if is_bare_await_ident(&tag.expression) {
+                        tag.expression.clone()
+                    } else {
+                        wrap_async_test(&tag.expression)
+                    };
                     let escape_call = t::call(
                         t::member_id(t::id("$"), "escape"),
-                        vec![rewritten],
+                        vec![inner],
                     );
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
@@ -4362,6 +4370,16 @@ fn build_if_chain_server_ex(
     })))
 }
 
+/// True when the expression is exactly `await IDENT` — the case upstream
+/// leaves untouched (no `$.save` wrap) because there's nothing to optimise.
+fn is_bare_await_ident(e: &Expression) -> bool {
+    if let Expression::Await(a) = e {
+        matches!(a.argument, Expression::Identifier(_))
+    } else {
+        false
+    }
+}
+
 /// `EXPR` → `(await $.save(EXPR))()`. Used when an async block's test
 /// needs blocker tracking.
 fn wrap_async_test(test: &Expression) -> Expression {
@@ -4474,10 +4492,13 @@ fn lower_fragment_for_async_block(
                 if let Some(stmt) = buf.flush() {
                     out.push(stmt);
                 }
-                // `$$renderer.push(async () => $.escape(await EXPR))`
+                // Inside an async block body, the await stays raw — upstream's
+                // PromiseOptimiser leaves the AwaitExpression as-is when it's
+                // the only content of an async push.
+                let inner = t.expression.clone();
                 let escape_call = t::call(
                     t::member_id(t::id("$"), "escape"),
-                    vec![t.expression.clone()],
+                    vec![inner],
                 );
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
