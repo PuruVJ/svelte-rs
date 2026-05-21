@@ -87,9 +87,12 @@ pub fn compile(
                 );
                 analysis.css_hash = hash.clone();
                 let rendered = analysis.css.as_ref().map(|sheet| {
-                    svelte_analyze::css_render::render_stylesheet_with_opts(
+                    let raw = svelte_analyze::css_render::render_stylesheet_with_opts(
                         source, sheet, &analysis.css_meta, &hash, false,
-                    )
+                    );
+                    // Upstream's `inject_styles && !dev` triggers minification.
+                    // We post-process the rendered CSS to match.
+                    minify_css(&raw)
                 });
                 rendered.map(|code| (hash, code))
             } else {
@@ -197,6 +200,72 @@ fn value_to_typed_comment_stub(c: &serde_json::Value) -> Option<svelte_codegen_j
         start: obj.get("start")?.as_u64()? as u32,
         end: obj.get("end")?.as_u64()? as u32,
     })
+}
+
+/// Simple CSS minifier — collapses whitespace around `{`, `}`, `:`, `;`
+/// and strips line breaks inside rule bodies. Used for SSR injected CSS
+/// to match upstream's `minify: inject_styles && !dev` output.
+fn minify_css(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    // States for whitespace handling. After certain tokens we suppress
+    // following whitespace (no space after `{` etc.).
+    let mut just_emitted_space = true; // suppress leading WS
+    let mut suppress_next_ws = true;
+    while let Some(c) = chars.next() {
+        match c {
+            // `/* ... */` comments are dropped in minify mode.
+            '/' if matches!(chars.peek(), Some('*')) => {
+                chars.next();
+                let mut prev = '\0';
+                for cc in chars.by_ref() {
+                    if prev == '*' && cc == '/' {
+                        break;
+                    }
+                    prev = cc;
+                }
+                // Treat the dropped comment as whitespace: collapse to a
+                // single space (unless suppressed).
+                if !suppress_next_ws && !just_emitted_space {
+                    out.push(' ');
+                    just_emitted_space = true;
+                }
+                continue;
+            }
+            // `{` keeps a leading space (`.foo {color}` — selector-brace gap).
+            '{' => {
+                out.push(c);
+                suppress_next_ws = true;
+                just_emitted_space = false;
+            }
+            '}' | ';' | ':' | ',' => {
+                // Strip any trailing space we just emitted.
+                if out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c);
+                suppress_next_ws = true;
+                just_emitted_space = false;
+            }
+            ' ' | '\t' | '\n' | '\r' => {
+                if suppress_next_ws || just_emitted_space {
+                    continue;
+                }
+                out.push(' ');
+                just_emitted_space = true;
+            }
+            _ => {
+                out.push(c);
+                just_emitted_space = false;
+                suppress_next_ws = false;
+            }
+        }
+    }
+    // Trim final whitespace.
+    while out.ends_with(' ') || out.ends_with('\n') || out.ends_with('\t') {
+        out.pop();
+    }
+    out
 }
 
 /// Detect `<svelte:options css="injected" />` at the root level.
