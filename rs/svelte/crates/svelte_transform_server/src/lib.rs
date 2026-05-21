@@ -2060,6 +2060,11 @@ thread_local! {
     /// inner fragment processor strips whitespace between adjacent
     /// Components (matches upstream's `<select>`-body clean_nodes).
     static IN_SELECT_BODY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// Set by `lower_component_server` when the returned statement is a
+    /// `$$renderer.child_block(async …)` wrap — upstream skips the
+    /// trailing `<!---->` anchor for async-wrapped components (component.js
+    /// line 351-357).
+    static LAST_COMPONENT_WAS_ASYNC: std::cell::Cell<bool> = std::cell::Cell::new(false);
     /// Filename for the current component compile, used to seed the
     /// `$.head(HASH, ...)` hash. Set by `try_typed_server_component_with_filename`.
     static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
@@ -2485,7 +2490,8 @@ fn lower_head_fragment(
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
                         .with(|s| s.borrow().contains(&c.name));
-                    last_was_component = !is_state;
+                    let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
+                    last_was_component = !is_state && !async_wrapped;
                 }
                 FragmentChild::SvelteElement(el) => {
                     out.push(lower_svelte_element_server(el)?);
@@ -2719,7 +2725,8 @@ fn lower_fragment_with_marker(
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
                         .with(|s| s.borrow().contains(&c.name));
-                    last_was_component = !is_state;
+                    let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
+                    last_was_component = !is_state && !async_wrapped;
                 }
                 FragmentChild::SvelteElement(el) => {
                     out.push(lower_svelte_element_server(el)?);
@@ -5030,7 +5037,8 @@ fn lower_element_with_non_inline_children(
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
                         .with(|s| s.borrow().contains(&c.name));
-                    last_was_component = !is_state;
+                    let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
+                    last_was_component = !is_state && !async_wrapped;
                 }
                 FragmentChild::SvelteElement(child) => {
                     out.push(lower_svelte_element_server(child)?);
@@ -6011,10 +6019,52 @@ fn lower_svelte_element_server(
 /// `<Foo a={x} b="y" {...rest}>BODY</Foo>` → `Foo($$renderer, { a: x, b: 'y', ...rest, children: ..., $$slots: { default: true } });`.
 /// Directives (`bind:this`, `on:click`, etc.) are dropped server-side.
 fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Statement> {
+    // Detect attributes whose value contains a top-level await. Each such
+    // expression gets hoisted to `const $$N = (await $.save(EXPR))()` inside
+    // a `$$renderer.child_block(async ...)` wrap, and the attribute uses
+    // the `$$N` placeholder.
+    let mut await_hoists: Vec<Expression> = Vec::new();
     let mut props: Vec<ObjectMember> = Vec::new();
     for attr in &c.attributes {
         match attr {
             ElementAttribute::Attribute(a) => {
+                // Inspect attribute value for top-level await.
+                let await_expr: Option<Expression> = match &a.value {
+                    AttributeValue::Single(t) if expr_has_await_top(&t.expression) => {
+                        Some(t.expression.clone())
+                    }
+                    AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
+                        AttributeValuePart::ExpressionTag(t)
+                            if expr_has_await_top(&t.expression) =>
+                        {
+                            Some(t.expression.clone())
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(expr) = await_expr {
+                    let idx = await_hoists.len();
+                    await_hoists.push(expr);
+                    let placeholder = if idx == 0 {
+                        "$$0".to_string()
+                    } else {
+                        format!("$${idx}")
+                    };
+                    props.push(ObjectMember::Property(Box::new(Property {
+                        key: PropertyKey::Identifier(Identifier {
+                            name: a.name.clone(),
+                            span: Span::ZERO,
+                        }),
+                        value: t::id(&placeholder),
+                        kind: PropertyKind::Init,
+                        computed: false,
+                        shorthand: false,
+                        method: false,
+                        span: Span::ZERO,
+                    })));
+                    continue;
+                }
                 if let Some(prop) = attribute_to_object_member(a) {
                     props.push(prop);
                 } else {
@@ -6143,7 +6193,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
     // State-bound Component (e.g. `let Component = $state()`) — the
     // binding can be nullish so wrap in `if (X) { ... } else { ... }`.
     let nullish = STATE_BINDINGS.with(|s| s.borrow().contains(&c.name));
-    if nullish {
+    let inner_stmt = if nullish {
         let then_branch = vec![
             push_string("<!--[-->"),
             t::stmt(call),
@@ -6153,7 +6203,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
             push_string("<!--[!-->"),
             push_string("<!--]-->"),
         ];
-        return Some(Statement::If(Box::new(IfStatement {
+        Statement::If(Box::new(IfStatement {
             test: t::id(&c.name),
             consequent: Statement::Block(Box::new(BlockStatement {
                 body: then_branch,
@@ -6164,9 +6214,52 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
                 span: Span::ZERO,
             }))),
             span: Span::ZERO,
-        })));
+        }))
+    } else {
+        t::stmt(call)
+    };
+
+    // If any attribute had a top-level await, wrap the component call in
+    // `$$renderer.child_block(async ($$renderer) => { const $$N = (await
+    // $.save(EXPR))(); …; Component(…); })`.
+    LAST_COMPONENT_WAS_ASYNC.with(|c| c.set(false));
+    if !await_hoists.is_empty() {
+        LAST_COMPONENT_WAS_ASYNC.with(|c| c.set(true));
+        let mut body: Vec<Statement> = Vec::new();
+        for (i, expr) in await_hoists.iter().enumerate() {
+            let placeholder = if i == 0 {
+                "$$0".to_string()
+            } else {
+                format!("$${i}")
+            };
+            let saved = wrap_async_test(expr);
+            body.push(Statement::Variable(Box::new(VariableDeclaration {
+                kind: VariableKind::Const,
+                declarations: vec![VariableDeclarator {
+                    id: t::pat_id(&placeholder),
+                    init: Some(saved),
+                    span: Span::ZERO,
+                }],
+                span: Span::ZERO,
+            })));
+        }
+        body.push(inner_stmt);
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body,
+                span: Span::ZERO,
+            })),
+            r#async: true,
+            span: Span::ZERO,
+        }));
+        return Some(t::stmt(t::call(
+            t::member_id(t::id("$$renderer"), "child_block"),
+            vec![arrow],
+        )));
     }
-    Some(t::stmt(call))
+
+    Some(inner_stmt)
 }
 
 /// `bind:NAME={target}` → `get NAME() { return target; }` accessor pair.
