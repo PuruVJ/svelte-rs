@@ -63,12 +63,14 @@ pub fn try_typed_server_component_with(
     if fragment_has_unsafe_call(&root.fragment) {
         needs_component_wrap = true;
     }
+    let mut legacy_export_props: Vec<String> = Vec::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
         uses_props = info.uses_props;
         needs_component_wrap |= info.needs_component_wrap();
         derived_bindings = info.derived_bindings;
+        legacy_export_props = info.legacy_export_props;
         if let Some(name) = &info.single_id_props {
             script::rewrite_props_destructure(&mut content, name);
         }
@@ -126,6 +128,35 @@ pub fn try_typed_server_component_with(
         func_body.extend(outer_settled);
     } else {
         func_body.extend(template_body);
+    }
+
+    // Legacy `export let X` writes back through `$.bind_props` at the end
+    // so the parent component sees mutations made inside the child.
+    if !legacy_export_props.is_empty() {
+        let mut props: Vec<ObjectMember> = Vec::with_capacity(legacy_export_props.len());
+        for name in &legacy_export_props {
+            props.push(ObjectMember::Property(Box::new(Property {
+                key: PropertyKey::Identifier(Identifier {
+                    name: name.clone(),
+                    span: Span::ZERO,
+                }),
+                value: t::id(name),
+                kind: PropertyKind::Init,
+                computed: false,
+                shorthand: true,
+                method: false,
+                span: Span::ZERO,
+            })));
+        }
+        let obj = Expression::Object(Box::new(ObjectExpression {
+            properties: props,
+            span: Span::ZERO,
+        }));
+        func_body.push(t::stmt(t::call(
+            t::member_id(t::id("$"), "bind_props"),
+            vec![t::id("$$props"), obj],
+        )));
+        uses_props = true;
     }
 
     // When script triggers component-context: wrap the whole body in
@@ -2971,11 +3002,52 @@ fn append_value_attribute(
                     }
                 }
                 buf.push_str("\"");
-                Some(())
-            } else {
-                // TODO: concat parts via template literal + $.attr.
-                None
+                return Some(());
             }
+            // Mixed Text + ExpressionTag → render as a template literal
+            // with `$.stringify(EXPR)` interpolations, wrapped in `$.attr`.
+            // Quasis come from text runs; consecutive ExpressionTags need
+            // an empty quasi between them to satisfy template-literal shape
+            // (N expressions → N+1 quasis).
+            let mut quasis: Vec<String> = Vec::with_capacity(parts.len() + 1);
+            let mut exprs: Vec<Expression> = Vec::with_capacity(parts.len());
+            let mut pending: String = String::new();
+            let mut expecting_quasi = true;
+            for p in parts {
+                match p {
+                    AttributeValuePart::Text(t) => {
+                        pending.push_str(&t.data);
+                        expecting_quasi = false;
+                    }
+                    AttributeValuePart::ExpressionTag(tag) => {
+                        if expecting_quasi {
+                            // Two ExpressionTags in a row — flush an empty quasi.
+                            quasis.push(std::mem::take(&mut pending));
+                        } else {
+                            quasis.push(std::mem::take(&mut pending));
+                            expecting_quasi = true;
+                        }
+                        exprs.push(Expression::Call(Box::new(CallExpression {
+                            callee: t::member_id(t::id("$"), "stringify"),
+                            arguments: vec![Argument::Expression(tag.expression.clone())],
+                            optional: false,
+                            span: Span::ZERO,
+                        })));
+                    }
+                }
+            }
+            quasis.push(pending);
+            let tpl = t::template_raw(quasis, exprs);
+            buf.push_expr(Expression::Call(Box::new(CallExpression {
+                callee: t::member_id(t::id("$"), "attr"),
+                arguments: vec![
+                    Argument::Expression(string_lit(name)),
+                    Argument::Expression(tpl),
+                ],
+                optional: false,
+                span: Span::ZERO,
+            })));
+            Some(())
         }
     }
 }

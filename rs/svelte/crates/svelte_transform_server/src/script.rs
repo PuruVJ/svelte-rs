@@ -29,6 +29,10 @@ pub struct RewriteInfo {
     pub single_id_props: Option<String>,
     /// Set when the script contains a class with rune-initialized fields.
     pub has_class_with_runes: bool,
+    /// Legacy `export let NAME[=default]` bindings, in source order. The
+    /// caller emits `$.bind_props($$props, { NAME, ... })` at the end of
+    /// the function body for these.
+    pub legacy_export_props: Vec<String>,
 }
 
 /// Result of `transform_async_script_server` — non-None when the script
@@ -694,6 +698,79 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
     for s in &mut p.body {
         rewrite_statement(s, &mut ctx);
     }
+
+    // Lower legacy `export let X[=default]` into plain `let` declarations
+    // that read from `$$props`. Preserves source order so the trailing
+    // `$.bind_props($$props, { X, Y, ... })` can be emitted by the caller
+    // with bindings in the right order.
+    let mut legacy_export_props: Vec<String> = Vec::new();
+    let mut new_body: Vec<Statement> = Vec::with_capacity(p.body.len());
+    for stmt in std::mem::take(&mut p.body) {
+        match stmt {
+            Statement::ExportNamed(e) if e.declaration.is_some() => {
+                // Only handle `export let NAME[=DEFAULT]` shape. Anything
+                // else (export class, export function) — strip the `export`
+                // and emit the inner declaration unchanged.
+                let mut owned = e;
+                let decl = owned.declaration.take();
+                match decl {
+                    Some(Statement::Variable(v))
+                        if matches!(v.kind, VariableKind::Let | VariableKind::Var) =>
+                    {
+                        let v = *v;
+                        for d in &v.declarations {
+                            if let Pattern::Identifier(id) = &d.id {
+                                legacy_export_props.push(id.name.clone());
+                            }
+                        }
+                        // Emit one `let X = $$props['X'][, $.fallback(...)]`
+                        // per declaration.
+                        for d in v.declarations {
+                            if let Pattern::Identifier(id) = &d.id {
+                                let key = id.name.clone();
+                                let read = Expression::Member(Box::new(MemberExpression {
+                                    object: t::id("$$props"),
+                                    property: MemberProperty::Expression(t::literal_str(&key)),
+                                    computed: true,
+                                    optional: false,
+                                    span: Span::ZERO,
+                                }));
+                                let init = if let Some(def) = d.init {
+                                    t::call(
+                                        t::member_id(t::id("$"), "fallback"),
+                                        vec![read, def],
+                                    )
+                                } else {
+                                    read
+                                };
+                                new_body.push(t::let_decl(&key, Some(init)));
+                            } else {
+                                // Destructured `export let { ... }` — pass
+                                // through unchanged; not lowered yet.
+                                new_body.push(Statement::Variable(Box::new(
+                                    VariableDeclaration {
+                                        kind: v.kind,
+                                        declarations: vec![d],
+                                        span: Span::ZERO,
+                                    },
+                                )));
+                            }
+                        }
+                        ctx.uses_props = true;
+                    }
+                    Some(other) => {
+                        new_body.push(other);
+                    }
+                    None => {
+                        new_body.push(Statement::ExportNamed(owned));
+                    }
+                }
+            }
+            other => new_body.push(other),
+        }
+    }
+    p.body = new_body;
+
     if single_id_props.is_some() || has_class_with_runes {
         ctx.uses_props = true;
     }
@@ -703,6 +780,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
         derived_bindings,
         single_id_props,
         has_class_with_runes,
+        legacy_export_props,
     }
 }
 
