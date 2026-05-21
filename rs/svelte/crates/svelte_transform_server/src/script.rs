@@ -33,6 +33,11 @@ pub struct RewriteInfo {
     /// caller emits `$.bind_props($$props, { NAME, ... })` at the end of
     /// the function body for these.
     pub legacy_export_props: Vec<String>,
+    /// Names of bindings initialized with `$state(...)` (the no-arg form
+    /// reads as `void 0`, so the runtime needs to wrap usages as
+    /// potentially-nullish — e.g. `let Component = $state()` → wrap
+    /// `<Component />` in `if (Component) { ... } else { ... }`).
+    pub state_bindings: HashSet<String>,
 }
 
 /// Result of `transform_async_script_server` — non-None when the script
@@ -711,11 +716,13 @@ impl RewriteInfo {
 pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
     let mut rune_bindings: HashSet<String> = HashSet::new();
     let mut derived_bindings: HashSet<String> = HashSet::new();
+    let mut state_bindings: HashSet<String> = HashSet::new();
     let mut single_id_props: Option<String> = None;
     let mut has_class_with_runes = false;
     for s in &p.body {
         collect_rune_bindings_stmt(s, &mut rune_bindings);
         collect_derived_bindings_stmt(s, &mut derived_bindings);
+        collect_state_bindings_stmt(s, &mut state_bindings);
         check_single_id_props_stmt(s, &mut single_id_props);
         if stmt_has_class_with_runes(s) {
             has_class_with_runes = true;
@@ -845,7 +852,39 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
         single_id_props,
         has_class_with_runes,
         legacy_export_props,
+        state_bindings,
     }
+}
+
+fn collect_state_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
+    match s {
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
+                    if is_state_call(init) {
+                        out.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+        Statement::Block(b) => {
+            for s in &b.body {
+                collect_state_bindings_stmt(s, out);
+            }
+        }
+        Statement::ExportNamed(e) => {
+            if let Some(d) = &e.declaration {
+                collect_state_bindings_stmt(d, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_state_call(e: &Expression) -> bool {
+    let Expression::Call(c) = e else { return false };
+    let Some(kp) = global_keypath(&c.callee) else { return false };
+    matches!(kp.as_str(), "$state" | "$state.raw" | "$state.eager")
 }
 
 fn collect_derived_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {

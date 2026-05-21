@@ -163,6 +163,7 @@ pub fn try_typed_server_component_full(
         }
     }
     let mut legacy_export_props: Vec<String> = Vec::new();
+    let mut state_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
@@ -170,6 +171,7 @@ pub fn try_typed_server_component_full(
         needs_component_wrap |= info.needs_component_wrap();
         derived_bindings = info.derived_bindings;
         legacy_export_props = info.legacy_export_props;
+        state_bindings = info.state_bindings;
         if let Some(name) = &info.single_id_props {
             script::rewrite_props_destructure(&mut content, name);
         }
@@ -182,6 +184,11 @@ pub fn try_typed_server_component_full(
             script_rest = rest;
         }
     }
+    // Stash state bindings for the lowering pass so Component callees can
+    // be wrapped in `if (X) { X(...); } else { ... }` when potentially nullish.
+    STATE_BINDINGS.with(|c| {
+        *c.borrow_mut() = state_bindings.clone();
+    });
 
     // Upstream's MemberExpression analyzer sets `needs_context = true` for
     // any non-safe MemberExpression in template position. A MemberExpression
@@ -1935,6 +1942,11 @@ thread_local! {
     static SIBLING_PROMISES_COUNTER: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// `$state(...)`-initialized binding names for the current component.
+    /// When a Component's callee is a state binding, it's potentially
+    /// nullish — the call gets wrapped in `if (X) X(...) else { ... }`.
+    static STATE_BINDINGS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
 /// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2 variant
@@ -2286,7 +2298,12 @@ fn lower_head_fragment(
             match n {
                 FragmentChild::Component(c) => {
                     out.push(lower_component_server(c)?);
-                    last_was_component = true;
+                    // State-bound components emit an if/else wrap that
+                    // already includes the open/close `<!--[-->` /
+                    // `<!--]-->` markers; no trailing anchor needed.
+                    let is_state = STATE_BINDINGS
+                        .with(|s| s.borrow().contains(&c.name));
+                    last_was_component = !is_state;
                 }
                 FragmentChild::SvelteElement(el) => {
                     out.push(lower_svelte_element_server(el)?);
@@ -2504,7 +2521,12 @@ fn lower_fragment_with_marker(
             match n {
                 FragmentChild::Component(c) => {
                     out.push(lower_component_server(c)?);
-                    last_was_component = true;
+                    // State-bound components emit an if/else wrap that
+                    // already includes the open/close `<!--[-->` /
+                    // `<!--]-->` markers; no trailing anchor needed.
+                    let is_state = STATE_BINDINGS
+                        .with(|s| s.borrow().contains(&c.name));
+                    last_was_component = !is_state;
                 }
                 FragmentChild::SvelteElement(el) => {
                     out.push(lower_svelte_element_server(el)?);
@@ -4473,7 +4495,12 @@ fn lower_element_with_non_inline_children(
             match n {
                 FragmentChild::Component(c) => {
                     out.push(lower_component_server(c)?);
-                    last_was_component = true;
+                    // State-bound components emit an if/else wrap that
+                    // already includes the open/close `<!--[-->` /
+                    // `<!--]-->` markers; no trailing anchor needed.
+                    let is_state = STATE_BINDINGS
+                        .with(|s| s.borrow().contains(&c.name));
+                    last_was_component = !is_state;
                 }
                 FragmentChild::SvelteElement(child) => {
                     out.push(lower_svelte_element_server(child)?);
@@ -5502,12 +5529,39 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
             span: Span::ZERO,
         }))),
     ];
-    Some(t::stmt(Expression::Call(Box::new(CallExpression {
+    let call = Expression::Call(Box::new(CallExpression {
         callee: t::id(&c.name),
         arguments: args,
         optional: false,
         span: Span::ZERO,
-    }))))
+    }));
+    // State-bound Component (e.g. `let Component = $state()`) — the
+    // binding can be nullish so wrap in `if (X) { ... } else { ... }`.
+    let nullish = STATE_BINDINGS.with(|s| s.borrow().contains(&c.name));
+    if nullish {
+        let then_branch = vec![
+            push_string("<!--[-->"),
+            t::stmt(call),
+            push_string("<!--]-->"),
+        ];
+        let else_branch = vec![
+            push_string("<!--[!-->"),
+            push_string("<!--]-->"),
+        ];
+        return Some(Statement::If(Box::new(IfStatement {
+            test: t::id(&c.name),
+            consequent: Statement::Block(Box::new(BlockStatement {
+                body: then_branch,
+                span: Span::ZERO,
+            })),
+            alternate: Some(Statement::Block(Box::new(BlockStatement {
+                body: else_branch,
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        })));
+    }
+    Some(t::stmt(call))
 }
 
 /// `bind:NAME={target}` → `get NAME() { return target; }` accessor pair.
