@@ -101,12 +101,22 @@ fn static_html(fragment: &Fragment) -> Option<String> {
             break;
         }
     }
+    // `is_text_first`: if the fragment's first non-WS child is text, the
+    // top-level push needs a leading `<!---->` anchor (so the text doesn't
+    // get fused into a neighbouring fragment during hydration).
+    let needs_anchor = matches!(
+        fragment.nodes.get(start),
+        Some(FragmentChild::Text(_))
+    );
     let mut out = String::with_capacity(64);
+    if needs_anchor {
+        out.push_str("<!---->");
+    }
     for c in &fragment.nodes[start..end] {
         append_static(c, &mut out)?;
     }
     // Also trim any leading whitespace from the first text and trailing
-    // whitespace from the last, then return.
+    // whitespace from the last.
     let trimmed = out.trim_matches(|c: char| c == ' ').to_string();
     Some(trimmed)
 }

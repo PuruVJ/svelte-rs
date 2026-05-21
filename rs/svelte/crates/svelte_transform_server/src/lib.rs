@@ -2109,13 +2109,13 @@ fn lower_fragment_with_marker(
     let mut after_dropped_comment = false;
     for n in nodes.iter() {
         // Before processing this node, if the previous node was a Component
-        // and we're now about to emit non-Component content, push `<!---->`
-        // to buf so it anchors the hydration scope.
+        // and we're now about to emit anything (even whitespace), push
+        // `<!---->` to buf so it anchors the hydration scope. The marker
+        // goes IN FRONT of any whitespace that follows the Component, so
+        // the order is `Component(); push(\`<!----> ...\`)`.
         if last_was_component {
-            if !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty()) {
-                buf.push_str("<!---->");
-                last_was_component = false;
-            }
+            buf.push_str("<!---->");
+            last_was_component = false;
         }
         // Text immediately after a dropped Comment: collapse leading
         // whitespace against the previous trailing whitespace.
@@ -2248,6 +2248,7 @@ fn lower_fragment_with_marker(
                     // `<svelte:options ...>` is compile-time metadata —
                     // css mode, namespace, custom-element flags. No output.
                     last_was_component = false;
+                    trim_leading_ws = true;
                 }
                 FragmentChild::SvelteBoundary(sb) => {
                     out.extend(lower_svelte_boundary_server(sb)?);
@@ -4057,13 +4058,19 @@ fn append_attributes_call(
         span: Span::ZERO,
     }));
 
-    // Append a namespace flag for SVG/MathML/custom-element. Mirrors
-    // upstream's ELEMENT_IS_NAMESPACED (1) | ELEMENT_PRESERVE_ATTRIBUTE_CASE (2):
+    // Append a namespace flag for SVG/MathML/custom-element/input. Mirrors
+    // upstream's constants:
+    //   ELEMENT_IS_NAMESPACED              = 1
+    //   ELEMENT_PRESERVE_ATTRIBUTE_CASE    = 2
+    //   ELEMENT_IS_INPUT                   = 4
     // - SVG/MathML elements: 1 | 2 = 3
     // - custom elements (tag contains `-`): 2
+    // - input: 4
     // - everything else: 0 (no flag arg emitted at all)
     let flag = if el.name == "svg" || el.name == "math" {
         Some(3.0)
+    } else if el.name == "input" {
+        Some(4.0)
     } else if el.name.contains('-') {
         Some(2.0)
     } else {
