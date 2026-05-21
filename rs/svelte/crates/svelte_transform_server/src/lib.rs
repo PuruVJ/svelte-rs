@@ -2202,6 +2202,20 @@ fn lower_fragment_with_marker(
                 continue;
             }
         }
+        // `<textarea>` has a unique server lowering: the `value=` attr or
+        // the body content gets extracted to `const $$body = $.escape(...)`
+        // and conditionally pushed as the element's inner text.
+        if let FragmentChild::RegularElement(el) = n {
+            if el.name == "textarea" {
+                if let Some(stmt) = buf.flush() {
+                    emitted_static_push = true;
+                    out.push(stmt);
+                }
+                out.extend(lower_textarea_server(el)?);
+                last_was_component = false;
+                continue;
+            }
+        }
         // `<select value=X ...>` or `<select bind:value={x}>` → wrap shape
         //   $$renderer.select({ value: X }, ($$renderer) => { ...options... });
         // Pure `<select>` (no value attr) keeps the inline shape.
@@ -2316,6 +2330,123 @@ fn lower_fragment_with_marker(
         // `<!---->` to close the hydration scope.
         out.push(push_template("<!---->"));
     }
+    Some(out)
+}
+
+/// Lower `<textarea value={expr}>` or `<textarea>BODY</textarea>` to:
+///   $$renderer.push(`<textarea${attrs}>`);
+///   const $$body = $.escape(VALUE_OR_BODY);
+///   if ($$body) { $$renderer.push(`${$$body}`); } else {}
+///   $$renderer.push(`</textarea>`);
+///
+/// The `$$body` source comes from the `value=` (or `bind:value=`) attr
+/// when present; otherwise it's a template literal of the body children.
+fn lower_textarea_server(
+    el: &svelte_ast::elements::RegularElement,
+) -> Option<Vec<Statement>> {
+    // Open tag + non-value attributes.
+    let mut open_buf = TemplateBuf::new();
+    open_buf.push_str("<textarea");
+    let mut value_expr: Option<Expression> = None;
+    for attr in &el.attributes {
+        match attr {
+            ElementAttribute::Attribute(a) if a.name == "value" => {
+                value_expr = match &a.value {
+                    AttributeValue::Single(t) => Some(t.expression.clone()),
+                    AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
+                        AttributeValuePart::ExpressionTag(t) => Some(t.expression.clone()),
+                        AttributeValuePart::Text(t) => Some(string_lit(&t.data)),
+                    },
+                    _ => None,
+                };
+            }
+            ElementAttribute::BindDirective(b) if b.name == "value" => {
+                value_expr = Some(b.expression.clone());
+            }
+            _ => {
+                append_element_attribute_server(attr, &mut open_buf)?;
+            }
+        }
+    }
+    open_buf.push_str(">");
+
+    // Determine the $$body source.
+    let body_source: Expression = if let Some(v) = value_expr {
+        v
+    } else {
+        // Build a template literal of the textarea's children. Each text
+        // node passes through verbatim; each ExpressionTag becomes
+        // `${$.stringify(EXPR)}`. Per HTML5 textarea rules, strip a
+        // leading newline from the first text node (browsers ignore it).
+        let mut quasis: Vec<String> = Vec::new();
+        let mut exprs: Vec<Expression> = Vec::new();
+        let mut pending = String::new();
+        let mut first_text = true;
+        for child in &el.fragment.nodes {
+            match child {
+                FragmentChild::Text(t) => {
+                    let data = if first_text {
+                        first_text = false;
+                        t.data.strip_prefix('\n').unwrap_or(&t.data)
+                    } else {
+                        &t.data
+                    };
+                    pending.push_str(data);
+                }
+                FragmentChild::ExpressionTag(tag) => {
+                    first_text = false;
+                    quasis.push(std::mem::take(&mut pending));
+                    exprs.push(Expression::Call(Box::new(CallExpression {
+                        callee: t::member_id(t::id("$"), "stringify"),
+                        arguments: vec![Argument::Expression(tag.expression.clone())],
+                        optional: false,
+                        span: Span::ZERO,
+                    })));
+                }
+                FragmentChild::Comment(_) => {}
+                _ => return None,
+            }
+        }
+        quasis.push(pending);
+        t::template_raw(quasis, exprs)
+    };
+
+    let escape_call = Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$"), "escape"),
+        arguments: vec![Argument::Expression(body_source)],
+        optional: false,
+        span: Span::ZERO,
+    }));
+
+    let mut out: Vec<Statement> = Vec::new();
+    // Open tag push.
+    if let Some(s) = open_buf.flush() {
+        out.push(s);
+    }
+    // `const $$body = $.escape(...);`
+    out.push(t::const_decl("$$body", escape_call));
+    // `if ($$body) { push(\`${$$body}\`); } else {}`
+    let push_body = t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "push"),
+        vec![t::template_raw(
+            vec![String::new(), String::new()],
+            vec![t::id("$$body")],
+        )],
+    ));
+    out.push(Statement::If(Box::new(IfStatement {
+        test: t::id("$$body"),
+        consequent: Statement::Block(Box::new(BlockStatement {
+            body: vec![push_body],
+            span: Span::ZERO,
+        })),
+        alternate: Some(Statement::Block(Box::new(BlockStatement {
+            body: Vec::new(),
+            span: Span::ZERO,
+        }))),
+        span: Span::ZERO,
+    })));
+    // Close tag push.
+    out.push(push_template("</textarea>"));
     Some(out)
 }
 
