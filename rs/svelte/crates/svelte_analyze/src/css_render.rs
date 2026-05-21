@@ -40,6 +40,32 @@ pub fn render_stylesheet_with_opts(
     hash: &str,
     dev: bool,
 ) -> String {
+    render_stylesheet_inner(source, stylesheet, css_meta, hash, dev, false)
+}
+
+/// Same as [`render_stylesheet_with_opts`] but with `minify` mode — pruned
+/// rules and selectors are REMOVED instead of being wrapped in
+/// `/* (unused) */` comments. Matches upstream's `state.minify` path
+/// (packages/svelte/src/compiler/phases/3-transform/css/index.js:139-260).
+pub fn render_stylesheet_with_opts_minify(
+    source: &str,
+    stylesheet: &StyleSheet,
+    css_meta: &CssAnalysis,
+    hash: &str,
+    dev: bool,
+    minify: bool,
+) -> String {
+    render_stylesheet_inner(source, stylesheet, css_meta, hash, dev, minify)
+}
+
+fn render_stylesheet_inner(
+    source: &str,
+    stylesheet: &StyleSheet,
+    css_meta: &CssAnalysis,
+    hash: &str,
+    dev: bool,
+    minify: bool,
+) -> String {
     // Operate on a MagicString of just the content range so all edits are
     // relative-positioned and `to_string()` returns exactly the rendered CSS.
     let content_start = stylesheet.content.start as usize;
@@ -52,6 +78,7 @@ pub fn render_stylesheet_with_opts(
         selector_suffix: format!(".{hash}"),
         content_offset: content_start as u32,
         dev,
+        minify,
     };
     for child in &stylesheet.children {
         match child {
@@ -72,6 +99,7 @@ fn rel(state: &RenderState, abs: u32) -> usize {
 }
 
 struct RenderState {
+    minify: bool,
     hash: String,
     #[allow(dead_code)]
     keyframes: Vec<String>,
@@ -148,6 +176,32 @@ fn visit_rule(
     ancestor_has_local: bool,
     is_nested: bool,
 ) {
+    // Minify: remove whitespace preceding this rule (and the `}` before
+    // its block close). Mirrors upstream's
+    // remove_preceding_whitespace(node.start, state) +
+    // remove_preceding_whitespace(node.block.end - 1, state).
+    if state.minify {
+        let raw = code.original.clone();
+        let bytes = raw.as_bytes();
+        // Preceding whitespace before the rule's start.
+        let mut start = rel(state, rule.start);
+        let end = start;
+        while start > 0 && bytes.get(start - 1).map_or(false, |c| c.is_ascii_whitespace()) {
+            start -= 1;
+        }
+        if start < end {
+            code.remove(start, end);
+        }
+        // Preceding whitespace before the block's `}`.
+        let mut bs = rel(state, rule.block.end) - 1;
+        let be = bs;
+        while bs > 0 && bytes.get(bs - 1).map_or(false, |c| c.is_ascii_whitespace()) {
+            bs -= 1;
+        }
+        if bs < be {
+            code.remove(bs, be);
+        }
+    }
     let key = (rule.start, rule.end);
     let meta = css_meta.rule_metadata.get(&key).copied().unwrap_or_default();
     if meta.is_global_block {
@@ -239,23 +293,33 @@ fn visit_rule(
     // Empty rule (no Declarations and no used non-empty inner rules) →
     // `/* (empty) ... */` wrapper. Upstream's `Rule` visitor at
     // packages/svelte/src/compiler/phases/3-transform/css/index.js:146.
-    // Dev mode keeps empty rules so they show up in devtools.
+    // Dev mode keeps empty rules so they show up in devtools. Minify mode
+    // removes them entirely.
     if !state.dev && !inside_global_block && is_empty_rule(rule, css_meta, inside_global_block) {
         let start = rel(state, rule.start);
         let end = rel(state, rule.end);
-        code.prepend_right(start, "/* (empty) ");
-        code.append_left(end, "*/");
-        escape_comment_close(rule, code, state);
+        if state.minify {
+            code.remove(start, end);
+        } else {
+            code.prepend_right(start, "/* (empty) ");
+            code.append_left(end, "*/");
+            escape_comment_close(rule, code, state);
+        }
         return;
     }
 
-    // Unused rule (no used selectors) → `/* (unused) ... */` wrapper.
+    // Unused rule (no used selectors). Minify mode removes the rule
+    // entirely; otherwise wrap in `/* (unused) ... */`.
     if !inside_global_block && !is_rule_used(rule, css_meta) {
         let start = rel(state, rule.start);
         let end = rel(state, rule.end);
-        code.prepend_right(start, "/* (unused) ");
-        code.append_left(end, "*/");
-        escape_comment_close(rule, code, state);
+        if state.minify {
+            code.remove(start, end);
+        } else {
+            code.prepend_right(start, "/* (unused) ");
+            code.append_left(end, "*/");
+            escape_comment_close(rule, code, state);
+        }
         return;
     }
 
@@ -366,9 +430,9 @@ fn visit_selector_list(
     initial_bumped: bool,
     is_nested: bool,
 ) {
-    // Wrap unused selectors in the list with `/* (unused) */`. Mirrors the
-    // SelectorList visitor at
-    // packages/svelte/src/compiler/phases/3-transform/css/index.js:198-258.
+    // Wrap unused selectors in the list with `/* (unused) */` — or, in
+    // minify mode, remove them entirely. Mirrors the SelectorList visitor
+    // at packages/svelte/src/compiler/phases/3-transform/css/index.js:198-258.
     if !inside_global_block && !list.children.is_empty() {
         let raw = code.original.clone();
         let bytes = raw.as_bytes();
@@ -389,18 +453,27 @@ fn visit_selector_list(
                         k -= 1;
                     }
                     let insert_at = if has_previous_used { k } else { k + 1 };
-                    code.append_right(insert_at, "*/");
+                    if state.minify {
+                        code.remove(prune_start, insert_at);
+                    } else {
+                        code.append_right(insert_at, "*/");
+                    }
                 } else {
                     // transition from used → unused: open comment before this
                     // selector.
                     if i == 0 {
-                        code.prepend_right(rel(state, sel.start), "/* (unused) ");
+                        if state.minify {
+                            // Track range to remove on next transition.
+                        } else {
+                            code.prepend_right(rel(state, sel.start), "/* (unused) ");
+                        }
+                    } else if state.minify {
+                        // Track range; remove at next transition.
                     } else {
                         code.overwrite(last, rel(state, sel.start), " /* (unused) ");
                     }
                 }
                 pruning = !pruning;
-                let _ = prune_start;
                 prune_start = if i == 0 { rel(state, sel.start) } else { last };
             }
             if !pruning && used {
@@ -409,7 +482,11 @@ fn visit_selector_list(
             last = rel(state, sel.end);
         }
         if pruning {
-            code.append_left(last, "*/");
+            if state.minify {
+                code.remove(prune_start, last);
+            } else {
+                code.append_left(last, "*/");
+            }
         }
     }
 

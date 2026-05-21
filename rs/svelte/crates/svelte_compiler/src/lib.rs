@@ -87,11 +87,12 @@ pub fn compile(
                 );
                 analysis.css_hash = hash.clone();
                 let rendered = analysis.css.as_ref().map(|sheet| {
-                    let raw = svelte_analyze::css_render::render_stylesheet_with_opts(
-                        source, sheet, &analysis.css_meta, &hash, false,
+                    let raw = svelte_analyze::css_render::render_stylesheet_with_opts_minify(
+                        source, sheet, &analysis.css_meta, &hash, false, true,
                     );
                     // Upstream's `inject_styles && !dev` triggers minification.
-                    // We post-process the rendered CSS to match.
+                    // The renderer already removed pruned content under
+                    // minify mode; post-process whitespace.
                     minify_css(&raw)
                 });
                 rendered.map(|code| (hash, code))
@@ -238,13 +239,25 @@ fn minify_css(src: &str) -> String {
                 suppress_next_ws = true;
                 just_emitted_space = false;
             }
-            '}' | ';' | ':' => {
+            ';' | ':' => {
                 // Strip any trailing space we just emitted.
                 if out.ends_with(' ') {
                     out.pop();
                 }
                 out.push(c);
                 suppress_next_ws = true;
+                just_emitted_space = false;
+            }
+            '}' => {
+                if out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c);
+                // Don't suppress trailing whitespace — the renderer's minify
+                // mode strips preceding whitespace from each rule, so any
+                // space that survives is meaningful (a leading-pruned-
+                // selector boundary kept its space).
+                suppress_next_ws = false;
                 just_emitted_space = false;
             }
             // `,` in selector lists keeps a following space (upstream's
