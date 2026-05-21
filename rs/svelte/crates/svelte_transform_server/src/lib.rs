@@ -2187,6 +2187,10 @@ thread_local! {
     /// trailing `<!---->` anchor for async-wrapped components (component.js
     /// line 351-357).
     static LAST_COMPONENT_WAS_ASYNC: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// Set while lowering the body of `<svelte:head>` (including nested
+    /// blocks). Used so TitleElement inside async if-consequents lowers to
+    /// `$$renderer.title(($$renderer) => { … })` instead of a plain push.
+    static IN_SVELTE_HEAD: std::cell::Cell<bool> = std::cell::Cell::new(false);
     /// Filename for the current component compile, used to seed the
     /// `$.head(HASH, ...)` hash. Set by `try_typed_server_component_with_filename`.
     static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
@@ -2252,6 +2256,15 @@ fn svelte_filename_hash(s: &str) -> String {
 /// Lower `<svelte:head>...` into `$.head(HASH, $$renderer, ($$renderer) => { BODY })`.
 /// `<title>` children inside the head become `$$renderer.title(($$renderer) => { ... })`.
 fn lower_svelte_head_server(
+    sh: &svelte_ast::elements::SvelteHead,
+) -> Option<Statement> {
+    IN_SVELTE_HEAD.with(|c| c.set(true));
+    let result = lower_svelte_head_server_inner(sh);
+    IN_SVELTE_HEAD.with(|c| c.set(false));
+    result
+}
+
+fn lower_svelte_head_server_inner(
     sh: &svelte_ast::elements::SvelteHead,
 ) -> Option<Statement> {
     // Compute hash from filename if set, else default to upstream's "(unknown)".
@@ -4666,9 +4679,42 @@ fn lower_fragment_for_async_block(
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::new();
     let mut buf = TemplateBuf::new();
+    let in_head = IN_SVELTE_HEAD.with(|c| c.get());
     let nodes = trim_boundary_whitespace(&f.nodes);
     let nodes = trim_boundary_text(nodes);
     for n in nodes.iter() {
+        // `<title>` inside `<svelte:head>` becomes `$$renderer.title(…)`
+        // even when the surrounding context is async.
+        if in_head {
+            if let FragmentChild::TitleElement(el) = n {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                let mut inner_buf = TemplateBuf::new();
+                inner_buf.push_str("<title>");
+                let kids = trim_boundary_whitespace(&el.fragment.nodes);
+                let kids = trim_boundary_text(kids);
+                for k in kids.iter() {
+                    append_node_to_template(k, &mut inner_buf)?;
+                }
+                inner_buf.push_str("</title>");
+                let inner_body = inner_buf.flush().into_iter().collect::<Vec<_>>();
+                let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: vec![t::pat_id("$$renderer")],
+                    body: ArrowBody::Block(Box::new(BlockStatement {
+                        body: inner_body,
+                        span: Span::ZERO,
+                    })),
+                    r#async: false,
+                    span: Span::ZERO,
+                }));
+                out.push(t::stmt(t::call(
+                    t::member_id(t::id("$$renderer"), "title"),
+                    vec![arrow],
+                )));
+                continue;
+            }
+        }
         if let FragmentChild::ExpressionTag(t) = n {
             if expr_has_await_top(&t.expression) {
                 if let Some(stmt) = buf.flush() {
