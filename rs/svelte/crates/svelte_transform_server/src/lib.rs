@@ -1498,11 +1498,26 @@ fn lower_fragment_server_async_with(
                         FragmentChild::ExpressionTag(t) => t,
                         _ => unreachable!(),
                     };
-                    // If the expression references an async binding, use the
-                    // blocker-tracked async wrap (`$$renderer.async([...], …)`).
-                    // Otherwise (raw `await EXPR`), use the simple async push:
-                    // `$$renderer.push(async () => $.escape((await $.save(EXPR))()))`.
-                    if expr_refs_any(&et.expression, async_bindings) {
+                    // Routing:
+                    // - expr has top-level await AND refs a blocker binding →
+                    //   blocker-tracked async wrap with the inner expression
+                    //   rewritten through `wrap_async_test` (each `await E`
+                    //   becomes `(await $.save(E))()`).
+                    // - expr refs an async binding but no top-level await →
+                    //   blocker-tracked async wrap with sync thunk (existing
+                    //   `emit_async_wrap_with`).
+                    // - raw top-level await with no binding ref → simple
+                    //   `$$renderer.push(async () => $.escape((await $.save(...))()))`.
+                    let has_await = expr_has_await_top(&et.expression);
+                    let blocker_idx = expr_blocker_idx(&et.expression, blocker_bindings);
+                    if has_await && blocker_idx.is_some() {
+                        let idx = blocker_idx.unwrap();
+                        out.push(emit_async_wrap_with_await(
+                            &et.expression,
+                            idx,
+                            promises_var,
+                        ));
+                    } else if expr_refs_any(&et.expression, async_bindings) {
                         out.push(emit_async_wrap_with(
                             &et.expression,
                             last_group_idx,
@@ -1977,6 +1992,7 @@ fn expr_refs_any(e: &Expression, names: &std::collections::HashSet<String>) -> b
         }
         Expression::Paren(p) => expr_refs_any(&p.expression, names),
         Expression::Template(t) => t.expressions.iter().any(|e| expr_refs_any(e, names)),
+        Expression::Await(a) => expr_refs_any(&a.argument, names),
         _ => false,
     }
 }
@@ -1985,6 +2001,112 @@ fn expr_refs_any(e: &Expression, names: &std::collections::HashSet<String>) -> b
 /// () => $.escape(EXPR)));`
 fn emit_async_wrap(expr: &Expression, group_idx: usize) -> Statement {
     emit_async_wrap_with(expr, group_idx, "$$promises")
+}
+
+/// First blocker index reached by walking the expression. Mirrors upstream's
+/// PromiseOptimiser.check_blockers — for now we just find the minimum.
+fn expr_blocker_idx(
+    e: &Expression,
+    blockers: &std::collections::HashMap<String, usize>,
+) -> Option<usize> {
+    if blockers.is_empty() {
+        return None;
+    }
+    let mut out: Option<usize> = None;
+    fn merge(out: &mut Option<usize>, v: Option<usize>) {
+        if let Some(idx) = v {
+            *out = Some(out.map_or(idx, |cur| cur.min(idx)));
+        }
+    }
+    match e {
+        Expression::Identifier(i) => {
+            return blockers.get(&i.name).copied();
+        }
+        Expression::Member(m) => {
+            merge(&mut out, expr_blocker_idx(&m.object, blockers));
+        }
+        Expression::Call(c) => {
+            merge(&mut out, expr_blocker_idx(&c.callee, blockers));
+            for a in &c.arguments {
+                match a {
+                    Argument::Expression(e) => merge(&mut out, expr_blocker_idx(e, blockers)),
+                    Argument::Spread(s) => {
+                        merge(&mut out, expr_blocker_idx(&s.argument, blockers))
+                    }
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            merge(&mut out, expr_blocker_idx(&b.left, blockers));
+            merge(&mut out, expr_blocker_idx(&b.right, blockers));
+        }
+        Expression::Logical(l) => {
+            merge(&mut out, expr_blocker_idx(&l.left, blockers));
+            merge(&mut out, expr_blocker_idx(&l.right, blockers));
+        }
+        Expression::Unary(u) => {
+            merge(&mut out, expr_blocker_idx(&u.argument, blockers));
+        }
+        Expression::Conditional(c) => {
+            merge(&mut out, expr_blocker_idx(&c.test, blockers));
+            merge(&mut out, expr_blocker_idx(&c.consequent, blockers));
+            merge(&mut out, expr_blocker_idx(&c.alternate, blockers));
+        }
+        Expression::Paren(p) => merge(&mut out, expr_blocker_idx(&p.expression, blockers)),
+        Expression::Await(a) => merge(&mut out, expr_blocker_idx(&a.argument, blockers)),
+        Expression::Template(t) => {
+            for ex in &t.expressions {
+                merge(&mut out, expr_blocker_idx(ex, blockers));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Like `emit_async_wrap_with` but for expressions that contain a top-level
+/// `await`. The inner push is async + the expression goes through
+/// `wrap_async_test`. Matches upstream's blocker-tracked async-with-await
+/// shape: `$$renderer.async([$$promises[N]], ($$renderer) => $$renderer.push(
+/// async () => $.escape((await $.save(EXPR))())));`.
+fn emit_async_wrap_with_await(
+    expr: &Expression,
+    idx: usize,
+    promises_var: &str,
+) -> Statement {
+    let promises_slot = Expression::Member(Box::new(MemberExpression {
+        object: t::id(promises_var),
+        property: MemberProperty::Expression(t::lit_number(idx as f64)),
+        computed: true,
+        optional: false,
+        span: Span::ZERO,
+    }));
+    let blockers = Expression::Array(Box::new(ArrayExpression {
+        elements: vec![ArrayElement::Expression(promises_slot)],
+        span: Span::ZERO,
+    }));
+    let rewritten = wrap_async_test(expr);
+    let escape_call = t::call(t::member_id(t::id("$"), "escape"), vec![rewritten]);
+    let push_thunk = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: Vec::new(),
+        body: ArrowBody::Expression(escape_call),
+        r#async: true,
+        span: Span::ZERO,
+    }));
+    let inner_push = t::call(
+        t::member_id(t::id("$$renderer"), "push"),
+        vec![push_thunk],
+    );
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Expression(inner_push),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+    t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "async"),
+        vec![blockers, arrow],
+    ))
 }
 
 fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str) -> Statement {
@@ -4493,17 +4615,11 @@ fn wrap_async_test(test: &Expression) -> Expression {
                 span: c.span,
             })),
             Expression::Paren(p) => {
-                // Source-level parens around an `await` get absorbed by the
-                // wrap: `(await E)` → `(await $.save(E))()`. No outer paren
-                // needed — the Call already binds tighter than &&.
-                if matches!(p.expression, Expression::Await(_)) {
-                    rewrite(&p.expression)
-                } else {
-                    Expression::Paren(Box::new(ParenthesizedExpression {
-                        expression: rewrite(&p.expression),
-                        span: p.span,
-                    }))
-                }
+                // Source-level parens are all redundant under the rewrite —
+                // the new shape (`(await $.save(E))()`, member chains, etc.)
+                // carries its own parenthesization. Mirrors upstream's
+                // PromiseOptimiser which strips parens during its visit.
+                rewrite(&p.expression)
             }
             Expression::Sequence(s) => Expression::Sequence(Box::new(SequenceExpression {
                 expressions: s.expressions.iter().map(rewrite).collect(),
