@@ -220,6 +220,39 @@ pub fn try_typed_server_component_with_opts(
         func_body.extend(template_body);
     }
 
+    // `$$restProps` plumbing — when the template spreads $$restProps, we
+    // need to prepend `const $$sanitized_props = $.sanitize_props($$props);
+    // const $$restProps = $.rest_props($$sanitized_props, ['name', ...]);`
+    // The names list is the legacy export prop names.
+    if fragment_uses_rest_props(&fragment) && !legacy_export_props.is_empty() {
+        let name_array = Expression::Array(Box::new(ArrayExpression {
+            elements: legacy_export_props
+                .iter()
+                .map(|n| ArrayElement::Expression(string_lit(n)))
+                .collect(),
+            span: Span::ZERO,
+        }));
+        let sanitize_decl = t::const_decl(
+            "$$sanitized_props",
+            t::call(
+                t::member_id(t::id("$"), "sanitize_props"),
+                vec![t::id("$$props")],
+            ),
+        );
+        let restprops_decl = t::const_decl(
+            "$$restProps",
+            t::call(
+                t::member_id(t::id("$"), "rest_props"),
+                vec![t::id("$$sanitized_props"), name_array],
+            ),
+        );
+        // Prepend to the function body.
+        let mut prefix = vec![sanitize_decl, restprops_decl];
+        prefix.extend(std::mem::take(&mut func_body));
+        func_body = prefix;
+        uses_props = true;
+    }
+
     // Legacy `export let X` writes back through `$.bind_props` at the end
     // so the parent component sees mutations made inside the child.
     if !legacy_export_props.is_empty() {
@@ -462,6 +495,43 @@ fn lower_fragment_server_async(
 /// Mirrors upstream's `is_safe_identifier` check inside CallExpression visitor.
 fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(node_has_unsafe_call)
+}
+
+/// Returns true if any spread attribute in the fragment references
+/// `$$restProps`. Used to trigger the sanitize_props / rest_props
+/// declarations.
+fn fragment_uses_rest_props(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().any(node_uses_rest_props)
+}
+
+fn node_uses_rest_props(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::RegularElement(el) => {
+            el.attributes.iter().any(|a| match a {
+                ElementAttribute::SpreadAttribute(s) => {
+                    matches!(&s.expression, Expression::Identifier(i) if i.name == "$$restProps")
+                }
+                _ => false,
+            }) || fragment_uses_rest_props(&el.fragment)
+        }
+        FragmentChild::Component(c) => {
+            c.attributes.iter().any(|a| match a {
+                ElementAttribute::SpreadAttribute(s) => {
+                    matches!(&s.expression, Expression::Identifier(i) if i.name == "$$restProps")
+                }
+                _ => false,
+            }) || fragment_uses_rest_props(&c.fragment)
+        }
+        FragmentChild::EachBlock(eb) => {
+            fragment_uses_rest_props(&eb.body)
+                || eb.fallback.as_ref().map_or(false, fragment_uses_rest_props)
+        }
+        FragmentChild::IfBlock(ib) => {
+            fragment_uses_rest_props(&ib.consequent)
+                || ib.alternate.as_ref().map_or(false, fragment_uses_rest_props)
+        }
+        _ => false,
+    }
 }
 
 /// Script-side "needs_context" trigger: any NewExpression / unsafe call
