@@ -1767,42 +1767,65 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
     }
 
     // Build the destructured `let { X, Y = INIT, ... } = $props();`.
-    let mut parts: Vec<String> = Vec::new();
-    for p in &props {
-        let init_text = if let Some((s, e)) = p.init {
-            Some(source[s as usize..e as usize].to_string())
-        } else {
-            None
-        };
-        let entry = if p.bindable {
-            match init_text {
-                Some(init) => format!("{} = $bindable({})", p.local, init),
-                None => format!("{} = $bindable()", p.local),
-            }
-        } else {
-            match init_text {
-                Some(init) => format!("{} = {}", p.local, init),
-                None => p.local.clone(),
-            }
-        };
-        parts.push(entry);
-    }
-    if uses_rest {
-        parts.push("...rest".to_string());
-    }
-    let props_decl = format!("let {{ {} }} = $props();", parts.join(", "));
+    // When $$props is used, upstream emits a rest-only `let { ...props } = $props();`
+    // and drops all `export let X` lines without their declarations becoming
+    // fields.
+    let props_decl = if uses_props {
+        "let { ...props } = $props();".to_string()
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        for p in &props {
+            let init_text = if let Some((s, e)) = p.init {
+                Some(source[s as usize..e as usize].to_string())
+            } else {
+                None
+            };
+            let entry = if p.bindable {
+                match init_text {
+                    Some(init) => format!("{} = $bindable({})", p.local, init),
+                    None => format!("{} = $bindable()", p.local),
+                }
+            } else {
+                match init_text {
+                    Some(init) => format!("{} = {}", p.local, init),
+                    None => p.local.clone(),
+                }
+            };
+            parts.push(entry);
+        }
+        if uses_rest {
+            parts.push("...rest".to_string());
+        }
+        format!("let {{ {} }} = $props();", parts.join(", "))
+    };
 
     // Replace `$$restProps` references with `rest` in template attributes.
     if uses_rest {
-        // Simple textual replacement on the template — only safe if
-        // `$$restProps` is unique enough (it is). Use MagicString
-        // replace_all-style: iterate source bytes.
         let needle = b"$$restProps";
         let n = needle.len();
         let mut i = 0;
         while i + n <= bytes.len() {
             if &bytes[i..i + n] == needle {
                 str.update(i, i + n, "rest");
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    // Replace `$$props` references with `props` (renaming).
+    if uses_props {
+        let needle = b"$$props";
+        let n = needle.len();
+        let mut i = 0;
+        while i + n <= bytes.len() {
+            // Make sure it's a standalone identifier.
+            let after_ok = i + n >= bytes.len()
+                || !(bytes[i + n].is_ascii_alphanumeric() || bytes[i + n] == b'_');
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if &bytes[i..i + n] == needle && before_ok && after_ok {
+                str.update(i, i + n, "props");
                 i += n;
             } else {
                 i += 1;
