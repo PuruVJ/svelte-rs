@@ -48,7 +48,8 @@ fn ssr_byte_equal_all_fixtures() {
             Ok(s) => s,
             Err(_) => { skipped += 1; continue; }
         };
-        let _cfg = fs::read_to_string(entry.path().join("_config.js")).unwrap_or_default();
+        let cfg = fs::read_to_string(entry.path().join("_config.js")).unwrap_or_default();
+        let preserve_comments = cfg.contains("preserveComments: true");
 
         let fname = format!(
             "packages/svelte/tests/server-side-rendering/samples/{}/main.svelte",
@@ -59,6 +60,7 @@ fn ssr_byte_equal_all_fixtures() {
             opts.module.generate = Some(Generate::Server);
             opts.module.experimental.async_ = true;
             opts.module.filename = Some(fname.clone());
+            opts.preserve_comments = preserve_comments;
             compile(&source, "Main", opts)
         });
 

@@ -27,25 +27,41 @@ pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<P
     try_typed_server_component_with_filename(root, component_name, false, None)
 }
 
-/// Compatibility shim — defaults filename to None.
+/// Compatibility shim — defaults filename to None, preserve_comments to false.
 pub fn try_typed_server_component_with(
     root: &Root,
     component_name: &str,
     experimental_async: bool,
 ) -> Option<Program> {
-    try_typed_server_component_with_filename(root, component_name, experimental_async, None)
+    try_typed_server_component_with_opts(
+        root, component_name, experimental_async, None, false,
+    )
 }
 
-/// Second-tier typed entry point. Currently handles:
-/// - "instance script (imports + optionally rune-erasable statements) + simple template"
-/// - "single <Component bind:this={x}/>"
-/// - "<svelte:element this={tag}>"
+/// Compatibility shim — preserve_comments defaults to false.
 pub fn try_typed_server_component_with_filename(
     root: &Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
 ) -> Option<Program> {
+    try_typed_server_component_with_opts(
+        root, component_name, experimental_async, filename, false,
+    )
+}
+
+/// Second-tier typed entry point. Currently handles:
+/// - "instance script (imports + optionally rune-erasable statements) + simple template"
+/// - "single <Component bind:this={x}/>"
+/// - "<svelte:element this={tag}>"
+pub fn try_typed_server_component_with_opts(
+    root: &Root,
+    component_name: &str,
+    experimental_async: bool,
+    filename: Option<&str>,
+    preserve_comments: bool,
+) -> Option<Program> {
+    PRESERVE_COMMENTS.with(|c| c.set(preserve_comments));
     // `<script module>` content is hoisted above the export default
     // function. Statements are pulled in source order; imports flow to
     // `script_imports` so they're emitted with the regular instance imports.
@@ -1749,6 +1765,12 @@ thread_local! {
     static CSS_HASH: std::cell::RefCell<Option<String>> = const {
         std::cell::RefCell::new(None)
     };
+    /// `compilerOptions.preserveComments`. When true, HTML comments
+    /// (`<!-- ... -->`) are emitted verbatim in the SSR output instead of
+    /// being dropped.
+    static PRESERVE_COMMENTS: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 /// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2 variant
@@ -2129,8 +2151,12 @@ fn lower_fragment_with_marker(
             after_dropped_comment = false;
         }
         if let FragmentChild::Comment(_) = n {
-            after_dropped_comment = true;
-            continue;
+            if !PRESERVE_COMMENTS.with(|p| p.get()) {
+                after_dropped_comment = true;
+                continue;
+            }
+            // preserveComments=true: fall through so the comment lands in
+            // the template literal via append_node_to_template.
         }
         if trim_leading_ws {
             if let FragmentChild::Text(t) = n {
@@ -3962,7 +3988,16 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                 Some(())
             }
         }
-        FragmentChild::Comment(_) => Some(()), // HTML comments dropped server-side
+        FragmentChild::Comment(c) => {
+            // HTML comments are dropped server-side by default. With
+            // `preserveComments: true`, emit them verbatim.
+            if PRESERVE_COMMENTS.with(|p| p.get()) {
+                buf.push_str("<!--");
+                buf.push_str(&escape_text(&c.data));
+                buf.push_str("-->");
+            }
+            Some(())
+        }
         FragmentChild::TitleElement(el) => {
             // Outside `<svelte:head>`, `<title>` is just an HTML element.
             // (Inside head, `lower_head_fragment` handles it specially.)

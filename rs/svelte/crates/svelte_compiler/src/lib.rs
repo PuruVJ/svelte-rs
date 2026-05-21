@@ -58,13 +58,14 @@ pub fn compile(
         Some(Generate::Server) => {
             let exp_async = options.module.experimental.async_;
             let filename = options.module.filename.as_deref();
+            let preserve_comments = options.preserve_comments;
             if let Some(p) = svelte_transform_server::try_typed_server_with(
                 &root, component_name, exp_async,
             ) {
                 p
             } else if let Some(p) =
-                svelte_transform_server::try_typed_server_component_with_filename(
-                    &root, component_name, exp_async, filename,
+                svelte_transform_server::try_typed_server_component_with_opts(
+                    &root, component_name, exp_async, filename, preserve_comments,
                 )
             {
                 p
