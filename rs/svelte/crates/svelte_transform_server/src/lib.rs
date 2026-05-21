@@ -2048,6 +2048,51 @@ fn lower_svelte_boundary_server(
     // 3. Build the body statements once (used by both wrap and no-wrap paths).
     let body_stmts = lower_fragment_server(&body_fragment)?;
 
+    // 3a. When `pending` is present (snippet or attribute), the boundary
+    //     lowers to an `if (pending) { snippet path } else { body path }`
+    //     form. This is upstream's choice for SSR — pending replaces the
+    //     boundary call entirely so the server can render synchronously.
+    let pending_expr: Option<Expression> = attr_snippets
+        .iter()
+        .find(|(n, _)| n == "pending")
+        .map(|(_, e)| e.clone())
+        .or_else(|| {
+            if snippet_names.iter().any(|n| n == "pending") {
+                Some(t::id("pending"))
+            } else {
+                None
+            }
+        });
+    if let Some(pending_expr) = pending_expr {
+        // Snippet path: \`push(\`<!--[!-->\`); pending($$renderer); push(\`<!--]-->\`);\`
+        let pending_branch = vec![
+            push_template("<!--[!-->"),
+            t::stmt(t::call(pending_expr.clone(), vec![t::id("$$renderer")])),
+            push_template("<!--]-->"),
+        ];
+        let body_branch = vec![
+            push_template("<!--[-->"),
+            Statement::Block(Box::new(BlockStatement {
+                body: body_stmts,
+                span: Span::ZERO,
+            })),
+            push_template("<!--]-->"),
+        ];
+        out.push(Statement::If(Box::new(IfStatement {
+            test: pending_expr,
+            consequent: Statement::Block(Box::new(BlockStatement {
+                body: pending_branch,
+                span: Span::ZERO,
+            })),
+            alternate: Some(Statement::Block(Box::new(BlockStatement {
+                body: body_branch,
+                span: Span::ZERO,
+            }))),
+            span: Span::ZERO,
+        })));
+        return Some(out);
+    }
+
     // 4. If there are no failed/pending snippets at all, emit the simpler
     //    no-wrap form: just `<!--[-->` + Block + `<!--]-->`. This keeps the
     //    boundary scope markers but skips the `$$renderer.boundary(...)`
