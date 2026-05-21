@@ -103,6 +103,15 @@ pub fn try_typed_server_component_with_filename(
     if fragment_has_unsafe_call(&root.fragment) {
         needs_component_wrap = true;
     }
+    // Script-side unsafe-call check: any `new Expression`, IIFE, method
+    // call on a complex object, or non-safe MemberExpression in the
+    // script body also triggers needs_context. Mirrors upstream's analyze
+    // visitors walking script statements.
+    if let Some(s) = root.instance.as_ref() {
+        if script_body_has_unsafe(&s.content.body) {
+            needs_component_wrap = true;
+        }
+    }
     let mut legacy_export_props: Vec<String> = Vec::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
@@ -425,6 +434,62 @@ fn lower_fragment_server_async(
 /// Mirrors upstream's `is_safe_identifier` check inside CallExpression visitor.
 fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(node_has_unsafe_call)
+}
+
+/// Script-side "needs_context" trigger: any NewExpression / unsafe call
+/// inside the instance script body. Mirrors upstream's analyze visitors
+/// walking script statements (NewExpression always triggers; CallExpression
+/// with non-safe callee triggers).
+fn script_body_has_unsafe(body: &[Statement]) -> bool {
+    body.iter().any(stmt_has_unsafe)
+}
+
+fn stmt_has_unsafe(s: &Statement) -> bool {
+    match s {
+        Statement::Variable(v) => v.declarations.iter().any(|d| {
+            d.init.as_ref().map_or(false, expr_has_unsafe_call)
+        }),
+        Statement::Expression(e) => expr_has_unsafe_call(&e.expression),
+        Statement::Return(r) => r.argument.as_ref().map_or(false, expr_has_unsafe_call),
+        Statement::If(i) => {
+            expr_has_unsafe_call(&i.test)
+                || stmt_has_unsafe(&i.consequent)
+                || i.alternate.as_ref().map_or(false, |a| stmt_has_unsafe(a))
+        }
+        Statement::Block(b) => b.body.iter().any(stmt_has_unsafe),
+        Statement::Function(f) => f.body.body.iter().any(stmt_has_unsafe),
+        Statement::Throw(t) => expr_has_unsafe_call(&t.argument),
+        Statement::Try(t) => {
+            t.block.body.iter().any(stmt_has_unsafe)
+                || t.handler.as_ref().map_or(false, |h| h.body.body.iter().any(stmt_has_unsafe))
+                || t.finalizer.as_ref().map_or(false, |f| f.body.iter().any(stmt_has_unsafe))
+        }
+        Statement::For(f) => {
+            f.test.as_ref().map_or(false, expr_has_unsafe_call)
+                || f.update.as_ref().map_or(false, expr_has_unsafe_call)
+                || stmt_has_unsafe(&f.body)
+        }
+        Statement::ForIn(f) => expr_has_unsafe_call(&f.right) || stmt_has_unsafe(&f.body),
+        Statement::ForOf(f) => expr_has_unsafe_call(&f.right) || stmt_has_unsafe(&f.body),
+        Statement::While(w) => expr_has_unsafe_call(&w.test) || stmt_has_unsafe(&w.body),
+        Statement::DoWhile(w) => expr_has_unsafe_call(&w.test) || stmt_has_unsafe(&w.body),
+        Statement::Switch(sw) => {
+            expr_has_unsafe_call(&sw.discriminant)
+                || sw.cases.iter().any(|c| {
+                    c.test.as_ref().map_or(false, expr_has_unsafe_call)
+                        || c.consequent.iter().any(stmt_has_unsafe)
+                })
+        }
+        Statement::ExportNamed(e) => {
+            e.declaration.as_ref().map_or(false, |d| stmt_has_unsafe(d))
+        }
+        Statement::ExportDefault(e) => match &e.declaration {
+            ExportDefault::Function(f) => f.body.body.iter().any(stmt_has_unsafe),
+            ExportDefault::Expression(ex) => expr_has_unsafe_call(ex),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Mirrors upstream MemberExpression visitor: returns true if any
@@ -1580,13 +1645,43 @@ fn lower_svelte_head_server(
 }
 
 /// Lower `<svelte:boundary>...</svelte:boundary>` to
-/// `$$renderer.boundary({ failed, pending }, ($$renderer) => { ... })`.
-/// `{#snippet failed/pending}` blocks inside the boundary hoist as local
-/// function declarations preceding the call.
+/// `$$renderer.boundary({ failed, pending }, ($$renderer) => { ... })`,
+/// or — when there's no `failed`/`pending` (only `onerror` or nothing) —
+/// just `<!--[--> { body } <!--]-->` with no wrap.
+///
+/// Snippets come in two flavors:
+///   - `{#snippet failed(...)}` blocks inside the boundary fragment → hoist
+///     as local function declarations + reference by name in the object.
+///   - `<svelte:boundary failed={ref} pending={ref}>` attributes → already
+///     bound to a snippet; emit as shorthand or key:value pairs.
 fn lower_svelte_boundary_server(
     sb: &svelte_ast::elements::SvelteBoundary,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::new();
+
+    // 1. Extract `failed`/`pending` snippet attributes (compile-time names
+    //    that map to a snippet binding).
+    let mut attr_snippets: Vec<(String, Expression)> = Vec::new();
+    for a in &sb.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            if attr.name == "failed" || attr.name == "pending" {
+                // Take the expression behind the attribute value.
+                let expr = match &attr.value {
+                    AttributeValue::Single(t) => Some(t.expression.clone()),
+                    AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
+                        AttributeValuePart::ExpressionTag(t) => Some(t.expression.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(e) = expr {
+                    attr_snippets.push((attr.name.clone(), e));
+                }
+            }
+        }
+    }
+
+    // 2. Snippet blocks inside the boundary → hoisted function decls.
     let mut snippet_names: Vec<String> = Vec::new();
     let mut body_fragment = sb.fragment.clone();
     let mut remaining: Vec<FragmentChild> = Vec::with_capacity(body_fragment.nodes.len());
@@ -1607,9 +1702,51 @@ fn lower_svelte_boundary_server(
     }
     body_fragment.nodes = remaining;
 
-    // Build the `{ failed, pending, ... }` object literal — shorthand props.
+    // 3. Build the body statements once (used by both wrap and no-wrap paths).
+    let body_stmts = lower_fragment_server(&body_fragment)?;
+
+    // 4. If there are no failed/pending snippets at all, emit the simpler
+    //    no-wrap form: just `<!--[-->` + Block + `<!--]-->`. This keeps the
+    //    boundary scope markers but skips the `$$renderer.boundary(...)`
+    //    call (which is only needed to install error/pending hooks).
+    if snippet_names.is_empty() && attr_snippets.is_empty() {
+        out.push(push_template("<!--[-->"));
+        out.push(Statement::Block(Box::new(BlockStatement {
+            body: body_stmts,
+            span: Span::ZERO,
+        })));
+        out.push(push_template("<!--]-->"));
+        return Some(out);
+    }
+
+    // 5. Otherwise, build the `{ failed, pending }` object and the
+    //    `$$renderer.boundary(...)` call.
     let mut obj_props: Vec<ObjectMember> = Vec::new();
+    // Attribute-style names first, then snippet-block names. Dedup by name.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (name, expr) in attr_snippets {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        // Shorthand if the expression is an identifier with matching name.
+        let shorthand = matches!(&expr, Expression::Identifier(i) if i.name == name);
+        obj_props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: name.clone(),
+                span: Span::ZERO,
+            }),
+            value: expr,
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand,
+            method: false,
+            span: Span::ZERO,
+        })));
+    }
     for name in &snippet_names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
         obj_props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
                 name: name.clone(),
@@ -1628,8 +1765,6 @@ fn lower_svelte_boundary_server(
         span: Span::ZERO,
     }));
 
-    // Body arrow: push `<!--[-->`, then BlockStatement of body, then `<!--]-->`.
-    let body_stmts = lower_fragment_server(&body_fragment)?;
     let mut arrow_body: Vec<Statement> = Vec::new();
     arrow_body.push(push_template("<!--[-->"));
     arrow_body.push(Statement::Block(Box::new(BlockStatement {
@@ -3340,11 +3475,37 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
         FragmentChild::RegularElement(el) => {
             buf.push_str("<");
             buf.push_str(&el.name);
-            for attr in &el.attributes {
-                append_element_attribute_server(attr, buf)?;
+            // If any attribute is a spread, emit the whole attribute set
+            // via `${$.attributes({ ...spread1, name: val, ...spread2 })}`
+            // — a single interpolation. Otherwise emit each attribute
+            // inline.
+            let has_spread = el.attributes.iter().any(|a| {
+                matches!(a, ElementAttribute::SpreadAttribute(_))
+            });
+            if has_spread {
+                append_attributes_call(el, buf);
+            } else {
+                // `<input type="file" bind:value={...}>` drops the bind in
+                // SSR — the runtime computes the value attribute from
+                // currentTime/etc., never re-rendered here.
+                let is_file_input = el.name == "input"
+                    && el.attributes.iter().any(|a| matches!(
+                        a, ElementAttribute::Attribute(attr)
+                        if attr.name == "type" && attr_value_is_text(&attr.value, "file")
+                    ));
+                // `<select bind:value={x}>` drops the bind too — the select
+                // lowerer handles it via the `{ value: ... }` first arg.
+                let is_select_value_bind = el.name == "select";
+                for attr in &el.attributes {
+                    if let ElementAttribute::BindDirective(b) = attr {
+                        if b.name == "value" && (is_file_input || is_select_value_bind) {
+                            continue;
+                        }
+                    }
+                    append_element_attribute_server(attr, buf)?;
+                }
             }
             if is_void(&el.name) {
-                // Self-closing void element form: `<br/>`.
                 buf.push_str("/>");
                 Some(())
             } else {
@@ -3443,6 +3604,100 @@ fn collapse_ws(s: &str) -> String {
 /// → `${$.attr('name', expr)}` interpolation. Event-handlers and most
 /// directives are dropped. `bind:X={expr}` becomes an `$.attr('X', expr)`
 /// interpolation (server emits the current value as an attribute).
+/// Build `${$.attributes({ ...spread, name: val, ... })}` for an element
+/// that has at least one spread attribute. Combines all attributes
+/// (statics + spreads + bind:) into a single object expression.
+fn append_attributes_call(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+) {
+    let mut members: Vec<ObjectMember> = Vec::new();
+    for attr in &el.attributes {
+        match attr {
+            ElementAttribute::SpreadAttribute(s) => {
+                members.push(ObjectMember::Spread(Box::new(SpreadElement {
+                    argument: s.expression.clone(),
+                    span: Span::ZERO,
+                })));
+            }
+            ElementAttribute::Attribute(a) => {
+                if is_event_handler_name(&a.name) {
+                    continue;
+                }
+                if let Some(prop) = attribute_to_object_member(a) {
+                    members.push(prop);
+                }
+            }
+            ElementAttribute::BindDirective(b) if b.name != "this" => {
+                members.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: b.name.clone(),
+                        span: Span::ZERO,
+                    }),
+                    value: b.expression.clone(),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            }
+            _ => {}
+        }
+    }
+    let obj = Expression::Object(Box::new(ObjectExpression {
+        properties: members,
+        span: Span::ZERO,
+    }));
+    buf.push_expr(Expression::Call(Box::new(CallExpression {
+        callee: t::member_id(t::id("$"), "attributes"),
+        arguments: vec![Argument::Expression(obj)],
+        optional: false,
+        span: Span::ZERO,
+    })));
+}
+
+/// Mirrors `binding_properties[name].omit_in_ssr` from upstream's
+/// `phases/bindings.js`. Returns true for bindings whose underlying
+/// property is readonly/browser-only and therefore has no SSR attribute.
+/// True if the attribute value is a single static Text part matching `expected`.
+fn attr_value_is_text(value: &AttributeValue, expected: &str) -> bool {
+    match value {
+        AttributeValue::Many(parts) if parts.len() == 1 => {
+            matches!(&parts[0], AttributeValuePart::Text(t) if t.data == expected)
+        }
+        _ => false,
+    }
+}
+
+fn bind_omit_in_ssr(name: &str) -> bool {
+    matches!(
+        name,
+        // media
+        "currentTime" | "duration" | "paused" | "buffered" | "seekable"
+        | "played" | "volume" | "muted" | "playbackRate" | "seeking"
+        | "ended" | "readyState"
+        // video
+        | "videoHeight" | "videoWidth"
+        // img
+        | "naturalWidth" | "naturalHeight"
+        // document
+        | "activeElement" | "fullscreenElement" | "pointerLockElement"
+        | "visibilityState"
+        // window
+        | "innerWidth" | "innerHeight" | "outerWidth" | "outerHeight"
+        | "scrollX" | "scrollY" | "online" | "devicePixelRatio"
+        // dimensions
+        | "clientWidth" | "clientHeight" | "offsetWidth" | "offsetHeight"
+        | "contentRect" | "contentBoxSize" | "borderBoxSize"
+        | "devicePixelContentBoxSize"
+        // checkbox/radio
+        | "indeterminate"
+        // refs / files
+        | "this" | "files"
+    )
+}
+
 fn append_element_attribute_server(
     attr: &ElementAttribute,
     buf: &mut TemplateBuf,
@@ -3463,11 +3718,15 @@ fn append_element_attribute_server(
             append_value_attribute(&a.name, &a.value, buf)
         }
         ElementAttribute::BindDirective(b) => {
-            // Server treats `bind:X={expr}` as `X={expr}` for attribute output.
-            // `bind:this` is dropped (refs are runtime-only).
-            if b.name == "this" {
+            // Bindings that resolve to readonly browser-only state aren't
+            // emitted in SSR (`bind:clientWidth`, `bind:innerHeight`, etc).
+            // Mirrors `binding_properties[name].omit_in_ssr`.
+            if bind_omit_in_ssr(&b.name) {
                 return Some(());
             }
+            // `bind:value` on a `<select>` is handled by the select lowerer.
+            // `bind:value` on `<input type="file">` is omitted.
+            // (Both are handled elsewhere; here we just emit the attribute.)
             buf.push_expr(Expression::Call(Box::new(CallExpression {
                 callee: t::member_id(t::id("$"), "attr"),
                 arguments: vec![
@@ -3500,6 +3759,28 @@ fn append_value_attribute(
             Some(())
         }
         AttributeValue::Single(tag) => {
+            // `style={...}` / `class={...}` use dedicated SSR helpers so the
+            // runtime can scope/normalize the value correctly.
+            if name == "style" {
+                buf.push_expr(Expression::Call(Box::new(CallExpression {
+                    callee: t::member_id(t::id("$"), "attr_style"),
+                    arguments: vec![Argument::Expression(tag.expression.clone())],
+                    optional: false,
+                    span: Span::ZERO,
+                })));
+                return Some(());
+            }
+            // Constant-fold literal-string ExpressionTags to inline form so
+            // `autocomplete={'no'}` → `autocomplete="no"` instead of going
+            // through `$.attr(...)`. Mirrors upstream's literal-fold pass.
+            if let Some(s) = literal_expr_to_string(&tag.expression) {
+                buf.push_str(" ");
+                buf.push_str(name);
+                buf.push_str("=\"");
+                buf.push_str(&escape_attribute_text(&s));
+                buf.push_str("\"");
+                return Some(());
+            }
             buf.push_expr(Expression::Call(Box::new(CallExpression {
                 callee: t::member_id(t::id("$"), "attr"),
                 arguments: vec![
@@ -3559,6 +3840,16 @@ fn append_value_attribute(
             }
             quasis.push(pending);
             let tpl = t::template_raw(quasis, exprs);
+            // `style='...'` → `${$.attr_style(\`...\`)}` (no name arg).
+            if name == "style" {
+                buf.push_expr(Expression::Call(Box::new(CallExpression {
+                    callee: t::member_id(t::id("$"), "attr_style"),
+                    arguments: vec![Argument::Expression(tpl)],
+                    optional: false,
+                    span: Span::ZERO,
+                })));
+                return Some(());
+            }
             buf.push_expr(Expression::Call(Box::new(CallExpression {
                 callee: t::member_id(t::id("$"), "attr"),
                 arguments: vec![

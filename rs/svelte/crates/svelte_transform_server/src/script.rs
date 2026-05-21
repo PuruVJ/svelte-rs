@@ -736,10 +736,47 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
                                     span: Span::ZERO,
                                 }));
                                 let init = if let Some(def) = d.init {
-                                    t::call(
-                                        t::member_id(t::id("$"), "fallback"),
-                                        vec![read, def],
-                                    )
+                                    // Object/array literal defaults need to
+                                    // be wrapped in a thunk (so each instance
+                                    // gets its own value) and the third
+                                    // `true` arg flags it as "shared default".
+                                    let is_obj_like = matches!(
+                                        &def,
+                                        Expression::Object(_) | Expression::Array(_)
+                                    );
+                                    if is_obj_like {
+                                        let arrow = Expression::Arrow(Box::new(
+                                            ArrowFunctionExpression {
+                                                params: Vec::new(),
+                                                body: ArrowBody::Expression(
+                                                    Expression::Paren(Box::new(ParenthesizedExpression {
+                                                        expression: def,
+                                                        span: Span::ZERO,
+                                                    })),
+                                                ),
+                                                r#async: false,
+                                                span: Span::ZERO,
+                                            },
+                                        ));
+                                        t::call(
+                                            t::member_id(t::id("$"), "fallback"),
+                                            vec![
+                                                read,
+                                                arrow,
+                                                Expression::Literal(Box::new(
+                                                    Literal::Boolean(BooleanLiteral {
+                                                        value: true,
+                                                        span: Span::ZERO,
+                                                    }),
+                                                )),
+                                            ],
+                                        )
+                                    } else {
+                                        t::call(
+                                            t::member_id(t::id("$"), "fallback"),
+                                            vec![read, def],
+                                        )
+                                    }
                                 } else {
                                     read
                                 };
