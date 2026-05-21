@@ -211,13 +211,175 @@ impl Printer {
     // ---- style --------------------------------------------------------
 
     fn emit_style(&mut self, css: &svelte_ast::css::StyleSheet) {
-        // Stub for now — emit a placeholder; real CSS pretty-printing in a
-        // follow-up commit. The style fixture needs the full CSS visitors.
-        self.write("<style>");
-        // Walk top-level children. For now emit verbatim from source if we
-        // can; otherwise empty.
-        let _ = css;
+        self.write("<style");
+        for a in &css.attributes {
+            self.write(" ");
+            let s = self.attribute_to_string(a);
+            self.write(&s);
+        }
+        self.write(">");
+        if css.children.is_empty() {
+            self.write("</style>");
+            return;
+        }
+        self.indent_in();
+        for (i, child) in css.children.iter().enumerate() {
+            if i == 0 {
+                self.newline();
+            } else {
+                self.out.push('\n');
+                self.out.push('\n');
+                self.out.push_str(&self.indent);
+            }
+            self.emit_css_child(child);
+        }
+        self.indent_out();
+        self.newline();
         self.write("</style>");
+    }
+
+    fn emit_css_child(&mut self, child: &svelte_ast::css::StyleSheetChild) {
+        match child {
+            svelte_ast::css::StyleSheetChild::Rule(r) => self.emit_css_rule(r),
+            svelte_ast::css::StyleSheetChild::Atrule(a) => self.emit_css_atrule(a),
+        }
+    }
+
+    fn emit_css_rule(&mut self, r: &svelte_ast::css::Rule) {
+        self.emit_css_selector_list(&r.prelude);
+        self.write(" ");
+        self.emit_css_block(&r.block);
+    }
+
+    fn emit_css_atrule(&mut self, a: &svelte_ast::css::Atrule) {
+        self.write("@");
+        self.write(&a.name);
+        if !a.prelude.is_empty() {
+            self.write(" ");
+            self.write(&a.prelude);
+        }
+        if let Some(b) = &a.block {
+            self.write(" ");
+            self.emit_css_block(b);
+        } else {
+            self.write(";");
+        }
+    }
+
+    fn emit_css_block(&mut self, b: &svelte_ast::css::Block) {
+        self.write("{");
+        if b.children.is_empty() {
+            self.write("}");
+            return;
+        }
+        self.indent_in();
+        for child in &b.children {
+            self.newline();
+            self.emit_css_block_child(child);
+        }
+        self.indent_out();
+        self.newline();
+        self.write("}");
+    }
+
+    fn emit_css_block_child(&mut self, c: &svelte_ast::css::BlockChild) {
+        match c {
+            svelte_ast::css::BlockChild::Declaration(d) => {
+                self.write(&d.property);
+                self.write(": ");
+                self.write(&d.value);
+                self.write(";");
+            }
+            svelte_ast::css::BlockChild::Rule(r) => self.emit_css_rule(r),
+            svelte_ast::css::BlockChild::Atrule(a) => self.emit_css_atrule(a),
+        }
+    }
+
+    fn emit_css_selector_list(&mut self, list: &svelte_ast::css::SelectorList) {
+        for (i, sel) in list.children.iter().enumerate() {
+            if i > 0 {
+                self.write(",");
+                self.newline();
+            }
+            self.emit_css_complex_selector(sel);
+        }
+    }
+
+    fn emit_css_complex_selector(&mut self, sel: &svelte_ast::css::ComplexSelector) {
+        for rel in &sel.children {
+            self.emit_css_relative_selector(rel);
+        }
+    }
+
+    fn emit_css_relative_selector(&mut self, rel: &svelte_ast::css::RelativeSelector) {
+        if let Some(comb) = &rel.combinator {
+            if comb.name == " " {
+                self.write(" ");
+            } else {
+                self.write(" ");
+                self.write(&comb.name);
+                self.write(" ");
+            }
+        }
+        for s in &rel.selectors {
+            self.emit_css_simple_selector(s);
+        }
+    }
+
+    fn emit_css_simple_selector(&mut self, s: &svelte_ast::css::SimpleSelector) {
+        use svelte_ast::css::SimpleSelector::*;
+        match s {
+            TypeSelector(t) => self.write(&t.name),
+            IdSelector(i) => {
+                self.write("#");
+                self.write(&i.name);
+            }
+            ClassSelector(c) => {
+                self.write(".");
+                self.write(&c.name);
+            }
+            AttributeSelector(a) => {
+                self.write("[");
+                self.write(&a.name);
+                if let Some(matcher) = &a.matcher {
+                    self.write(matcher);
+                    if let Some(v) = &a.value {
+                        self.write("\"");
+                        self.write(v);
+                        self.write("\"");
+                    }
+                    if let Some(f) = &a.flags {
+                        self.write(" ");
+                        self.write(f);
+                    }
+                }
+                self.write("]");
+            }
+            PseudoElementSelector(p) => {
+                self.write("::");
+                self.write(&p.name);
+            }
+            PseudoClassSelector(p) => {
+                self.write(":");
+                self.write(&p.name);
+                if let Some(args) = &p.args {
+                    self.write("(");
+                    for (i, sel) in args.children.iter().enumerate() {
+                        if i > 0 {
+                            self.write(", ");
+                        }
+                        self.emit_css_complex_selector(sel);
+                    }
+                    self.write(")");
+                }
+            }
+            Percentage(p) => {
+                self.write(&p.value);
+                self.write("%");
+            }
+            Nth(n) => self.write(&n.value),
+            NestingSelector(_) => self.write("&"),
+        }
     }
 
     // ---- fragment -----------------------------------------------------

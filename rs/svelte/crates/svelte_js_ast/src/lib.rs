@@ -324,6 +324,9 @@ pub struct StaticBlock {
 pub struct ImportDeclaration {
     pub specifiers: Vec<ImportSpecifierKind>,
     pub source: StringLiteral,
+    /// `import type { X } from '…'` — TypeScript type-only import. When
+    /// true, individual specifiers don't carry their own `type` keyword.
+    pub type_only: bool,
     pub span: Span,
 }
 
@@ -341,6 +344,9 @@ pub enum ImportSpecifierKind {
 pub struct ImportSpecifier {
     pub imported: ModuleExportName,
     pub local: Identifier,
+    /// `import { type X } from '…'` — per-specifier type-only marker.
+    /// Independent of the parent ImportDeclaration's `type_only` flag.
+    pub type_only: bool,
     pub span: Span,
 }
 

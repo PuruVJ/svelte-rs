@@ -381,6 +381,10 @@ fn import_declaration(
                         ImportSpecifierKind::Named(ImportSpecifier {
                             imported: module_export_name(&s.imported, shift),
                             local: binding_identifier(&s.local, shift),
+                            type_only: matches!(
+                                s.import_kind,
+                                oxc::ImportOrExportKind::Type
+                            ),
                             span: span_of(s.span, shift),
                         })
                     }
@@ -403,6 +407,7 @@ fn import_declaration(
     ImportDeclaration {
         specifiers,
         source: string_literal(&i.source, shift),
+        type_only: matches!(i.import_kind, oxc::ImportOrExportKind::Type),
         span: span_of(i.span, shift),
     }
 }

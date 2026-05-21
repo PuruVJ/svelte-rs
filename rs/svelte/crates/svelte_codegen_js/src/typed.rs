@@ -834,6 +834,9 @@ impl<'a> Emitter<'a> {
 
     fn emit_import(&mut self, d: &ImportDeclaration) {
         self.write("import ");
+        if d.type_only {
+            self.write("type ");
+        }
         if d.specifiers.is_empty() {
             self.emit_string_literal(&d.source);
             self.write(";");
@@ -866,10 +869,11 @@ impl<'a> Emitter<'a> {
                     ModuleExportName::Identifier(id) => id.name.clone(),
                     ModuleExportName::String(s) => s.value.clone(),
                 };
+                let prefix = if n.type_only { "type " } else { "" };
                 if imported == n.local.name {
-                    n.local.name.clone()
+                    format!("{}{}", prefix, n.local.name)
                 } else {
-                    format!("{} as {}", imported, n.local.name)
+                    format!("{}{} as {}", prefix, imported, n.local.name)
                 }
             }).collect();
             // Conservative wrap: switch to multi-line when there are
@@ -2018,6 +2022,7 @@ mod tests {
                     raw: None,
                     span: Span::ZERO,
                 },
+                type_only: false,
                 span: Span::ZERO,
             }))],
             span: Span::ZERO,

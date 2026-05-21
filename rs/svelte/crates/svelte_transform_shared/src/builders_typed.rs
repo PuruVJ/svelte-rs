@@ -296,6 +296,7 @@ pub fn import_side_effect(source: &str) -> Statement {
             raw: None,
             span: Span::ZERO,
         },
+        type_only: false,
         span: Span::ZERO,
     }))
 }
@@ -315,6 +316,7 @@ pub fn import_namespace(local: &str, source: &str) -> Statement {
             raw: None,
             span: Span::ZERO,
         },
+        type_only: false,
         span: Span::ZERO,
     }))
 }
@@ -334,6 +336,7 @@ pub fn import_default(local: &str, source: &str) -> Statement {
             raw: None,
             span: Span::ZERO,
         },
+        type_only: false,
         span: Span::ZERO,
     }))
 }
