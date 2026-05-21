@@ -1453,6 +1453,7 @@ fn lower_fragment_server_async_with(
                     out.push(stmt);
                 }
                 out.extend(lower_each_block_server(eb)?);
+                buf.push_str("<!--]-->");
             }
             FragmentChild::AwaitBlock(ab) => {
                 if let Some(stmt) = buf.flush() {
@@ -2292,6 +2293,7 @@ fn lower_head_fragment(
                 }
                 FragmentChild::EachBlock(eb) => {
                     out.extend(lower_each_block_server(eb)?);
+                    buf.push_str("<!--]-->");
                 }
                 FragmentChild::IfBlock(ib) => {
                     out.extend(lower_if_block_server(ib)?);
@@ -2510,6 +2512,8 @@ fn lower_fragment_with_marker(
                 }
                 FragmentChild::EachBlock(eb) => {
                     out.extend(lower_each_block_server(eb)?);
+                    // BLOCK_CLOSE `<!--]-->` fuses with the next text push.
+                    buf.push_str("<!--]-->");
                     last_was_component = false;
                 }
                 FragmentChild::AwaitBlock(ab) => {
@@ -3581,8 +3585,28 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         }
         body_stmts.extend(lower_fragment_for_async_block(&eb.body)?);
     } else {
-        let needs_marker = body_needs_marker(&eb.body);
-        body_stmts.extend(lower_fragment_with_marker(&eb.body, needs_marker)?);
+        // Detect `{@const X = await ...}` in the body → route to the
+        // const-await lowerer with a fresh promises_N name.
+        let empty_blockers: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        if fragment_has_const_with_await_or_blocker(&eb.body, &empty_blockers) {
+            let idx = SIBLING_PROMISES_COUNTER.with(|c| {
+                let i = c.get();
+                c.set(i + 1);
+                i
+            });
+            let promises_var = if idx == 0 {
+                "promises".to_string()
+            } else {
+                format!("promises_{idx}")
+            };
+            body_stmts.extend(lower_fragment_with_const_await_with(
+                &eb.body, &empty_blockers, &promises_var,
+            )?);
+        } else {
+            let needs_marker = body_needs_marker(&eb.body);
+            body_stmts.extend(lower_fragment_with_marker(&eb.body, needs_marker)?);
+        }
     }
 
     let each_array_init = if expr_is_async {
@@ -3684,14 +3708,14 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             t::member_id(t::id("$$renderer"), "child_block"),
             vec![arrow],
         )));
-        out.push(push_template("<!--]-->"));
+        // Caller pushes `<!--]-->` into buf so adjacent content fuses.
         Some(out)
     } else {
         Some(vec![
             push_template("<!--[-->"),
             each_array_decl,
             for_stmt,
-            push_template("<!--]-->"),
+            // Caller pushes `<!--]-->` into buf so adjacent content fuses.
         ])
     }
 }
@@ -4456,6 +4480,7 @@ fn lower_element_with_non_inline_children(
                 }
                 FragmentChild::EachBlock(eb) => {
                     out.extend(lower_each_block_server(eb)?);
+                    buf.push_str("<!--]-->");
                 }
                 FragmentChild::AwaitBlock(ab) => {
                     out.extend(lower_await_block_server(ab)?);
