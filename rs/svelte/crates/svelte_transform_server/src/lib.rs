@@ -1464,7 +1464,8 @@ fn lower_fragment_server_async_with(
         match n {
             FragmentChild::RegularElement(el) => {
                 // Detect: element whose only non-ws child is an
-                // async-tainted ExpressionTag.
+                // async-tainted ExpressionTag (refs an async binding OR
+                // contains a top-level await directly).
                 let body_non_ws: Vec<&FragmentChild> = el
                     .fragment
                     .nodes
@@ -1477,7 +1478,9 @@ fn lower_fragment_server_async_with(
                 let split_async = body_non_ws.len() == 1
                     && matches!(
                         body_non_ws[0],
-                        FragmentChild::ExpressionTag(t) if expr_refs_any(&t.expression, async_bindings)
+                        FragmentChild::ExpressionTag(t)
+                            if expr_refs_any(&t.expression, async_bindings)
+                                || expr_has_await_top(&t.expression)
                     );
                 if split_async {
                     // Open tag → buf
@@ -1495,11 +1498,33 @@ fn lower_fragment_server_async_with(
                         FragmentChild::ExpressionTag(t) => t,
                         _ => unreachable!(),
                     };
-                    out.push(emit_async_wrap_with(
-                        &et.expression,
-                        last_group_idx,
-                        promises_var,
-                    ));
+                    // If the expression references an async binding, use the
+                    // blocker-tracked async wrap (`$$renderer.async([...], …)`).
+                    // Otherwise (raw `await EXPR`), use the simple async push:
+                    // `$$renderer.push(async () => $.escape((await $.save(EXPR))()))`.
+                    if expr_refs_any(&et.expression, async_bindings) {
+                        out.push(emit_async_wrap_with(
+                            &et.expression,
+                            last_group_idx,
+                            promises_var,
+                        ));
+                    } else {
+                        let rewritten = wrap_async_test(&et.expression);
+                        let escape_call = t::call(
+                            t::member_id(t::id("$"), "escape"),
+                            vec![rewritten],
+                        );
+                        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                            params: Vec::new(),
+                            body: ArrowBody::Expression(escape_call),
+                            r#async: true,
+                            span: Span::ZERO,
+                        }));
+                        out.push(t::stmt(t::call(
+                            t::member_id(t::id("$$renderer"), "push"),
+                            vec![arrow],
+                        )));
+                    }
                     // Close tag → buf
                     buf.push_str("</");
                     buf.push_str(&el.name);
@@ -2767,6 +2792,24 @@ fn lower_fragment_with_marker(
                     }));
                     out.push(t::stmt(t::call(
                         t::member_id(t::id("$$renderer"), "child_block"),
+                        vec![arrow],
+                    )));
+                    last_was_component = false;
+                }
+                FragmentChild::ExpressionTag(tag) if expr_has_await_top(&tag.expression) => {
+                    let rewritten = wrap_async_test(&tag.expression);
+                    let escape_call = t::call(
+                        t::member_id(t::id("$"), "escape"),
+                        vec![rewritten],
+                    );
+                    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(escape_call),
+                        r#async: true,
+                        span: Span::ZERO,
+                    }));
+                    out.push(t::stmt(t::call(
+                        t::member_id(t::id("$$renderer"), "push"),
                         vec![arrow],
                     )));
                     last_was_component = false;
@@ -4365,10 +4408,19 @@ fn wrap_async_test(test: &Expression) -> Expression {
                 alternate: rewrite(&c.alternate),
                 span: c.span,
             })),
-            Expression::Paren(p) => Expression::Paren(Box::new(ParenthesizedExpression {
-                expression: rewrite(&p.expression),
-                span: p.span,
-            })),
+            Expression::Paren(p) => {
+                // Source-level parens around an `await` get absorbed by the
+                // wrap: `(await E)` → `(await $.save(E))()`. No outer paren
+                // needed — the Call already binds tighter than &&.
+                if matches!(p.expression, Expression::Await(_)) {
+                    rewrite(&p.expression)
+                } else {
+                    Expression::Paren(Box::new(ParenthesizedExpression {
+                        expression: rewrite(&p.expression),
+                        span: p.span,
+                    }))
+                }
+            }
             Expression::Sequence(s) => Expression::Sequence(Box::new(SequenceExpression {
                 expressions: s.expressions.iter().map(rewrite).collect(),
                 span: s.span,
@@ -4795,8 +4847,10 @@ fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement) -> boo
             | FragmentChild::RenderTag(_)
             | FragmentChild::SvelteHead(_)
             | FragmentChild::SvelteBoundary(_) => true,
-            // `{@html await EXPR}` splits into child_block — non-inline.
+            // `{@html await EXPR}` and `{await EXPR}` split into separate
+            // async pushes — non-inline.
             FragmentChild::HtmlTag(t) => expr_has_await_top(&t.expression),
+            FragmentChild::ExpressionTag(t) => expr_has_await_top(&t.expression),
             FragmentChild::RegularElement(child) => {
                 child.fragment.nodes.iter().any(node_is_non_inline)
             }
@@ -4894,6 +4948,25 @@ fn lower_element_with_non_inline_children(
                         vec![arrow],
                     )));
                 }
+                // `{await EXPR}` inside an element → emit
+                // `$$renderer.push(async () => $.escape((await $.save(EXPR))() …))`
+                FragmentChild::ExpressionTag(tag) if expr_has_await_top(&tag.expression) => {
+                    let rewritten = wrap_async_test(&tag.expression);
+                    let escape_call = t::call(
+                        t::member_id(t::id("$"), "escape"),
+                        vec![rewritten],
+                    );
+                    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+                        params: Vec::new(),
+                        body: ArrowBody::Expression(escape_call),
+                        r#async: true,
+                        span: Span::ZERO,
+                    }));
+                    out.push(t::stmt(t::call(
+                        t::member_id(t::id("$$renderer"), "push"),
+                        vec![arrow],
+                    )));
+                }
                 _ => return None,
             }
         } else {
@@ -4916,6 +4989,12 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             Some(())
         }
         FragmentChild::ExpressionTag(tag) => {
+            // `{await EXPR}` cannot be inlined — splitting into a separate
+            // `$$renderer.push(async () => $.escape((await $.save(EXPR))()))`
+            // is handled by the outer lowerer.
+            if expr_has_await_top(&tag.expression) {
+                return None;
+            }
             // Constant-fold literal expressions (no `$.escape` wrap, just inline).
             if let Some(s) = literal_expr_to_string(&tag.expression) {
                 buf.push_str(&escape_text(&s));
