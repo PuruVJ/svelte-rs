@@ -91,6 +91,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
     migrate_simple_state(source, &mut str, &parsed);
+    migrate_simple_derivations(source, &mut str, &parsed);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
@@ -1628,6 +1629,243 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
             str.remove(start + 2, start + 3);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Simple derivations: `$: x = expr;` (with single Identifier target, or
+// destructure target) → `let x = $derived(expr);` (or `let { x } = $derived(expr);`).
+// If preceded by `let x;` (no init), remove that line.
+// Only fires for the easy case — no other assignment to x in script, no
+// modifications inside the labeled statement, no multi-statement block.
+// ---------------------------------------------------------------------------
+
+fn migrate_simple_derivations(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(instance) = &root.instance else {
+        return;
+    };
+    let body = &instance.content.body;
+
+    // Pre-pass: count "outside-$:" assignment targets, so we only convert
+    // when the only assignment is inside the $: block itself.
+    let mut outside_assigns: std::collections::HashMap<String, usize> = Default::default();
+    for stmt in body {
+        // Skip $: labeled statements (we want to count NON-$: assignments).
+        if let Statement::Labeled(l) = stmt {
+            if l.label.name == "$" {
+                continue;
+            }
+        }
+        let mut targets = std::collections::HashSet::new();
+        collect_assignment_targets(stmt, &mut targets);
+        for t in targets {
+            *outside_assigns.entry(t).or_insert(0) += 1;
+        }
+    }
+    // Also handler-bound assignments in the template count as outside.
+    walk_fragment(&root.fragment, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => Some(&e.attributes),
+            FragmentChild::Component(e) => Some(&e.attributes),
+            FragmentChild::SvelteComponent(e) => Some(&e.attributes),
+            FragmentChild::SvelteElement(e) => Some(&e.attributes),
+            _ => None,
+        };
+        if let Some(attrs) = attrs {
+            for a in attrs {
+                match a {
+                    ElementAttribute::OnDirective(od) => {
+                        if let Some(expr) = &od.expression {
+                            let mut targets = std::collections::HashSet::new();
+                            collect_assignment_targets_expr(expr, &mut targets);
+                            for t in targets {
+                                *outside_assigns.entry(t).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    ElementAttribute::Attribute(attr) => match &attr.value {
+                        AttributeValue::Single(t) => {
+                            let mut targets = std::collections::HashSet::new();
+                            collect_assignment_targets_expr(&t.expression, &mut targets);
+                            for t in targets {
+                                *outside_assigns.entry(t).or_insert(0) += 1;
+                            }
+                        }
+                        AttributeValue::Many(parts) => {
+                            for p in parts {
+                                if let AttributeValuePart::ExpressionTag(t) = p {
+                                    let mut targets = std::collections::HashSet::new();
+                                    collect_assignment_targets_expr(&t.expression, &mut targets);
+                                    for t in targets {
+                                        *outside_assigns.entry(t).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    // Also count how many $: blocks each target appears in — only convert when 1.
+    let mut dollar_assigns: std::collections::HashMap<String, usize> = Default::default();
+    for stmt in body {
+        if let Statement::Labeled(l) = stmt {
+            if l.label.name == "$" {
+                if let Statement::Expression(es) = &l.body {
+                    if let Expression::Assignment(asn) = &es.expression {
+                        match &asn.left {
+                            svelte_js_ast::AssignmentTarget::Expression(
+                                Expression::Identifier(id),
+                            ) => {
+                                *dollar_assigns.entry(id.name.clone()).or_insert(0) += 1;
+                            }
+                            svelte_js_ast::AssignmentTarget::Pattern(p) => {
+                                let mut names = std::collections::HashSet::new();
+                                collect_pattern_names(p, &mut names);
+                                for n in names {
+                                    *dollar_assigns.entry(n).or_insert(0) += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 1: iterate labeled `$:` ExpressionStatement(AssignmentExpression).
+    let bytes = source.as_bytes();
+    for stmt in body {
+        let Statement::Labeled(l) = stmt else { continue };
+        if l.label.name != "$" {
+            continue;
+        }
+        let Statement::Expression(es) = &l.body else {
+            continue;
+        };
+        // Unwrap parens: `$: ({x} = …);` parses with Paren around AssignmentExpression.
+        let inner = match &es.expression {
+            Expression::Paren(p) => &p.expression,
+            other => other,
+        };
+        let Expression::Assignment(asn) = inner else {
+            continue;
+        };
+        if asn.operator != svelte_js_ast::AssignmentOperator::Assign {
+            continue;
+        }
+        // Identify target style.
+        let (target_text, target_names): (String, Vec<String>) = match &asn.left {
+            svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) => {
+                (id.name.clone(), vec![id.name.clone()])
+            }
+            svelte_js_ast::AssignmentTarget::Pattern(p) => {
+                // Use the source slice as-is for the destructure pattern.
+                let (s, e) = pattern_span(p);
+                let slice = &source[s as usize..e as usize];
+                let mut names = std::collections::HashSet::new();
+                collect_pattern_names(p, &mut names);
+                if names.is_empty() {
+                    continue;
+                }
+                (slice.to_string(), names.into_iter().collect())
+            }
+            _ => continue,
+        };
+        // Skip if any target has outside assignment (state-like) or multiple
+        // `$:` assignments.
+        let mut skip = false;
+        for n in &target_names {
+            if outside_assigns.get(n).copied().unwrap_or(0) > 0 {
+                skip = true;
+                break;
+            }
+            if dollar_assigns.get(n).copied().unwrap_or(0) > 1 {
+                skip = true;
+                break;
+            }
+        }
+        if skip {
+            continue;
+        }
+        // Also skip if any name clashes with a rune.
+        if target_names.iter().any(|n| n == "derived") {
+            continue;
+        }
+        // Get RHS bounds.
+        let (rs, re) = expr_span(&asn.right);
+        let rhs_text = &source[rs as usize..re as usize];
+
+        // Build the replacement for the labeled statement: `let TARGET = $derived(RHS)`
+        let l_start = l.span.start as usize;
+        let l_end = l.span.end as usize;
+        // Preserve trailing `;` semantics: l_end may or may not include it.
+        let has_trailing_semi = bytes
+            .get(l_end - 1)
+            .map(|b| *b == b';')
+            .unwrap_or(false);
+        let _ = has_trailing_semi;
+
+        // Build target text: if it's an object pattern that comes from
+        // `({ x } = …)`, the source slice includes the parens — strip them.
+        let target_clean = if target_text.starts_with('(') && target_text.ends_with(')') {
+            target_text[1..target_text.len() - 1].trim().to_string()
+        } else {
+            target_text
+        };
+
+        // Look for a preceding sibling `let X;` (single declarator, no init,
+        // Identifier matching a target name).
+        let mut preceding_let_id_end: Option<usize> = None;
+        for sibling in body {
+            let Statement::Variable(v) = sibling else {
+                continue;
+            };
+            if v.span.start as usize >= l_start {
+                continue;
+            }
+            if v.declarations.len() != 1 {
+                continue;
+            }
+            let d = &v.declarations[0];
+            let Pattern::Identifier(id) = &d.id else {
+                continue;
+            };
+            if d.init.is_some() {
+                continue;
+            }
+            if !target_names.contains(&id.name) {
+                continue;
+            }
+            preceding_let_id_end = Some(id.span.end as usize);
+        }
+
+        if let Some(id_end) = preceding_let_id_end {
+            // Upstream approach: append ` = $derived(RHS)` after the `let X`
+            // identifier and remove the labeled statement entirely. Keeps
+            // visual whitespace where `$:` used to be (the indent stays put,
+            // we only strip from `$` to end-of-statement so the blank line
+            // is `\t\n` not `\n`).
+            str.append_left(id_end, format!(" = $derived({})", rhs_text));
+            str.remove(l_start, l_end);
+        } else {
+            // No preceding let → replace the labeled statement with a fresh
+            // `let TARGET = $derived(RHS);` (preserving the trailing `;` if
+            // present).
+            let replacement = format!("let {} = $derived({})", target_clean, rhs_text);
+            let final_replacement = if bytes.get(l_end.saturating_sub(1)).copied() == Some(b';') {
+                format!("{};", replacement)
+            } else {
+                replacement
+            };
+            str.update(l_start, l_end, &final_replacement);
+        }
+    }
+    let _ = str;
 }
 
 // ---------------------------------------------------------------------------
