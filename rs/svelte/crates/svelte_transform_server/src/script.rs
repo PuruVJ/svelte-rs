@@ -893,6 +893,20 @@ fn is_state_call(e: &Expression) -> bool {
     matches!(kp.as_str(), "$state" | "$state.raw" | "$state.eager")
 }
 
+/// `$state(EXPR)` / `$state.raw(EXPR)` → `Some(EXPR)`; otherwise None.
+/// Used by the destructure-unroll path so `let [a, b] = $state([1, 2])`
+/// can pull the original array out for `let tmp = [1, 2], ...`.
+fn state_call_first_arg(e: &Expression) -> Option<Expression> {
+    if !is_state_call(e) {
+        return None;
+    }
+    let Expression::Call(c) = e else { return None };
+    c.arguments.iter().find_map(|a| match a {
+        Argument::Expression(e) => Some(e.clone()),
+        _ => None,
+    })
+}
+
 fn collect_derived_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
     match s {
         Statement::Variable(v) => {
@@ -1569,6 +1583,49 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
     use Statement as S;
     match s {
         S::Variable(v) => {
+            // Pre-pass: `let [a, b] = $state(EXPR)` unrolls to
+            // `let tmp = EXPR, $$array = $.to_array(tmp, N), a = $$array[0], …`.
+            // This must happen before rewrite_expression strips the $state.
+            let mut new_decls: Vec<VariableDeclarator> = Vec::new();
+            for d in std::mem::take(&mut v.declarations) {
+                if let (Pattern::Array(arr), Some(init)) = (&d.id, &d.init) {
+                    if let Some(state_arg) = state_call_first_arg(init) {
+                        let elems = arr.elements.clone();
+                        let n = elems.len();
+                        new_decls.push(VariableDeclarator {
+                            id: t::pat_id("tmp"),
+                            init: Some(state_arg),
+                            span: Span::ZERO,
+                        });
+                        new_decls.push(VariableDeclarator {
+                            id: t::pat_id("$$array"),
+                            init: Some(t::call(
+                                t::member_id(t::id("$"), "to_array"),
+                                vec![t::id("tmp"), t::lit_number(n as f64)],
+                            )),
+                            span: Span::ZERO,
+                        });
+                        for (i, slot) in elems.iter().enumerate() {
+                            if let Some(Pattern::Identifier(id)) = slot {
+                                new_decls.push(VariableDeclarator {
+                                    id: t::pat_id(&id.name),
+                                    init: Some(Expression::Member(Box::new(MemberExpression {
+                                        object: t::id("$$array"),
+                                        property: MemberProperty::Expression(t::lit_number(i as f64)),
+                                        computed: true,
+                                        optional: false,
+                                        span: Span::ZERO,
+                                    }))),
+                                    span: Span::ZERO,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+                new_decls.push(d);
+            }
+            v.declarations = new_decls;
             for d in &mut v.declarations {
                 if let Some(init) = &mut d.init {
                     rewrite_expression(init, ctx);
@@ -2352,31 +2409,75 @@ fn rewrite_store_refs_inner(
 pub fn collect_top_level_bindings(p: &Program) -> HashSet<String> {
     let mut out = HashSet::new();
     for s in &p.body {
-        match s {
-            Statement::Variable(v) => {
-                for d in &v.declarations {
-                    if let Pattern::Identifier(id) = &d.id {
-                        out.insert(id.name.clone());
-                    }
-                }
-            }
-            Statement::Import(im) => {
-                for sp in &im.specifiers {
-                    match sp {
-                        ImportSpecifierKind::Default(d) => {
-                            out.insert(d.local.name.clone());
-                        }
-                        ImportSpecifierKind::Named(n) => {
-                            out.insert(n.local.name.clone());
-                        }
-                        ImportSpecifierKind::Namespace(n) => {
-                            out.insert(n.local.name.clone());
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
+        collect_bindings_from_stmt(s, &mut out);
     }
     out
+}
+
+/// Collect bindings from a single top-level statement. Handles `let/const/var`
+/// (recursing into destructure patterns) and `import` specifiers.
+pub fn collect_bindings_from_stmt(s: &Statement, out: &mut HashSet<String>) {
+    match s {
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                collect_names_in_pattern(&d.id, out);
+            }
+        }
+        Statement::Function(f) => {
+            if let Some(id) = &f.id {
+                out.insert(id.name.clone());
+            }
+        }
+        Statement::Class(c) => {
+            if let Some(id) = &c.id {
+                out.insert(id.name.clone());
+            }
+        }
+        Statement::Import(im) => {
+            for sp in &im.specifiers {
+                match sp {
+                    ImportSpecifierKind::Default(d) => {
+                        out.insert(d.local.name.clone());
+                    }
+                    ImportSpecifierKind::Named(n) => {
+                        out.insert(n.local.name.clone());
+                    }
+                    ImportSpecifierKind::Namespace(n) => {
+                        out.insert(n.local.name.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_names_in_pattern(p: &Pattern, out: &mut HashSet<String>) {
+    match p {
+        Pattern::Identifier(id) => {
+            out.insert(id.name.clone());
+        }
+        Pattern::Array(a) => {
+            for el in &a.elements {
+                if let Some(p) = el {
+                    collect_names_in_pattern(p, out);
+                }
+            }
+        }
+        Pattern::Object(o) => {
+            for pr in &o.properties {
+                match pr {
+                    ObjectPatternMember::Property(prop) => {
+                        collect_names_in_pattern(&prop.value, out);
+                    }
+                    ObjectPatternMember::Rest(r) => {
+                        collect_names_in_pattern(&r.argument, out);
+                    }
+                }
+            }
+        }
+        Pattern::Assignment(a) => collect_names_in_pattern(&a.left, out),
+        Pattern::Rest(r) => collect_names_in_pattern(&r.argument, out),
+        _ => {}
+    }
 }

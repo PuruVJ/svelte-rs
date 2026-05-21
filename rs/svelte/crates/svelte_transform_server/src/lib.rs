@@ -90,8 +90,11 @@ pub fn try_typed_server_component_full(
     // `script_imports` so they're emitted with the regular instance imports.
     let mut module_imports: Vec<Statement> = Vec::new();
     let mut module_rest: Vec<Statement> = Vec::new();
+    let mut module_bindings: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     if let Some(m) = root.module.as_ref() {
         for s in m.content.body.iter() {
+            script::collect_bindings_from_stmt(s, &mut module_bindings);
             match s {
                 Statement::Import(_) => module_imports.push(s.clone()),
                 _ => module_rest.push(s.clone()),
@@ -119,6 +122,7 @@ pub fn try_typed_server_component_full(
 
     // Reset the per-component each-array counter for `<select>` lowering.
     SELECT_EACH_COUNTER.with(|c| c.set(0));
+    EACH_ARRAY_COUNTER.with(|c| c.set(0));
     // Thread filename into the lowering pass for `$.head(HASH, ...)`.
     HEAD_FILENAME.with(|c| {
         *c.borrow_mut() = filename.map(|s| s.to_string());
@@ -152,7 +156,12 @@ pub fn try_typed_server_component_full(
         }
         // Imports → "unsafe" callee: any `import { X } from '...'; X(...)`
         // in script body or template position triggers needs_context too.
-        let import_names = collect_import_names(&s.content.body);
+        // Module-script bindings count the same way: `<script module>`
+        // values referenced from instance/template can't be inlined.
+        let mut import_names = collect_import_names(&s.content.body);
+        for m in &module_bindings {
+            import_names.insert(m.clone());
+        }
         if !import_names.is_empty() {
             if script_body_has_unsafe_with_imports(&s.content.body, &import_names) {
                 needs_component_wrap = true;
@@ -2000,6 +2009,9 @@ thread_local! {
     /// Shared each-array counter spanning every `<select>` in the current
     /// component lowering. Reset at the top of `try_typed_server_component`.
     static SELECT_EACH_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    /// Counter for each-block `each_array` names — first is `each_array`,
+    /// then `each_array_1`, `each_array_2`, ... Reset per component.
+    static EACH_ARRAY_COUNTER: std::cell::Cell<usize> = std::cell::Cell::new(0);
     /// Filename for the current component compile, used to seed the
     /// `$.head(HASH, ...)` hash. Set by `try_typed_server_component_with_filename`.
     static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
@@ -3643,9 +3655,30 @@ fn body_needs_marker(f: &svelte_ast::fragment::Fragment) -> bool {
 /// $$renderer.push(`<!--]-->`);
 /// ```
 fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Statement>> {
+    // Per-component each-array counter — first block uses `each_array`,
+    // subsequent blocks get `each_array_1`, `each_array_2`, ... Same index
+    // suffix applies to the per-iteration `$$index` (`$$index_1`, ...).
+    let array_idx = EACH_ARRAY_COUNTER.with(|c| {
+        let i = c.get();
+        c.set(i + 1);
+        i
+    });
+    let each_array_name = if array_idx == 0 {
+        "each_array".to_string()
+    } else {
+        format!("each_array_{array_idx}")
+    };
+
     // Index name — explicit when given, `$$index` otherwise. No-context form
-    // (no `as`) still uses the explicit index if present.
-    let index_name = eb.index.clone().unwrap_or_else(|| "$$index".to_string());
+    // (no `as`) still uses the explicit index if present. The index counter
+    // also picks up the suffix when the each-block is the second-or-later.
+    let index_name = eb.index.clone().unwrap_or_else(|| {
+        if array_idx == 0 {
+            "$$index".to_string()
+        } else {
+            format!("$$index_{array_idx}")
+        }
+    });
 
     // for-loop init: `let INDEX = 0, $$length = each_array.length`
     let init = Statement::Variable(Box::new(VariableDeclaration {
@@ -3659,7 +3692,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             VariableDeclarator {
                 id: t::pat_id("$$length"),
                 init: Some(Expression::Member(Box::new(MemberExpression {
-                    object: t::id("each_array"),
+                    object: t::id(&each_array_name),
                     property: MemberProperty::Identifier(Identifier {
                         name: "length".to_string(),
                         span: Span::ZERO,
@@ -3695,7 +3728,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             declarations: vec![VariableDeclarator {
                 id: ctx.clone(),
                 init: Some(Expression::Member(Box::new(MemberExpression {
-                    object: t::id("each_array"),
+                    object: t::id(&each_array_name),
                     property: MemberProperty::Expression(t::id(&index_name)),
                     computed: true,
                     optional: false,
@@ -3751,7 +3784,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
     let each_array_decl = Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Const,
         declarations: vec![VariableDeclarator {
-            id: t::pat_id("each_array"),
+            id: t::pat_id(&each_array_name),
             init: Some(Expression::Call(Box::new(CallExpression {
                 callee: t::member_id(t::id("$"), "ensure_array_like"),
                 arguments: vec![Argument::Expression(each_array_init)],
@@ -3844,12 +3877,78 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         // Caller pushes `<!--]-->` into buf so adjacent content fuses.
         Some(out)
     } else {
-        Some(vec![
-            push_template("<!--[-->"),
-            each_array_decl,
-            for_stmt,
-            // Caller pushes `<!--]-->` into buf so adjacent content fuses.
-        ])
+        // Non-async path. With a fallback (`{:else}`) the for-loop is wrapped
+        // in `if (each_array.length !== 0) { '<!--[-->' + for_stmt }
+        // else { '<!--[!-->' + fallback }`. Without fallback, just the marker
+        // + for-loop in sequence.
+        if let Some(fallback) = &eb.fallback {
+            let length_member = Expression::Member(Box::new(MemberExpression {
+                object: t::id(&each_array_name),
+                property: MemberProperty::Identifier(Identifier {
+                    name: "length".to_string(),
+                    span: Span::ZERO,
+                }),
+                computed: false,
+                optional: false,
+                span: Span::ZERO,
+            }));
+            let test_neq_zero = Expression::Binary(Box::new(BinaryExpression {
+                left: length_member,
+                operator: BinaryOperator::StrictNotEq,
+                right: t::lit_number(0.0),
+                span: Span::ZERO,
+            }));
+            let then_branch: Vec<Statement> = vec![push_string("<!--[-->"), for_stmt];
+            // Else branch: `<!--[!-->` marker + fallback body. The fallback
+            // may itself contain `{@const X = await ...}` → route through
+            // the const-await lowerer with a fresh `promises_N` name.
+            let mut else_branch: Vec<Statement> = vec![push_string("<!--[!-->")];
+            let empty_blockers: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            if fragment_has_const_with_await_or_blocker(fallback, &empty_blockers) {
+                let idx = SIBLING_PROMISES_COUNTER.with(|c| {
+                    let i = c.get();
+                    c.set(i + 1);
+                    i
+                });
+                let promises_var = if idx == 0 {
+                    "promises".to_string()
+                } else {
+                    format!("promises_{idx}")
+                };
+                else_branch.extend(lower_fragment_with_const_await_with(
+                    fallback,
+                    &empty_blockers,
+                    &promises_var,
+                )?);
+            } else {
+                let needs_marker = body_needs_marker(fallback);
+                else_branch.extend(lower_fragment_with_marker(fallback, needs_marker)?);
+            }
+            Some(vec![
+                each_array_decl,
+                Statement::If(Box::new(IfStatement {
+                    test: test_neq_zero,
+                    consequent: Statement::Block(Box::new(BlockStatement {
+                        body: then_branch,
+                        span: Span::ZERO,
+                    })),
+                    alternate: Some(Statement::Block(Box::new(BlockStatement {
+                        body: else_branch,
+                        span: Span::ZERO,
+                    }))),
+                    span: Span::ZERO,
+                })),
+                // Caller pushes `<!--]-->` into buf so adjacent content fuses.
+            ])
+        } else {
+            Some(vec![
+                push_template("<!--[-->"),
+                each_array_decl,
+                for_stmt,
+                // Caller pushes `<!--]-->` into buf so adjacent content fuses.
+            ])
+        }
     }
 }
 

@@ -517,7 +517,27 @@ impl<'a> Emitter<'a> {
             found
         };
 
-        if has_inter_comment {
+        // Heuristic: declarations of 3+ declarators where at least one has
+        // a non-trivial init expression (Call/Member/Array/Object/Template/…)
+        // wrap onto multiple lines — matches upstream esrap's fit-on-line
+        // behavior for synthesized `let tmp = …, $$array = $.to_array(…)…`
+        // declarations.
+        fn init_is_nontrivial(e: &Expression) -> bool {
+            !matches!(
+                e,
+                Expression::Identifier(_)
+                    | Expression::Literal(_)
+            )
+        }
+        let force_multiline = !has_inter_comment
+            && v.declarations.len() >= 3
+            && v.declarations
+                .iter()
+                .filter(|d| d.init.as_ref().map_or(false, init_is_nontrivial))
+                .count()
+                >= 2;
+
+        if has_inter_comment || force_multiline {
             self.indent_in();
             for (i, d) in v.declarations.iter().enumerate() {
                 if i > 0 {
@@ -525,7 +545,7 @@ impl<'a> Emitter<'a> {
                     self.newline();
                 }
                 let start = decl_start(d);
-                if start != 0 {
+                if start != 0 && has_inter_comment {
                     self.flush_comments_until(start, false);
                 }
                 self.emit_pattern(&d.id);

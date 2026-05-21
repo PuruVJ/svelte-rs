@@ -238,13 +238,23 @@ fn minify_css(src: &str) -> String {
                 suppress_next_ws = true;
                 just_emitted_space = false;
             }
-            '}' | ';' | ':' | ',' => {
+            '}' | ';' | ':' => {
                 // Strip any trailing space we just emitted.
                 if out.ends_with(' ') {
                     out.pop();
                 }
                 out.push(c);
                 suppress_next_ws = true;
+                just_emitted_space = false;
+            }
+            // `,` in selector lists keeps a following space (upstream's
+            // injected-CSS output emits `.a, .b {…}`).
+            ',' => {
+                if out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c);
+                suppress_next_ws = false;
                 just_emitted_space = false;
             }
             ' ' | '\t' | '\n' | '\r' => {
