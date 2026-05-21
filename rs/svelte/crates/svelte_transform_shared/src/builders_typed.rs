@@ -67,11 +67,16 @@ pub fn lit_number(n: f64) -> Expression {
 
 pub fn template_raw(parts: Vec<String>, exprs: Vec<Expression>) -> Expression {
     // parts has N entries; exprs has N-1. Build alternating quasi/expr.
+    // Each quasi's raw form needs JS template-literal escaping:
+    // - Backslash → `\\`
+    // - Backtick → `` \` ``
+    // - `${` interpolation prefix → `\${` (so it stays literal)
     let mut quasis = Vec::with_capacity(parts.len());
     for (i, p) in parts.iter().enumerate() {
+        let raw = escape_template_quasi(p);
         quasis.push(TemplateElement {
             cooked: p.clone(),
-            raw: p.clone(),
+            raw,
             tail: i == parts.len() - 1,
             span: Span::ZERO,
         });
@@ -81,6 +86,33 @@ pub fn template_raw(parts: Vec<String>, exprs: Vec<Expression>) -> Expression {
         expressions: exprs,
         span: Span::ZERO,
     }))
+}
+
+fn escape_template_quasi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\\' => {
+                out.push_str("\\\\");
+            }
+            b'`' => {
+                out.push_str("\\`");
+            }
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => {
+                out.push_str("\\${");
+                i += 2;
+                continue;
+            }
+            _ => {
+                out.push(c as char);
+            }
+        }
+        i += 1;
+    }
+    out
 }
 
 pub fn array(elements: Vec<Expression>) -> Expression {

@@ -111,6 +111,17 @@ pub fn try_typed_server_component_with_filename(
         if script_body_has_unsafe(&s.content.body) {
             needs_component_wrap = true;
         }
+        // Imports → "unsafe" callee: any `import { X } from '...'; X(...)`
+        // in script body or template position triggers needs_context too.
+        let import_names = collect_import_names(&s.content.body);
+        if !import_names.is_empty() {
+            if script_body_has_unsafe_with_imports(&s.content.body, &import_names) {
+                needs_component_wrap = true;
+            }
+            if fragment_has_unsafe_callee(&root.fragment, &import_names) {
+                needs_component_wrap = true;
+            }
+        }
     }
     let mut legacy_export_props: Vec<String> = Vec::new();
     if let Some(s) = root.instance.as_ref() {
@@ -442,6 +453,148 @@ fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment) -> bool {
 /// with non-safe callee triggers).
 fn script_body_has_unsafe(body: &[Statement]) -> bool {
     body.iter().any(stmt_has_unsafe)
+}
+
+/// Collect the imported binding names from `import` statements at the top
+/// of a script body. Used to mark CallExpressions whose callee is an
+/// imported identifier as "unsafe" (triggers needs_context).
+fn collect_import_names(body: &[Statement]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for s in body {
+        if let Statement::Import(imp) = s {
+            for spec in &imp.specifiers {
+                match spec {
+                    ImportSpecifierKind::Default(d) => { out.insert(d.local.name.clone()); }
+                    ImportSpecifierKind::Namespace(n) => { out.insert(n.local.name.clone()); }
+                    ImportSpecifierKind::Named(n) => { out.insert(n.local.name.clone()); }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Walk script body looking for `CallExpression` whose callee identifier is
+/// in `imports`. Mirrors `!is_safe_identifier(callee, scope)` when binding
+/// kind is `'import'`.
+fn script_body_has_unsafe_with_imports(
+    body: &[Statement],
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    body.iter().any(|s| stmt_has_unsafe_call_with_imports(s, imports))
+}
+
+fn stmt_has_unsafe_call_with_imports(
+    s: &Statement,
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    match s {
+        Statement::Variable(v) => v.declarations.iter().any(|d| {
+            d.init.as_ref().map_or(false, |e| expr_calls_import(e, imports))
+        }),
+        Statement::Expression(e) => expr_calls_import(&e.expression, imports),
+        Statement::Return(r) => r.argument.as_ref().map_or(false, |e| expr_calls_import(e, imports)),
+        Statement::If(i) => {
+            expr_calls_import(&i.test, imports)
+                || stmt_has_unsafe_call_with_imports(&i.consequent, imports)
+                || i.alternate.as_ref().map_or(false, |a| stmt_has_unsafe_call_with_imports(a, imports))
+        }
+        Statement::Block(b) => b.body.iter().any(|s| stmt_has_unsafe_call_with_imports(s, imports)),
+        Statement::Function(f) => f.body.body.iter().any(|s| stmt_has_unsafe_call_with_imports(s, imports)),
+        _ => false,
+    }
+}
+
+fn expr_calls_import(
+    e: &Expression,
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    match e {
+        Expression::Call(c) => {
+            // Callee is a plain Identifier that's imported → unsafe.
+            if let Expression::Identifier(id) = &c.callee {
+                if imports.contains(&id.name) {
+                    return true;
+                }
+            }
+            expr_calls_import(&c.callee, imports)
+                || c.arguments.iter().any(|a| match a {
+                    svelte_js_ast::Argument::Expression(e) => expr_calls_import(e, imports),
+                    svelte_js_ast::Argument::Spread(s) => expr_calls_import(&s.argument, imports),
+                })
+        }
+        Expression::Binary(b) => expr_calls_import(&b.left, imports) || expr_calls_import(&b.right, imports),
+        Expression::Logical(l) => expr_calls_import(&l.left, imports) || expr_calls_import(&l.right, imports),
+        Expression::Unary(u) => expr_calls_import(&u.argument, imports),
+        Expression::Conditional(c) => {
+            expr_calls_import(&c.test, imports)
+                || expr_calls_import(&c.consequent, imports)
+                || expr_calls_import(&c.alternate, imports)
+        }
+        Expression::Paren(p) => expr_calls_import(&p.expression, imports),
+        Expression::Member(m) => expr_calls_import(&m.object, imports),
+        Expression::Await(a) => expr_calls_import(&a.argument, imports),
+        _ => false,
+    }
+}
+
+/// Walk a fragment looking for any template-position CallExpression whose
+/// callee is an imported identifier.
+fn fragment_has_unsafe_callee(
+    f: &svelte_ast::fragment::Fragment,
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    f.nodes.iter().any(|n| node_has_unsafe_callee(n, imports))
+}
+
+fn node_has_unsafe_callee(
+    n: &FragmentChild,
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    match n {
+        FragmentChild::ExpressionTag(t) => expr_calls_import(&t.expression, imports),
+        FragmentChild::HtmlTag(t) => expr_calls_import(&t.expression, imports),
+        FragmentChild::ConstTag(ct) => ct.declaration.declarations.iter().any(|d| {
+            d.init.as_ref().map_or(false, |e| expr_calls_import(e, imports))
+        }),
+        FragmentChild::RegularElement(el) => {
+            el.attributes.iter().any(|a| attr_has_unsafe_callee(a, imports))
+                || fragment_has_unsafe_callee(&el.fragment, imports)
+        }
+        FragmentChild::Component(c) => {
+            c.attributes.iter().any(|a| attr_has_unsafe_callee(a, imports))
+                || fragment_has_unsafe_callee(&c.fragment, imports)
+        }
+        FragmentChild::IfBlock(ib) => {
+            expr_calls_import(&ib.test, imports)
+                || fragment_has_unsafe_callee(&ib.consequent, imports)
+                || ib.alternate.as_ref().map_or(false, |f| fragment_has_unsafe_callee(f, imports))
+        }
+        FragmentChild::EachBlock(eb) => {
+            expr_calls_import(&eb.expression, imports)
+                || fragment_has_unsafe_callee(&eb.body, imports)
+                || eb.fallback.as_ref().map_or(false, |f| fragment_has_unsafe_callee(f, imports))
+        }
+        _ => false,
+    }
+}
+
+fn attr_has_unsafe_callee(
+    a: &ElementAttribute,
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    match a {
+        ElementAttribute::Attribute(attr) => match &attr.value {
+            AttributeValue::Single(t) => expr_calls_import(&t.expression, imports),
+            AttributeValue::Many(parts) => parts.iter().any(|p| match p {
+                AttributeValuePart::ExpressionTag(t) => expr_calls_import(&t.expression, imports),
+                _ => false,
+            }),
+            _ => false,
+        },
+        ElementAttribute::SpreadAttribute(s) => expr_calls_import(&s.expression, imports),
+        _ => false,
+    }
 }
 
 fn stmt_has_unsafe(s: &Statement) -> bool {
@@ -1561,8 +1714,25 @@ fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str)
 }
 
 /// Lower an entire root-level fragment to a sequence of server statements.
+/// The leading `<!---->` anchor mirrors upstream's `is_text_first` rule:
+/// if the first non-WS child is Text or ExpressionTag (or @html), insert
+/// a marker so the text node doesn't get fused with surrounding fragments.
 fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<Statement>> {
-    lower_fragment_with_marker(f, false)
+    lower_fragment_with_marker(f, is_text_first(f))
+}
+
+fn is_text_first(f: &svelte_ast::fragment::Fragment) -> bool {
+    let first = f.nodes.iter().find(|n| match n {
+        FragmentChild::Text(t) => !t.data.trim().is_empty(),
+        FragmentChild::Comment(_) => false,
+        _ => true,
+    });
+    matches!(
+        first,
+        Some(FragmentChild::Text(_))
+            | Some(FragmentChild::ExpressionTag(_))
+            | Some(FragmentChild::HtmlTag(_))
+    )
 }
 
 thread_local! {
@@ -1952,6 +2122,22 @@ fn lower_fragment_with_marker(
                 continue;
             }
         }
+        // `<select value=X ...>` or `<select bind:value={x}>` → wrap shape
+        //   $$renderer.select({ value: X }, ($$renderer) => { ...options... });
+        // Pure `<select>` (no value attr) keeps the inline shape.
+        if let FragmentChild::RegularElement(el) = n {
+            if el.name == "select" {
+                if let Some(value_expr) = select_value_attr(el) {
+                    if let Some(stmt) = buf.flush() {
+                        emitted_static_push = true;
+                        out.push(stmt);
+                    }
+                    out.push(lower_select_with_value(el, value_expr)?);
+                    last_was_component = false;
+                    continue;
+                }
+            }
+        }
         // `<select>` (or other option-child container) routes to the inline
         // emitter so blocks inside it can produce `$$renderer.option(...)` calls.
         if let FragmentChild::RegularElement(el) = n {
@@ -2049,6 +2235,107 @@ fn lower_fragment_with_marker(
         out.push(push_template("<!---->"));
     }
     Some(out)
+}
+
+/// Returns the value expression for `<select value=X>` (any of the three
+/// shapes: static text, `{expr}`, `bind:value={x}`) or None when the
+/// select has no value attribute.
+fn select_value_attr(
+    el: &svelte_ast::elements::RegularElement,
+) -> Option<Expression> {
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) if attr.name == "value" => {
+                return match &attr.value {
+                    AttributeValue::Single(t) => Some(t.expression.clone()),
+                    AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
+                        AttributeValuePart::Text(t) => Some(Expression::Literal(Box::new(
+                            Literal::String(StringLiteral {
+                                value: t.data.clone(),
+                                raw: Some(format!("'{}'", t.data.replace('\'', "\\'"))),
+                                span: Span::ZERO,
+                            }),
+                        ))),
+                        AttributeValuePart::ExpressionTag(t) => Some(t.expression.clone()),
+                    },
+                    _ => None,
+                };
+            }
+            ElementAttribute::BindDirective(b) if b.name == "value" => {
+                return Some(b.expression.clone());
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Lower `<select value=X ...>...options...</select>` to:
+///   `$$renderer.select({ value: X }, ($$renderer) => { option_calls });`
+/// Other (non-value, non-bind) attributes on the `<select>` flow into the
+/// first-arg object too as additional properties.
+fn lower_select_with_value(
+    el: &svelte_ast::elements::RegularElement,
+    value_expr: Expression,
+) -> Option<Statement> {
+    // Build the props object: { value: VALUE, ...other_attrs }.
+    let mut props: Vec<ObjectMember> = Vec::new();
+    props.push(ObjectMember::Property(Box::new(Property {
+        key: PropertyKey::Identifier(Identifier {
+            name: "value".to_string(),
+            span: Span::ZERO,
+        }),
+        value: value_expr,
+        kind: PropertyKind::Init,
+        computed: false,
+        shorthand: false,
+        method: false,
+        span: Span::ZERO,
+    })));
+    for a in &el.attributes {
+        match a {
+            ElementAttribute::Attribute(attr) if attr.name == "value" => {}
+            ElementAttribute::BindDirective(b) if b.name == "value" => {}
+            ElementAttribute::Attribute(attr) => {
+                if let Some(p) = attribute_to_object_member(attr) {
+                    props.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let props_obj = Expression::Object(Box::new(ObjectExpression {
+        properties: props,
+        span: Span::ZERO,
+    }));
+
+    // Build the children arrow body using the existing select-child lowerer.
+    let mut inner_buf = TemplateBuf::new();
+    let mut inner_out: Vec<Statement> = Vec::new();
+    let children = trim_boundary_whitespace(&el.fragment.nodes);
+    SELECT_EACH_COUNTER.with(|c| {
+        for child in children {
+            let _ = lower_select_child(child, &mut inner_buf, &mut inner_out, c);
+        }
+    });
+    if let Some(stmt) = inner_buf.flush() {
+        inner_out.push(stmt);
+    }
+
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: inner_out,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    Some(t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "select"),
+        vec![props_obj, arrow],
+    )))
 }
 
 /// Inline emit `<select>` with `<option>` children — writes the open tag
@@ -2768,11 +3055,10 @@ fn build_if_chain_server_ex(
 
     let consequent_marker = format!("<!--[{branch_idx}-->");
     let mut consequent_body: Vec<Statement> = Vec::new();
-    consequent_body.push(if use_async_marker {
-        push_string(&consequent_marker)
-    } else {
-        push_template(&consequent_marker)
-    });
+    // Upstream always emits the if-branch marker as a plain string literal
+    // (`b.literal('<!--[0-->')`) — both inside async wraps and out.
+    consequent_body.push(push_string(&consequent_marker));
+    let _ = use_async_marker;
     if test_is_async {
         consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
     } else if consequent_has_const_await {
@@ -2894,11 +3180,7 @@ fn build_if_chain_server_ex(
             // Final `else` branch.
             let final_marker = "<!--[-1-->";
             let mut alternate_body: Vec<Statement> = Vec::new();
-            alternate_body.push(if use_async_marker {
-                push_string(final_marker)
-            } else {
-                push_template(final_marker)
-            });
+            alternate_body.push(push_string(final_marker));
             if test_is_async {
                 alternate_body.extend(lower_fragment_for_async_block(alt)?);
             } else {
@@ -2914,11 +3196,7 @@ fn build_if_chain_server_ex(
         // No alternate at all. Still emit the final-else block with just the
         // `<!--[-1-->` marker so the close marker has a partner.
         let final_marker = "<!--[-1-->";
-        let alternate_body = vec![if use_async_marker {
-            push_string(final_marker)
-        } else {
-            push_template(final_marker)
-        }];
+        let alternate_body = vec![push_string(final_marker)];
         Some(Statement::Block(Box::new(BlockStatement {
             body: alternate_body,
             span: Span::ZERO,
@@ -3649,9 +3927,36 @@ fn append_attributes_call(
         properties: members,
         span: Span::ZERO,
     }));
+
+    // Append a namespace flag for SVG/MathML/custom-element. Mirrors
+    // upstream's ELEMENT_IS_NAMESPACED (1) | ELEMENT_PRESERVE_ATTRIBUTE_CASE (2):
+    // - SVG/MathML elements: 1 | 2 = 3
+    // - custom elements (tag contains `-`): 2
+    // - everything else: 0 (no flag arg emitted at all)
+    let flag = if el.name == "svg" || el.name == "math" {
+        Some(3.0)
+    } else if el.name.contains('-') {
+        Some(2.0)
+    } else {
+        None
+    };
+    let mut args = vec![Argument::Expression(obj)];
+    if let Some(f) = flag {
+        let void0 = void_zero_expr();
+        args.push(Argument::Expression(void0.clone()));
+        args.push(Argument::Expression(void0.clone()));
+        args.push(Argument::Expression(void0));
+        args.push(Argument::Expression(Expression::Literal(Box::new(Literal::Number(
+            NumberLiteral {
+                value: f,
+                raw: Some((f as u32).to_string()),
+                span: Span::ZERO,
+            },
+        )))));
+    }
     buf.push_expr(Expression::Call(Box::new(CallExpression {
         callee: t::member_id(t::id("$"), "attributes"),
-        arguments: vec![Argument::Expression(obj)],
+        arguments: args,
         optional: false,
         span: Span::ZERO,
     })));
