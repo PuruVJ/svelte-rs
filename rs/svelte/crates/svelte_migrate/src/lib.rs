@@ -81,6 +81,8 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_script_module_context(source, &mut str, &parsed);
     migrate_self_closing_elements(source, &mut str, &parsed.fragment);
     migrate_svelte_self_no_filename(source, &mut str, &parsed.fragment, opts.filename.as_deref());
+    migrate_svelte_element_static_this(source, &mut str, &parsed.fragment);
+    migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
@@ -282,33 +284,59 @@ fn collect_identifiers_in_expr(expr: &Expression, out: &mut std::collections::Ha
     }
 }
 
-/// `export let X = …` + `$$props` referenced anywhere.
+/// `export let X = …` + `$$props` referenced anywhere. Upstream only errors
+/// when at least one named prop has an init OR is `updated` (bind:/assignment).
 fn detect_props_and_dollar_props(root: &Root, source: &str) -> Option<String> {
     let instance = root.instance.as_ref()?;
 
-    // Find named props: `export let X` (one or more).
-    let mut has_named_export_with_init_or_updated = false;
+    // First check `$$props` is used at all.
+    if !source_uses_dollar_dollar(source, "$$props") {
+        return None;
+    }
+
+    // Collect bind:-targeted identifiers and assignment-target identifiers in
+    // both script and template (approximation of `binding.updated`).
+    let mut updated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    walk_fragment(&root.fragment, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => Some(&e.attributes),
+            FragmentChild::Component(e) => Some(&e.attributes),
+            FragmentChild::SvelteComponent(e) => Some(&e.attributes),
+            FragmentChild::SvelteElement(e) => Some(&e.attributes),
+            FragmentChild::SvelteBody(e)
+            | FragmentChild::SvelteBoundary(e)
+            | FragmentChild::SvelteDocument(e)
+            | FragmentChild::SvelteFragment(e)
+            | FragmentChild::SvelteHead(e)
+            | FragmentChild::SvelteOptions(e)
+            | FragmentChild::SvelteSelf(e)
+            | FragmentChild::SvelteWindow(e) => Some(&e.attributes),
+            _ => None,
+        };
+        if let Some(attrs) = attrs {
+            for a in attrs {
+                if let ElementAttribute::BindDirective(b) = a {
+                    if let Some(name) = bind_target_identifier(&b.expression) {
+                        updated.insert(name);
+                    }
+                }
+            }
+        }
+    });
+    // Scan script for assignment targets.
+    for stmt in &instance.content.body {
+        collect_assignment_targets(stmt, &mut updated);
+    }
+
+    // Now find a named prop that has init or is updated.
+    let mut bad_prop = false;
     for stmt in &instance.content.body {
         if let Statement::ExportNamed(en) = stmt {
-            if let Some(decl) = &en.declaration {
-                if let Statement::Variable(v) = decl {
-                    for d in &v.declarations {
-                        if let Pattern::Identifier(_) = &d.id {
-                            if d.init.is_some() {
-                                has_named_export_with_init_or_updated = true;
-                            } else {
-                                // Without an init, upstream still treats the
-                                // prop as named; but the error fires only
-                                // when `$$props` is used AND the prop is
-                                // either init or `updated`. Be conservative:
-                                // treat any named export prop without init
-                                // as "named export" — actual error path fires
-                                // when `$$props` is referenced AND init|updated.
-                                // For init==None we still mark, since the
-                                // upstream test fixture (impossible-migrate-prop-and-$$props)
-                                // has an init.
-                                has_named_export_with_init_or_updated = true;
-                            }
+            if let Some(Statement::Variable(v)) = en.declaration.as_ref() {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        if d.init.is_some() || updated.contains(&id.name) {
+                            bad_prop = true;
                         }
                     }
                 }
@@ -316,19 +344,96 @@ fn detect_props_and_dollar_props(root: &Root, source: &str) -> Option<String> {
         }
     }
 
-    if !has_named_export_with_init_or_updated {
+    if !bad_prop {
         return None;
     }
 
-    // Check if `$$props` appears anywhere in the original source. The
-    // `$$props` identifier is unique enough that a textual scan suffices.
-    if source_uses_dollar_dollar(source, "$$props") {
-        return Some(
-            "$$props is used together with named props in a way that cannot be automatically migrated.".to_string()
-        );
-    }
+    Some(
+        "$$props is used together with named props in a way that cannot be automatically migrated.".to_string()
+    )
+}
 
-    None
+fn collect_assignment_targets(stmt: &Statement, out: &mut std::collections::HashSet<String>) {
+    match stmt {
+        Statement::Expression(es) => collect_assignment_targets_expr(&es.expression, out),
+        Statement::Block(b) => {
+            for s in &b.body {
+                collect_assignment_targets(s, out);
+            }
+        }
+        Statement::Variable(v) => {
+            for d in &v.declarations {
+                if let Some(init) = &d.init {
+                    collect_assignment_targets_expr(init, out);
+                }
+            }
+        }
+        Statement::Function(f) => {
+            for s in &f.body.body {
+                collect_assignment_targets(s, out);
+            }
+        }
+        Statement::If(ifs) => {
+            collect_assignment_targets_expr(&ifs.test, out);
+            collect_assignment_targets(&ifs.consequent, out);
+            if let Some(a) = &ifs.alternate {
+                collect_assignment_targets(a, out);
+            }
+        }
+        Statement::Labeled(l) => collect_assignment_targets(&l.body, out),
+        Statement::For(f) => {
+            collect_assignment_targets(&f.body, out);
+        }
+        Statement::While(w) => collect_assignment_targets(&w.body, out),
+        _ => {}
+    }
+}
+
+fn collect_assignment_targets_expr(
+    expr: &Expression,
+    out: &mut std::collections::HashSet<String>,
+) {
+    match expr {
+        Expression::Assignment(a) => {
+            if let svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) =
+                &a.left
+            {
+                out.insert(id.name.clone());
+            }
+            collect_assignment_targets_expr(&a.right, out);
+        }
+        Expression::Update(u) => {
+            if let Expression::Identifier(id) = &u.argument {
+                out.insert(id.name.clone());
+            }
+        }
+        Expression::Call(c) => {
+            collect_assignment_targets_expr(&c.callee, out);
+            for arg in &c.arguments {
+                if let svelte_js_ast::Argument::Expression(e) = arg {
+                    collect_assignment_targets_expr(e, out);
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            collect_assignment_targets_expr(&b.left, out);
+            collect_assignment_targets_expr(&b.right, out);
+        }
+        Expression::Arrow(a) => match &a.body {
+            svelte_js_ast::ArrowBody::Expression(e) => collect_assignment_targets_expr(e, out),
+            svelte_js_ast::ArrowBody::Block(b) => {
+                for s in &b.body {
+                    collect_assignment_targets(s, out);
+                }
+            }
+        },
+        Expression::Function(f) => {
+            for s in &f.body.body {
+                collect_assignment_targets(s, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn source_uses_dollar_dollar(source: &str, needle: &str) -> bool {
@@ -1113,6 +1218,228 @@ fn migrate_svelte_self_no_filename(
             );
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// `<svelte:element this="div" />` → `<svelte:element this={"div"} />`
+// Only when `this`-value is a static Literal string.
+// ---------------------------------------------------------------------------
+
+fn migrate_svelte_element_static_this(source: &str, str: &mut MagicString, frag: &Fragment) {
+    walk_fragment(frag, &mut |child| {
+        if let FragmentChild::SvelteElement(el) = child {
+            if let Expression::Literal(lit) = &el.tag {
+                if let svelte_js_ast::Literal::String(sl) = lit.as_ref() {
+                    // sl.span covers the *string literal* (with quotes). We
+                    // need to find the `=` before the literal and check the
+                    // span starts at a quote.
+                    let bytes = source.as_bytes();
+                    let s = sl.span.start as usize;
+                    let e = sl.span.end as usize;
+                    if s == 0 || e > bytes.len() || s >= e {
+                        return;
+                    }
+                    // Walk back from s-1 to find `=` or `{`. If `{` first
+                    // appears, it's already a `{...}` expression — skip.
+                    let mut a = s;
+                    let mut found_eq = false;
+                    while a > 0 {
+                        a -= 1;
+                        if bytes[a] == b'{' {
+                            return;
+                        }
+                        if bytes[a] == b'=' {
+                            found_eq = true;
+                            break;
+                        }
+                    }
+                    if !found_eq {
+                        return;
+                    }
+                    // The character at a+1 should be the opening quote.
+                    let quote = bytes.get(a + 1).copied();
+                    if quote != Some(b'"') && quote != Some(b'\'') {
+                        return;
+                    }
+                    if bytes.get(e).copied() != quote {
+                        return;
+                    }
+                    // Prepend `{` after `=` and append `}` after the closing
+                    // quote.
+                    str.prepend_left(a + 1, "{");
+                    str.append_right(e + 1, "}");
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// `<div slot="invalid-id">…` etc. — when the slot name isn't a valid
+// identifier (`:` or space) AND the slot is on a child of a Component, the
+// upstream migration emits a leading `<!-- @migration-task -->` comment
+// pointing out the issue. For reserved words (e.g. `new`) too.
+// ---------------------------------------------------------------------------
+
+fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragment) {
+    // Visit the fragment with the parent context. The slot-name check only
+    // applies when the parent is a Component (or SvelteComponent).
+    walk_with_parent(frag, None, &mut |child, parent| {
+        let parent_is_comp = matches!(
+            parent,
+            Some(
+                FragmentChild::Component(_)
+                    | FragmentChild::SvelteComponent(_)
+            )
+        );
+        if !parent_is_comp {
+            return;
+        }
+        let (attrs, start) = match child {
+            FragmentChild::RegularElement(e) => (&e.attributes, e.start as usize),
+            FragmentChild::SvelteFragment(e) => (&e.attributes, e.start as usize),
+            FragmentChild::SvelteElement(e) => (&e.attributes, e.start as usize),
+            _ => return,
+        };
+        for a in attrs {
+            if let ElementAttribute::Attribute(attr) = a {
+                if attr.name == "slot" {
+                    if let Some(name) = attribute_static_string(&attr.value) {
+                        if !is_valid_identifier_strict(&name) {
+                            // Find the indent for this line.
+                            let bytes = source.as_bytes();
+                            let mut ls = start;
+                            while ls > 0 && bytes[ls - 1] != b'\n' {
+                                ls -= 1;
+                            }
+                            let indent = &source[ls..start];
+                            str.prepend_right(
+                                start,
+                                format!(
+                                    "<!-- @migration-task: migrate this slot by hand, `{}` is an invalid identifier -->\n{}",
+                                    name, indent
+                                ),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn walk_with_parent<'a, F: FnMut(&'a FragmentChild, Option<&'a FragmentChild>)>(
+    frag: &'a Fragment,
+    parent: Option<&'a FragmentChild>,
+    visit: &mut F,
+) {
+    for child in &frag.nodes {
+        visit(child, parent);
+        let p = Some(child);
+        match child {
+            FragmentChild::Component(c) => walk_with_parent(&c.fragment, p, visit),
+            FragmentChild::RegularElement(e) => walk_with_parent(&e.fragment, p, visit),
+            FragmentChild::SlotElement(e) => walk_with_parent(&e.fragment, p, visit),
+            FragmentChild::TitleElement(e) => walk_with_parent(&e.fragment, p, visit),
+            FragmentChild::SvelteBody(e)
+            | FragmentChild::SvelteBoundary(e)
+            | FragmentChild::SvelteDocument(e)
+            | FragmentChild::SvelteFragment(e)
+            | FragmentChild::SvelteHead(e)
+            | FragmentChild::SvelteOptions(e)
+            | FragmentChild::SvelteSelf(e)
+            | FragmentChild::SvelteWindow(e) => walk_with_parent(&e.fragment, p, visit),
+            FragmentChild::SvelteComponent(e) => walk_with_parent(&e.fragment, p, visit),
+            FragmentChild::SvelteElement(e) => walk_with_parent(&e.fragment, p, visit),
+            FragmentChild::IfBlock(b) => {
+                walk_with_parent(&b.consequent, p, visit);
+                if let Some(alt) = &b.alternate {
+                    walk_with_parent(alt, p, visit);
+                }
+            }
+            FragmentChild::EachBlock(b) => {
+                walk_with_parent(&b.body, p, visit);
+                if let Some(f) = &b.fallback {
+                    walk_with_parent(f, p, visit);
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                if let Some(f) = &b.pending {
+                    walk_with_parent(f, p, visit);
+                }
+                if let Some(f) = &b.then {
+                    walk_with_parent(f, p, visit);
+                }
+                if let Some(f) = &b.catch_ {
+                    walk_with_parent(f, p, visit);
+                }
+            }
+            FragmentChild::KeyBlock(b) => walk_with_parent(&b.fragment, p, visit),
+            FragmentChild::SnippetBlock(b) => walk_with_parent(&b.body, p, visit),
+            _ => {}
+        }
+    }
+}
+
+/// A stricter identifier check that also rejects reserved words.
+fn is_valid_identifier_strict(s: &str) -> bool {
+    if !is_valid_identifier(s) {
+        return false;
+    }
+    !is_reserved_word(s)
+}
+
+fn is_reserved_word(s: &str) -> bool {
+    matches!(
+        s,
+        "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "new"
+            | "null"
+            | "return"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+            | "enum"
+            | "implements"
+            | "interface"
+            | "let"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "static"
+            | "await"
+    )
 }
 
 // ---------------------------------------------------------------------------
