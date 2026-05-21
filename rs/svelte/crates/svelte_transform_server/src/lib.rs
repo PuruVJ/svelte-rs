@@ -2549,6 +2549,10 @@ fn lower_select_child(
             // Comments dropped server-side. Top-level snippet blocks were already
             // extracted before this point.
         }
+        // Whitespace-only Text between `<option>`/`<optgroup>` siblings is
+        // dropped — each option emits its own self-anchored call, so there's
+        // no need to preserve the inter-element whitespace.
+        FragmentChild::Text(t) if t.data.trim().is_empty() => {}
         other => {
             if append_node_to_template(other, buf).is_none() {
                 return None;
@@ -4518,14 +4522,13 @@ impl TemplateBuf {
         self.exprs.is_empty() && self.parts.iter().all(|s| s.chars().all(|c| c.is_whitespace()))
     }
 
-    /// Flush to a `$$renderer.push(\`...\`)` statement (or None when empty
-    /// or whitespace-only). Boundary whitespace is handled at the fragment
-    /// level by `trim_boundary_whitespace`, not here.
+    /// Flush to a `$$renderer.push(\`...\`)` statement (or None when empty).
+    /// Whitespace-only buffers DO flush — they typically represent
+    /// inter-element WS between side-statements that upstream preserves
+    /// as `$$renderer.push(\` \`)`. Boundary trim is handled by
+    /// `trim_boundary_whitespace`.
     fn flush(&mut self) -> Option<Statement> {
-        if self.is_empty() || self.is_whitespace_only() {
-            self.parts.clear();
-            self.parts.push(String::new());
-            self.exprs.clear();
+        if self.is_empty() {
             return None;
         }
         let parts = std::mem::take(&mut self.parts);
