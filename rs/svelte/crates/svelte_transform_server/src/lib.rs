@@ -2056,6 +2056,10 @@ thread_local! {
     /// `is_standalone` flag, which suppresses the trailing `<!---->` anchor
     /// for the lone render tag. Reset per component to false.
     static IS_STANDALONE: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// Set while inside the customizable `<select>` body lowering so the
+    /// inner fragment processor strips whitespace between adjacent
+    /// Components (matches upstream's `<select>`-body clean_nodes).
+    static IN_SELECT_BODY: std::cell::Cell<bool> = std::cell::Cell::new(false);
     /// Filename for the current component compile, used to seed the
     /// `$.head(HASH, ...)` hash. Set by `try_typed_server_component_with_filename`.
     static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
@@ -2550,7 +2554,18 @@ fn lower_fragment_with_marker(
     // Extracted SnippetBlocks DON'T set this (they preserve the boundary
     // and let two adjacent texts emit two spaces).
     let mut after_dropped_comment = false;
+    let in_select_body = IN_SELECT_BODY.with(|c| c.get());
     for n in nodes.iter() {
+        // Inside a `<select>` callback body, whitespace-only Text between
+        // siblings (Component/RenderTag/anything) is dropped — matches
+        // upstream's clean_nodes for select bodies.
+        if in_select_body {
+            if let FragmentChild::Text(t) = n {
+                if t.data.trim().is_empty() {
+                    continue;
+                }
+            }
+        }
         // Before processing this node, if the previous node was a Component
         // and we're now about to emit anything (even whitespace), push
         // `<!---->` to buf so it anchors the hydration scope. The marker
@@ -3204,6 +3219,16 @@ fn lower_select_with_value(
     el: &svelte_ast::elements::RegularElement,
     value_expr: Expression,
 ) -> Option<Statement> {
+    let value_expr_orig = value_expr.clone();
+    let value_has_await = expr_has_await_top(&value_expr_orig);
+    // When the value expression contains a top-level await, the inner
+    // select uses a `$$0` placeholder filled by the outer `$$renderer.child`
+    // wrap below. Otherwise the value flows in unchanged.
+    let value_expr = if value_has_await {
+        t::id("$$0")
+    } else {
+        value_expr
+    };
     // Build the props object preserving the source order. The `value:`
     // entry takes the same position the value attribute occupied; other
     // attrs land at their original index.
@@ -3277,7 +3302,10 @@ fn lower_select_with_value(
     // through the template literal.
     let customizable = is_customizable_select(el);
     let inner_out: Vec<Statement> = if customizable {
-        lower_fragment_with_marker(&el.fragment, false)?
+        IN_SELECT_BODY.with(|c| c.set(true));
+        let stmts = lower_fragment_with_marker(&el.fragment, false)?;
+        IN_SELECT_BODY.with(|c| c.set(false));
+        stmts
     } else {
         let mut inner_buf = TemplateBuf::new();
         let mut inner_out: Vec<Statement> = Vec::new();
@@ -3333,10 +3361,41 @@ fn lower_select_with_value(
             BooleanLiteral { value: true, span: Span::ZERO },
         ))));
     }
-    Some(t::stmt(t::call(
+    let select_call = t::stmt(t::call(
         t::member_id(t::id("$$renderer"), "select"),
         select_args,
-    )))
+    ));
+
+    // If the value expression contains a top-level await, wrap the whole
+    // select call in `$$renderer.child(async ($$renderer) => { const $$0 =
+    // (await $.save(VALUE_EXPR))(); $$renderer.select({ value: $$0 }, …); })`.
+    if value_has_await {
+        let saved = wrap_async_test(&value_expr_orig);
+        let const_decl = Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Const,
+            declarations: vec![VariableDeclarator {
+                id: t::pat_id("$$0"),
+                init: Some(saved),
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        }));
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![const_decl, select_call],
+                span: Span::ZERO,
+            })),
+            r#async: true,
+            span: Span::ZERO,
+        }));
+        return Some(t::stmt(t::call(
+            t::member_id(t::id("$$renderer"), "child"),
+            vec![arrow],
+        )));
+    }
+
+    Some(select_call)
 }
 
 /// Inline emit `<select>` with `<option>` children — writes the open tag
@@ -4674,8 +4733,25 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
         None
     };
 
+    // If the synthetic_value_node expression contains a top-level await,
+    // wrap the whole option call in `$$renderer.child(async ($$renderer) => {
+    // const $$0 = (await $.save(EXPR))(); $$renderer.option({…}, $$0); })`.
+    // Detected here and propagated via `child_wrap_with`.
+    let child_wrap_with: Option<Expression> =
+        single_expr_value.as_ref().and_then(|e| {
+            if expr_has_await_top(e) {
+                Some(e.clone())
+            } else {
+                None
+            }
+        });
+
     let body_arg = if let Some(expr) = single_expr_value {
-        expr
+        if child_wrap_with.is_some() {
+            t::id("$$0")
+        } else {
+            expr
+        }
     } else {
         let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
         Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -4725,12 +4801,41 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             }),
         ))));
     }
-    Some(t::stmt(Expression::Call(Box::new(CallExpression {
+    let option_call = t::stmt(Expression::Call(Box::new(CallExpression {
         callee: t::member_id(t::id("$$renderer"), "option"),
         arguments,
         optional: false,
         span: Span::ZERO,
-    }))))
+    })));
+
+    if let Some(awaited_expr) = child_wrap_with {
+        // const $$0 = (await $.save(EXPR))();
+        let saved = wrap_async_test(&awaited_expr);
+        let const_decl = Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Const,
+            declarations: vec![VariableDeclarator {
+                id: t::pat_id("$$0"),
+                init: Some(saved),
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        }));
+        let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+            params: vec![t::pat_id("$$renderer")],
+            body: ArrowBody::Block(Box::new(BlockStatement {
+                body: vec![const_decl, option_call],
+                span: Span::ZERO,
+            })),
+            r#async: true,
+            span: Span::ZERO,
+        }));
+        return Some(t::stmt(t::call(
+            t::member_id(t::id("$$renderer"), "child"),
+            vec![arrow],
+        )));
+    }
+
+    Some(option_call)
 }
 
 fn void_zero_expr() -> Expression {
