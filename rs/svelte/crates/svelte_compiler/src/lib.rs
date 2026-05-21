@@ -15,6 +15,7 @@ pub use options::{
 };
 pub use svelte_ast::Root;
 pub use svelte_diagnostics::CompileDiagnostic;
+pub use svelte_print::{print as print_root, PrintOptions, PrintResult};
 
 /// `parse(source, options)` — delegates to `svelte_parse::parse`.
 ///

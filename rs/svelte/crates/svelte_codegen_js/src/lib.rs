@@ -12,6 +12,7 @@
 pub mod typed;
 
 pub use typed::{
-    print_typed, LineMap, Segment, TypedComment, TypedCommentKind, TypedPrintOptions,
+    print_expression_str, print_pattern_str, print_statements_str, print_typed,
+    LineMap, Segment, TypedComment, TypedCommentKind, TypedPrintOptions,
     TypedPrintResult,
 };

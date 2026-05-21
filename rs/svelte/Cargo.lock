@@ -977,6 +977,7 @@ dependencies = [
  "svelte_migrate",
  "svelte_parse",
  "svelte_preprocess",
+ "svelte_print",
  "svelte_transform_client",
  "svelte_transform_server",
 ]
@@ -1064,6 +1065,16 @@ dependencies = [
  "sourcemap",
  "svelte_diagnostics",
  "svelte_magic_string",
+]
+
+[[package]]
+name = "svelte_print"
+version = "0.0.0"
+dependencies = [
+ "svelte_ast",
+ "svelte_codegen_js",
+ "svelte_js_ast",
+ "svelte_parse",
 ]
 
 [[package]]

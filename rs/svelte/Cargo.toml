@@ -17,6 +17,7 @@ members = [
     "crates/svelte_transform_server",
     "crates/svelte_preprocess",
     "crates/svelte_migrate",
+    "crates/svelte_print",
     "crates/svelte_compiler",
     "crates/svelte_wasm",
     "crates/svelte_test_harness",
@@ -47,6 +48,7 @@ svelte_transform_client = { path = "crates/svelte_transform_client" }
 svelte_transform_server = { path = "crates/svelte_transform_server" }
 svelte_preprocess = { path = "crates/svelte_preprocess" }
 svelte_migrate = { path = "crates/svelte_migrate" }
+svelte_print = { path = "crates/svelte_print" }
 svelte_compiler = { path = "crates/svelte_compiler" }
 
 # External crates — versions pinned at workspace level for consistency

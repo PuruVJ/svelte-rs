@@ -25,6 +25,7 @@ svelte_transform_server = { workspace = true }
 svelte_codegen_js = { workspace = true }
 svelte_preprocess = { workspace = true }
 svelte_migrate = { workspace = true }
+svelte_print = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

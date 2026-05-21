@@ -113,6 +113,41 @@ pub fn print_typed(program: &Program, opts: &TypedPrintOptions) -> TypedPrintRes
     emitter.finish(opts)
 }
 
+/// Print a single Expression to its source-form string. Used by
+/// `svelte_print` for inlining JS expressions inside template tags
+/// (e.g. `{name}`, attribute values, block tests).
+pub fn print_expression_str(e: &Expression) -> String {
+    let opts = TypedPrintOptions::default();
+    let comment_index = std::cell::Cell::new(0usize);
+    let mut emitter = Emitter::new(&opts, &opts.comments, &comment_index);
+    emitter.emit_expression(e);
+    emitter.code
+}
+
+/// Print a single Pattern (e.g. for `{#each ... as PAT}` contexts).
+pub fn print_pattern_str(p: &Pattern) -> String {
+    let opts = TypedPrintOptions::default();
+    let comment_index = std::cell::Cell::new(0usize);
+    let mut emitter = Emitter::new(&opts, &opts.comments, &comment_index);
+    emitter.emit_pattern(p);
+    emitter.code
+}
+
+/// Print a list of top-level statements (`<script>` body, `{@const}` body)
+/// using the existing program emitter — preserves margin / formatting rules.
+pub fn print_statements_str(body: &[Statement]) -> String {
+    let prog = Program {
+        source_type: svelte_js_ast::SourceType::Module,
+        body: body.to_vec(),
+        span: svelte_js_ast::Span::ZERO,
+    };
+    let opts = TypedPrintOptions::default();
+    let comment_index = std::cell::Cell::new(0usize);
+    let mut emitter = Emitter::new(&opts, &opts.comments, &comment_index);
+    emitter.emit_program(&prog);
+    emitter.code
+}
+
 // ----- Emitter ------------------------------------------------------------
 
 struct Emitter<'a> {
