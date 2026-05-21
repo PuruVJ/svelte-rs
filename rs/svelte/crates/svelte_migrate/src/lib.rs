@@ -48,29 +48,35 @@ pub struct MigrateResult {
 /// Best-effort migration of Svelte 4 source towards Svelte 5 runes,
 /// event attributes, and render tags. Returns the migrated source.
 pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
-    // 1. Parse the source. On hard failure → prepend the @migration-task
-    //    comment + return source unchanged. Mirrors upstream's catch-all
-    //    around `parse(source)`.
-    let parsed = match svelte_parse::parse(source, false) {
+    let og_source = source;
+    // Upstream blanks `<style>` blocks before parsing — they can contain
+    // SCSS/LESS/etc. that the Svelte parser can't handle. Replace each
+    // style body with a single-length placeholder, then restore after edits.
+    let (source_blanked, style_contents) = blank_style_blocks(source);
+
+    // 1. Parse the (blanked) source. On hard failure → prepend the
+    //    @migration-task comment + return the original source unchanged.
+    let parsed = match svelte_parse::parse(&source_blanked, false) {
         Ok(r) => r,
         Err(diag) => {
-            // diag.message already ends with "\nhttps://svelte.dev/e/{code}".
             return MigrateResult {
                 code: format!(
                     "<!-- @migration-task Error while migrating Svelte code: {} -->\n{}",
-                    diag.message, source
+                    diag.message, og_source
                 ),
             };
         }
     };
+    let source = source_blanked.as_str();
 
     // 2. Detect "impossible to migrate" patterns. If any are found,
-    //    prepend the migration-task comment and bail.
+    //    prepend the migration-task comment and bail. Use the original
+    //    (un-blanked) source for the returned body.
     if let Some(err_msg) = detect_impossible(&parsed, source) {
         return MigrateResult {
             code: format!(
                 "<!-- @migration-task Error while migrating Svelte code: {} -->\n{}",
-                err_msg, source
+                err_msg, og_source
             ),
         };
     }
@@ -86,9 +92,84 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
+    // Restore the original `<style>` bodies that we blanked before parsing.
+    for (start, content) in &style_contents {
+        let end = start + STYLE_PLACEHOLDER.len();
+        str.overwrite(*start, end, content);
+    }
+
     MigrateResult {
         code: str.to_string(),
     }
+}
+
+const STYLE_PLACEHOLDER: &str = "/*$$__STYLE_CONTENT__$$*/";
+
+/// Replace each `<style …>BODY</style>` body with a fixed-length placeholder.
+/// Returns the modified source and a list of `(placeholder_start_offset,
+/// original_body)` pairs for restoration after MagicString edits.
+fn blank_style_blocks(source: &str) -> (String, Vec<(usize, String)>) {
+    let mut out = String::with_capacity(source.len());
+    let mut contents: Vec<(usize, String)> = Vec::new();
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Look for `<style` followed by attrs/space + `>`.
+        if bytes[i] == b'<' && source[i..].to_ascii_lowercase().starts_with("<style") {
+            // Find the closing `>` of the open tag.
+            let mut j = i + "<style".len();
+            // The next char must be `>` or whitespace (or `/`).
+            let valid_open = j < bytes.len()
+                && (bytes[j] == b'>'
+                    || bytes[j].is_ascii_whitespace()
+                    || bytes[j] == b'/');
+            if !valid_open {
+                out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+            while j < bytes.len() && bytes[j] != b'>' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                // Unterminated open tag — pass through.
+                out.push_str(&source[i..]);
+                i = bytes.len();
+                continue;
+            }
+            // `j` is at `>`.
+            let body_start_in_src = j + 1;
+            // Find `</style>` (case-insensitive).
+            let after = &source[body_start_in_src..];
+            let close = match find_close_style(after) {
+                Some(rel) => body_start_in_src + rel,
+                None => {
+                    out.push_str(&source[i..]);
+                    i = bytes.len();
+                    continue;
+                }
+            };
+            // Emit `<style…>`.
+            out.push_str(&source[i..body_start_in_src]);
+            // Record placeholder start in the OUTPUT (i.e. after writing the open tag).
+            let placeholder_start = out.len();
+            out.push_str(STYLE_PLACEHOLDER);
+            let original_body = source[body_start_in_src..close].to_string();
+            contents.push((placeholder_start, original_body));
+            // Emit the rest from `</style>` onward.
+            out.push_str(&source[close..close + "</style>".len()]);
+            i = close + "</style>".len();
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    (out, contents)
+}
+
+fn find_close_style(s: &str) -> Option<usize> {
+    let lc = s.to_ascii_lowercase();
+    lc.find("</style>")
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,16 +1366,14 @@ fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragm
     // Visit the fragment with the parent context. The slot-name check only
     // applies when the parent is a Component (or SvelteComponent).
     walk_with_parent(frag, None, &mut |child, parent| {
-        let parent_is_comp = matches!(
-            parent,
-            Some(
-                FragmentChild::Component(_)
-                    | FragmentChild::SvelteComponent(_)
-            )
-        );
-        if !parent_is_comp {
+        let parent_attrs = match parent {
+            Some(FragmentChild::Component(c)) => Some(&c.attributes),
+            Some(FragmentChild::SvelteComponent(c)) => Some(&c.attributes),
+            _ => None,
+        };
+        let Some(parent_attrs) = parent_attrs else {
             return;
-        }
+        };
         let (attrs, start) = match child {
             FragmentChild::RegularElement(e) => (&e.attributes, e.start as usize),
             FragmentChild::SvelteFragment(e) => (&e.attributes, e.start as usize),
@@ -1305,8 +1384,26 @@ fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragm
             if let ElementAttribute::Attribute(attr) = a {
                 if attr.name == "slot" {
                     if let Some(name) = attribute_static_string(&attr.value) {
-                        if !is_valid_identifier_strict(&name) {
-                            // Find the indent for this line.
+                        let invalid_id = !is_valid_identifier_strict(&name);
+                        let shadows_parent_prop = !invalid_id
+                            && parent_attrs.iter().any(|pa| match pa {
+                                ElementAttribute::Attribute(a) => a.name == name,
+                                _ => false,
+                            });
+                        let reason = if invalid_id {
+                            Some(format!(
+                                "`{}` is an invalid identifier",
+                                name
+                            ))
+                        } else if shadows_parent_prop {
+                            Some(format!(
+                                "`{}` would shadow a prop on the parent component",
+                                name
+                            ))
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
                             let bytes = source.as_bytes();
                             let mut ls = start;
                             while ls > 0 && bytes[ls - 1] != b'\n' {
@@ -1316,8 +1413,8 @@ fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragm
                             str.prepend_right(
                                 start,
                                 format!(
-                                    "<!-- @migration-task: migrate this slot by hand, `{}` is an invalid identifier -->\n{}",
-                                    name, indent
+                                    "<!-- @migration-task: migrate this slot by hand, {} -->\n{}",
+                                    reason, indent
                                 ),
                             );
                             break;
