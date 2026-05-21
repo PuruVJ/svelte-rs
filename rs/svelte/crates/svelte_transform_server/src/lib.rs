@@ -2372,9 +2372,21 @@ fn lower_select_with_value(
         span: Span::ZERO,
     }));
 
+    let mut select_args = vec![props_obj, arrow];
+    // The 3rd arg is the `svelte-{hash}` only when the element itself
+    // carries a `class=` attribute that needs scoping. Otherwise upstream
+    // omits the arg.
+    let has_class_attr = el.attributes.iter().any(|a| matches!(
+        a, ElementAttribute::Attribute(attr) if attr.name == "class"
+    ));
+    if has_class_attr {
+        if let Some(hash) = CSS_HASH.with(|c| c.borrow().clone()) {
+            select_args.push(string_lit(&hash));
+        }
+    }
     Some(t::stmt(t::call(
         t::member_id(t::id("$$renderer"), "select"),
-        vec![props_obj, arrow],
+        select_args,
     )))
 }
 
@@ -3558,10 +3570,27 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
         }))),
         Argument::Expression(body_arg),
     ];
+    // The 3rd arg is the `svelte-{hash}` only when the `<option>` itself
+    // carries a `class=` attribute (or rich content forces the 7-arg form
+    // and we need to fill slot 3). Otherwise upstream omits it.
+    let has_class_attr = el.attributes.iter().any(|a| matches!(
+        a, ElementAttribute::Attribute(attr) if attr.name == "class"
+    ));
+    let css_hash = if has_class_attr {
+        CSS_HASH.with(|c| c.borrow().clone())
+    } else {
+        None
+    };
+    if let Some(hash) = css_hash.as_ref() {
+        arguments.push(Argument::Expression(string_lit(hash)));
+    }
     if is_rich {
-        // 7-arg form: pad slots 3-6 with `void 0` and pass `true` as the
-        // customizable-select-element flag (slot 7).
-        for _ in 0..4 {
+        // 7-arg form: pad slots 4-6 with `void 0` (slot 3 is css_hash,
+        // already filled above when scoped) and pass `true` as slot 7.
+        if css_hash.is_none() {
+            arguments.push(Argument::Expression(void_zero_expr()));
+        }
+        for _ in 0..3 {
             arguments.push(Argument::Expression(void_zero_expr()));
         }
         arguments.push(Argument::Expression(Expression::Literal(Box::new(
