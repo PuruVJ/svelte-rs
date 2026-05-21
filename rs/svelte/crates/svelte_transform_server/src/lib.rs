@@ -46,8 +46,18 @@ pub fn try_typed_server_component_with_filename(
     experimental_async: bool,
     filename: Option<&str>,
 ) -> Option<Program> {
-    if root.module.is_some() {
-        return None;
+    // `<script module>` content is hoisted above the export default
+    // function. Statements are pulled in source order; imports flow to
+    // `script_imports` so they're emitted with the regular instance imports.
+    let mut module_imports: Vec<Statement> = Vec::new();
+    let mut module_rest: Vec<Statement> = Vec::new();
+    if let Some(m) = root.module.as_ref() {
+        for s in m.content.body.iter() {
+            match s {
+                Statement::Import(_) => module_imports.push(s.clone()),
+                _ => module_rest.push(s.clone()),
+            }
+        }
     }
     // When the source has a `<style>` block, append `svelte-{hash}` to every
     // class attribute and (if css injection is enabled) also emit
@@ -236,12 +246,16 @@ pub fn try_typed_server_component_with_filename(
     // when the script itself doesn't have top-level await.
     let template_has_async = fragment_has_async(&root.fragment);
 
-    let mut top: Vec<Statement> = Vec::with_capacity(3 + script_imports.len());
+    let mut top: Vec<Statement> = Vec::with_capacity(3 + script_imports.len() + module_imports.len() + module_rest.len());
     if experimental_async || async_info.is_some() || template_has_async {
         top.push(t::import_side_effect("svelte/internal/flags/async"));
     }
     top.push(t::import_namespace("$", "svelte/internal/server"));
+    top.extend(module_imports);
     top.extend(script_imports);
+    // Non-import `<script module>` statements (e.g. `const X = ...`) emit
+    // after the imports, before the default export.
+    top.extend(module_rest);
     // Hoisted snippet function declarations come before the default export.
     top.extend(snippet_decls);
     top.push(t::export_default_function(component_name, params, func_body));
@@ -1064,6 +1078,35 @@ fn lower_fragment_server_async_with(
                     return None;
                 }
             }
+            FragmentChild::Component(c) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.push(lower_component_server(c)?);
+                buf.push_str("<!---->");
+            }
+            FragmentChild::RenderTag(rt) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.push(lower_render_tag_for_select(rt)?);
+                buf.push_str("<!---->");
+            }
+            FragmentChild::SvelteHead(sh) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.push(lower_svelte_head_server(sh)?);
+            }
+            FragmentChild::SvelteBoundary(sb) => {
+                if let Some(stmt) = buf.flush() {
+                    out.push(stmt);
+                }
+                out.extend(lower_svelte_boundary_server(sb)?);
+            }
+            FragmentChild::SvelteOptions(_) => {
+                // metadata, no output
+            }
             _ => return None,
         }
     }
@@ -1842,13 +1885,19 @@ fn lower_fragment_with_marker(
                     last_was_component = false;
                 }
                 FragmentChild::SvelteOptions(_) => {
-                    // `<svelte:options ...>` is a compile-time directive
-                    // (sets css mode, namespace, custom-element flags, etc.).
-                    // No runtime output.
+                    // `<svelte:options ...>` is compile-time metadata —
+                    // css mode, namespace, custom-element flags. No output.
                     last_was_component = false;
                 }
                 FragmentChild::SvelteBoundary(sb) => {
                     out.extend(lower_svelte_boundary_server(sb)?);
+                    last_was_component = false;
+                }
+                FragmentChild::RenderTag(rt) => {
+                    out.push(lower_render_tag_for_select(rt)?);
+                    // `{@render snippet()}` at top level (outside select)
+                    // emits a trailing `<!---->` anchor on the next push.
+                    buf.push_str("<!---->");
                     last_was_component = false;
                 }
                 _ => return None,
@@ -3312,6 +3361,18 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             }
         }
         FragmentChild::Comment(_) => Some(()), // HTML comments dropped server-side
+        FragmentChild::TitleElement(el) => {
+            // Outside `<svelte:head>`, `<title>` is just an HTML element.
+            // (Inside head, `lower_head_fragment` handles it specially.)
+            buf.push_str("<title>");
+            let kids = trim_boundary_whitespace(&el.fragment.nodes);
+            let kids = trim_boundary_text(kids);
+            for k in kids.iter() {
+                append_node_to_template(k, buf)?;
+            }
+            buf.push_str("</title>");
+            Some(())
+        }
         _ => None,
     }
 }
