@@ -1536,6 +1536,81 @@ fn lower_svelte_head_server(
     )))
 }
 
+/// Lower `<svelte:boundary>...</svelte:boundary>` to
+/// `$$renderer.boundary({ failed, pending }, ($$renderer) => { ... })`.
+/// `{#snippet failed/pending}` blocks inside the boundary hoist as local
+/// function declarations preceding the call.
+fn lower_svelte_boundary_server(
+    sb: &svelte_ast::elements::SvelteBoundary,
+) -> Option<Vec<Statement>> {
+    let mut out: Vec<Statement> = Vec::new();
+    let mut snippet_names: Vec<String> = Vec::new();
+    let mut body_fragment = sb.fragment.clone();
+    let mut remaining: Vec<FragmentChild> = Vec::with_capacity(body_fragment.nodes.len());
+    for n in std::mem::take(&mut body_fragment.nodes) {
+        if let FragmentChild::SnippetBlock(snip) = &n {
+            let name = snip.expression.name.clone();
+            let needs_marker = body_needs_marker(&snip.body);
+            let body_stmts = lower_fragment_with_marker(&snip.body, needs_marker)?;
+            let mut params = vec![t::pat_id("$$renderer")];
+            for p in &snip.parameters {
+                params.push(p.clone());
+            }
+            out.push(t::function_decl(&name, params, body_stmts));
+            snippet_names.push(name);
+            continue;
+        }
+        remaining.push(n);
+    }
+    body_fragment.nodes = remaining;
+
+    // Build the `{ failed, pending, ... }` object literal — shorthand props.
+    let mut obj_props: Vec<ObjectMember> = Vec::new();
+    for name in &snippet_names {
+        obj_props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: name.clone(),
+                span: Span::ZERO,
+            }),
+            value: t::id(name),
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand: true,
+            method: false,
+            span: Span::ZERO,
+        })));
+    }
+    let snippets_obj = Expression::Object(Box::new(ObjectExpression {
+        properties: obj_props,
+        span: Span::ZERO,
+    }));
+
+    // Body arrow: push `<!--[-->`, then BlockStatement of body, then `<!--]-->`.
+    let body_stmts = lower_fragment_server(&body_fragment)?;
+    let mut arrow_body: Vec<Statement> = Vec::new();
+    arrow_body.push(push_template("<!--[-->"));
+    arrow_body.push(Statement::Block(Box::new(BlockStatement {
+        body: body_stmts,
+        span: Span::ZERO,
+    })));
+    arrow_body.push(push_template("<!--]-->"));
+    let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body: arrow_body,
+            span: Span::ZERO,
+        })),
+        r#async: false,
+        span: Span::ZERO,
+    }));
+
+    out.push(t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "boundary"),
+        vec![snippets_obj, body_arrow],
+    )));
+    Some(out)
+}
+
 fn lower_head_fragment(
     f: &svelte_ast::fragment::Fragment,
 ) -> Option<Vec<Statement>> {
@@ -1770,6 +1845,10 @@ fn lower_fragment_with_marker(
                     // `<svelte:options ...>` is a compile-time directive
                     // (sets css mode, namespace, custom-element flags, etc.).
                     // No runtime output.
+                    last_was_component = false;
+                }
+                FragmentChild::SvelteBoundary(sb) => {
+                    out.extend(lower_svelte_boundary_server(sb)?);
                     last_was_component = false;
                 }
                 _ => return None,
