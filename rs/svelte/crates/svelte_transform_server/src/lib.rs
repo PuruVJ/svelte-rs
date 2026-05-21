@@ -84,6 +84,7 @@ pub fn try_typed_server_component_full(
 ) -> Option<Program> {
     PRESERVE_COMMENTS.with(|c| c.set(preserve_comments));
     BODY_VAR_COUNTER.with(|c| c.set(0));
+    SIBLING_PROMISES_COUNTER.with(|c| c.set(0));
     // `<script module>` content is hoisted above the export default
     // function. Statements are pulled in source order; imports flow to
     // `script_imports` so they're emitted with the regular instance imports.
@@ -1308,8 +1309,15 @@ fn lower_fragment_server_async_with(
     let mut const_await_counter: usize = 0;
 
     // If the first non-whitespace top-level node is an async-tainted
-    // ExpressionTag, prepend `<!---->` marker.
-    let needs_anchor = matches!(
+    // ExpressionTag, prepend `<!---->` marker. Skip when SUPPRESS_INNER_ANCHOR
+    // is set (the caller already pushed its own marker — e.g. if-branch's
+    // `<!--[0-->`).
+    let suppress = SUPPRESS_INNER_ANCHOR.with(|c| {
+        let v = c.get();
+        c.set(false);
+        v
+    });
+    let needs_anchor = !suppress && matches!(
         nodes.first(),
         Some(FragmentChild::ExpressionTag(t)) if expr_refs_any(&t.expression, async_bindings)
     );
@@ -1648,20 +1656,9 @@ fn lower_fragment_with_const_await_with(
         }
     }
 
-    // Trailing `() => undefined` only when the last group is async. Mirrors
-    // upstream's `b.thunk(...)` pattern: an async-trailing run-array needs a
-    // sync fallback so `last_group_idx` lands on something awaitable.
-    if last_was_async {
-        groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: Vec::new(),
-            body: ArrowBody::Expression(Expression::Identifier(Identifier {
-                name: "undefined".to_string(),
-                span: Span::ZERO,
-            })),
-            r#async: false,
-            span: Span::ZERO,
-        })));
-    }
+    // (No trailing `() => undefined` sentinel — upstream's const-await
+    // run-array uses just the actual async thunks.)
+    let _ = last_was_async;
 
     // Emit hoisted lets
     for name in &const_names {
@@ -1694,6 +1691,10 @@ fn lower_fragment_with_const_await_with(
     let stub_fragment = svelte_ast::fragment::Fragment { nodes: rest_nodes };
     let empty_blockers: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // When called inside an if-block branch, the caller already pushed
+    // its marker (`'<!--[0-->'`) which anchors the scope — so skip the
+    // inner lowerer's leading `<!---->` anchor in that case. We signal
+    // this via a thread-local since the call site is deep.
     out.extend(lower_fragment_server_async_with(
         &stub_fragment,
         &async_set,
@@ -1920,6 +1921,17 @@ thread_local! {
     /// Counter for `$$body` / `$$body_1` / ... name allocation for
     /// content-editable bind:innerText/textContent/innerHTML + textarea.
     static BODY_VAR_COUNTER: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// Set by the if-block branch lowering when it pushes its own
+    /// `<!--[N-->` marker before invoking const-await — signals the
+    /// const-await body lowerer to skip its leading `<!---->` anchor.
+    static SUPPRESS_INNER_ANCHOR: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    /// Shared counter for sibling const-await fragments in if/elseif/else
+    /// branches — each gets its own `promises` / `promises_1` / ... name.
+    static SIBLING_PROMISES_COUNTER: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
 }
@@ -3765,24 +3777,35 @@ fn build_if_chain_server_ex(
         consequent_body.extend(lower_fragment_for_async_block(&ib.consequent)?);
     } else if consequent_has_const_await {
         // Pick a unique `promises`/`promises_1`/... name from the sibling
-        // counter on AsyncCtx (or default to "promises" when there's no ctx).
+        // counter. Prefer async_ctx's counter when present; otherwise use
+        // a top-level thread-local that resets each component.
         let idx = async_ctx
             .map(|c| {
                 let i = c.const_await_counter.get();
                 c.const_await_counter.set(i + 1);
                 i
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|| {
+                SIBLING_PROMISES_COUNTER.with(|c| {
+                    let i = c.get();
+                    c.set(i + 1);
+                    i
+                })
+            });
         let promises_var = if idx == 0 {
             "promises".to_string()
         } else {
             format!("promises_{idx}")
         };
+        // The if-branch marker (`'<!--[0-->'`) was already pushed above,
+        // so the const-await inner lowerer should NOT add another anchor.
+        SUPPRESS_INNER_ANCHOR.with(|c| c.set(true));
         consequent_body.extend(lower_fragment_with_const_await_with(
             &ib.consequent,
             blocker_bindings,
             &promises_var,
         )?);
+        SUPPRESS_INNER_ANCHOR.with(|c| c.set(false));
     } else {
         // Inside an async_block / child_block (use_async_marker=true), the
         // wrap's string-literal `<!--[N-->` push already anchors the scope —
@@ -3885,6 +3908,33 @@ fn build_if_chain_server_ex(
             alternate_body.push(push_string(final_marker));
             if test_is_async {
                 alternate_body.extend(lower_fragment_for_async_block(alt)?);
+            } else if fragment_has_const_with_await_or_blocker(alt, blocker_bindings) {
+                // Else branch with `{@const X = await ...}` needs the same
+                // const-await machinery as the consequent — pick a fresh
+                // promises_N name and reuse the lowerer.
+                let idx = async_ctx
+                    .map(|c| {
+                        let i = c.const_await_counter.get();
+                        c.const_await_counter.set(i + 1);
+                        i
+                    })
+                    .unwrap_or_else(|| {
+                        SIBLING_PROMISES_COUNTER.with(|c| {
+                            let i = c.get();
+                            c.set(i + 1);
+                            i
+                        })
+                    });
+                let promises_var = if idx == 0 {
+                    "promises".to_string()
+                } else {
+                    format!("promises_{idx}")
+                };
+                SUPPRESS_INNER_ANCHOR.with(|c| c.set(true));
+                alternate_body.extend(lower_fragment_with_const_await_with(
+                    alt, blocker_bindings, &promises_var,
+                )?);
+                SUPPRESS_INNER_ANCHOR.with(|c| c.set(false));
             } else {
                 let needs_marker = !use_async_marker && body_needs_marker(alt);
                 alternate_body.extend(lower_fragment_with_marker(alt, needs_marker)?);
