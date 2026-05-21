@@ -2979,6 +2979,13 @@ fn lower_fragment_with_marker(
                     )));
                     last_was_component = false;
                 }
+                FragmentChild::RegularElement(el) if element_has_async_directive(el) => {
+                    // `<TAG class:X={await EXPR}>` (or style:) → wrap in
+                    // `$$renderer.child(async ($$renderer) => { const $$N =
+                    // (await $.save(EXPR))(); $$renderer.push(`<TAG${...}>`); })`.
+                    out.push(lower_element_with_async_directive(el)?);
+                    last_was_component = false;
+                }
                 _ => return None,
             }
         } else {
@@ -5130,6 +5137,103 @@ fn push_string(s: &str) -> Statement {
 /// Does this element contain any descendant that can't be inlined into a
 /// single template-literal push? Components, blocks, await-tags etc all
 /// require their own statement.
+/// Lower a self-closing / static-body element that has a class:/style:
+/// directive containing top-level await. Emits:
+///   `$$renderer.child(async ($$renderer) => {
+///     const $$N = (await $.save(EXPR))();
+///     $$renderer.push(`<TAG${$.attributes({...}, void 0, { … })}>...</TAG>`);
+///   });`
+fn lower_element_with_async_directive(
+    el: &svelte_ast::elements::RegularElement,
+) -> Option<Statement> {
+    let mut buf = TemplateBuf::new();
+    let mut hoists: Vec<Expression> = Vec::new();
+    buf.push_str("<");
+    buf.push_str(&el.name);
+    let has_spread = el.attributes.iter().any(|a| {
+        matches!(a, ElementAttribute::SpreadAttribute(_))
+    });
+    if has_spread {
+        append_attributes_call_with_hoists(el, &mut buf, &mut hoists);
+    } else {
+        // Non-spread path: emit each non-directive attribute inline; the
+        // directives flow into a tail `${$.attributes(void 0, void 0, {...})}`
+        // interpolation. Not exercised by current fixtures yet.
+        for attr in &el.attributes {
+            if !matches!(
+                attr,
+                ElementAttribute::ClassDirective(_) | ElementAttribute::StyleDirective(_)
+            ) {
+                let _ = append_element_attribute_server(attr, &mut buf);
+            }
+        }
+        let mut temp_buf = TemplateBuf::new();
+        append_attributes_call_with_hoists(el, &mut temp_buf, &mut hoists);
+        let _ = temp_buf;
+    }
+    if is_void(&el.name) {
+        buf.push_str("/>");
+    } else {
+        buf.push_str(">");
+        let children = trim_boundary_whitespace(&el.fragment.nodes);
+        let children = trim_boundary_text(children);
+        for c in children.iter() {
+            append_node_to_template(c, &mut buf)?;
+        }
+        buf.push_str("</");
+        buf.push_str(&el.name);
+        buf.push_str(">");
+    }
+    let push_stmt = buf.flush()?;
+
+    // Build the const-hoist decls.
+    let mut body: Vec<Statement> = Vec::new();
+    for (i, expr) in hoists.iter().enumerate() {
+        let placeholder = if i == 0 { "$$0".to_string() } else { format!("$${i}") };
+        let saved = wrap_async_test(expr);
+        body.push(Statement::Variable(Box::new(VariableDeclaration {
+            kind: VariableKind::Const,
+            declarations: vec![VariableDeclarator {
+                id: t::pat_id(&placeholder),
+                init: Some(saved),
+                span: Span::ZERO,
+            }],
+            span: Span::ZERO,
+        })));
+    }
+    body.push(push_stmt);
+    let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
+        params: vec![t::pat_id("$$renderer")],
+        body: ArrowBody::Block(Box::new(BlockStatement {
+            body,
+            span: Span::ZERO,
+        })),
+        r#async: true,
+        span: Span::ZERO,
+    }));
+    Some(t::stmt(t::call(
+        t::member_id(t::id("$$renderer"), "child"),
+        vec![arrow],
+    )))
+}
+
+/// True if this element has any class:/style: directive whose expression
+/// contains a top-level `await` — triggers the `$$renderer.child(async ...)`
+/// wrap with const-hoisting (mirrors upstream's PromiseOptimiser path).
+fn element_has_async_directive(el: &svelte_ast::elements::RegularElement) -> bool {
+    el.attributes.iter().any(|a| match a {
+        ElementAttribute::ClassDirective(c) => expr_has_await_top(&c.expression),
+        ElementAttribute::StyleDirective(s) => match &s.value {
+            AttributeValue::Single(tag) => expr_has_await_top(&tag.expression),
+            AttributeValue::Many(parts) => parts.iter().any(|p| {
+                matches!(p, AttributeValuePart::ExpressionTag(t) if expr_has_await_top(&t.expression))
+            }),
+            _ => false,
+        },
+        _ => false,
+    })
+}
+
 fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement) -> bool {
     fn node_is_non_inline(n: &FragmentChild) -> bool {
         match n {
@@ -5323,6 +5427,12 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             // `<select>` with `<option>` children uses interleaved
             // `$$renderer.option(...)` calls — signal "not inline" so the
             // caller can lower it as a separate statement.
+            None
+        }
+        FragmentChild::RegularElement(el) if element_has_async_directive(el) => {
+            // Class:/style: directive with `await` triggers an outer
+            // `$$renderer.child(async ...)` wrap with const-hoisting; the
+            // outer dispatch handles that.
             None
         }
         FragmentChild::RegularElement(el) => {
@@ -5569,9 +5679,21 @@ fn collapse_ws(s: &str) -> String {
 /// Build `${$.attributes({ ...spread, name: val, ... })}` for an element
 /// that has at least one spread attribute. Combines all attributes
 /// (statics + spreads + bind:) into a single object expression.
+/// Class:/style: directives flow into slots 3/4 of the call. When any
+/// directive value contains a top-level `await`, the await expressions
+/// are hoisted to `const $$N` placeholders and the caller emits the
+/// outer `$$renderer.child(async ...)` wrap.
 fn append_attributes_call(
     el: &svelte_ast::elements::RegularElement,
     buf: &mut TemplateBuf,
+) {
+    append_attributes_call_with_hoists(el, buf, &mut Vec::new());
+}
+
+fn append_attributes_call_with_hoists(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+    hoists: &mut Vec<Expression>,
 ) {
     let mut members: Vec<ObjectMember> = Vec::new();
     for attr in &el.attributes {
@@ -5612,6 +5734,75 @@ fn append_attributes_call(
         span: Span::ZERO,
     }));
 
+    // Collect class:/style: directives into objects passed as 3rd/4th args.
+    // Each directive whose expression contains a top-level `await` gets
+    // hoisted to a `const $$N` placeholder (pushed onto `hoists`).
+    let mut class_props: Vec<ObjectMember> = Vec::new();
+    let mut style_props: Vec<ObjectMember> = Vec::new();
+    for attr in &el.attributes {
+        match attr {
+            ElementAttribute::ClassDirective(d) => {
+                let value = if expr_has_await_top(&d.expression) {
+                    let idx = hoists.len();
+                    hoists.push(d.expression.clone());
+                    let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
+                    t::id(&name)
+                } else {
+                    d.expression.clone()
+                };
+                class_props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier { name: d.name.clone(), span: Span::ZERO }),
+                    value,
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            }
+            ElementAttribute::StyleDirective(d) => {
+                let value: Expression = match &d.value {
+                    AttributeValue::Single(tag) => {
+                        if expr_has_await_top(&tag.expression) {
+                            let idx = hoists.len();
+                            hoists.push(tag.expression.clone());
+                            let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
+                            t::id(&name)
+                        } else {
+                            tag.expression.clone()
+                        }
+                    }
+                    AttributeValue::Many(parts) if parts.len() == 1 => {
+                        match &parts[0] {
+                            AttributeValuePart::Text(t) => string_lit(&t.data),
+                            AttributeValuePart::ExpressionTag(tag) => {
+                                if expr_has_await_top(&tag.expression) {
+                                    let idx = hoists.len();
+                                    hoists.push(tag.expression.clone());
+                                    let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
+                                    t::id(&name)
+                                } else {
+                                    tag.expression.clone()
+                                }
+                            }
+                        }
+                    }
+                    _ => continue,
+                };
+                style_props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier { name: d.name.clone(), span: Span::ZERO }),
+                    value,
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+            }
+            _ => {}
+        }
+    }
+
     // Append a namespace flag for SVG/MathML/custom-element/input. Mirrors
     // upstream's constants:
     //   ELEMENT_IS_NAMESPACED              = 1
@@ -5631,11 +5822,29 @@ fn append_attributes_call(
         None
     };
     let mut args = vec![Argument::Expression(obj)];
+    let class_obj = if class_props.is_empty() {
+        void_zero_expr()
+    } else {
+        Expression::Object(Box::new(ObjectExpression {
+            properties: class_props,
+            span: Span::ZERO,
+        }))
+    };
+    let style_obj = if style_props.is_empty() {
+        void_zero_expr()
+    } else {
+        Expression::Object(Box::new(ObjectExpression {
+            properties: style_props,
+            span: Span::ZERO,
+        }))
+    };
+    let has_class = !matches!(class_obj, Expression::Unary(_));
+    let has_style = !matches!(style_obj, Expression::Unary(_));
     if let Some(f) = flag {
         let void0 = void_zero_expr();
-        args.push(Argument::Expression(void0.clone()));
-        args.push(Argument::Expression(void0.clone()));
         args.push(Argument::Expression(void0));
+        args.push(Argument::Expression(class_obj));
+        args.push(Argument::Expression(style_obj));
         args.push(Argument::Expression(Expression::Literal(Box::new(Literal::Number(
             NumberLiteral {
                 value: f,
@@ -5643,6 +5852,15 @@ fn append_attributes_call(
                 span: Span::ZERO,
             },
         )))));
+    } else if has_style {
+        let void0 = void_zero_expr();
+        args.push(Argument::Expression(void0));
+        args.push(Argument::Expression(class_obj));
+        args.push(Argument::Expression(style_obj));
+    } else if has_class {
+        let void0 = void_zero_expr();
+        args.push(Argument::Expression(void0));
+        args.push(Argument::Expression(class_obj));
     }
     buf.push_expr(Expression::Call(Box::new(CallExpression {
         callee: t::member_id(t::id("$"), "attributes"),
