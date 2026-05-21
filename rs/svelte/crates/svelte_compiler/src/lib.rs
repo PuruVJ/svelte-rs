@@ -59,13 +59,51 @@ pub fn compile(
             let exp_async = options.module.experimental.async_;
             let filename = options.module.filename.as_deref();
             let preserve_comments = options.preserve_comments;
+
+            // CSS injection (compile option OR `<svelte:options css="injected" />`).
+            // The svelte:options form wins when present.
+            let svelte_options_inject = svelte_options_css_is_injected(&root);
+            let css_inject = svelte_options_inject
+                .unwrap_or(matches!(options.css, CssMode::Injected));
+            // Pre-render the CSS when in injected mode + the source has
+            // a `<style>` block.
+            let css_inject_args: Option<(String, String)> = if css_inject && root.css.is_some() {
+                let analysis_res = svelte_analyze::analyze_component(
+                    root.clone(),
+                    options.module.filename.as_deref(),
+                );
+                let mut analysis = match analysis_res {
+                    Ok(a) => a,
+                    Err(_) => return Err(CompileDiagnostic {
+                        code: "css_inject_analyze_failed",
+                        message: "failed to analyze CSS for injection".to_string(),
+                        position: None,
+                    }),
+                };
+                let basis = options.module.filename.as_deref().unwrap_or("(unknown)");
+                let hash = format!(
+                    "svelte-{}",
+                    svelte_transform_server::svelte_filename_hash_pub(basis)
+                );
+                analysis.css_hash = hash.clone();
+                let rendered = analysis.css.as_ref().map(|sheet| {
+                    svelte_analyze::css_render::render_stylesheet_with_opts(
+                        source, sheet, &analysis.css_meta, &hash, false,
+                    )
+                });
+                rendered.map(|code| (hash, code))
+            } else {
+                None
+            };
+
             if let Some(p) = svelte_transform_server::try_typed_server_with(
                 &root, component_name, exp_async,
             ) {
                 p
             } else if let Some(p) =
-                svelte_transform_server::try_typed_server_component_with_opts(
+                svelte_transform_server::try_typed_server_component_full(
                     &root, component_name, exp_async, filename, preserve_comments,
+                    css_inject_args,
                 )
             {
                 p
@@ -161,4 +199,28 @@ fn value_to_typed_comment_stub(c: &serde_json::Value) -> Option<svelte_codegen_j
     })
 }
 
-
+/// Detect `<svelte:options css="injected" />` at the root level.
+/// Returns Some(true) when present and set to "injected", Some(false) when
+/// present but set to "external", None when no svelte:options css attr.
+fn svelte_options_css_is_injected(root: &Root) -> Option<bool> {
+    use svelte_ast::fragment::FragmentChild;
+    use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
+    for n in &root.fragment.nodes {
+        if let FragmentChild::SvelteOptions(opt) = n {
+            for a in &opt.attributes {
+                if let ElementAttribute::Attribute(attr) = a {
+                    if attr.name == "css" {
+                        if let AttributeValue::Many(parts) = &attr.value {
+                            if parts.len() == 1 {
+                                if let AttributeValuePart::Text(t) = &parts[0] {
+                                    return Some(t.data == "injected");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}

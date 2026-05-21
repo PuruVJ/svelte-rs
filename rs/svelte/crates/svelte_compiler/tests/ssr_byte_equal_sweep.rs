@@ -50,6 +50,7 @@ fn ssr_byte_equal_all_fixtures() {
         };
         let cfg = fs::read_to_string(entry.path().join("_config.js")).unwrap_or_default();
         let preserve_comments = cfg.contains("preserveComments: true");
+        let css_injected = cfg.contains("css: 'injected'") || cfg.contains("css: \"injected\"");
 
         let fname = format!(
             "packages/svelte/tests/server-side-rendering/samples/{}/main.svelte",
@@ -61,6 +62,9 @@ fn ssr_byte_equal_all_fixtures() {
             opts.module.experimental.async_ = true;
             opts.module.filename = Some(fname.clone());
             opts.preserve_comments = preserve_comments;
+            if css_injected {
+                opts.css = svelte_compiler::CssMode::Injected;
+            }
             compile(&source, "Main", opts)
         });
 

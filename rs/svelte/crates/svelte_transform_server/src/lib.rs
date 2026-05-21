@@ -50,16 +50,37 @@ pub fn try_typed_server_component_with_filename(
     )
 }
 
-/// Second-tier typed entry point. Currently handles:
-/// - "instance script (imports + optionally rune-erasable statements) + simple template"
-/// - "single <Component bind:this={x}/>"
-/// - "<svelte:element this={tag}>"
+/// Compatibility shim — css_inject defaults to None.
 pub fn try_typed_server_component_with_opts(
     root: &Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
     preserve_comments: bool,
+) -> Option<Program> {
+    try_typed_server_component_full(
+        root, component_name, experimental_async, filename, preserve_comments, None,
+    )
+}
+
+/// Expose the filename-hash function for `svelte_compiler` to compute
+/// the `svelte-{hash}` prefix when assembling the `$$css` const outside
+/// the transform.
+pub fn svelte_filename_hash_pub(s: &str) -> String {
+    svelte_filename_hash(s)
+}
+
+/// Second-tier typed entry point. Currently handles:
+/// - "instance script (imports + optionally rune-erasable statements) + simple template"
+/// - "single <Component bind:this={x}/>"
+/// - "<svelte:element this={tag}>"
+pub fn try_typed_server_component_full(
+    root: &Root,
+    component_name: &str,
+    experimental_async: bool,
+    filename: Option<&str>,
+    preserve_comments: bool,
+    css_inject: Option<(String, String)>,
 ) -> Option<Program> {
     PRESERVE_COMMENTS.with(|c| c.set(preserve_comments));
     BODY_VAR_COUNTER.with(|c| c.set(0));
@@ -282,6 +303,26 @@ pub fn try_typed_server_component_with_opts(
         uses_props = true;
     }
 
+    // CSS injection: when the compile option / `<svelte:options css="injected" />`
+    // is set, prepend `$$renderer.global.css.add($$css);` to the function
+    // body. The `const $$css = { hash, code };` declaration is emitted at
+    // module-top after imports.
+    if css_inject.is_some() {
+        let add_call = t::stmt(t::call(
+            t::member_id(
+                t::member_id(
+                    t::member_id(t::id("$$renderer"), "global"),
+                    "css",
+                ),
+                "add",
+            ),
+            vec![t::id("$$css")],
+        ));
+        let mut prefix = vec![add_call];
+        prefix.extend(std::mem::take(&mut func_body));
+        func_body = prefix;
+    }
+
     // When script triggers component-context: wrap the whole body in
     // `$$renderer.component(($$renderer) => { ... });`.
     if needs_component_wrap {
@@ -328,6 +369,40 @@ pub fn try_typed_server_component_with_opts(
     top.extend(module_rest);
     // Hoisted snippet function declarations come before the default export.
     top.extend(snippet_decls);
+    // `const $$css = { hash, code };` for css injection — emitted between
+    // snippet decls and the export default.
+    if let Some((hash, code)) = css_inject {
+        let obj = Expression::Object(Box::new(ObjectExpression {
+            properties: vec![
+                ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: "hash".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    value: string_lit(&hash),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })),
+                ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: "code".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    value: string_lit(&code),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })),
+            ],
+            span: Span::ZERO,
+        }));
+        top.push(t::const_decl("$$css", obj));
+    }
     top.push(t::export_default_function(component_name, params, func_body));
     Some(t::program(top))
 }
