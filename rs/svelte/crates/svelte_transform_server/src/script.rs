@@ -147,6 +147,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     enum Lowered {
         AsyncSet { name: String, init: Expression },
         Sync(Statement),
+        AwaitExpr(Expression),
     }
     let mut lowered: Vec<Lowered> = Vec::new();
 
@@ -199,6 +200,13 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                         lowered.push(Lowered::Sync(t::stmt(void_zero())));
                         continue;
                     }
+                }
+                // `await EXPR;` (top-level await expression statement) — each
+                // gets its own thunk in the run array (not merged with sibling
+                // sync stmts). The thunk body unwraps to just `EXPR`.
+                if let Expression::Await(a) = &e.expression {
+                    lowered.push(Lowered::AwaitExpr(a.argument.clone()));
+                    continue;
                 }
                 lowered.push(Lowered::Sync(s.clone()));
             }
@@ -275,6 +283,18 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             }
             Lowered::Sync(stmt) => {
                 current_sync.push(stmt);
+                last_was_async = false;
+            }
+            Lowered::AwaitExpr(arg) => {
+                if !current_sync.is_empty() {
+                    flush_sync(&mut groups, &mut current_sync);
+                }
+                groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
+                    params: Vec::new(),
+                    body: ArrowBody::Expression(arg),
+                    r#async: false,
+                    span: Span::ZERO,
+                })));
                 last_was_async = false;
             }
         }
