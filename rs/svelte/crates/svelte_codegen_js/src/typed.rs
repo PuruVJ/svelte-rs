@@ -19,6 +19,18 @@
 
 use svelte_js_ast::*;
 
+/// Start byte offset of a pattern (for comment-flushing alignment).
+fn pattern_start(p: &Pattern) -> u32 {
+    match p {
+        Pattern::Identifier(i) => i.span.start,
+        Pattern::Array(a) => a.span.start,
+        Pattern::Object(o) => o.span.start,
+        Pattern::Rest(r) => r.span.start,
+        Pattern::Assignment(a) => a.span.start,
+        Pattern::Member(m) => m.span.start,
+    }
+}
+
 /// One mapping segment: `(generated_column, source_index, original_line, original_column)`.
 /// Source index is always 0 (single source per compile).
 pub type Segment = (u32, u32, u32, u32);
@@ -611,6 +623,12 @@ impl<'a> Emitter<'a> {
         for (i, p) in params.iter().enumerate() {
             if i > 0 {
                 self.write(", ");
+            }
+            // Flush any block comments that sit just before this param's
+            // start position — e.g. `(/** @type {string} */ key) => …`.
+            let start = pattern_start(p);
+            if start != 0 {
+                self.flush_comments_until(start, true);
             }
             self.emit_pattern(p);
         }

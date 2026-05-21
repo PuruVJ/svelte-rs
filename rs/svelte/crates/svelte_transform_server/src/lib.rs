@@ -2193,6 +2193,8 @@ fn lower_svelte_boundary_server(
 
     // 3. Build the body statements once (used by both wrap and no-wrap paths).
     // Detect const-with-await in boundary body → route to const-await lowerer.
+    // Plain ExpressionTag-with-await goes through lower_fragment_for_async_block
+    // which splits adjacent text + the async expression into separate pushes.
     let empty_blockers: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     let body_stmts = if fragment_has_const_with_await_or_blocker(
@@ -2211,6 +2213,15 @@ fn lower_svelte_boundary_server(
         lower_fragment_with_const_await_with(
             &body_fragment, &empty_blockers, &promises_var,
         )?
+    } else if fragment_has_async(&body_fragment) {
+        // Boundary body needs a leading `<!---->` anchor (the boundary's
+        // open marker counts as its sibling) — same rule as snippets/each.
+        let mut stmts = Vec::new();
+        if body_needs_marker(&body_fragment) {
+            stmts.push(push_template("<!---->"));
+        }
+        stmts.extend(lower_fragment_for_async_block(&body_fragment)?);
+        stmts
     } else {
         lower_fragment_server(&body_fragment)?
     };
@@ -3208,18 +3219,28 @@ fn lower_select_with_value(
         span: Span::ZERO,
     }));
 
-    // Build the children arrow body using the existing select-child lowerer.
-    let mut inner_buf = TemplateBuf::new();
-    let mut inner_out: Vec<Statement> = Vec::new();
-    let children = trim_boundary_whitespace(&el.fragment.nodes);
-    SELECT_EACH_COUNTER.with(|c| {
-        for child in children {
-            let _ = lower_select_child(child, &mut inner_buf, &mut inner_out, c);
+    // Build the children arrow body. Customizable select (Component / rich
+    // children) → route via regular fragment lowering so children don't get
+    // the inline-select `<!>` hydration anchor. Pure option/optgroup → use
+    // the select-child lowerer that knows the markers needed for hydration
+    // through the template literal.
+    let customizable = is_customizable_select(el);
+    let inner_out: Vec<Statement> = if customizable {
+        lower_fragment_with_marker(&el.fragment, false)?
+    } else {
+        let mut inner_buf = TemplateBuf::new();
+        let mut inner_out: Vec<Statement> = Vec::new();
+        let children = trim_boundary_whitespace(&el.fragment.nodes);
+        SELECT_EACH_COUNTER.with(|c| {
+            for child in children {
+                let _ = lower_select_child(child, &mut inner_buf, &mut inner_out, c);
+            }
+        });
+        if let Some(stmt) = inner_buf.flush() {
+            inner_out.push(stmt);
         }
-    });
-    if let Some(stmt) = inner_buf.flush() {
-        inner_out.push(stmt);
-    }
+        inner_out
+    };
 
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
@@ -3238,10 +3259,28 @@ fn lower_select_with_value(
     let has_class_attr = el.attributes.iter().any(|a| matches!(
         a, ElementAttribute::Attribute(attr) if attr.name == "class"
     ));
-    if has_class_attr {
-        if let Some(hash) = CSS_HASH.with(|c| c.borrow().clone()) {
-            select_args.push(string_lit(&hash));
+    let scoped_hash = if has_class_attr {
+        CSS_HASH.with(|c| c.borrow().clone())
+    } else {
+        None
+    };
+    if let Some(hash) = &scoped_hash {
+        select_args.push(string_lit(hash));
+    }
+    // Customizable select (has Component / non-option children) → 7-arg form
+    // with trailing `true` flag. Slots 3-6 padded with `void 0` (or the
+    // scoped hash already filled slot 3 above).
+    if customizable {
+        if scoped_hash.is_none() {
+            select_args.push(void_zero_expr());
         }
+        // Pad slots 4, 5, 6.
+        select_args.push(void_zero_expr());
+        select_args.push(void_zero_expr());
+        select_args.push(void_zero_expr());
+        select_args.push(Expression::Literal(Box::new(Literal::Boolean(
+            BooleanLiteral { value: true, span: Span::ZERO },
+        ))));
     }
     Some(t::stmt(t::call(
         t::member_id(t::id("$$renderer"), "select"),
@@ -4541,8 +4580,17 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             _ => true,
         })
         .collect();
+    // Direct (2-arg) form fires when the option's sole content is a single
+    // ExpressionTag AND there's no explicit `value=` attribute. This mirrors
+    // upstream's `synthetic_value_node` mechanism (analyze/RegularElement.js
+    // line 99) — the option "inherits" the body's value via the synthetic
+    // node, so the runtime gets the expression directly.
+    let has_value_attr = el.attributes.iter().any(|a| matches!(
+        a, ElementAttribute::Attribute(attr) if attr.name == "value"
+    ));
     let single_expr_value: Option<Expression> = if !is_rich
         && non_ws.len() == 1
+        && !has_value_attr
     {
         if let FragmentChild::ExpressionTag(t) = non_ws[0] {
             Some(t.expression.clone())
@@ -4623,6 +4671,44 @@ fn void_zero_expr() -> Expression {
         prefix: true,
         span: Span::ZERO,
     }))
+}
+
+/// Mirrors upstream's `is_customizable_select_element` for the `<select>` case:
+/// returns true if any descendant beyond `<option>`/`<optgroup>` children
+/// is found — including direct Text content, Components, RenderTags, etc.
+fn is_customizable_select(el: &svelte_ast::elements::RegularElement) -> bool {
+    fn check(n: &FragmentChild) -> bool {
+        match n {
+            // Allowed inside <select>: option, optgroup, expressions, etc.
+            FragmentChild::Comment(_)
+            | FragmentChild::ExpressionTag(_)
+            | FragmentChild::ConstTag(_)
+            | FragmentChild::SnippetBlock(_)
+            | FragmentChild::DebugTag(_) => false,
+            // Direct text in <select> = rich content.
+            FragmentChild::Text(t) => !t.data.trim().is_empty(),
+            FragmentChild::RegularElement(child) => {
+                child.name != "option" && child.name != "optgroup"
+            }
+            FragmentChild::IfBlock(ib) => {
+                ib.consequent.nodes.iter().any(check)
+                    || ib.alternate.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+            }
+            FragmentChild::EachBlock(eb) => {
+                eb.body.nodes.iter().any(check)
+                    || eb.fallback.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+            }
+            FragmentChild::KeyBlock(kb) => kb.fragment.nodes.iter().any(check),
+            FragmentChild::AwaitBlock(ab) => {
+                ab.pending.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+                    || ab.then.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+                    || ab.catch_.as_ref().map_or(false, |a| a.nodes.iter().any(check))
+            }
+            FragmentChild::SvelteBoundary(b) => b.fragment.nodes.iter().any(check),
+            _ => true,
+        }
+    }
+    el.fragment.nodes.iter().any(check)
 }
 
 /// Mirrors upstream's `is_customizable_select_element` for the `<option>` case:
