@@ -4008,6 +4008,16 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             });
             if has_spread {
                 append_attributes_call(el, buf);
+                // XSS event-capture: load/error elements with spread attrs
+                // get ` onload="this.__e=event" onerror="this.__e=event"`
+                // appended so the runtime can capture events that may have
+                // been overridden by malicious spread content. Mirrors
+                // upstream's is_load_error_element list.
+                if is_load_error_element(&el.name) {
+                    buf.push_str(
+                        " onload=\"this.__e=event\" onerror=\"this.__e=event\""
+                    );
+                }
             } else {
                 // `<input type="file" bind:value={...}>` drops the bind in
                 // SSR — the runtime computes the value attribute from
@@ -4677,6 +4687,15 @@ fn escape_text(s: &str) -> String {
         }
     }
     out
+}
+
+/// Mirrors upstream's `LOAD_ERROR_ELEMENTS` in `packages/svelte/src/utils.js`.
+fn is_load_error_element(name: &str) -> bool {
+    matches!(
+        name,
+        "body" | "embed" | "iframe" | "img" | "link" | "object"
+        | "script" | "style" | "track"
+    )
 }
 
 fn is_void(name: &str) -> bool {
