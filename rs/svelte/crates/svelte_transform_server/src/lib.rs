@@ -6346,9 +6346,22 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
             if parts.len() == 1 {
                 match &parts[0] {
                     AttributeValuePart::Text(t) => {
+                        // class= attribute values get whitespace-collapsed:
+                        // upstream's render-pass trims + collapses internal
+                        // whitespace runs to single spaces.
+                        let (val, raw) = if a.name == "class" {
+                            let collapsed: String = t
+                                .data
+                                .split_whitespace()
+                                .collect::<Vec<&str>>()
+                                .join(" ");
+                            (collapsed.clone(), format!("'{}'", collapsed.replace('\'', "\\'")))
+                        } else {
+                            (t.data.clone(), format!("'{}'", t.raw.replace('\'', "\\'")))
+                        };
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: t.data.clone(),
-                            raw: Some(format!("'{}'", t.raw.replace('\'', "\\'"))),
+                            value: val,
+                            raw: Some(raw),
                             span: Span::ZERO,
                         })))
                     }

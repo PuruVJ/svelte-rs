@@ -1536,7 +1536,19 @@ impl<'a> Emitter<'a> {
                         ObjectMember::Property(prop) => c.emit_property(prop),
                         ObjectMember::Spread(s) => {
                             c.write("...");
-                            c.emit_expression(&s.argument);
+                            // `{...({})}` / `{...(EXPR)}` — strip the outer
+                            // parens around an ObjectExpression argument so
+                            // we emit `{...{}}` directly. Other shapes keep
+                            // the paren for precedence safety.
+                            let arg = match &s.argument {
+                                Expression::Paren(p)
+                                    if matches!(p.expression, Expression::Object(_)) =>
+                                {
+                                    &p.expression
+                                }
+                                e => e,
+                            };
+                            c.emit_expression(arg);
                         }
                     }
                     c
