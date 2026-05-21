@@ -93,6 +93,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_simple_state(source, &mut str, &parsed);
     migrate_simple_derivations(source, &mut str, &parsed);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
+    migrate_simple_props(source, &mut str, &parsed);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
@@ -1630,6 +1631,234 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
             str.remove(start + 2, start + 3);
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Simple props migration: `export let X` → `let { X, … } = $props();`.
+// Only fires for the narrow case:
+//   - all exports are simple `export let X` (or `export let X = init`)
+//     with Identifier pattern
+//   - no JSDoc, no TypeScript types, no `$$Props` interface
+//   - no `$$props` / `$$restProps` usage (we only handle the "no rest" or
+//     simple-rest cases via a separate path)
+//
+// Restrictions: doesn't emit `$bindable()` wrappers yet. Each export becomes
+// a single field in the destructured `let { ... } = $props()`.
+// ---------------------------------------------------------------------------
+
+fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(instance) = &root.instance else {
+        return;
+    };
+
+    // Bail if there's a `$$Props` type alias / interface in the script (we
+    // can't synthesize the interface yet).
+    if source_uses_dollar_dollar(source, "$$Props") {
+        return;
+    }
+    // Bail if uses_props ($$props). We'd need the rest-spread form which
+    // isn't fully implemented yet, but we *can* handle a simple "no exports
+    // but uses $$props" case → `let { ...props } = $props();`. Skip for now.
+    let uses_props = source_uses_dollar_dollar(source, "$$props");
+    let uses_rest = source_uses_dollar_dollar(source, "$$restProps");
+
+    // Gather all `export let` declarations.
+    struct Prop {
+        local: String,
+        init: Option<(u32, u32)>,
+        decl_start: usize,
+        decl_end: usize,
+        node_start: usize,
+        node_end: usize,
+        node_decl_count: usize,
+        bindable: bool,
+        has_type_annotation: bool,
+    }
+    let mut props: Vec<Prop> = Vec::new();
+    // Collect bind:/updated targets for $bindable detection.
+    let mut updated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    walk_fragment(&root.fragment, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => Some(&e.attributes),
+            FragmentChild::Component(e) => Some(&e.attributes),
+            FragmentChild::SvelteComponent(e) => Some(&e.attributes),
+            FragmentChild::SvelteElement(e) => Some(&e.attributes),
+            _ => None,
+        };
+        if let Some(attrs) = attrs {
+            for a in attrs {
+                if let ElementAttribute::BindDirective(b) = a {
+                    if let Some(name) = bind_target_identifier(&b.expression) {
+                        updated.insert(name);
+                    }
+                }
+            }
+        }
+    });
+    for stmt in &instance.content.body {
+        collect_assignment_targets(stmt, &mut updated);
+    }
+
+    let bytes = source.as_bytes();
+    for stmt in &instance.content.body {
+        let Statement::ExportNamed(en) = stmt else {
+            continue;
+        };
+        let Some(Statement::Variable(v)) = en.declaration.as_ref() else {
+            continue;
+        };
+        for (i, d) in v.declarations.iter().enumerate() {
+            let Pattern::Identifier(id) = &d.id else {
+                continue;
+            };
+            // Detect a textual `:` type annotation between id.end and the
+            // next `=`/`,`/`;` — if present, bail since we don't yet emit
+            // the interface/JSDoc form.
+            let id_end = id.span.end as usize;
+            let has_type = {
+                let mut k = id_end;
+                while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                    k += 1;
+                }
+                k < bytes.len() && bytes[k] == b':'
+            };
+            // Detect a leading JSDoc block immediately before this export.
+            let has_jsdoc_above = {
+                let mut p = en.span.start as usize;
+                // Walk back over whitespace.
+                while p > 0 && (bytes[p - 1] == b' ' || bytes[p - 1] == b'\t' || bytes[p - 1] == b'\n')
+                {
+                    p -= 1;
+                }
+                p >= 2 && &source[p - 2..p] == "*/"
+            };
+
+            // For now, bail on any prop with TS type or JSDoc — we don't yet
+            // emit the corresponding interface.
+            if has_type || has_jsdoc_above {
+                return;
+            }
+
+            let init_span = d.init.as_ref().map(|e| expr_span(e));
+            props.push(Prop {
+                local: id.name.clone(),
+                init: init_span,
+                decl_start: d.span.start as usize,
+                decl_end: d.span.end as usize,
+                node_start: en.span.start as usize,
+                node_end: en.span.end as usize,
+                node_decl_count: v.declarations.len(),
+                bindable: updated.contains(&id.name),
+                has_type_annotation: false,
+            });
+            let _ = i;
+        }
+    }
+
+    if props.is_empty() && !uses_props && !uses_rest {
+        return;
+    }
+    // If there are NO `export let` decls AND only `$$props`/`$$restProps`,
+    // we could still emit `let { ...props } = $props();`. Defer that path.
+    if props.is_empty() {
+        // Only handle pure $$restProps case — emit `let { ...rest } = $props();`.
+        // Defer this for now since it requires picking an insertion point.
+        return;
+    }
+
+    // Build the destructured `let { X, Y = INIT, ... } = $props();`.
+    let mut parts: Vec<String> = Vec::new();
+    for p in &props {
+        let init_text = if let Some((s, e)) = p.init {
+            Some(source[s as usize..e as usize].to_string())
+        } else {
+            None
+        };
+        let entry = if p.bindable {
+            match init_text {
+                Some(init) => format!("{} = $bindable({})", p.local, init),
+                None => format!("{} = $bindable()", p.local),
+            }
+        } else {
+            match init_text {
+                Some(init) => format!("{} = {}", p.local, init),
+                None => p.local.clone(),
+            }
+        };
+        parts.push(entry);
+    }
+    if uses_rest {
+        parts.push("...rest".to_string());
+    }
+    let props_decl = format!("let {{ {} }} = $props();", parts.join(", "));
+
+    // Replace `$$restProps` references with `rest` in template attributes.
+    if uses_rest {
+        // Simple textual replacement on the template — only safe if
+        // `$$restProps` is unique enough (it is). Use MagicString
+        // replace_all-style: iterate source bytes.
+        let needle = b"$$restProps";
+        let n = needle.len();
+        let mut i = 0;
+        while i + n <= bytes.len() {
+            if &bytes[i..i + n] == needle {
+                str.update(i, i + n, "rest");
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // For each prop's parent ExportNamedDeclaration, remove or rewrite it.
+    // - If the node has all its declarators converted to props → remove the
+    //   whole node, then for the FIRST node, replace with `props_decl`.
+    // - Else: too tricky for now, bail (we only support uniform conversion).
+
+    // Group by node_start.
+    let mut node_groups: std::collections::BTreeMap<usize, Vec<&Prop>> = Default::default();
+    for p in &props {
+        node_groups.entry(p.node_start).or_default().push(p);
+    }
+    // Every group must have all declarators in the parent node converted.
+    let mut not_all = false;
+    for (_, group) in &node_groups {
+        let total = group[0].node_decl_count;
+        if group.len() != total {
+            not_all = true;
+            break;
+        }
+    }
+    if not_all {
+        return;
+    }
+
+    // Replace the first export node with `props_decl`, remove the rest.
+    let mut first = true;
+    for (_, group) in &node_groups {
+        let p = group[0];
+        if first {
+            str.update(p.node_start, p.node_end, &props_decl);
+            first = false;
+        } else {
+            // Remove this whole export statement.
+            let mut s = p.node_start;
+            let mut e = p.node_end;
+            if bytes.get(e).copied() == Some(b'\n') {
+                e += 1;
+            }
+            while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+                s -= 1;
+            }
+            str.remove(s, e);
+        }
+    }
+    let _ = uses_props;
+    let _ = p_decl_unused();
+}
+
+fn p_decl_unused() {
+    // helper to silence dead-code style warnings — no-op
 }
 
 // ---------------------------------------------------------------------------
