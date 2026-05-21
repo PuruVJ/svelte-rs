@@ -2073,9 +2073,9 @@ fn lower_head_fragment(
             last_was_component = false;
         }
     }
-    if last_was_component {
-        buf.push_str("<!---->");
-    }
+    // No trailing-Component anchor inside `<svelte:head>` — upstream's
+    // head body skips the close-marker since the head wrapper itself
+    // provides the boundary.
     if let Some(stmt) = buf.flush() {
         out.push(stmt);
     }

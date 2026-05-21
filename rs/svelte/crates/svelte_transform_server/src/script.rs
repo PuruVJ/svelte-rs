@@ -1105,7 +1105,13 @@ pub fn collect_script_constants(
     let mut candidates: HashMap<String, Expression> = HashMap::new();
     for s in &p.body {
         if let Statement::Variable(v) = s {
-            if !matches!(v.kind, VariableKind::Const) && !runes_mode {
+            // Only fold `let X = LITERAL` in runes mode. `const` is left
+            // alone — upstream doesn't constant-propagate `const` bindings
+            // into templates (the binding stays as a Variable reference).
+            if !runes_mode {
+                continue;
+            }
+            if !matches!(v.kind, VariableKind::Let) {
                 continue;
             }
             for d in &v.declarations {

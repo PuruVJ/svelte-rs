@@ -1075,13 +1075,11 @@ fn property_key_as_expr(k: &oxc::PropertyKey<'_>, shift: Shift) -> Expression {
             span: span_of(n.span, shift),
         }))),
         K::TemplateLiteral(t) => Expression::Template(Box::new(template_literal(t, shift))),
-        _ => {
-            let s = k.span();
-            Expression::Identifier(Identifier {
-                name: "__computed_key__".to_string(),
-                span: span_of(s, shift),
-            })
-        }
+        // PropertyKey is a superset of Expression in OXC — for non-literal
+        // computed keys (BinaryExpression, CallExpression, MemberExpression,
+        // ...) funnel through the regular `expression()` mapper so all
+        // variants render correctly.
+        _ => expression(k.to_expression(), shift),
     }
 }
 
