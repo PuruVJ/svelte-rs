@@ -2809,24 +2809,43 @@ fn lower_select_with_value(
     el: &svelte_ast::elements::RegularElement,
     value_expr: Expression,
 ) -> Option<Statement> {
-    // Build the props object: { value: VALUE, ...other_attrs }.
+    // Build the props object preserving the source order. The `value:`
+    // entry takes the same position the value attribute occupied; other
+    // attrs land at their original index.
     let mut props: Vec<ObjectMember> = Vec::new();
-    props.push(ObjectMember::Property(Box::new(Property {
-        key: PropertyKey::Identifier(Identifier {
-            name: "value".to_string(),
-            span: Span::ZERO,
-        }),
-        value: value_expr,
-        kind: PropertyKind::Init,
-        computed: false,
-        shorthand: false,
-        method: false,
-        span: Span::ZERO,
-    })));
+    let mut value_pushed = false;
     for a in &el.attributes {
         match a {
-            ElementAttribute::Attribute(attr) if attr.name == "value" => {}
-            ElementAttribute::BindDirective(b) if b.name == "value" => {}
+            ElementAttribute::Attribute(attr) if attr.name == "value" => {
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: "value".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    value: value_expr.clone(),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+                value_pushed = true;
+            }
+            ElementAttribute::BindDirective(b) if b.name == "value" => {
+                props.push(ObjectMember::Property(Box::new(Property {
+                    key: PropertyKey::Identifier(Identifier {
+                        name: "value".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    value: value_expr.clone(),
+                    kind: PropertyKind::Init,
+                    computed: false,
+                    shorthand: false,
+                    method: false,
+                    span: Span::ZERO,
+                })));
+                value_pushed = true;
+            }
             ElementAttribute::Attribute(attr) => {
                 if let Some(p) = attribute_to_object_member(attr) {
                     props.push(p);
@@ -2834,6 +2853,22 @@ fn lower_select_with_value(
             }
             _ => {}
         }
+    }
+    if !value_pushed {
+        // Shouldn't happen — caller guarantees value attr exists. But
+        // safeguard by pushing value at the end.
+        props.push(ObjectMember::Property(Box::new(Property {
+            key: PropertyKey::Identifier(Identifier {
+                name: "value".to_string(),
+                span: Span::ZERO,
+            }),
+            value: value_expr,
+            kind: PropertyKind::Init,
+            computed: false,
+            shorthand: false,
+            method: false,
+            span: Span::ZERO,
+        })));
     }
     let props_obj = Expression::Object(Box::new(ObjectExpression {
         properties: props,
