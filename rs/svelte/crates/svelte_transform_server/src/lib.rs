@@ -2095,11 +2095,27 @@ fn lower_head_fragment(
             last_was_component = false;
         }
     }
-    // No trailing-Component anchor inside `<svelte:head>` — upstream's
-    // head body skips the close-marker since the head wrapper itself
-    // provides the boundary.
+    // Trailing-Component anchor: only when the head body had preceding
+    // non-Component content (mirrors the main loop's
+    // `emitted_static_push && last_was_component` rule).
+    let emitted_static_push = !out.is_empty();
     if let Some(stmt) = buf.flush() {
         out.push(stmt);
+    } else if last_was_component && emitted_static_push {
+        // Need to know if there was any non-Component statement
+        // before the Component. `out` contains the function decls AND
+        // any prior pushes/Component calls. Simplification: if there's
+        // anything besides the last Component call, emit the anchor.
+        let has_non_component = out
+            .iter()
+            .take(out.len().saturating_sub(1))
+            .any(|s| !matches!(s, Statement::Expression(e)
+                if matches!(&e.expression, Expression::Call(c)
+                    if matches!(&c.callee, Expression::Identifier(id) if id.name.chars().next().map_or(false, |ch| ch.is_uppercase())))
+            ));
+        if has_non_component {
+            out.push(push_template("<!---->"));
+        }
     }
     Some(out)
 }
