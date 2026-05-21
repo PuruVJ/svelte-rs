@@ -38,6 +38,10 @@ pub struct RewriteInfo {
     /// potentially-nullish — e.g. `let Component = $state()` → wrap
     /// `<Component />` in `if (Component) { ... } else { ... }`).
     pub state_bindings: HashSet<String>,
+    /// Names of top-level `let/const/var` declarations and imports — used
+    /// to resolve store-subscription references like `$X` (where `X` is one
+    /// of these). Includes names that survive the rune-rewrite pass.
+    pub top_bindings: HashSet<String>,
 }
 
 /// Result of `transform_async_script_server` — non-None when the script
@@ -845,6 +849,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
     if single_id_props.is_some() || has_class_with_runes {
         ctx.uses_props = true;
     }
+    let top_bindings = collect_top_level_bindings(p);
     RewriteInfo {
         uses_props: ctx.uses_props,
         rune_bindings,
@@ -853,6 +858,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
         has_class_with_runes,
         legacy_export_props,
         state_bindings,
+        top_bindings,
     }
 }
 
@@ -2107,4 +2113,270 @@ fn global_keypath(e: &Expression) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Walk an Expression and rewrite every Identifier `$X` where `X` is in
+/// `top_bindings` into `$.store_get($$store_subs ??= {}, '$X', X)`.
+/// Records the full `$X` names that were rewritten in `refs`. Mirrors
+/// upstream's `serialize_get_binding` / store_get rewriting for SSR.
+pub fn rewrite_store_refs(
+    e: &mut Expression,
+    top_bindings: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    if top_bindings.is_empty() {
+        return;
+    }
+    rewrite_store_refs_inner(e, top_bindings, refs);
+}
+
+pub fn rewrite_store_refs_in_stmts(
+    stmts: &mut [Statement],
+    top_bindings: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    if top_bindings.is_empty() {
+        return;
+    }
+    for s in stmts {
+        rewrite_store_refs_stmt(s, top_bindings, refs);
+    }
+}
+
+fn rewrite_store_refs_stmt(
+    s: &mut Statement,
+    top_bindings: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    match s {
+        Statement::Variable(v) => {
+            for d in &mut v.declarations {
+                rewrite_store_refs_in_pattern(&mut d.id, top_bindings, refs);
+                if let Some(init) = &mut d.init {
+                    rewrite_store_refs_inner(init, top_bindings, refs);
+                }
+            }
+        }
+        Statement::Expression(es) => {
+            rewrite_store_refs_inner(&mut es.expression, top_bindings, refs);
+        }
+        Statement::Return(r) => {
+            if let Some(a) = &mut r.argument {
+                rewrite_store_refs_inner(a, top_bindings, refs);
+            }
+        }
+        Statement::If(i) => {
+            rewrite_store_refs_inner(&mut i.test, top_bindings, refs);
+            rewrite_store_refs_stmt(&mut i.consequent, top_bindings, refs);
+            if let Some(a) = &mut i.alternate {
+                rewrite_store_refs_stmt(a, top_bindings, refs);
+            }
+        }
+        Statement::Block(b) => {
+            for s in &mut b.body {
+                rewrite_store_refs_stmt(s, top_bindings, refs);
+            }
+        }
+        Statement::For(f) => {
+            if let Some(init) = &mut f.init {
+                match init {
+                    ForInit::Declaration(v) => {
+                        for d in &mut v.declarations {
+                            if let Some(i) = &mut d.init {
+                                rewrite_store_refs_inner(i, top_bindings, refs);
+                            }
+                        }
+                    }
+                    ForInit::Expression(e) => rewrite_store_refs_inner(e, top_bindings, refs),
+                }
+            }
+            if let Some(t) = &mut f.test {
+                rewrite_store_refs_inner(t, top_bindings, refs);
+            }
+            if let Some(u) = &mut f.update {
+                rewrite_store_refs_inner(u, top_bindings, refs);
+            }
+            rewrite_store_refs_stmt(&mut f.body, top_bindings, refs);
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_store_refs_in_pattern(
+    p: &mut Pattern,
+    top_bindings: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    match p {
+        Pattern::Object(o) => {
+            for prop in &mut o.properties {
+                match prop {
+                    ObjectPatternMember::Property(pr) => {
+                        rewrite_store_refs_in_pattern(&mut pr.value, top_bindings, refs);
+                    }
+                    ObjectPatternMember::Rest(r) => {
+                        rewrite_store_refs_in_pattern(&mut r.argument, top_bindings, refs);
+                    }
+                }
+            }
+        }
+        Pattern::Array(a) => {
+            for el in &mut a.elements {
+                if let Some(p) = el {
+                    rewrite_store_refs_in_pattern(p, top_bindings, refs);
+                }
+            }
+        }
+        Pattern::Assignment(a) => {
+            rewrite_store_refs_in_pattern(&mut a.left, top_bindings, refs);
+            rewrite_store_refs_inner(&mut a.right, top_bindings, refs);
+        }
+        Pattern::Rest(r) => {
+            rewrite_store_refs_in_pattern(&mut r.argument, top_bindings, refs);
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_store_refs_inner(
+    e: &mut Expression,
+    top_bindings: &HashSet<String>,
+    refs: &mut HashSet<String>,
+) {
+    // Self check: if this expression IS a $X identifier where X is a top
+    // binding, rewrite it.
+    if let Expression::Identifier(id) = e {
+        if id.name.len() >= 2 && id.name.starts_with('$') && !id.name.starts_with("$$") {
+            let base = id.name[1..].to_string();
+            if top_bindings.contains(&base) {
+                let store_name = id.name.clone();
+                refs.insert(store_name.clone());
+                let coalesce = Expression::Assignment(Box::new(AssignmentExpression {
+                    left: AssignmentTarget::Expression(t::id("$$store_subs")),
+                    operator: AssignmentOperator::CoalesceAssign,
+                    right: Expression::Object(Box::new(ObjectExpression {
+                        properties: vec![],
+                        span: Span::ZERO,
+                    })),
+                    span: Span::ZERO,
+                }));
+                *e = t::call(
+                    t::member_id(t::id("$"), "store_get"),
+                    vec![coalesce, t::literal_str(&store_name), t::id(&base)],
+                );
+                return;
+            }
+        }
+    }
+    match e {
+        Expression::Member(m) => {
+            rewrite_store_refs_inner(&mut m.object, top_bindings, refs);
+            if let MemberProperty::Expression(e) = &mut m.property {
+                rewrite_store_refs_inner(e, top_bindings, refs);
+            }
+        }
+        Expression::Call(c) => {
+            rewrite_store_refs_inner(&mut c.callee, top_bindings, refs);
+            for a in &mut c.arguments {
+                match a {
+                    Argument::Expression(e) => {
+                        rewrite_store_refs_inner(e, top_bindings, refs);
+                    }
+                    Argument::Spread(s) => {
+                        rewrite_store_refs_inner(&mut s.argument, top_bindings, refs);
+                    }
+                }
+            }
+        }
+        Expression::Binary(b) => {
+            rewrite_store_refs_inner(&mut b.left, top_bindings, refs);
+            rewrite_store_refs_inner(&mut b.right, top_bindings, refs);
+        }
+        Expression::Logical(l) => {
+            rewrite_store_refs_inner(&mut l.left, top_bindings, refs);
+            rewrite_store_refs_inner(&mut l.right, top_bindings, refs);
+        }
+        Expression::Conditional(c) => {
+            rewrite_store_refs_inner(&mut c.test, top_bindings, refs);
+            rewrite_store_refs_inner(&mut c.consequent, top_bindings, refs);
+            rewrite_store_refs_inner(&mut c.alternate, top_bindings, refs);
+        }
+        Expression::Unary(u) => rewrite_store_refs_inner(&mut u.argument, top_bindings, refs),
+        Expression::Sequence(s) => {
+            for e in &mut s.expressions {
+                rewrite_store_refs_inner(e, top_bindings, refs);
+            }
+        }
+        Expression::Template(t) => {
+            for ex in &mut t.expressions {
+                rewrite_store_refs_inner(ex, top_bindings, refs);
+            }
+        }
+        Expression::Paren(p) => rewrite_store_refs_inner(&mut p.expression, top_bindings, refs),
+        Expression::Assignment(a) => {
+            rewrite_store_refs_inner(&mut a.right, top_bindings, refs);
+        }
+        Expression::Array(a) => {
+            for el in &mut a.elements {
+                match el {
+                    ArrayElement::Expression(e) => rewrite_store_refs_inner(e, top_bindings, refs),
+                    ArrayElement::Spread(s) => rewrite_store_refs_inner(&mut s.argument, top_bindings, refs),
+                    ArrayElement::Elision => {}
+                }
+            }
+        }
+        Expression::Object(o) => {
+            for p in &mut o.properties {
+                match p {
+                    ObjectMember::Property(pr) => {
+                        if pr.computed {
+                            if let PropertyKey::Expression(k) = &mut pr.key {
+                                rewrite_store_refs_inner(k, top_bindings, refs);
+                            }
+                        }
+                        rewrite_store_refs_inner(&mut pr.value, top_bindings, refs);
+                    }
+                    ObjectMember::Spread(s) => {
+                        rewrite_store_refs_inner(&mut s.argument, top_bindings, refs);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect names of top-level `let/const/var` bindings (only direct Identifier
+/// patterns; destructure patterns are skipped — store-detection only needs
+/// the names users would reference via the `$X` form).
+pub fn collect_top_level_bindings(p: &Program) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for s in &p.body {
+        match s {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    if let Pattern::Identifier(id) = &d.id {
+                        out.insert(id.name.clone());
+                    }
+                }
+            }
+            Statement::Import(im) => {
+                for sp in &im.specifiers {
+                    match sp {
+                        ImportSpecifierKind::Default(d) => {
+                            out.insert(d.local.name.clone());
+                        }
+                        ImportSpecifierKind::Named(n) => {
+                            out.insert(n.local.name.clone());
+                        }
+                        ImportSpecifierKind::Namespace(n) => {
+                            out.insert(n.local.name.clone());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }

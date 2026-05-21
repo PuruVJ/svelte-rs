@@ -787,24 +787,47 @@ impl<'a> Emitter<'a> {
             self.write(", ");
         }
         if !named.is_empty() {
-            self.write("{ ");
-            for (i, n) in named.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
-                }
-                let imported_name = match &n.imported {
-                    ModuleExportName::Identifier(id) => &id.name,
-                    ModuleExportName::String(s) => &s.value,
+            // Pre-compute display string per named for wrap-length check.
+            let names_str: Vec<String> = named.iter().map(|n| {
+                let imported = match &n.imported {
+                    ModuleExportName::Identifier(id) => id.name.clone(),
+                    ModuleExportName::String(s) => s.value.clone(),
                 };
-                if imported_name == &n.local.name {
-                    self.write(&n.local.name);
+                if imported == n.local.name {
+                    n.local.name.clone()
                 } else {
-                    self.write(imported_name);
-                    self.write(" as ");
-                    self.write(&n.local.name);
+                    format!("{} as {}", imported, n.local.name)
                 }
+            }).collect();
+            // Conservative wrap: switch to multi-line when there are
+            // many named imports (≥7) — long lists wrap, short ones stay.
+            // Upstream esrap wraps when the total line exceeds ~80 cols;
+            // we use count as a cheap proxy to avoid getting `col` math wrong.
+            let multi = names_str.len() >= 7;
+            if multi {
+                self.write("{");
+                self.indent_in();
+                self.newline();
+                for (i, s) in names_str.iter().enumerate() {
+                    if i > 0 {
+                        self.write(",");
+                        self.newline();
+                    }
+                    self.write(s);
+                }
+                self.indent_out();
+                self.newline();
+                self.write("}");
+            } else {
+                self.write("{ ");
+                for (i, s) in names_str.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.write(s);
+                }
+                self.write(" }");
             }
-            self.write(" }");
         }
         self.write(" from ");
         self.emit_string_literal(&d.source);

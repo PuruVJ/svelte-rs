@@ -164,6 +164,8 @@ pub fn try_typed_server_component_full(
     }
     let mut legacy_export_props: Vec<String> = Vec::new();
     let mut state_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut store_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut script_top_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(s) = root.instance.as_ref() {
         let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
@@ -172,9 +174,19 @@ pub fn try_typed_server_component_full(
         derived_bindings = info.derived_bindings;
         legacy_export_props = info.legacy_export_props;
         state_bindings = info.state_bindings;
+        script_top_bindings = info.top_bindings;
         if let Some(name) = &info.single_id_props {
             script::rewrite_props_destructure(&mut content, name);
         }
+        // Rewrite `$X` identifiers (where X is a top-level binding) into
+        // `$.store_get($$store_subs ??= {}, '$X', X)` — both in the script
+        // and in the template fragment (the fragment rewrite happens just
+        // below, after we've cloned the fragment for transformation).
+        script::rewrite_store_refs_in_stmts(
+            &mut content.body,
+            &script_top_bindings,
+            &mut store_refs,
+        );
         consts = script::collect_script_constants(&content, &info.rune_bindings);
         let (imports, rest) = partition_imports(&content.body)?;
         script_imports = imports;
@@ -218,6 +230,12 @@ pub fn try_typed_server_component_full(
     let derived = &derived_bindings;
     if !derived.is_empty() {
         call_derived_in_fragment(&mut fragment, derived);
+    }
+    // Rewrite `$X` identifiers in the fragment (template position) — the
+    // script-side pass already mutated content.body before partition.
+    rewrite_store_refs_in_fragment(&mut fragment, &script_top_bindings, &mut store_refs);
+    if !store_refs.is_empty() {
+        needs_component_wrap = true;
     }
 
     // Extract top-level SnippetBlocks to hoist as separate `function` decls
@@ -328,6 +346,39 @@ pub fn try_typed_server_component_full(
         ));
         let mut prefix = vec![add_call];
         prefix.extend(std::mem::take(&mut func_body));
+        func_body = prefix;
+    }
+
+    // Store-subscriptions: prepend `var $$store_subs;` and append
+    // `if ($$store_subs) $.unsubscribe_stores($$store_subs);` inside the
+    // function body before the component-wrap moves them into the inner
+    // arrow.
+    if !store_refs.is_empty() {
+        let mut prefix: Vec<Statement> = vec![Statement::Variable(Box::new(
+            VariableDeclaration {
+                kind: VariableKind::Var,
+                declarations: vec![VariableDeclarator {
+                    id: Pattern::Identifier(Identifier {
+                        name: "$$store_subs".to_string(),
+                        span: Span::ZERO,
+                    }),
+                    init: None,
+                    span: Span::ZERO,
+                }],
+                span: Span::ZERO,
+            },
+        ))];
+        prefix.extend(std::mem::take(&mut func_body));
+        // Trailing unsubscribe guard.
+        prefix.push(Statement::If(Box::new(IfStatement {
+            test: t::id("$$store_subs"),
+            consequent: t::stmt(t::call(
+                t::member_id(t::id("$"), "unsubscribe_stores"),
+                vec![t::id("$$store_subs")],
+            )),
+            alternate: None,
+            span: Span::ZERO,
+        })));
         func_body = prefix;
     }
 
@@ -696,11 +747,26 @@ fn stmt_has_unsafe_call_with_imports(
     }
 }
 
+fn member_root_is_import(
+    e: &Expression,
+    imports: &std::collections::HashSet<String>,
+) -> bool {
+    match e {
+        Expression::Identifier(id) => imports.contains(&id.name),
+        Expression::Member(m) => member_root_is_import(&m.object, imports),
+        Expression::Paren(p) => member_root_is_import(&p.expression, imports),
+        _ => false,
+    }
+}
+
 fn expr_calls_import(
     e: &Expression,
     imports: &std::collections::HashSet<String>,
 ) -> bool {
     match e {
+        // Bare reference to an imported binding is fine (e.g. passing as prop);
+        // only unsafe when *invoked* or *accessed via member chain*.
+        Expression::Identifier(_) => false,
         Expression::Call(c) => {
             // Callee is a plain Identifier that's imported → unsafe.
             if let Expression::Identifier(id) = &c.callee {
@@ -723,7 +789,10 @@ fn expr_calls_import(
                 || expr_calls_import(&c.alternate, imports)
         }
         Expression::Paren(p) => expr_calls_import(&p.expression, imports),
-        Expression::Member(m) => expr_calls_import(&m.object, imports),
+        // Member chain rooted at an imported identifier → unsafe.
+        Expression::Member(m) => {
+            member_root_is_import(&m.object, imports) || expr_calls_import(&m.object, imports)
+        }
         Expression::Await(a) => expr_calls_import(&a.argument, imports),
         _ => false,
     }
@@ -5815,6 +5884,123 @@ fn call_derived_in_fragment(
 ) {
     for n in &mut f.nodes {
         call_derived_in_node(n, derived);
+    }
+}
+
+fn rewrite_store_refs_in_fragment(
+    f: &mut svelte_ast::fragment::Fragment,
+    top_bindings: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    if top_bindings.is_empty() {
+        return;
+    }
+    for n in &mut f.nodes {
+        rewrite_store_refs_in_node(n, top_bindings, refs);
+    }
+}
+
+fn rewrite_store_refs_in_node(
+    n: &mut FragmentChild,
+    top_bindings: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    match n {
+        FragmentChild::ExpressionTag(t) => {
+            script::rewrite_store_refs(&mut t.expression, top_bindings, refs);
+        }
+        FragmentChild::HtmlTag(t) => {
+            script::rewrite_store_refs(&mut t.expression, top_bindings, refs);
+        }
+        FragmentChild::RegularElement(el) => {
+            for attr in &mut el.attributes {
+                rewrite_store_refs_in_attr(attr, top_bindings, refs);
+            }
+            rewrite_store_refs_in_fragment(&mut el.fragment, top_bindings, refs);
+        }
+        FragmentChild::Component(c) => {
+            for attr in &mut c.attributes {
+                rewrite_store_refs_in_attr(attr, top_bindings, refs);
+            }
+            rewrite_store_refs_in_fragment(&mut c.fragment, top_bindings, refs);
+        }
+        FragmentChild::SvelteElement(el) => {
+            script::rewrite_store_refs(&mut el.tag, top_bindings, refs);
+            for attr in &mut el.attributes {
+                rewrite_store_refs_in_attr(attr, top_bindings, refs);
+            }
+            rewrite_store_refs_in_fragment(&mut el.fragment, top_bindings, refs);
+        }
+        FragmentChild::EachBlock(eb) => {
+            script::rewrite_store_refs(&mut eb.expression, top_bindings, refs);
+            if let Some(k) = &mut eb.key {
+                script::rewrite_store_refs(k, top_bindings, refs);
+            }
+            rewrite_store_refs_in_fragment(&mut eb.body, top_bindings, refs);
+            if let Some(f) = &mut eb.fallback {
+                rewrite_store_refs_in_fragment(f, top_bindings, refs);
+            }
+        }
+        FragmentChild::IfBlock(ib) => {
+            script::rewrite_store_refs(&mut ib.test, top_bindings, refs);
+            rewrite_store_refs_in_fragment(&mut ib.consequent, top_bindings, refs);
+            if let Some(a) = &mut ib.alternate {
+                rewrite_store_refs_in_fragment(a, top_bindings, refs);
+            }
+        }
+        FragmentChild::AwaitBlock(ab) => {
+            script::rewrite_store_refs(&mut ab.expression, top_bindings, refs);
+            if let Some(p) = &mut ab.pending {
+                rewrite_store_refs_in_fragment(p, top_bindings, refs);
+            }
+            if let Some(t) = &mut ab.then {
+                rewrite_store_refs_in_fragment(t, top_bindings, refs);
+            }
+            if let Some(c) = &mut ab.catch_ {
+                rewrite_store_refs_in_fragment(c, top_bindings, refs);
+            }
+        }
+        FragmentChild::KeyBlock(kb) => {
+            script::rewrite_store_refs(&mut kb.expression, top_bindings, refs);
+            rewrite_store_refs_in_fragment(&mut kb.fragment, top_bindings, refs);
+        }
+        FragmentChild::ConstTag(ct) => {
+            for d in &mut ct.declaration.declarations {
+                if let Some(init) = &mut d.init {
+                    script::rewrite_store_refs(init, top_bindings, refs);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_store_refs_in_attr(
+    attr: &mut ElementAttribute,
+    top_bindings: &std::collections::HashSet<String>,
+    refs: &mut std::collections::HashSet<String>,
+) {
+    match attr {
+        ElementAttribute::Attribute(a) => match &mut a.value {
+            AttributeValue::Single(tag) => {
+                script::rewrite_store_refs(&mut tag.expression, top_bindings, refs);
+            }
+            AttributeValue::Many(parts) => {
+                for p in parts {
+                    if let AttributeValuePart::ExpressionTag(t) = p {
+                        script::rewrite_store_refs(&mut t.expression, top_bindings, refs);
+                    }
+                }
+            }
+            _ => {}
+        },
+        ElementAttribute::SpreadAttribute(s) => {
+            script::rewrite_store_refs(&mut s.expression, top_bindings, refs);
+        }
+        ElementAttribute::BindDirective(b) => {
+            script::rewrite_store_refs(&mut b.expression, top_bindings, refs);
+        }
+        _ => {}
     }
 }
 
