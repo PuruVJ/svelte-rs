@@ -46,9 +46,22 @@ pub fn try_typed_server_component_with_filename(
     experimental_async: bool,
     filename: Option<&str>,
 ) -> Option<Program> {
-    if root.css.is_some() || root.module.is_some() {
+    if root.module.is_some() {
         return None;
     }
+    // When the source has a `<style>` block, append `svelte-{hash}` to every
+    // class attribute and (if css injection is enabled) also emit
+    // `const $$css = { hash, code }` + `$$renderer.global.css.add($$css);`.
+    // The hash matches upstream's default `cssHash` (hash of filename, or hash
+    // of css source if filename is unknown).
+    let css_hash: Option<String> = root.css.as_ref().map(|_css| {
+        let basis = filename.unwrap_or("(unknown)");
+        format!("svelte-{}", svelte_filename_hash(basis))
+    });
+    // Set the thread-local so element-attribute emission can read the hash.
+    CSS_HASH.with(|c| {
+        *c.borrow_mut() = css_hash.clone();
+    });
 
     // Defer entirely-static fragments to typed_fast (it's cheaper).
     if root.instance.is_none() && is_pure_static_fragment(&root.fragment) {
@@ -1453,6 +1466,11 @@ thread_local! {
     static HEAD_FILENAME: std::cell::RefCell<Option<String>> = const {
         std::cell::RefCell::new(None)
     };
+    /// `svelte-{hash}` to append to every scoped class attribute, or None
+    /// when the source has no `<style>` block.
+    static CSS_HASH: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
 /// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2 variant
@@ -1746,6 +1764,12 @@ fn lower_fragment_with_marker(
                 }
                 FragmentChild::SvelteHead(sh) => {
                     out.push(lower_svelte_head_server(sh)?);
+                    last_was_component = false;
+                }
+                FragmentChild::SvelteOptions(_) => {
+                    // `<svelte:options ...>` is a compile-time directive
+                    // (sets css mode, namespace, custom-element flags, etc.).
+                    // No runtime output.
                     last_was_component = false;
                 }
                 _ => return None,
@@ -3289,6 +3313,13 @@ fn append_element_attribute_server(
             if is_event_handler_name(&a.name) {
                 return Some(());
             }
+            // Class attribute on a scoped element: append `svelte-{hash}`.
+            if a.name == "class" {
+                let hash = CSS_HASH.with(|c| c.borrow().clone());
+                if let Some(hash) = hash {
+                    return append_class_attribute_with_hash(&a.value, &hash, buf);
+                }
+            }
             append_value_attribute(&a.name, &a.value, buf)
         }
         ElementAttribute::BindDirective(b) => {
@@ -3398,6 +3429,95 @@ fn append_value_attribute(
                 span: Span::ZERO,
             })));
             Some(())
+        }
+    }
+}
+
+/// Append the `class` attribute with the scoped CSS hash spliced into the
+/// final class list. Handles three shapes:
+///   - Empty: `class=""` → `class="svelte-HASH"`
+///   - Single ExpressionTag: `class={x}` → `${$.attr_class(x, 'svelte-HASH')}`
+///   - Many parts (Text/ExpressionTag mix): static if all text, otherwise
+///     template-literal wrapped in `$.attr_class`.
+fn append_class_attribute_with_hash(
+    value: &AttributeValue,
+    hash: &str,
+    buf: &mut TemplateBuf,
+) -> Option<()> {
+    match value {
+        AttributeValue::Empty => {
+            buf.push_str(" class=\"");
+            buf.push_str(hash);
+            buf.push_str("\"");
+            Some(())
+        }
+        AttributeValue::Single(tag) => {
+            buf.push_expr(Expression::Call(Box::new(CallExpression {
+                callee: t::member_id(t::id("$"), "attr_class"),
+                arguments: vec![
+                    Argument::Expression(tag.expression.clone()),
+                    Argument::Expression(string_lit(hash)),
+                ],
+                optional: false,
+                span: Span::ZERO,
+            })));
+            Some(())
+        }
+        AttributeValue::Many(parts) => {
+            if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                // Static text → splice the hash into the literal value.
+                let mut combined = String::new();
+                for p in parts {
+                    if let AttributeValuePart::Text(t) = p {
+                        combined.push_str(&t.data);
+                    }
+                }
+                let combined = format!("{} {}", combined.trim(), hash);
+                buf.push_str(" class=\"");
+                buf.push_str(&escape_attribute_text(combined.trim()));
+                buf.push_str("\"");
+                Some(())
+            } else {
+                // Dynamic — wrap in `$.attr_class(\`...\`, 'svelte-HASH')`.
+                let mut quasis: Vec<String> = Vec::with_capacity(parts.len() + 1);
+                let mut exprs: Vec<Expression> = Vec::with_capacity(parts.len());
+                let mut pending: String = String::new();
+                let mut expecting_quasi = true;
+                for p in parts {
+                    match p {
+                        AttributeValuePart::Text(t) => {
+                            pending.push_str(&t.data);
+                            expecting_quasi = false;
+                        }
+                        AttributeValuePart::ExpressionTag(tag) => {
+                            if expecting_quasi {
+                                quasis.push(std::mem::take(&mut pending));
+                            } else {
+                                quasis.push(std::mem::take(&mut pending));
+                                expecting_quasi = true;
+                            }
+                            exprs.push(Expression::Call(Box::new(CallExpression {
+                                callee: t::member_id(t::id("$"), "stringify"),
+                                arguments: vec![Argument::Expression(tag.expression.clone())],
+                                optional: false,
+                                span: Span::ZERO,
+                            })));
+                        }
+                    }
+                }
+                quasis.push(pending);
+                let tpl = t::template_raw(quasis, exprs);
+                buf.push_expr(Expression::Call(Box::new(CallExpression {
+                    callee: t::member_id(t::id("$"), "attr_class"),
+                    arguments: vec![
+                        Argument::Expression(tpl),
+                        Argument::Expression(string_lit(hash)),
+                    ],
+                    optional: false,
+                    span: Span::ZERO,
+                })));
+                Some(())
+            }
         }
     }
 }
