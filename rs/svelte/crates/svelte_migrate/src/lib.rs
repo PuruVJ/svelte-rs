@@ -638,10 +638,14 @@ fn collect_assignment_targets_expr(
 ) {
     match expr {
         Expression::Assignment(a) => {
-            if let svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) =
-                &a.left
-            {
-                out.insert(id.name.clone());
+            match &a.left {
+                svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) => {
+                    out.insert(id.name.clone());
+                }
+                svelte_js_ast::AssignmentTarget::Pattern(p) => {
+                    collect_pattern_names(p, out);
+                }
+                _ => {}
             }
             collect_assignment_targets_expr(&a.right, out);
         }
@@ -2541,7 +2545,10 @@ fn migrate_simple_derivations(
 
         // Look for a preceding sibling `let X;` (single declarator, no init,
         // Identifier matching a target name).
+        // Also detect a preceding `let X = INIT;` (WITH init) for a target —
+        // in that case, upstream treats X as state, not derived, so we bail.
         let mut preceding_let_id_end: Option<usize> = None;
+        let mut preceding_let_with_init = false;
         for sibling in body {
             let Statement::Variable(v) = sibling else {
                 continue;
@@ -2549,20 +2556,23 @@ fn migrate_simple_derivations(
             if v.span.start as usize >= l_start {
                 continue;
             }
-            if v.declarations.len() != 1 {
-                continue;
+            for d in &v.declarations {
+                let Pattern::Identifier(id) = &d.id else {
+                    continue;
+                };
+                if !target_names.contains(&id.name) {
+                    continue;
+                }
+                if d.init.is_some() {
+                    preceding_let_with_init = true;
+                } else if v.declarations.len() == 1 {
+                    preceding_let_id_end = Some(id.span.end as usize);
+                }
             }
-            let d = &v.declarations[0];
-            let Pattern::Identifier(id) = &d.id else {
-                continue;
-            };
-            if d.init.is_some() {
-                continue;
-            }
-            if !target_names.contains(&id.name) {
-                continue;
-            }
-            preceding_let_id_end = Some(id.span.end as usize);
+        }
+        if preceding_let_with_init {
+            // Falls through to the `run(...)` effect path.
+            continue;
         }
 
         if let Some(id_end) = preceding_let_id_end {
@@ -2616,20 +2626,40 @@ fn migrate_simple_state(source: &str, str: &mut MagicString, root: &Root) {
     }
 
     // Detect $: targets (would become derived) — skip these.
+    // But: if a $: target is ALSO declared as `let X = INIT;` (with init),
+    // upstream treats X as state, not derived — so we do NOT skip it here.
     let mut derived_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut decl_with_init: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for stmt in &instance.content.body {
+        if let Statement::Variable(v) = stmt {
+            for d in &v.declarations {
+                if d.init.is_some() {
+                    if let Pattern::Identifier(id) = &d.id {
+                        decl_with_init.insert(id.name.clone());
+                    }
+                }
+            }
+        }
+    }
     for stmt in &instance.content.body {
         if let Statement::Labeled(l) = stmt {
             if l.label.name == "$" {
                 if let Statement::Expression(es) = &l.body {
                     if let Expression::Assignment(asn) = &es.expression {
+                        let mut local: std::collections::HashSet<String> = Default::default();
                         if let svelte_js_ast::AssignmentTarget::Expression(
                             Expression::Identifier(id),
                         ) = &asn.left
                         {
-                            derived_targets.insert(id.name.clone());
+                            local.insert(id.name.clone());
                         }
                         if let svelte_js_ast::AssignmentTarget::Pattern(p) = &asn.left {
-                            collect_pattern_names(p, &mut derived_targets);
+                            collect_pattern_names(p, &mut local);
+                        }
+                        for n in local {
+                            if !decl_with_init.contains(&n) {
+                                derived_targets.insert(n);
+                            }
                         }
                     }
                 }
