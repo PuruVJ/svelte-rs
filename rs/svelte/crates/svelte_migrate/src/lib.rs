@@ -259,12 +259,25 @@ fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
             _ => {}
         }
     }
-    // Determine `props_insertion_point` (where `let { … } = $props()` will go).
-    // For our heuristic, treat all `export let` props as if declared at the
-    // first labeled statement's position (so dependency on a prop counts as
-    // "before"). Upstream uses the actual `props_insertion_point` computed
-    // by analyze.
-    let _ = prop_names;
+    // Compute `props_insertion_point` = end of the LAST top-level
+    // ImportDeclaration in the script (mirrors upstream's
+    // `ImportDeclaration` visitor which sets it to `node.end`). Default to
+    // the script content start.
+    let mut props_insertion_point = instance.content.span.start as usize;
+    for stmt in body {
+        if let Statement::Import(imp) = stmt {
+            let e = imp.span.end as usize;
+            if e > props_insertion_point {
+                props_insertion_point = e;
+            }
+        }
+    }
+    // For each prop name, override its decl_start with props_insertion_point
+    // so that "depends on a prop declared later" is computed against the
+    // actual prop insertion site (after all imports).
+    for n in &prop_names {
+        decl_start.insert(n.clone(), props_insertion_point);
+    }
     // Also register labeled statements that produce targets as the binding's
     // declaration point. `$: mobile = …` introduces an implicit `mobile`.
     for (s, _e, targets, _deps) in &labeled {
@@ -3445,6 +3458,9 @@ fn migrate_simple_props(
         jsdoc_type: Option<String>,
         // JSDoc *block* start/end if found above the export (so we can erase).
         jsdoc_span: Option<(usize, usize)>,
+        // Verbatim TS type annotation text (without the leading `:`). None
+        // when the export has no inline type annotation.
+        ts_type: Option<String>,
     }
     let mut props: Vec<Prop> = Vec::new();
     // Collect bind:/updated targets for $bindable detection.
@@ -3484,15 +3500,52 @@ fn migrate_simple_props(
                 continue;
             };
             // Detect a textual `:` type annotation between id.end and the
-            // next `=`/`,`/`;` — if present, bail since we don't yet emit
-            // the interface/JSDoc form.
+            // next `=`/`,`/`;`. If present, capture the type text.
             let id_end = id.span.end as usize;
-            let has_type = {
+            let (has_type, ts_type) = {
                 let mut k = id_end;
                 while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
                     k += 1;
                 }
-                k < bytes.len() && bytes[k] == b':'
+                if k < bytes.len() && bytes[k] == b':' {
+                    // Skip the colon and any whitespace.
+                    let mut p = k + 1;
+                    while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                        p += 1;
+                    }
+                    // Scan forward until a top-level `=`, `,`, `;`, `\n` or
+                    // the end of the declarator. Respect nested brackets and
+                    // string literals.
+                    let mut q = p;
+                    let mut depth_paren = 0i32;
+                    let mut depth_brace = 0i32;
+                    let mut depth_bracket = 0i32;
+                    let mut depth_angle = 0i32;
+                    while q < bytes.len() {
+                        let b = bytes[q];
+                        if depth_paren == 0 && depth_brace == 0 && depth_bracket == 0 && depth_angle == 0
+                            && (b == b'=' || b == b',' || b == b';' || b == b'\n')
+                        {
+                            break;
+                        }
+                        match b {
+                            b'(' => depth_paren += 1,
+                            b')' => depth_paren -= 1,
+                            b'{' => depth_brace += 1,
+                            b'}' => depth_brace -= 1,
+                            b'[' => depth_bracket += 1,
+                            b']' => depth_bracket -= 1,
+                            b'<' => depth_angle += 1,
+                            b'>' => depth_angle -= 1,
+                            _ => {}
+                        }
+                        q += 1;
+                    }
+                    let ty = source[p..q].trim_end().to_string();
+                    (true, Some(ty))
+                } else {
+                    (false, None)
+                }
             };
             // Detect a leading JSDoc block immediately before this export.
             let jsdoc_span = {
@@ -3518,13 +3571,6 @@ fn migrate_simple_props(
             // Extract `@type {…}` from JSDoc if present.
             let jsdoc_type = jsdoc_span.and_then(|(s, e)| extract_jsdoc_type(&source[s..e]));
 
-            // For now, bail on TS-typed exports (we don't synthesize the
-            // interface from TS annotations yet) — but accept JSDoc-typed
-            // exports going forward.
-            if has_type {
-                return;
-            }
-
             let init_span = d.init.as_ref().map(|e| expr_span(e));
             props.push(Prop {
                 local: id.name.clone(),
@@ -3535,9 +3581,10 @@ fn migrate_simple_props(
                 node_end: en.span.end as usize,
                 node_decl_count: v.declarations.len(),
                 bindable: updated.contains(&id.name),
-                has_type_annotation: false,
+                has_type_annotation: has_type,
                 jsdoc_type,
                 jsdoc_span,
+                ts_type,
             });
             let _ = i;
         }
@@ -3675,7 +3722,16 @@ fn migrate_simple_props(
     // has_type_or_fallback signal, AND additionally emit the type when every
     // prop is a slot (slot-only components).
     let all_props_are_slots = !slots.props.is_empty() && props.is_empty();
-    let need_props_type = (has_any_jsdoc_type || all_props_are_slots) && !uses_props;
+    let has_any_ts_type = props.iter().any(|p| p.ts_type.is_some());
+    // Emit a Props type block when we have explicit TS or JSDoc types, OR
+    // every prop is a slot (slot-only components), OR (TS-mode) the
+    // component uses `$$restProps` so we can add the indexed signature
+    // `[key: string]: any`.
+    let need_props_type = (has_any_jsdoc_type
+        || all_props_are_slots
+        || has_any_ts_type
+        || (uses_ts && uses_rest))
+        && !uses_props;
 
     // Build the Props typedef/interface block.
     let typedef_block: Option<String> = if need_props_type {
@@ -3688,10 +3744,11 @@ fn migrate_simple_props(
                     .init
                     .map(|(s, e)| source[s as usize..e as usize].to_string());
                 let ty = p
-                    .jsdoc_type
+                    .ts_type
                     .clone()
+                    .or_else(|| p.jsdoc_type.clone())
                     .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
-                let optional = init_text.is_some();
+                let optional = init_text.is_some() || p.bindable;
                 let opt = if optional { "?" } else { "" };
                 parts.push(format!("{}{}: {};", p.local, opt, ty));
             }
@@ -3702,6 +3759,9 @@ fn migrate_simple_props(
                     "import('svelte').Snippet"
                 };
                 parts.push(format!("{}?: {};", sp.name, ty));
+            }
+            if uses_rest {
+                parts.push("[key: string]: any".to_string());
             }
             s.push_str(inner_sep);
             s.push_str(&parts.join(inner_sep));
@@ -3929,15 +3989,34 @@ fn migrate_simple_props(
             str.remove(s, e);
         }
     } else {
-        // No JSDoc types — replace first node with final_block (single-line)
-        // and remove the rest. Preserves the historical behavior.
-        let mut first = true;
-        for (_, group) in &node_groups {
-            let p = group[0];
-            if first {
-                str.update(p.node_start, p.node_end, &final_block);
-                first = false;
-            } else {
+        // No JSDoc types. Determine the props_insertion_point: the end of
+        // the last top-level Import declaration in the script (or 0 if
+        // none). If any imports come AFTER the first export, we insert the
+        // final block at that point and remove all exports. Otherwise we
+        // replace the first export in place and remove the rest.
+        let mut props_insertion_point: usize = instance.content.span.start as usize;
+        let mut has_import_after_first_export: bool = false;
+        let first_export_start = props.iter().map(|p| p.node_start).min().unwrap_or(0);
+        for stmt in &instance.content.body {
+            if let Statement::Import(imp) = stmt {
+                let imp_end = imp.span.end as usize;
+                let imp_start = imp.span.start as usize;
+                if imp_end > props_insertion_point {
+                    props_insertion_point = imp_end;
+                }
+                if imp_start > first_export_start {
+                    has_import_after_first_export = true;
+                }
+            }
+        }
+        if has_import_after_first_export {
+            // Insert final block AFTER the last import; remove all exports.
+            str.append_left(
+                props_insertion_point,
+                format!("\n{}{}", indent, final_block),
+            );
+            for (_, group) in &node_groups {
+                let p = group[0];
                 let mut s = p.node_start;
                 let mut e = p.node_end;
                 if bytes.get(e).copied() == Some(b'\n') {
@@ -3947,6 +4026,27 @@ fn migrate_simple_props(
                     s -= 1;
                 }
                 str.remove(s, e);
+            }
+        } else {
+            // Replace first node with final_block (single-line) and remove
+            // the rest. Preserves the historical behavior.
+            let mut first = true;
+            for (_, group) in &node_groups {
+                let p = group[0];
+                if first {
+                    str.update(p.node_start, p.node_end, &final_block);
+                    first = false;
+                } else {
+                    let mut s = p.node_start;
+                    let mut e = p.node_end;
+                    if bytes.get(e).copied() == Some(b'\n') {
+                        e += 1;
+                    }
+                    while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+                        s -= 1;
+                    }
+                    str.remove(s, e);
+                }
             }
         }
     }
