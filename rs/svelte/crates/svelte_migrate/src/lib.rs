@@ -270,22 +270,32 @@ fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
             _ => {}
         }
     }
-    // Compute `props_insertion_point` = end of the LAST top-level
-    // ImportDeclaration in the script (mirrors upstream's
-    // `ImportDeclaration` visitor which sets it to `node.end`). Default to
-    // the script content start.
+    // Compute `props_insertion_point` mirror upstream's logic:
+    // initial = content.start, then moved by each ImportDeclaration to
+    // node.end, then by each VariableDeclaration containing a prop to
+    // declarator.end (single-decl) or node.end (multi-decl). All visits in
+    // source order; the FINAL value is what's used by the dep check.
     let mut props_insertion_point = instance.content.span.start as usize;
     for stmt in body {
-        if let Statement::Import(imp) = stmt {
-            let e = imp.span.end as usize;
-            if e > props_insertion_point {
-                props_insertion_point = e;
+        match stmt {
+            Statement::Import(imp) => {
+                props_insertion_point = imp.span.end as usize;
             }
+            Statement::ExportNamed(en) => {
+                if let Some(Statement::Variable(v)) = en.declaration.as_ref() {
+                    if v.declarations.len() == 1 {
+                        props_insertion_point = v.declarations[0].span.end as usize;
+                    } else {
+                        props_insertion_point = en.span.end as usize;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // For each prop name, override its decl_start with props_insertion_point
     // so that "depends on a prop declared later" is computed against the
-    // actual prop insertion site (after all imports).
+    // actual prop insertion site.
     for n in &prop_names {
         decl_start.insert(n.clone(), props_insertion_point);
     }
@@ -3826,6 +3836,22 @@ fn migrate_simple_props(
         }
     }
 
+    if std::env::var("MIGRATE_DEBUG").ok().as_deref() == Some("props") {
+        eprintln!(
+            "[props] count={} uses_props={} uses_rest={} slots_count={}",
+            props.len(),
+            uses_props,
+            uses_rest,
+            slots.props.len()
+        );
+        for p in &props {
+            eprintln!(
+                "  prop {} init={:?} jsdoc_type={:?} ts_type={:?} node=[{}..{}]",
+                p.local, p.init, p.jsdoc_type, p.ts_type, p.node_start, p.node_end
+            );
+        }
+    }
+    let _debug_props = std::env::var("MIGRATE_DEBUG").ok().as_deref() == Some("props");
     if props.is_empty() && !uses_props && !uses_rest && slots.props.is_empty() {
         return;
     }
@@ -3995,7 +4021,7 @@ fn migrate_simple_props(
             // Rewrite `$$slots.X` references in the init text (so the prop
             // can reference the local slot binding instead of the global
             // `$$slots.X`).
-            let init_text = init_text.map(|t| rewrite_dollar_dollar_refs(&t));
+            let init_text = init_text.map(|t| rewrite_dollar_dollar_refs_ctx(&t, uses_props));
             // Emit any slots referenced in this prop's init that haven't
             // already been emitted.
             if let Some(t) = &init_text {
@@ -4076,12 +4102,14 @@ fn migrate_simple_props(
     // Emit a Props type block when we have explicit TS or JSDoc types, OR
     // every prop is a slot (slot-only components), OR (TS-mode) the
     // component uses `$$restProps` so we can add the indexed signature
-    // `[key: string]: any`.
-    let need_props_type = (has_any_jsdoc_type
+    // `[key: string]: any`. When `uses_props` is set we still emit the
+    // typedef so the user gets the slot type info even though the
+    // destructure is `let { ...props } = $props();`.
+    let need_props_type = has_any_jsdoc_type
         || all_props_are_slots
         || has_any_ts_type
-        || (uses_ts && uses_rest))
-        && !uses_props;
+        || (uses_ts && uses_rest)
+        || (uses_props && !slots.props.is_empty());
 
     // Build the Props typedef/interface block.
     let typedef_block: Option<String> = if need_props_type {
@@ -4098,7 +4126,7 @@ fn migrate_simple_props(
                     .clone()
                     .or_else(|| p.jsdoc_type.clone())
                     .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
-                let optional = init_text.is_some() || p.bindable;
+                let optional = init_text.is_some();
                 let opt = if optional { "?" } else { "" };
                 parts.push(format!("{}{}: {};", p.local, opt, ty));
             }
@@ -4212,6 +4240,11 @@ fn migrate_simple_props(
         }
     }
 
+    if _debug_props {
+        eprintln!("[props] final_block={:?}", final_block);
+        eprintln!("[props] str before emit:\n{}", str.to_string());
+    }
+
     // For each prop's parent ExportNamedDeclaration, remove or rewrite it.
     // - If the node has all its declarators converted to props → remove the
     //   whole node, then for the FIRST node, replace with `props_decl`.
@@ -4232,7 +4265,13 @@ fn migrate_simple_props(
         }
     }
     if not_all {
+        if _debug_props {
+            eprintln!("[props] BAIL: not_all");
+        }
         return;
+    }
+    if _debug_props {
+        eprintln!("[props] not_all=false, proceeding to emit");
     }
 
     if props.is_empty() {
@@ -4281,63 +4320,58 @@ fn migrate_simple_props(
             }
         }
     } else if has_any_jsdoc_type {
-        // Find the position of the first non-whitespace char of the instance
-        // script (where the JSDoc / export starts).
-        let mut after_ws = instance.content.span.start as usize;
-        while after_ws < bytes.len()
-            && (bytes[after_ws] == b'\n' || bytes[after_ws] == b' ' || bytes[after_ws] == b'\t')
-        {
-            after_ws += 1;
-        }
-        // Use prepend_left at that position so the prepended text comes
-        // BEFORE the JSDoc (and stays even if JSDoc is later removed).
-        // The prepended text supplies its own preceding `\n${indent}` so that
-        // the output reads `<script>\n${indent}\n${indent}{block}…`. The
-        // original `\n${indent}` of the source already precedes that.
-        str.prepend_left(
-            after_ws,
-            format!("\n{}{}", indent, final_block),
-        );
+        // Mirror upstream behavior: clear the JSDoc spans, clear each export
+        // node's full line (`\n...\n` boundary), then append the
+        // props_declaration at the last declarator's end position.
+        let any_real_jsdoc = props.iter().any(|p| p.jsdoc_span.is_some());
         for p in &props {
             if let Some((s, e)) = p.jsdoc_span {
-                // Eat trailing whitespace + newline after JSDoc (the indent
-                // before the export gets preserved separately).
-                let mut ee = e;
-                while ee < bytes.len() && (bytes[ee] == b' ' || bytes[ee] == b'\t') {
-                    ee += 1;
-                }
-                if ee < bytes.len() && bytes[ee] == b'\n' {
-                    ee += 1;
-                }
-                str.remove(s, ee);
+                // Clear just the JSDoc text — upstream uses `update(s, e, '')`
+                // with NO surrounding whitespace eaten.
+                str.remove(s, e);
             }
         }
-        // Track which export node_starts we've already eaten (multi-decl).
-        // Sort by node_start so we can identify the last one.
+        // For each export node: walk start back to the previous `\n` and end
+        // forward to the next `\n`, then clear that range. This eats the
+        // leading indent + trailing whitespace cleanly. Mirror upstream's
+        // line 904 logic.
         let mut export_starts: Vec<usize> = props.iter().map(|p| p.node_start).collect();
         export_starts.sort();
         export_starts.dedup();
-        let last_export_start = *export_starts.last().unwrap();
         let mut seen_node: std::collections::HashSet<usize> = Default::default();
         for p in &props {
             if !seen_node.insert(p.node_start) {
                 continue;
             }
-            // Remove the export node + its leading indent + trailing newline.
-            // For the LAST export, don't eat the trailing newline — that
-            // newline is the source's separator from `</script>` and we want
-            // to preserve it.
             let mut s = p.node_start;
             let mut e = p.node_end;
-            while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+            // Walk back until bytes[s] is the `\n` BEFORE this line.
+            while s > 0 && bytes[s] != b'\n' {
                 s -= 1;
             }
-            let is_last = p.node_start == last_export_start;
-            if !is_last && bytes.get(e).copied() == Some(b'\n') {
+            // Walk forward until bytes[e] is the `\n` AFTER this line
+            // (or the end of source).
+            while e < bytes.len() && bytes[e] != b'\n' {
                 e += 1;
             }
-            str.remove(s, e);
+            if s < e {
+                str.update(s, e, String::new());
+            }
         }
+        // Insertion point: the end of the LAST visited declarator. Mirror
+        // upstream's `state.props_insertion_point = declarator.end` (single
+        // declarator case). We use the last prop's `decl_end` which is the
+        // end of the VariableDeclarator AST node.
+        let insertion_point = props.iter().map(|p| p.decl_end).max().unwrap_or(0);
+        // When there's a real JSDoc, the typedef precedes the props block;
+        // otherwise the props block goes inline at the original first export
+        // position (without a leading blank line).
+        let prefix = if any_real_jsdoc {
+            format!("\n{}", indent)
+        } else {
+            format!("\n{}", indent)
+        };
+        str.append_right(insertion_point, format!("{}{}", prefix, final_block));
     } else {
         // No JSDoc types. Determine the props_insertion_point: the end of
         // the last top-level Import declaration in the script (or 0 if
@@ -4384,7 +4418,13 @@ fn migrate_simple_props(
             for (_, group) in &node_groups {
                 let p = group[0];
                 if first {
+                    if _debug_props {
+                        eprintln!("[props] update [{}..{}] with final_block", p.node_start, p.node_end);
+                    }
                     str.update(p.node_start, p.node_end, &final_block);
+                    if _debug_props {
+                        eprintln!("[props] after first update:\n{}", str.to_string());
+                    }
                     first = false;
                 } else {
                     let mut s = p.node_start;
@@ -4395,7 +4435,13 @@ fn migrate_simple_props(
                     while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
                         s -= 1;
                     }
+                    if _debug_props {
+                        eprintln!("[props] remove [{}..{}]", s, e);
+                    }
                     str.remove(s, e);
+                    if _debug_props {
+                        eprintln!("[props] after remove:\n{}", str.to_string());
+                    }
                 }
             }
         }
@@ -4481,12 +4527,20 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
         return;
     }
     let en = spec_exports[0];
+    // Collect (local, exported) pairs from specifiers.
     let mut names: Vec<String> = Vec::new();
+    let mut exported_of: std::collections::HashMap<String, String> = Default::default();
     for sp in &en.specifiers {
         let svelte_js_ast::ModuleExportName::Identifier(id) = &sp.local else {
             continue;
         };
-        names.push(id.name.clone());
+        let local = id.name.clone();
+        let exported = match &sp.exported {
+            svelte_js_ast::ModuleExportName::Identifier(eid) => eid.name.clone(),
+            _ => local.clone(),
+        };
+        exported_of.insert(local.clone(), exported);
+        names.push(local);
     }
     if names.is_empty() {
         return;
@@ -4502,6 +4556,8 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
         decl_start: usize,
         decl_end: usize,
         var_decl_count: usize,
+        init: Option<(u32, u32)>,
+        id_end: usize,
     }
     let mut sites: Vec<Site> = Vec::new();
     for stmt in &instance.content.body {
@@ -4516,6 +4572,7 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
                 continue;
             };
             if names.contains(&id.name) {
+                let init = d.init.as_ref().map(|e| expr_span(e));
                 sites.push(Site {
                     name: id.name.clone(),
                     var_start: v.span.start as usize,
@@ -4524,6 +4581,8 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
                     decl_start: d.span.start as usize,
                     decl_end: d.span.end as usize,
                     var_decl_count: v.declarations.len(),
+                    init,
+                    id_end: id.span.end as usize,
                 });
             }
         }
@@ -4533,14 +4592,90 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
         return;
     }
 
-    // Bail if any of these declarators has an init (we don't carry through
-    // default values yet for this path) or a type annotation.
     let bytes = source.as_bytes();
-    for s in &sites {
-        let txt = &source[s.decl_start..s.decl_end];
-        if txt.contains('=') || txt.contains(':') {
-            return;
+
+    // Detect TS mode.
+    let has_lang_ts = instance.attributes.iter().any(|a| {
+        a.name == "lang"
+            && matches!(
+                attribute_static_string(&a.value).as_deref(),
+                Some("ts") | Some("typescript")
+            )
+    });
+    let uses_ts = has_lang_ts;
+
+    // Detect TS type annotation on the declarator's id.
+    fn extract_ts_type_annotation(source: &str, id_end: usize) -> Option<String> {
+        let bytes = source.as_bytes();
+        let mut k = id_end;
+        while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+            k += 1;
         }
+        if k >= bytes.len() || bytes[k] != b':' {
+            return None;
+        }
+        let mut p = k + 1;
+        while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+            p += 1;
+        }
+        let mut q = p;
+        let mut depth_paren = 0i32;
+        let mut depth_brace = 0i32;
+        let mut depth_bracket = 0i32;
+        let mut depth_angle = 0i32;
+        while q < bytes.len() {
+            let b = bytes[q];
+            if depth_paren == 0 && depth_brace == 0 && depth_bracket == 0 && depth_angle == 0
+                && (b == b'=' || b == b',' || b == b';' || b == b'\n')
+            {
+                break;
+            }
+            match b {
+                b'(' => depth_paren += 1,
+                b')' => depth_paren -= 1,
+                b'{' => depth_brace += 1,
+                b'}' => depth_brace -= 1,
+                b'[' => depth_bracket += 1,
+                b']' => depth_bracket -= 1,
+                b'<' => depth_angle += 1,
+                b'>' => depth_angle -= 1,
+                _ => {}
+            }
+            q += 1;
+        }
+        Some(source[p..q].trim_end().to_string())
+    }
+    // Map name → init text + ts_type.
+    let mut name_init: std::collections::HashMap<String, Option<String>> = Default::default();
+    let mut name_type: std::collections::HashMap<String, Option<String>> = Default::default();
+    for s in &sites {
+        let init_text = s.init.map(|(a, b)| source[a as usize..b as usize].to_string());
+        name_init.insert(s.name.clone(), init_text);
+        name_type.insert(s.name.clone(), extract_ts_type_annotation(source, s.id_end));
+    }
+
+    // Collect bindable info.
+    let mut updated: std::collections::HashSet<String> = Default::default();
+    walk_fragment(&root.fragment, &mut |child| {
+        let attrs = match child {
+            FragmentChild::RegularElement(e) => Some(&e.attributes),
+            FragmentChild::Component(e) => Some(&e.attributes),
+            FragmentChild::SvelteComponent(e) => Some(&e.attributes),
+            FragmentChild::SvelteElement(e) => Some(&e.attributes),
+            _ => None,
+        };
+        if let Some(attrs) = attrs {
+            for a in attrs {
+                if let ElementAttribute::BindDirective(b) = a {
+                    if let Some(name) = bind_target_identifier(&b.expression) {
+                        updated.insert(name);
+                    }
+                }
+            }
+        }
+    });
+    for stmt in &instance.content.body {
+        collect_assignment_targets(stmt, &mut updated);
     }
 
     // For each site, surgically remove just that declarator from the parent
@@ -4600,65 +4735,182 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
             }
         }
     }
-    // Apply full var removals: remove `let X, Y;\n`.
+    // Apply full var removals — mirror upstream's behavior: walk start back
+    // to the `\n` BEFORE the line, walk end forward to the `\n` AFTER the
+    // line. Update [start, end) to ''.
     for var_start in &full_removals {
         let v = sites.iter().find(|s| s.var_start == *var_start).unwrap();
         let mut s = v.var_start;
         let mut e = v.var_end;
-        if bytes.get(e).copied() == Some(b'\n') {
-            e += 1;
-        }
-        while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+        while s > 0 && bytes[s] != b'\n' {
             s -= 1;
         }
-        str.remove(s, e);
+        while e < bytes.len() && bytes[e] != b'\n' {
+            e += 1;
+        }
+        if s < e {
+            str.update(s, e, String::new());
+        }
     }
 
     // Build the props destructure declaration. Upstream uses
     // `\n${indent}${indent}` between props when >3 props (newline_sep),
     // otherwise a single space.
-    let indent = "\t"; // best guess — most fixtures use tabs
+    let indent_owned = guess_indent(source, instance);
+    let indent = indent_owned.as_str();
     let newline_sep = format!("\n{}{}", indent, indent);
     let has_many = names.len() > 3;
     let sep = if has_many { newline_sep.as_str() } else { " " };
 
-    let inner = if has_many {
-        format!(
-            "{}{}{}{}",
-            sep,
-            names.join(&format!(",{}", sep)),
-            format!("\n{}", indent),
-            ""
-        )
-    } else {
-        format!(" {} ", names.join(", "))
-    };
-    let props_decl = format!("let {{{}}} = $props();", inner);
+    // Helpers
+    fn infer_type_for_specifier(init_text: Option<&str>) -> String {
+        let Some(t) = init_text else {
+            return "any".to_string();
+        };
+        let t = t.trim();
+        if t.starts_with('\'') || t.starts_with('"') || t.starts_with('`') {
+            return "string".to_string();
+        }
+        if t == "true" || t == "false" {
+            return "boolean".to_string();
+        }
+        if t.parse::<f64>().is_ok() {
+            return "number".to_string();
+        }
+        "any".to_string()
+    }
 
-    // Insertion point: end of the LAST `let` declaration that contained any
-    // prop name (in source order). Mirrors upstream's
-    // `state.props_insertion_point = node.end` when at least one declarator
-    // was exported.
+    // Determine has_type_or_fallback: any specifier has TS type, or any has a
+    // literal init.
+    let any_ts_type = names.iter().any(|n| name_type.get(n).and_then(|x| x.as_ref()).is_some());
+    let any_literal_init = names.iter().any(|n| {
+        name_init
+            .get(n)
+            .and_then(|x| x.as_ref())
+            .map(|t| {
+                let s = t.trim();
+                s.starts_with('\'') || s.starts_with('"') || s.starts_with('`')
+                    || s == "true" || s == "false" || s.parse::<f64>().is_ok()
+            })
+            .unwrap_or(false)
+    });
+    let has_type_or_fallback = any_ts_type || any_literal_init;
+
+    // Build the destructure RHS.
+    let mut parts: Vec<String> = Vec::new();
+    for n in &names {
+        let exported = exported_of.get(n).cloned().unwrap_or_else(|| n.clone());
+        let init = name_init.get(n).and_then(|x| x.clone());
+        let bindable = updated.contains(n);
+        let entry_lhs = if &exported == n {
+            n.clone()
+        } else {
+            format!("{}: {}", exported, n)
+        };
+        let entry = if bindable {
+            match init.as_deref() {
+                Some(t) => format!("{} = $bindable({})", entry_lhs, t),
+                None => format!("{} = $bindable()", entry_lhs),
+            }
+        } else {
+            match init.as_deref() {
+                Some(t) => format!("{} = {}", entry_lhs, t),
+                None => entry_lhs,
+            }
+        };
+        parts.push(entry);
+    }
+
+    // Build the type block.
+    let type_block: Option<String> = if has_type_or_fallback {
+        if uses_ts {
+            let mut s = format!("interface Props {{");
+            let mut interface_parts: Vec<String> = Vec::new();
+            for n in &names {
+                let exported = exported_of.get(n).cloned().unwrap_or_else(|| n.clone());
+                let init = name_init.get(n).and_then(|x| x.clone());
+                let bindable = updated.contains(n);
+                let optional = init.is_some();
+                let ty = name_type
+                    .get(n)
+                    .and_then(|x| x.clone())
+                    .unwrap_or_else(|| infer_type_for_specifier(init.as_deref()));
+                let opt = if optional { "?" } else { "" };
+                interface_parts.push(format!("{}{}: {};", exported, opt, ty));
+                let _ = bindable;
+            }
+            s.push_str(&newline_sep);
+            s.push_str(&interface_parts.join(&newline_sep));
+            s.push_str(&format!("\n{}}}", indent));
+            Some(s)
+        } else {
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(format!("/**"));
+            lines.push(format!("{} * @typedef {{Object}} Props", indent));
+            for n in &names {
+                let exported = exported_of.get(n).cloned().unwrap_or_else(|| n.clone());
+                let init = name_init.get(n).and_then(|x| x.clone());
+                let optional = init.is_some();
+                let ty = name_type
+                    .get(n)
+                    .and_then(|x| x.clone())
+                    .unwrap_or_else(|| infer_type_for_specifier(init.as_deref()));
+                let name = if optional {
+                    format!("[{}]", exported)
+                } else {
+                    exported
+                };
+                lines.push(format!("{} * @property {{{}}} {}", indent, ty, name));
+            }
+            lines.push(format!("{} */", indent));
+            Some(lines.join("\n"))
+        }
+    } else {
+        None
+    };
+
+    let props_decl = if has_many {
+        format!("let {{{}{}{}{}}} = $props();", sep, parts.join(&format!(",{}", sep)), "\n", indent)
+    } else {
+        format!("let {{ {} }} = $props();", parts.join(", "))
+    };
+
+    let final_block = if let Some(td) = &type_block {
+        if uses_ts {
+            let decl_with_ann = props_decl.replace(" = $props();", ": Props = $props();");
+            format!("{}\n\n{}{}", td, indent, decl_with_ann)
+        } else {
+            format!("{}\n\n{}/** @type {{Props}} */\n{}{}", td, indent, indent, props_decl)
+        }
+    } else {
+        props_decl
+    };
+
+    // Insertion point: end of the LAST exported declarator (single-decl
+    // case) or end of containing var (multi-decl case). Mirrors upstream's
+    // `state.props_insertion_point = declarator.end / node.end`.
     let mut insertion_point: usize = instance.content.span.start as usize;
     {
-        let mut last_var_end: Option<usize> = None;
         for stmt in &instance.content.body {
             let Statement::Variable(v) = stmt else {
                 continue;
             };
             let vs = v.span.start as usize;
             let group = group_indices.get(&vs);
-            if group.is_some() {
-                last_var_end = Some(v.span.end as usize);
+            if let Some(g) = group {
+                if v.declarations.len() == 1 {
+                    // single-decl: declarator.end
+                    insertion_point = g[0].decl_end;
+                } else {
+                    // multi-decl: node.end
+                    insertion_point = v.span.end as usize;
+                }
             }
-        }
-        if let Some(p) = last_var_end {
-            insertion_point = p;
         }
     }
 
-    // Insert `\n\tlet { … } = $props();` at the insertion point.
-    str.append_right(insertion_point, format!("\n{}{}", indent, props_decl));
+    // Insert `\n\t<final_block>` at the insertion point.
+    str.append_right(insertion_point, format!("\n{}{}", indent, final_block));
     // Remove just the `export { … }` statement text (not its leading/trailing
     // whitespace — leaves the blank line + indent the surrounding source had).
     str.remove(en.span.start as usize, en.span.end as usize);
@@ -4978,6 +5230,10 @@ fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root:
 /// textual snippet so we can safely substitute it into a MagicString edit
 /// without risking later passes attempting to re-overwrite the same positions.
 fn rewrite_dollar_dollar_refs(s: &str) -> String {
+    rewrite_dollar_dollar_refs_ctx(s, false)
+}
+
+fn rewrite_dollar_dollar_refs_ctx(s: &str, uses_props: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -5002,7 +5258,11 @@ fn rewrite_dollar_dollar_refs(s: &str) -> String {
                         if nm == "default" {
                             nm = "children".to_string();
                         }
-                        out.push_str(&nm);
+                        if uses_props {
+                            out.push_str(&format!("props.{}", nm));
+                        } else {
+                            out.push_str(&nm);
+                        }
                         i = e_idx;
                         continue;
                     }
@@ -5028,7 +5288,11 @@ fn rewrite_dollar_dollar_refs(s: &str) -> String {
                                 if nm == "default" {
                                     nm = "children".to_string();
                                 }
-                                out.push_str(&nm);
+                                if uses_props {
+                                    out.push_str(&format!("props.{}", nm));
+                                } else {
+                                    out.push_str(&nm);
+                                }
                                 i = k + 1;
                                 continue;
                             }
@@ -5256,10 +5520,11 @@ fn migrate_simple_derivations(
         // Get RHS bounds.
         let (rs, re) = expr_span(&asn.right);
         let rhs_text_raw = source[rs as usize..re as usize].to_string();
-        // Rewrite `$$slots.X` / `$$slots['X']` to `X` so the apply_slot_template_edits
-        // global replace doesn't try to re-overwrite a position we've already
-        // updated. Also normalize `$$props.X` / `$$restProps` references.
-        let rhs_text_owned = rewrite_dollar_dollar_refs(&rhs_text_raw);
+        // Rewrite `$$slots.X` / `$$slots['X']` to `X` (or `props.X` when
+        // $$props is used) so the apply_slot_template_edits global replace
+        // doesn't try to re-overwrite a position we've already updated.
+        let uses_props_global = source_uses_dollar_dollar(source, "$$props");
+        let rhs_text_owned = rewrite_dollar_dollar_refs_ctx(&rhs_text_raw, uses_props_global);
         let rhs_text = rhs_text_owned.as_str();
 
         // Determine if RHS has any identifier dependencies. If not (e.g.,
