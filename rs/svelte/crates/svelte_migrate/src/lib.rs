@@ -121,6 +121,11 @@ fn run_pipeline(
     migrate_svelte_component(source, &mut str, &parsed.fragment);
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
+    // Gather slot info early so we can do the `$$slots.X` → `X` global
+    // replace BEFORE derivations/state passes (which may issue overlapping
+    // updates that would otherwise clobber when MagicString splits chunks).
+    let slot_info = gather_slot_info(source, &parsed);
+    apply_slot_template_edits(source, &mut str, &parsed, &slot_info);
     // Run derivations first so we know which `$:` statements will become
     // `let X = $derived(...)` (or `$state(LIT)`). State migration then skips
     // bindings already consumed by the derivation pass.
@@ -128,8 +133,6 @@ fn run_pipeline(
         migrate_simple_derivations(source, &mut str, &parsed);
     migrate_simple_state(source, &mut str, &parsed, &derived_consumed_names);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
-    let slot_info = gather_slot_info(source, &parsed);
-    apply_slot_template_edits(source, &mut str, &parsed, &slot_info);
     migrate_simple_props(
         source,
         &mut str,
@@ -3980,11 +3983,55 @@ fn migrate_simple_props(
     let props_decl = if uses_props {
         "let { ...props } = $props();".to_string()
     } else {
+        // Compute which slot names each prop's init references so we can
+        // interleave their order. Slots referenced from a prop's init are
+        // emitted BEFORE that prop. Other slots are emitted after all props.
+        let mut emitted_slots: std::collections::HashSet<String> = Default::default();
         let mut parts: Vec<String> = Vec::new();
         for p in &props {
             let init_text: Option<String> = p
                 .init
                 .map(|(s, e)| source[s as usize..e as usize].to_string());
+            // Rewrite `$$slots.X` references in the init text (so the prop
+            // can reference the local slot binding instead of the global
+            // `$$slots.X`).
+            let init_text = init_text.map(|t| rewrite_dollar_dollar_refs(&t));
+            // Emit any slots referenced in this prop's init that haven't
+            // already been emitted.
+            if let Some(t) = &init_text {
+                for sp in &slots.props {
+                    if emitted_slots.contains(&sp.name) {
+                        continue;
+                    }
+                    // Simple substring check is sufficient — the rewrite
+                    // already turned `$$slots.X` into `X`.
+                    let is_referenced = {
+                        let bytes = t.as_bytes();
+                        let needle = sp.name.as_bytes();
+                        let n = needle.len();
+                        let mut found = false;
+                        let mut k = 0;
+                        while k + n <= bytes.len() {
+                            if &bytes[k..k + n] == needle {
+                                let before_ok = k == 0
+                                    || !(bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_');
+                                let after_ok = k + n >= bytes.len()
+                                    || !(bytes[k + n].is_ascii_alphanumeric() || bytes[k + n] == b'_');
+                                if before_ok && after_ok {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            k += 1;
+                        }
+                        found
+                    };
+                    if is_referenced {
+                        parts.push(sp.name.clone());
+                        emitted_slots.insert(sp.name.clone());
+                    }
+                }
+            }
             let entry = if p.bindable {
                 match init_text.as_deref() {
                     Some(init) => format!("{} = $bindable({})", p.local, init),
@@ -3998,8 +4045,11 @@ fn migrate_simple_props(
             };
             parts.push(entry);
         }
+        // Emit remaining slots in their source-order.
         for sp in &slots.props {
-            parts.push(sp.name.clone());
+            if !emitted_slots.contains(&sp.name) {
+                parts.push(sp.name.clone());
+            }
         }
         if uses_rest {
             parts.push("...rest".to_string());
@@ -4924,6 +4974,100 @@ fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root:
 // modifications inside the labeled statement, no multi-statement block.
 // ---------------------------------------------------------------------------
 
+/// Rewrite `$$slots.X` / `$$slots['X']` / `$$props.X` / `$$restProps` in a
+/// textual snippet so we can safely substitute it into a MagicString edit
+/// without risking later passes attempting to re-overwrite the same positions.
+fn rewrite_dollar_dollar_refs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // `$$slots.X` or `$$slots['X']`.
+        if bytes[i..].starts_with(b"$$slots") {
+            // Bounds check identifier prefix.
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if before_ok {
+                let mut k = i + "$$slots".len();
+                if k < bytes.len() && bytes[k] == b'.' {
+                    let s_idx = k + 1;
+                    let mut e_idx = s_idx;
+                    while e_idx < bytes.len()
+                        && (bytes[e_idx].is_ascii_alphanumeric() || bytes[e_idx] == b'_')
+                    {
+                        e_idx += 1;
+                    }
+                    if e_idx > s_idx {
+                        let mut nm = s[s_idx..e_idx].to_string();
+                        if nm == "default" {
+                            nm = "children".to_string();
+                        }
+                        out.push_str(&nm);
+                        i = e_idx;
+                        continue;
+                    }
+                } else if k < bytes.len() && bytes[k] == b'[' {
+                    k += 1;
+                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if k < bytes.len() && (bytes[k] == b'\'' || bytes[k] == b'"') {
+                        let quote = bytes[k];
+                        k += 1;
+                        let s_idx = k;
+                        while k < bytes.len() && bytes[k] != quote {
+                            k += 1;
+                        }
+                        if k < bytes.len() {
+                            let mut nm = s[s_idx..k].to_string();
+                            k += 1;
+                            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                                k += 1;
+                            }
+                            if k < bytes.len() && bytes[k] == b']' {
+                                if nm == "default" {
+                                    nm = "children".to_string();
+                                }
+                                out.push_str(&nm);
+                                i = k + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // `$$restProps` → `rest`, `$$props` → `props` (as standalone tokens).
+        if bytes[i..].starts_with(b"$$restProps") {
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok = i + "$$restProps".len() >= bytes.len()
+                || !(bytes[i + "$$restProps".len()].is_ascii_alphanumeric()
+                    || bytes[i + "$$restProps".len()] == b'_');
+            if before_ok && after_ok {
+                out.push_str("rest");
+                i += "$$restProps".len();
+                continue;
+            }
+        }
+        if bytes[i..].starts_with(b"$$props") {
+            let before_ok = i == 0
+                || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok = i + "$$props".len() >= bytes.len()
+                || !(bytes[i + "$$props".len()].is_ascii_alphanumeric()
+                    || bytes[i + "$$props".len()] == b'_');
+            if before_ok && after_ok {
+                out.push_str("props");
+                i += "$$props".len();
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 fn migrate_simple_derivations(
     source: &str,
     str: &mut MagicString,
@@ -5111,7 +5255,12 @@ fn migrate_simple_derivations(
         };
         // Get RHS bounds.
         let (rs, re) = expr_span(&asn.right);
-        let rhs_text = &source[rs as usize..re as usize];
+        let rhs_text_raw = source[rs as usize..re as usize].to_string();
+        // Rewrite `$$slots.X` / `$$slots['X']` to `X` so the apply_slot_template_edits
+        // global replace doesn't try to re-overwrite a position we've already
+        // updated. Also normalize `$$props.X` / `$$restProps` references.
+        let rhs_text_owned = rewrite_dollar_dollar_refs(&rhs_text_raw);
+        let rhs_text = rhs_text_owned.as_str();
 
         // Determine if RHS has any identifier dependencies. If not (e.g.,
         // `$: x = 42`), upstream treats this as `$state(...)` rather than
