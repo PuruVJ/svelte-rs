@@ -116,6 +116,7 @@ fn run_pipeline(
     migrate_script_module_context(source, &mut str, &parsed);
     migrate_self_closing_elements(source, &mut str, &parsed.fragment);
     migrate_svelte_self_no_filename(source, &mut str, &parsed.fragment, opts.filename.as_deref());
+    migrate_svelte_self_with_filename(source, &mut str, &parsed, opts.filename.as_deref());
     migrate_svelte_element_static_this(source, &mut str, &parsed.fragment);
     migrate_svelte_component(source, &mut str, &parsed.fragment);
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
@@ -129,7 +130,14 @@ fn run_pipeline(
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
     let slot_info = gather_slot_info(source, &parsed);
     apply_slot_template_edits(source, &mut str, &parsed, &slot_info);
-    migrate_simple_props(source, &mut str, &parsed, &slot_info, opts.use_ts);
+    migrate_simple_props(
+        source,
+        &mut str,
+        &parsed,
+        &slot_info,
+        opts.use_ts,
+        opts.filename.as_deref(),
+    );
     migrate_export_specifier_props(source, &mut str, &parsed);
     migrate_effects(source, &mut str, &parsed, &derived_labeled_starts);
     migrate_comments(source, &mut str, &parsed);
@@ -1849,6 +1857,178 @@ fn migrate_svelte_self_no_filename(
     });
 }
 
+/// Derive the component name from a filename: `output.svelte` → `Output`.
+/// Falls back to `Component` if the basename is empty.
+fn analysis_name_from_filename(filename: &str) -> String {
+    let base = filename
+        .rsplit('/')
+        .next()
+        .unwrap_or(filename)
+        .trim_end_matches(".svelte");
+    if base.is_empty() {
+        return "Component".to_string();
+    }
+    let mut chars = base.chars();
+    let mut out = String::new();
+    if let Some(c) = chars.next() {
+        out.push(c.to_ascii_uppercase());
+    }
+    for c in chars {
+        out.push(c);
+    }
+    // Sanitize: replace non-identifier characters with underscore.
+    let out: String = out
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    out
+}
+
+/// `<svelte:self>` migration when a filename is available. Rewrites each
+/// `<svelte:self ...>` to `<X ...>` (where `X` is the derived component
+/// name) and arranges for an `import X from './file.svelte';` at the top
+/// of the script body.
+///
+/// Also handles the case where `X` clashes with an existing top-level
+/// identifier in the script — generates `X_1` etc.
+fn migrate_svelte_self_with_filename(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    filename: Option<&str>,
+) -> bool {
+    let Some(filename) = filename else {
+        return false;
+    };
+    // Re-walk to collect spans.
+    let mut self_spans: Vec<(usize, usize)> = Vec::new();
+    let mut self_has_fragment: Vec<bool> = Vec::new();
+    walk_fragment(&root.fragment, &mut |child| {
+        if let FragmentChild::SvelteSelf(s) = child {
+            self_spans.push((s.start as usize, s.end as usize));
+            self_has_fragment.push(!s.fragment.nodes.is_empty());
+        }
+    });
+    if self_spans.is_empty() {
+        return false;
+    }
+    // Compute base name from filename, and resolve clashes with existing
+    // top-level identifiers in the instance script.
+    let base_name = analysis_name_from_filename(filename);
+    let mut existing: std::collections::HashSet<String> = Default::default();
+    if let Some(instance) = &root.instance {
+        for stmt in &instance.content.body {
+            collect_top_level_decl_names(stmt, &mut existing);
+        }
+    }
+    let component_name = if existing.contains(&base_name) {
+        let mut n = 1usize;
+        loop {
+            let candidate = format!("{}_{}", base_name, n);
+            if !existing.contains(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        }
+    } else {
+        base_name.clone()
+    };
+    let bytes = source.as_bytes();
+    for ((start, end), has_frag) in self_spans.iter().zip(self_has_fragment.iter()) {
+        // Open tag: overwrite `<svelte:self` → `<COMPONENT`.
+        let open_kw_start = *start + 1;
+        let open_kw_end = open_kw_start + "svelte:self".len();
+        if open_kw_end > bytes.len() || &bytes[open_kw_start..open_kw_end] != b"svelte:self" {
+            continue;
+        }
+        str.update(open_kw_start, open_kw_end, &component_name);
+        // Close tag for fragment-bearing self: locate `</svelte:self` before `>`.
+        if *has_frag {
+            // Find the last `</` before `end`.
+            let mut k = *end;
+            while k > *start && &bytes[k - 1..k] != b">" {
+                k -= 1;
+            }
+            // k is just past `>`. Find `</`.
+            // Easier: search for `</svelte:self` in [start..end].
+            if let Some(rel) = source[*start..*end].rfind("</svelte:self") {
+                let close_kw_start = *start + rel + 2;
+                let close_kw_end = close_kw_start + "svelte:self".len();
+                if close_kw_end <= bytes.len() && &bytes[close_kw_start..close_kw_end] == b"svelte:self" {
+                    str.update(close_kw_start, close_kw_end, &component_name);
+                }
+            }
+        } else {
+            // Also handle the explicit `<svelte:self></svelte:self>` case (no
+            // fragment but the closing tag is still present).
+            if let Some(rel) = source[*start..*end].rfind("</svelte:self") {
+                let close_kw_start = *start + rel + 2;
+                let close_kw_end = close_kw_start + "svelte:self".len();
+                if close_kw_end <= bytes.len() && &bytes[close_kw_start..close_kw_end] == b"svelte:self" {
+                    str.update(close_kw_start, close_kw_end, &component_name);
+                }
+            }
+        }
+    }
+    // Inject `import COMPONENT from './basename';` at the top of script.
+    // If no script tag, defer to emit_props_script_no_instance which will
+    // synthesize the `<script>` block (so we don't double-create one).
+    let file_basename = filename.rsplit('/').next().unwrap_or(filename);
+    let import_line = format!("import {} from './{}';", component_name, file_basename);
+    if let Some(instance) = &root.instance {
+        let indent = guess_indent(source, instance);
+        let insertion_point = instance.content.span.start as usize;
+        str.append_right(insertion_point, format!("\n{}{}", indent, import_line));
+    }
+    // For the no-instance case the script is synthesized later (in
+    // emit_props_script_no_instance / build_props_block path).
+
+    // Replace `$$props` / `$$restProps` everywhere — these need to become
+    // the `let { ...props } = $props()` rest binding. We do this here
+    // (before slot edits run) so subsequent slot-template rewrites see the
+    // already-renamed identifier and don't double-edit.
+    let uses_props_source = source_uses_dollar_dollar(source, "$$props");
+    let uses_rest_source = source_uses_dollar_dollar(source, "$$restProps");
+    let bytes_local = source.as_bytes();
+    if uses_props_source {
+        let needle = b"$$props";
+        let n = needle.len();
+        let mut i = 0;
+        while i + n <= bytes_local.len() {
+            let after_ok = i + n >= bytes_local.len()
+                || !(bytes_local[i + n].is_ascii_alphanumeric() || bytes_local[i + n] == b'_');
+            let before_ok = i == 0
+                || !(bytes_local[i - 1].is_ascii_alphanumeric() || bytes_local[i - 1] == b'_');
+            if &bytes_local[i..i + n] == needle && before_ok && after_ok {
+                str.update(i, i + n, "props");
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if uses_rest_source {
+        let needle = b"$$restProps";
+        let n = needle.len();
+        let mut i = 0;
+        while i + n <= bytes_local.len() {
+            if &bytes_local[i..i + n] == needle {
+                str.update(i, i + n, "rest");
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // `<svelte:element this="div" />` → `<svelte:element this={"div"} />`
 // Only when `this`-value is a static Literal string.
@@ -3149,6 +3329,7 @@ fn emit_props_script_no_instance(
     root: &Root,
     slots: &SlotInfo,
     opt_use_ts: bool,
+    filename: Option<&str>,
 ) {
     // Choose indent. Upstream's `guess_indent` looks at the first indented
     // line in the source — same as ours.
@@ -3170,9 +3351,36 @@ fn emit_props_script_no_instance(
 
     let block = build_props_block(slots, uses_props, uses_rest, uses_ts, indent, &[]);
 
+    // If there's a `<svelte:self>` AND a filename, also inject the
+    // `import X from './file.svelte';` at the top of the synthesized script.
+    let mut svelte_self_import: Option<String> = None;
+    if let Some(filename) = filename {
+        let mut has_self = false;
+        walk_fragment(&root.fragment, &mut |c| {
+            if matches!(c, FragmentChild::SvelteSelf(_)) {
+                has_self = true;
+            }
+        });
+        if has_self {
+            let base_name = analysis_name_from_filename(filename);
+            // Resolve clashes (none here — no script body).
+            let component_name = base_name;
+            let file_basename = filename.rsplit('/').next().unwrap_or(filename);
+            svelte_self_import = Some(format!(
+                "import {} from './{}';",
+                component_name, file_basename
+            ));
+        }
+    }
+
     // Prepend `<script>\n\t{block}\n</script>\n\n`.
     let head = if uses_ts { "<script lang=\"ts\">" } else { "<script>" };
-    let full = format!("{}\n{}{}\n</script>\n\n", head, indent, block);
+    let inner = if let Some(imp) = &svelte_self_import {
+        format!("{}{}\n{}{}", indent, imp, indent, block)
+    } else {
+        format!("{}{}", indent, block)
+    };
+    let full = format!("{}\n{}\n</script>\n\n", head, inner);
     str.prepend_left(0, full);
     let _ = source;
 }
@@ -3347,6 +3555,12 @@ fn build_props_block(
             let ann = format!("/** @type {{{}{}}} */", type_name, intersection);
             format!("{}\n\n{}{}\n{}{}", t, indent, ann, indent, decl)
         }
+    } else if (uses_props || uses_rest) && !uses_ts {
+        // No typedef but using $$props/$$restProps in non-TS mode — emit a
+        // bare `/** @type {{ [key: string]: any }} */` annotation above the
+        // destructure so the type is preserved.
+        let ann = "/** @type {{ [key: string]: any }} */".to_string();
+        format!("{}\n{}{}", ann, indent, decl)
     } else {
         decl
     }
@@ -3421,11 +3635,30 @@ fn migrate_simple_props(
     root: &Root,
     slots: &SlotInfo,
     opt_use_ts: bool,
+    filename: Option<&str>,
 ) {
+    // Pre-check for $$props / $$restProps and svelte:self even when there's
+    // no <script> tag. If either is present, we must synthesize a script
+    // with `let { ...props } = $props();`.
+    let no_instance_uses_props = root.instance.is_none()
+        && (source_uses_dollar_dollar(source, "$$props")
+            || source_uses_dollar_dollar(source, "$$restProps"));
     let Some(instance) = &root.instance else {
         // No <script> tag at all. If there are slots, we need to emit one.
-        if !slots.props.is_empty() {
-            emit_props_script_no_instance(source, str, root, slots, opt_use_ts);
+        if !slots.props.is_empty() || no_instance_uses_props {
+            emit_props_script_no_instance(source, str, root, slots, opt_use_ts, filename);
+        } else {
+            // Even with no script or props, we may still need to inject the
+            // svelte:self import. Detect svelte:self existence and a filename.
+            let mut has_self = false;
+            walk_fragment(&root.fragment, &mut |c| {
+                if matches!(c, FragmentChild::SvelteSelf(_)) {
+                    has_self = true;
+                }
+            });
+            if has_self && filename.is_some() {
+                emit_props_script_no_instance(source, str, root, slots, opt_use_ts, filename);
+            }
         }
         return;
     };
@@ -3594,10 +3827,77 @@ fn migrate_simple_props(
         return;
     }
     // If there are NO `export let` decls AND only `$$props`/`$$restProps`,
-    // we could still emit `let { ...props } = $props();`. Defer that path.
+    // we still emit `let { ...props } = $props();` (or `...rest`). Insert
+    // it after the last import, or at script content start.
     if props.is_empty() && slots.props.is_empty() {
-        // Only handle pure $$restProps case — emit `let { ...rest } = $props();`.
-        // Defer this for now since it requires picking an insertion point.
+        let rest_name = if uses_props { "props" } else { "rest" };
+        let has_lang_ts = instance.attributes.iter().any(|a| {
+            a.name == "lang"
+                && matches!(
+                    attribute_static_string(&a.value).as_deref(),
+                    Some("ts") | Some("typescript")
+                )
+        });
+        let indent_str = guess_indent(source, instance);
+        let indent = indent_str.as_str();
+        let block = if has_lang_ts {
+            format!(
+                "/** @type {{{{ [key: string]: any }}}} */\n{}let {{ ...{} }} = $props();",
+                indent, rest_name
+            )
+        } else {
+            format!(
+                "/** @type {{{{ [key: string]: any }}}} */\n{}let {{ ...{} }} = $props();",
+                indent, rest_name
+            )
+        };
+        // Compute insertion point = max(last import end, content start).
+        let mut insertion_point = instance.content.span.start as usize;
+        for stmt in &instance.content.body {
+            if let Statement::Import(imp) = stmt {
+                let e = imp.span.end as usize;
+                if e > insertion_point {
+                    insertion_point = e;
+                }
+            }
+        }
+        // Use append_right so the block sits AFTER previously appended-right
+        // imports (e.g. the svelte:self import added by
+        // migrate_svelte_self_with_filename earlier in the pipeline).
+        str.append_right(insertion_point, format!("\n{}{}", indent, block));
+        // Replace `$$props` / `$$restProps` identifier uses in the rest of
+        // the script + template.
+        let bytes_local = source.as_bytes();
+        if uses_props {
+            let needle = b"$$props";
+            let n = needle.len();
+            let mut i = 0;
+            while i + n <= bytes_local.len() {
+                let after_ok = i + n >= bytes_local.len()
+                    || !(bytes_local[i + n].is_ascii_alphanumeric() || bytes_local[i + n] == b'_');
+                let before_ok = i == 0
+                    || !(bytes_local[i - 1].is_ascii_alphanumeric() || bytes_local[i - 1] == b'_');
+                if &bytes_local[i..i + n] == needle && before_ok && after_ok {
+                    str.update(i, i + n, "props");
+                    i += n;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if uses_rest {
+            let needle = b"$$restProps";
+            let n = needle.len();
+            let mut i = 0;
+            while i + n <= bytes_local.len() {
+                if &bytes_local[i..i + n] == needle {
+                    str.update(i, i + n, "rest");
+                    i += n;
+                } else {
+                    i += 1;
+                }
+            }
+        }
         return;
     }
 
