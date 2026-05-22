@@ -386,6 +386,7 @@ pub fn try_typed_server_component_full(
                         span: Span::ZERO,
                     }),
                     init: None,
+                    type_annotation: None,
                     span: Span::ZERO,
                 }],
                 span: Span::ZERO,
@@ -410,6 +411,7 @@ pub fn try_typed_server_component_full(
     if needs_component_wrap {
         let inner = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: func_body,
                 span: Span::ZERO,
@@ -584,6 +586,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
                 value: true,
                 span: Span::ZERO,
             })))),
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -594,6 +597,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
         declarations: vec![VariableDeclarator {
             id: t::pat_id("$$inner_renderer"),
             init: None,
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -1258,6 +1262,7 @@ fn wrap_async_block(
     }));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: inner,
             span: Span::ZERO,
@@ -1275,6 +1280,7 @@ fn wrap_async_block(
 fn wrap_child_block(inner: Vec<Statement>) -> Statement {
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: inner,
             span: Span::ZERO,
@@ -1531,6 +1537,7 @@ fn lower_fragment_server_async_with(
                         );
                         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: Vec::new(),
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Expression(escape_call),
                             r#async: true,
                             span: Span::ZERO,
@@ -1783,6 +1790,7 @@ fn lower_fragment_with_const_await_with(
                         };
                         groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: Vec::new(),
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Expression(body),
                             r#async: false,
                             span: Span::ZERO,
@@ -1803,6 +1811,7 @@ fn lower_fragment_with_const_await_with(
                     }));
                     groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(assign),
                         r#async: has_await,
                         span: Span::ZERO,
@@ -1828,6 +1837,7 @@ fn lower_fragment_with_const_await_with(
             declarations: vec![VariableDeclarator {
                 id: t::pat_id(name),
                 init: None,
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
@@ -2089,6 +2099,7 @@ fn emit_async_wrap_with_await(
     let escape_call = t::call(t::member_id(t::id("$"), "escape"), vec![rewritten]);
     let push_thunk = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(escape_call),
         r#async: true,
         span: Span::ZERO,
@@ -2099,6 +2110,7 @@ fn emit_async_wrap_with_await(
     );
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(inner_push),
         r#async: false,
         span: Span::ZERO,
@@ -2124,6 +2136,7 @@ fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str)
     let escape_call = t::call(t::member_id(t::id("$"), "escape"), vec![expr.clone()]);
     let push_thunk = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(escape_call),
         r#async: false,
         span: Span::ZERO,
@@ -2134,6 +2147,7 @@ fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str)
     );
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(inner_push),
         r#async: false,
         span: Span::ZERO,
@@ -2281,6 +2295,7 @@ fn lower_svelte_head_server_inner(
 
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
             span: Span::ZERO,
@@ -2509,6 +2524,7 @@ fn lower_svelte_boundary_server(
     arrow_body.push(push_template("<!--]-->"));
     let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -2589,6 +2605,7 @@ fn lower_head_fragment(
             let inner_body = inner_buf.flush().into_iter().collect::<Vec<_>>();
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: vec![t::pat_id("$$renderer")],
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: inner_body,
                     span: Span::ZERO,
@@ -2940,6 +2957,7 @@ fn lower_fragment_with_marker(
                     ));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id("$$renderer")],
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: vec![push_call],
                             span: Span::ZERO,
@@ -2969,6 +2987,7 @@ fn lower_fragment_with_marker(
                     );
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(escape_call),
                         r#async: true,
                         span: Span::ZERO,
@@ -3472,6 +3491,7 @@ fn lower_select_with_value(
 
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: inner_out,
             span: Span::ZERO,
@@ -3525,12 +3545,14 @@ fn lower_select_with_value(
             declarations: vec![VariableDeclarator {
                 id: t::pat_id("$$0"),
                 init: Some(saved),
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
         }));
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![const_decl, select_call],
                 span: Span::ZERO,
@@ -3830,6 +3852,7 @@ fn lower_each_for_select(
             VariableDeclarator {
                 id: t::pat_id(&index_name),
                 init: Some(t::lit_number(0.0)),
+                type_annotation: None,
                 span: Span::ZERO,
             },
             VariableDeclarator {
@@ -3844,6 +3867,7 @@ fn lower_each_for_select(
                     optional: false,
                     span: Span::ZERO,
                 }))),
+                type_annotation: None,
                 span: Span::ZERO,
             },
         ],
@@ -3874,6 +3898,7 @@ fn lower_each_for_select(
                     optional: false,
                     span: Span::ZERO,
                 }))),
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
@@ -4037,6 +4062,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             VariableDeclarator {
                 id: t::pat_id(&index_name),
                 init: Some(t::lit_number(0.0)),
+                type_annotation: None,
                 span: Span::ZERO,
             },
             VariableDeclarator {
@@ -4051,6 +4077,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
                     optional: false,
                     span: Span::ZERO,
                 }))),
+                type_annotation: None,
                 span: Span::ZERO,
             },
         ],
@@ -4084,6 +4111,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
                     optional: false,
                     span: Span::ZERO,
                 }))),
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
@@ -4141,6 +4169,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
                 optional: false,
                 span: Span::ZERO,
             }))),
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -4206,6 +4235,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         }
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: inside_body,
                 span: Span::ZERO,
@@ -4325,6 +4355,7 @@ fn lower_if_block_server(
         // Wrap in `$$renderer.child_block(async ($$renderer) => { if(...) {...} else {...} })`
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![if_stmt],
                 span: Span::ZERO,
@@ -4708,6 +4739,7 @@ fn lower_fragment_for_async_block(
                 let inner_body = inner_buf.flush().into_iter().collect::<Vec<_>>();
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$renderer")],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
                         span: Span::ZERO,
@@ -4737,6 +4769,7 @@ fn lower_fragment_for_async_block(
                 );
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(escape_call),
                     r#async: true,
                     span: Span::ZERO,
@@ -4802,6 +4835,7 @@ fn build_block_arrow(
     };
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
         params,
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: body_stmts,
             span: Span::ZERO,
@@ -4932,6 +4966,7 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
         let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: body_stmts,
                 span: Span::ZERO,
@@ -4992,12 +5027,14 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             declarations: vec![VariableDeclarator {
                 id: t::pat_id("$$0"),
                 init: Some(saved),
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
         }));
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![const_decl, option_call],
                 span: Span::ZERO,
@@ -5196,6 +5233,7 @@ fn lower_element_with_async_directive(
             declarations: vec![VariableDeclarator {
                 id: t::pat_id(&placeholder),
                 init: Some(saved),
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
@@ -5204,6 +5242,7 @@ fn lower_element_with_async_directive(
     body.push(push_stmt);
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
             span: Span::ZERO,
@@ -5336,6 +5375,7 @@ fn lower_element_with_non_inline_children(
                     ));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id("$$renderer")],
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: vec![push_call],
                             span: Span::ZERO,
@@ -5358,6 +5398,7 @@ fn lower_element_with_non_inline_children(
                     );
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(escape_call),
                         r#async: true,
                         span: Span::ZERO,
@@ -6378,6 +6419,7 @@ fn lower_svelte_element_server(
         args.push(Argument::Expression(Expression::Arrow(Box::new(
             ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: body_stmts,
                     span: Span::ZERO,
@@ -6506,6 +6548,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         };
         let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: body_stmts,
                 span: Span::ZERO,
@@ -6618,6 +6661,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
                 declarations: vec![VariableDeclarator {
                     id: t::pat_id(&placeholder),
                     init: Some(saved),
+                    type_annotation: None,
                     span: Span::ZERO,
                 }],
                 span: Span::ZERO,
@@ -6626,6 +6670,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         body.push(inner_stmt);
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$renderer")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body,
                 span: Span::ZERO,
@@ -6656,6 +6701,7 @@ fn make_bind_getter(name: &str, target: &Expression) -> ObjectMember {
         value: Expression::Function(Box::new(FunctionExpression {
             id: None,
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: BlockStatement {
                 body,
                 span: Span::ZERO,
@@ -6698,6 +6744,7 @@ fn make_bind_setter(name: &str, target: &Expression) -> ObjectMember {
         value: Expression::Function(Box::new(FunctionExpression {
             id: None,
             params: vec![t::pat_id("$$value")],
+            param_type_annotations: Vec::new(),
             body: BlockStatement {
                 body,
                 span: Span::ZERO,

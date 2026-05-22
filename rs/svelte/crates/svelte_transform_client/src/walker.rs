@@ -218,6 +218,7 @@ fn emit_svelte_head_program(
         })));
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![assign],
                 span: Span::ZERO,
@@ -238,6 +239,7 @@ fn emit_svelte_head_program(
     }
     let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: head_body,
             span: Span::ZERO,
@@ -432,6 +434,7 @@ fn emit_head_if_block_program(
                 cons_body.push(t::var(&var_name, init));
                 let html_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(ht.expression.clone()),
                     r#async: false,
                     span: Span::ZERO,
@@ -489,6 +492,7 @@ fn emit_head_if_block_program(
 
     let cons_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: cons_body,
             span: Span::ZERO,
@@ -511,6 +515,7 @@ fn emit_head_if_block_program(
     }));
     let if_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$render")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![if_inner_stmt],
             span: Span::ZERO,
@@ -545,6 +550,7 @@ fn emit_head_if_block_program(
 
     let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: head_body_stmts,
             span: Span::ZERO,
@@ -736,6 +742,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     ));
     let eff_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![set_text_inner, set_text_trailing],
             span: Span::ZERO,
@@ -941,6 +948,7 @@ fn emit_select_with_rich_options_static(
             ];
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: arrow_body,
                     span: Span::ZERO,
@@ -1832,6 +1840,7 @@ fn emit_boundary_pending_attribute_program(
             }),
             init: Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: vec![t::pat_id("$$anchor")],
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: snippet_arrow_body,
                     span: Span::ZERO,
@@ -1839,6 +1848,7 @@ fn emit_boundary_pending_attribute_program(
                 r#async: false,
                 span: Span::ZERO,
             }))),
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -1859,6 +1869,7 @@ fn emit_boundary_pending_attribute_program(
     );
     let inner_async_derived_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(t::call(
             Expression::Await(Box::new(AwaitExpression {
                 argument: inner_save,
@@ -1895,6 +1906,7 @@ fn emit_boundary_pending_attribute_program(
     }));
     let run_async_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(assign_data),
         r#async: true,
         span: Span::ZERO,
@@ -1908,6 +1920,7 @@ fn emit_boundary_pending_attribute_program(
                 span: Span::ZERO,
             }),
             init: None,
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -1943,6 +1956,7 @@ fn emit_boundary_pending_attribute_program(
     );
     let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(set_text_call),
         r#async: false,
         span: Span::ZERO,
@@ -1973,6 +1987,7 @@ fn emit_boundary_pending_attribute_program(
 
     let boundary_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: boundary_body,
             span: Span::ZERO,
@@ -1994,6 +2009,7 @@ fn emit_boundary_pending_attribute_program(
         value: Expression::Function(Box::new(FunctionExpression {
             id: None,
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: BlockStatement {
                 body: getter_body,
                 span: Span::ZERO,
@@ -2478,6 +2494,7 @@ fn emit_select_with_optgroup_rich(
                                     t::member_id(t::id("$"), "template_effect"),
                                     vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                                         params: Vec::new(),
+                                        param_type_annotations: Vec::new(),
                                         body: eff_body,
                                         r#async: false,
                                         span: Span::ZERO,
@@ -2516,6 +2533,7 @@ fn emit_select_with_optgroup_rich(
                                     t::id(&opt_var),
                                     Expression::Arrow(Box::new(ArrowFunctionExpression {
                                         params: Vec::new(),
+                                        param_type_annotations: Vec::new(),
                                         body: ArrowBody::Block(Box::new(BlockStatement {
                                             body: opt_cb_body,
                                             span: Span::ZERO,
@@ -2782,6 +2800,7 @@ fn emit_select_with_optgroup_rich(
                 t::member_id(t::id("$"), "template_effect"),
                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: eff_body,
                     r#async: false,
                     span: Span::ZERO,
@@ -2912,6 +2931,7 @@ fn emit_select_with_optgroup_rich(
             let rich = rich_ogs.iter().find(|r| r.og_idx == oi).expect("rich_og");
             let cb = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: rich.callback_body.clone(),
                     span: Span::ZERO,
@@ -3519,6 +3539,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                 t::member_id(t::id("$"), "template_effect"),
                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: eff_body,
                     r#async: false,
                     span: Span::ZERO,
@@ -3565,6 +3586,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         if let Some(rich) = rich_options.iter().find(|r| r.option_idx == oi) {
             let cb = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: rich.callback_body.clone(),
                     span: Span::ZERO,
@@ -4690,6 +4712,7 @@ pub fn try_typed_client_walker_with(
                 rewrite_expr_for_state(&mut getter_body, &script.state_bindings);
                 let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(getter_body),
                     r#async: false,
                     span: Span::ZERO,
@@ -4705,6 +4728,7 @@ pub fn try_typed_client_walker_with(
                 }
                 let then = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: then_params,
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: Vec::new(),
                         span: Span::ZERO,
@@ -4857,6 +4881,7 @@ pub fn try_typed_client_walker_with(
             );
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(set_call),
                 r#async: false,
                 span: Span::ZERO,
@@ -4877,6 +4902,7 @@ pub fn try_typed_client_walker_with(
             }
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: block_body,
                     span: Span::ZERO,
@@ -4971,6 +4997,7 @@ fn emit_directives(
         };
         let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression({
                 if state_bindings.contains(&target_name) {
                     t::call(
@@ -4986,6 +5013,7 @@ fn emit_directives(
         }));
         let setter = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$value")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression({
                 if state_bindings.contains(&target_name) {
                     t::call(
@@ -5408,6 +5436,7 @@ fn emit_single_component_program(
                 ];
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body,
                         span: Span::ZERO,
@@ -5465,6 +5494,7 @@ fn emit_single_component_program(
             };
             let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: default_body,
                     span: Span::ZERO,
@@ -5549,6 +5579,7 @@ fn emit_single_component_program(
                     ));
                     let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: vec![inner_call],
                             span: Span::ZERO,
@@ -5681,6 +5712,7 @@ fn emit_single_component_program(
         );
         let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(fn_body),
             r#async: false,
             span: Span::ZERO,
@@ -5695,6 +5727,7 @@ fn emit_single_component_program(
         )));
         let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: slot_body,
                 span: Span::ZERO,
@@ -5804,6 +5837,7 @@ fn emit_single_async_expr_program(
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(set_call),
         r#async: false,
         span: Span::ZERO,
@@ -5899,6 +5933,7 @@ fn emit_async_branch_body(
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$0")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(set_text_call),
         r#async: false,
         span: Span::ZERO,
@@ -5906,6 +5941,7 @@ fn emit_async_branch_body(
     let inner = strip_outer_await(expr);
     let dep_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(inner),
         r#async: false,
         span: Span::ZERO,
@@ -6118,6 +6154,7 @@ fn emit_multi_element_branch_body_with_context(
             t::member_id(t::id("$"), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: effect_arrow_body,
                 r#async: false,
                 span: Span::ZERO,
@@ -6294,6 +6331,7 @@ fn emit_multi_element_each_body(
         t::member_id(t::id("$"), "template_effect"),
         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: eff_body,
             r#async: false,
             span: Span::ZERO,
@@ -6385,6 +6423,7 @@ fn emit_vanilla_branch_body_with_context(
             );
             let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(set_text_call),
                 r#async: false,
                 span: Span::ZERO,
@@ -6465,6 +6504,7 @@ fn emit_vanilla_branch_body_with_context(
                 );
                 let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(set_text),
                     r#async: false,
                     span: Span::ZERO,
@@ -6593,6 +6633,7 @@ fn emit_vanilla_branch_body_with_context(
             ));
             let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(ht.expression.clone()),
                 r#async: false,
                 span: Span::ZERO,
@@ -6650,6 +6691,7 @@ fn emit_single_vanilla_if_program(
 
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent_body,
             span: Span::ZERO,
@@ -6663,6 +6705,7 @@ fn emit_single_vanilla_if_program(
     if let Some(alt_body) = alternate_body {
         let alt_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: alt_body,
                 span: Span::ZERO,
@@ -6698,6 +6741,7 @@ fn emit_single_vanilla_if_program(
     }));
     let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$render")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![render_if],
             span: Span::ZERO,
@@ -6904,6 +6948,7 @@ fn emit_top_level_html_tag_program(
     } else {
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(inner),
             r#async: false,
             span: Span::ZERO,
@@ -7128,6 +7173,7 @@ fn emit_single_element_wrapping_html_tag_program(
     } else {
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(inner),
             r#async: false,
             span: Span::ZERO,
@@ -7394,6 +7440,7 @@ fn emit_top_level_single_expression_program(
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(set_text),
         r#async: false,
         span: Span::ZERO,
@@ -7707,6 +7754,7 @@ fn emit_single_element_with_inner_snippet_program(
         }
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params,
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body,
                 span: Span::ZERO,
@@ -7741,6 +7789,7 @@ fn emit_single_element_with_inner_snippet_program(
                 );
                 let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(snapshot_call),
                     r#async: false,
                     span: Span::ZERO,
@@ -7774,6 +7823,7 @@ fn emit_single_element_with_inner_snippet_program(
         }
         let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: effect_body,
                 span: Span::ZERO,
@@ -8086,6 +8136,7 @@ fn emit_single_element_wrapping_ifs_program(
         };
         let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: consequent_body,
                 span: Span::ZERO,
@@ -8105,6 +8156,7 @@ fn emit_single_element_wrapping_ifs_program(
         }));
         let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$render")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![render_if],
                 span: Span::ZERO,
@@ -8792,6 +8844,7 @@ fn emit_top_level_multi_if_program(
                 };
                 let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor")],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: consequent_body,
                         span: Span::ZERO,
@@ -8811,6 +8864,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$render")],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: vec![render_if],
                         span: Span::ZERO,
@@ -8926,6 +8980,7 @@ fn emit_top_level_multi_if_program(
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
                         span: Span::ZERO,
@@ -8947,6 +9002,7 @@ fn emit_top_level_multi_if_program(
                     let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
                     Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(rewritten),
                         r#async: false,
                         span: Span::ZERO,
@@ -8992,6 +9048,7 @@ fn emit_top_level_multi_if_program(
                         )?;
                         Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: vec![t::pat_id("$$anchor")],
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Block(Box::new(BlockStatement {
                                 body: fb_body,
                                 span: Span::ZERO,
@@ -9007,6 +9064,7 @@ fn emit_top_level_multi_if_program(
                     None => t::member_id(t::id("$"), "index"),
                     Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id(&item_name)],
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(k.clone()),
                         r#async: false,
                         span: Span::ZERO,
@@ -9074,6 +9132,7 @@ fn emit_top_level_multi_if_program(
                 let inner = rewrite_legacy_prop_reads(&inner, &legacy_prop_names);
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(inner),
                     r#async: false,
                     span: Span::ZERO,
@@ -9109,6 +9168,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 let attr_effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(paren),
                     r#async: false,
                     span: Span::ZERO,
@@ -9217,6 +9277,7 @@ fn emit_top_level_multi_if_program(
                     };
                     let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: effect_body,
                         r#async: false,
                         span: Span::ZERO,
@@ -9352,6 +9413,7 @@ fn emit_top_level_multi_if_program(
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
                         span: Span::ZERO,
@@ -9373,6 +9435,7 @@ fn emit_top_level_multi_if_program(
                     let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
                     Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(rewritten),
                         r#async: false,
                         span: Span::ZERO,
@@ -9415,6 +9478,7 @@ fn emit_top_level_multi_if_program(
                         )?;
                         Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: vec![t::pat_id("$$anchor")],
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Block(Box::new(BlockStatement {
                                 body: fb_body,
                                 span: Span::ZERO,
@@ -9429,6 +9493,7 @@ fn emit_top_level_multi_if_program(
                     None => t::member_id(t::id("$"), "index"),
                     Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id(&item_name)],
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(k.clone()),
                         r#async: false,
                         span: Span::ZERO,
@@ -9550,6 +9615,7 @@ fn emit_top_level_multi_if_program(
                 let inner = rewrite_legacy_prop_reads(&inner, &legacy_prop_names);
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(inner),
                     r#async: false,
                     span: Span::ZERO,
@@ -9773,6 +9839,7 @@ fn emit_top_level_multi_if_program(
             t::member_id(t::id("$"), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: arrow_body,
                 r#async: false,
                 span: Span::ZERO,
@@ -9794,6 +9861,7 @@ fn emit_top_level_multi_if_program(
             t::member_id(t::id("$"), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: arrow_body,
                 r#async: false,
                 span: Span::ZERO,
@@ -10534,6 +10602,7 @@ fn emit_single_element_wrapping_each_program(
         t::member_id(t::id("$"), "template_effect"),
         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(set_text),
             r#async: false,
             span: Span::ZERO,
@@ -10545,6 +10614,7 @@ fn emit_single_element_wrapping_each_program(
     )));
     let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: item_body,
             span: Span::ZERO,
@@ -10588,6 +10658,7 @@ fn emit_single_element_wrapping_each_program(
         let rewritten = rewrite_legacy_prop_reads(&eb.expression, &legacy_prop_names);
         let untracked_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(rewritten),
             r#async: false,
             span: Span::ZERO,
@@ -10606,6 +10677,7 @@ fn emit_single_element_wrapping_each_program(
         }));
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(seq),
             r#async: false,
             span: Span::ZERO,
@@ -10616,6 +10688,7 @@ fn emit_single_element_wrapping_each_program(
         let rewritten = rewrite_legacy_prop_reads(&rewritten, &legacy_prop_names);
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(rewritten),
             r#async: false,
             span: Span::ZERO,
@@ -10635,6 +10708,7 @@ fn emit_single_element_wrapping_each_program(
         None => t::member_id(t::id("$"), "index"),
         Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id(&item_name)],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(k.clone()),
             r#async: false,
             span: Span::ZERO,
@@ -10927,6 +11001,7 @@ fn rewrite_legacy_prop_writes_to_calls(
     match e {
         Expression::Arrow(a) => Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: a.params.clone(),
+            param_type_annotations: Vec::new(),
             body: match &a.body {
                 ArrowBody::Expression(e) => ArrowBody::Expression(
                     rewrite_legacy_prop_writes_to_calls(e, legacy_props),
@@ -11192,6 +11267,7 @@ fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
         })),
         Expression::Arrow(a) => Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: a.params.clone(),
+            param_type_annotations: Vec::new(),
             body: match &a.body {
                 ArrowBody::Expression(e) => {
                     ArrowBody::Expression(rewrite_get_for_each_var(e, var_name))
@@ -11329,6 +11405,7 @@ fn emit_single_element_with_spread_program(
     }));
     let attr_effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(paren_obj),
         r#async: false,
         span: Span::ZERO,
@@ -11508,6 +11585,7 @@ fn emit_single_element_with_bind_this_program(
     };
     let setter_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$value")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(setter_body),
         r#async: false,
         span: Span::ZERO,
@@ -11519,6 +11597,7 @@ fn emit_single_element_with_bind_this_program(
     };
     let getter_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(getter_body),
         r#async: false,
         span: Span::ZERO,
@@ -12123,6 +12202,7 @@ fn emit_single_dynamic_element_program(
         };
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(expr),
             r#async: false,
             span: Span::ZERO,
@@ -12130,6 +12210,7 @@ fn emit_single_dynamic_element_program(
     } else {
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement { body: effect_stmts, span: Span::ZERO })),
             r#async: false,
             span: Span::ZERO,
@@ -12200,6 +12281,7 @@ fn emit_single_async_if_program(
     // consequent arrow
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent_body,
             span: Span::ZERO,
@@ -12212,6 +12294,7 @@ fn emit_single_async_if_program(
     if let Some(alt_body) = alternate_body {
         let alt_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: alt_body,
                 span: Span::ZERO,
@@ -12244,6 +12327,7 @@ fn emit_single_async_if_program(
     }));
     let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$render")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![render_if],
             span: Span::ZERO,
@@ -12261,6 +12345,7 @@ fn emit_single_async_if_program(
         elements: vec![ArrayElement::Expression(Expression::Arrow(Box::new(
             ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(test_inner),
                 r#async: false,
                 span: Span::ZERO,
@@ -12274,6 +12359,7 @@ fn emit_single_async_if_program(
     }));
     let async_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("node"), t::pat_id("$$condition")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: async_inner_body,
             span: Span::ZERO,
@@ -12462,6 +12548,7 @@ fn emit_async_const_chain_program(
 
         let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: consequent_body,
                 span: Span::ZERO,
@@ -12480,6 +12567,7 @@ fn emit_async_const_chain_program(
         }));
         let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$render")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![render_if],
                 span: Span::ZERO,
@@ -12603,6 +12691,7 @@ fn build_async_const_consequent(
                         }));
                         thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: Vec::new(),
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Expression(with_promise),
                             r#async: false,
                             span: Span::ZERO,
@@ -12620,6 +12709,7 @@ fn build_async_const_consequent(
                     let async_derived_arrow = Expression::Arrow(Box::new(
                         ArrowFunctionExpression {
                             params: Vec::new(),
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Expression(rewritten),
                             r#async: true,
                             span: Span::ZERO,
@@ -12638,6 +12728,7 @@ fn build_async_const_consequent(
                     }));
                     thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(assign),
                         r#async: true,
                         span: Span::ZERO,
@@ -12649,6 +12740,7 @@ fn build_async_const_consequent(
                         t::member_id(t::id("$"), "derived"),
                         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: Vec::new(),
+                            param_type_annotations: Vec::new(),
                             body: ArrowBody::Expression(rewritten),
                             r#async: false,
                             span: Span::ZERO,
@@ -12662,6 +12754,7 @@ fn build_async_const_consequent(
                     }));
                     thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(assign),
                         r#async: false,
                         span: Span::ZERO,
@@ -12678,6 +12771,7 @@ fn build_async_const_consequent(
             declarations: vec![VariableDeclarator {
                 id: t::pat_id(name),
                 init: None,
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
@@ -12852,6 +12946,7 @@ fn emit_const_async_if_program(
                     save_await_call_client(inner);
                 let async_derived_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(inner_save_await),
                     r#async: true,
                     span: Span::ZERO,
@@ -12869,6 +12964,7 @@ fn emit_const_async_if_program(
                 }));
                 thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(assign),
                     r#async: true,
                     span: Span::ZERO,
@@ -12880,6 +12976,7 @@ fn emit_const_async_if_program(
                     t::member_id(t::id("$"), "derived"),
                     vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(rewritten),
                         r#async: false,
                         span: Span::ZERO,
@@ -12893,6 +12990,7 @@ fn emit_const_async_if_program(
                 }));
                 thunks.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(assign),
                     r#async: false,
                     span: Span::ZERO,
@@ -12916,6 +13014,7 @@ fn emit_const_async_if_program(
             declarations: vec![VariableDeclarator {
                 id: t::pat_id(name),
                 init: None,
+                type_annotation: None,
                 span: Span::ZERO,
             }],
             span: Span::ZERO,
@@ -12964,6 +13063,7 @@ fn emit_const_async_if_program(
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(set_text_call),
         r#async: false,
         span: Span::ZERO,
@@ -12996,6 +13096,7 @@ fn emit_const_async_if_program(
 
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent,
             span: Span::ZERO,
@@ -13016,6 +13117,7 @@ fn emit_const_async_if_program(
     }));
     let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$render")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![render_if],
             span: Span::ZERO,
@@ -13295,6 +13397,7 @@ fn emit_async_if_block(
                 t::member_id(t::id("$"), "derived"),
                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(cur.test.clone()),
                     r#async: false,
                     span: Span::ZERO,
@@ -13368,6 +13471,7 @@ fn emit_async_if_block(
     let render_body = build_render_body(&branches, alt_arrow_name.as_deref(), false);
     let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$render")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![render_body],
             span: Span::ZERO,
@@ -13421,6 +13525,7 @@ fn emit_async_if_block(
             };
             let test_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(body_expr),
                 r#async: is_async_arrow,
                 span: Span::ZERO,
@@ -13440,6 +13545,7 @@ fn emit_async_if_block(
         };
         let cb = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: cb_params,
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: chain_body,
                 span: Span::ZERO,
@@ -13672,6 +13778,7 @@ fn emit_select_rich_content_program(
     for (name, body) in snippet_decls {
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body,
                 span: Span::ZERO,
@@ -14137,6 +14244,7 @@ fn build_customizable_select_body_with_html(
     let node_var = ctx.next_named("node");
     let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(html_expr),
         r#async: false,
         span: Span::ZERO,
@@ -14165,6 +14273,7 @@ fn build_customizable_select_body_with_html(
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -14219,6 +14328,7 @@ fn build_customizable_select_body_with_next(
     )));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -14327,6 +14437,7 @@ fn build_customizable_select_body(
     )));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -14430,6 +14541,7 @@ fn lower_select_with_each(
         let body_arrow = build_each_iter_arrow(eb, ctx)?;
         let expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(eb.expression.clone()),
             r#async: false,
             span: Span::ZERO,
@@ -14465,6 +14577,7 @@ fn lower_select_with_each(
         ];
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: arrow_body,
                 span: Span::ZERO,
@@ -14512,6 +14625,7 @@ fn build_each_body_for_select(
     let body_arrow = build_each_iter_arrow(eb, ctx)?;
     let expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(eb.expression.clone()),
         r#async: false,
         span: Span::ZERO,
@@ -14587,6 +14701,7 @@ fn build_each_iter_arrow(
             t::member_id(t::id("$"), "derived_safe_equal"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(rewritten),
                 r#async: false,
                 span: Span::ZERO,
@@ -14701,6 +14816,7 @@ fn build_each_iter_arrow(
                     let effect_body = vec![set_text_call, if_stmt];
                     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: effect_body,
                             span: Span::ZERO,
@@ -14785,6 +14901,7 @@ fn build_each_iter_arrow(
                     )));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: arrow_body,
                             span: Span::ZERO,
@@ -14821,6 +14938,7 @@ fn build_each_iter_arrow(
     }
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor"), t::pat_id(&ctx_name)],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
             span: Span::ZERO,
@@ -14974,6 +15092,7 @@ fn emit_rich_content_reactivity(
                     );
                     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(set_text_call),
                         r#async: false,
                         span: Span::ZERO,
@@ -15022,6 +15141,7 @@ fn lower_select_with_if(
         let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
         let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: consequent_body,
                 span: Span::ZERO,
@@ -15038,6 +15158,7 @@ fn lower_select_with_if(
         }));
         let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$render")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![render_if],
                 span: Span::ZERO,
@@ -15076,6 +15197,7 @@ fn lower_select_with_if(
         ];
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: arrow_body,
                 span: Span::ZERO,
@@ -15101,6 +15223,7 @@ fn lower_select_with_if(
     let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent_body,
             span: Span::ZERO,
@@ -15117,6 +15240,7 @@ fn lower_select_with_if(
     }));
     let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$render")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![render_if],
             span: Span::ZERO,
@@ -15202,6 +15326,7 @@ fn build_if_consequent_for_select(
             let body_arrow = build_each_iter_arrow(eb, ctx)?;
             let expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(eb.expression.clone()),
                 r#async: false,
                 span: Span::ZERO,
@@ -15286,6 +15411,7 @@ fn lower_select_with_key(
     let opt_var = ctx.next_named("option");
     let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![
                 t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
@@ -15301,6 +15427,7 @@ fn lower_select_with_key(
     }));
     let key_expr_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(kb.expression.clone()),
         r#async: false,
         span: Span::ZERO,
@@ -15396,6 +15523,7 @@ fn lower_select_with_boundary(
     }
     let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -15475,6 +15603,7 @@ fn lower_select_with_component(
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -15541,6 +15670,7 @@ fn lower_select_with_render(
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -15578,6 +15708,7 @@ fn lower_select_with_html(
     let node_var = ctx.next_named("node");
     let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(ht.expression.clone()),
         r#async: false,
         span: Span::ZERO,
@@ -15606,6 +15737,7 @@ fn lower_select_with_html(
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
             span: Span::ZERO,
@@ -15738,6 +15870,7 @@ fn lower_select_with_optgroup(
             ];
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: arrow_body,
                     span: Span::ZERO,
@@ -15808,6 +15941,7 @@ fn lower_select_with_optgroup(
             ];
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: arrow_body,
                     span: Span::ZERO,
@@ -16121,6 +16255,7 @@ fn emit_deep_static_walker_program(
         }));
         let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(self_assign),
             r#async: false,
             span: Span::ZERO,
@@ -16138,6 +16273,7 @@ fn emit_deep_static_walker_program(
             t::member_id(t::id("$"), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(t::call(
                     t::member_id(t::id("$"), "set_text"),
                     vec![t::id(&text_var), expr],
@@ -16158,6 +16294,7 @@ fn emit_deep_static_walker_program(
             t::member_id(t::id("$"), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: block_body,
                     span: Span::ZERO,
@@ -16517,6 +16654,7 @@ fn walk_element_interior(
                 let expr = rewrite_props_destructured(&ht.expression, &script.props_destructured);
                 let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(expr),
                     r#async: false,
                     span: Span::ZERO,
@@ -17275,6 +17413,7 @@ fn rewrite_stmt_props_destructured(s: &Statement, names: &HashSet<String>) -> St
                         .init
                         .as_ref()
                         .map(|e| rewrite_props_destructured(e, names)),
+                    type_annotation: None,
                     span: d.span,
                 })
                 .collect(),
@@ -17378,6 +17517,7 @@ fn build_legacy_exports_object(props: &[(String, Option<Expression>)]) -> Expres
             value: Expression::Function(Box::new(FunctionExpression {
                 id: None,
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: BlockStatement { body: getter_body, span: Span::ZERO },
                 generator: false,
                 r#async: false,
@@ -17398,6 +17538,7 @@ fn build_legacy_exports_object(props: &[(String, Option<Expression>)]) -> Expres
             value: Expression::Function(Box::new(FunctionExpression {
                 id: None,
                 params: vec![t::pat_id("$$value")],
+                param_type_annotations: Vec::new(),
                 body: BlockStatement { body: setter_body, span: Span::ZERO },
                 generator: false,
                 r#async: false,
@@ -17556,6 +17697,7 @@ fn build_branch_arrow(
     )));
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
             span: Span::ZERO,
@@ -17595,6 +17737,7 @@ fn build_breakout_alternate_arrow(
     )));
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
             span: Span::ZERO,
@@ -17908,6 +18051,7 @@ fn emit_single_async_each_program(
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$0")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(set_text_call),
         r#async: false,
         span: Span::ZERO,
@@ -17927,6 +18071,7 @@ fn emit_single_async_each_program(
     };
     let dep_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(body_with_get),
         r#async: false,
         span: Span::ZERO,
@@ -17949,6 +18094,7 @@ fn emit_single_async_each_program(
 
     let each_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: each_body_stmts,
             span: Span::ZERO,
@@ -17960,6 +18106,7 @@ fn emit_single_async_each_program(
     // `$.each(node, FLAG, () => $.get($$collection), $.index, body_arrow[, fallback_arrow])`
     let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(t::call(
             t::member_id(t::id("$"), "get"),
             vec![t::id("$$collection")],
@@ -18004,12 +18151,14 @@ fn emit_single_async_each_program(
                 );
                 let fb_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$0")],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(fb_set),
                     r#async: false,
                     span: Span::ZERO,
                 }));
                 let fb_dep = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(inner_fb),
                     r#async: false,
                     span: Span::ZERO,
@@ -18031,6 +18180,7 @@ fn emit_single_async_each_program(
                 )));
                 each_args.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: vec![t::pat_id("$$anchor")],
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: fb_body,
                         span: Span::ZERO,
@@ -18052,6 +18202,7 @@ fn emit_single_async_each_program(
 
     let async_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("node"), t::pat_id("$$collection")],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![each_call],
             span: Span::ZERO,
@@ -18071,6 +18222,7 @@ fn emit_single_async_each_program(
                 elements: vec![ArrayElement::Expression(Expression::Arrow(Box::new(
                     ArrowFunctionExpression {
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(collection_inner),
                         r#async: false,
                         span: Span::ZERO,
@@ -18146,6 +18298,7 @@ fn emit_single_svelte_element_program(
     } else {
         Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(se.tag.clone()),
             r#async: false,
             span: Span::ZERO,
@@ -18201,6 +18354,7 @@ fn emit_single_svelte_element_program(
         )));
         let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id("$$element"), t::pat_id("$$anchor")],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: render_body,
                 span: Span::ZERO,
@@ -18455,6 +18609,7 @@ fn emit_single_each_preserve_whitespace_program(
         t::member_id(t::id("$"), "template_effect"),
         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![],
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(set_text),
             r#async: false,
             span: Span::ZERO,
@@ -18467,6 +18622,7 @@ fn emit_single_each_preserve_whitespace_program(
 
     let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: item_body,
             span: Span::ZERO,
@@ -18478,6 +18634,7 @@ fn emit_single_each_preserve_whitespace_program(
     // is_runes_iter — for literal 'abc' it's false; legacy iter is also false.
     let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![],
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(eb.expression.clone()),
         r#async: false,
         span: Span::ZERO,
@@ -18792,6 +18949,7 @@ fn emit_single_each_program(
         );
         let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(fn_body),
             r#async: false,
             span: Span::ZERO,
@@ -18820,6 +18978,7 @@ fn emit_single_each_program(
 
     let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params,
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: body_stmts,
             span: Span::ZERO,
@@ -18847,6 +19006,7 @@ fn emit_single_each_program(
     );
     let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(getter_expr),
         r#async: false,
         span: Span::ZERO,
@@ -18887,6 +19047,7 @@ fn emit_single_each_program(
             let pname = item_name_opt.clone().unwrap_or_else(|| "$$item".into());
             Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: vec![t::pat_id(&pname)],
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(k.clone()),
                 r#async: false,
                 span: Span::ZERO,
@@ -19480,6 +19641,7 @@ fn rewrite_async_derived_client(e: &Expression) -> Option<Expression> {
     };
     let new_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: new_body,
         r#async: new_async,
         span: Span::ZERO,
@@ -19645,6 +19807,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
             if let Statement::Expression(es) = s {
                 groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(es.expression),
                     r#async: false,
                     span: Span::ZERO,
@@ -19655,6 +19818,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
         }
         groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: std::mem::take(current_sync),
                 span: Span::ZERO,
@@ -19678,6 +19842,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                 }));
                 groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(assign),
                     r#async: true,
                     span: Span::ZERO,
@@ -19712,6 +19877,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                     span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
                 }),
                 init: None,
+                type_annotation: None,
                 span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
             })
             .collect();
@@ -20361,6 +20527,7 @@ fn rewrite_class_body_client(c: &mut ClassDeclaration) {
                                 t::member_id(t::id("$"), "derived"),
                                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                                     params: Vec::new(),
+                                    param_type_annotations: Vec::new(),
                                     body: ArrowBody::Expression(arg),
                                     r#async: false,
                                     span: Span::ZERO,
@@ -20438,6 +20605,7 @@ fn make_state_getter(public_name: &str) -> ClassMember {
         value: FunctionExpression {
             id: None,
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: BlockStatement { body, span: Span::ZERO },
             generator: false,
             r#async: false,
@@ -20471,6 +20639,7 @@ fn make_state_setter(public_name: &str) -> ClassMember {
         value: FunctionExpression {
             id: None,
             params: vec![t::pat_id("value")],
+            param_type_annotations: Vec::new(),
             body: BlockStatement { body, span: Span::ZERO },
             generator: false,
             r#async: false,
@@ -20499,6 +20668,7 @@ fn make_derived_getter_client(public_name: &str) -> ClassMember {
         value: FunctionExpression {
             id: None,
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: BlockStatement { body, span: Span::ZERO },
             generator: false,
             r#async: false,
@@ -20525,6 +20695,7 @@ fn make_derived_setter_client(public_name: &str) -> ClassMember {
         value: FunctionExpression {
             id: None,
             params: vec![t::pat_id("value")],
+            param_type_annotations: Vec::new(),
             body: BlockStatement { body, span: Span::ZERO },
             generator: false,
             r#async: false,
@@ -20688,6 +20859,7 @@ fn lower_to_derived_init(init: &mut Expression) {
         if let Some(inner) = arg {
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(inner),
                 r#async: false,
                 span: Span::ZERO,
@@ -22090,6 +22262,7 @@ fn emit_element_content(
             };
             let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(t::call(
                     t::member_id(t::id("$"), "set_text"),
                     vec![t::id("text"), set_text_arg],
@@ -22197,6 +22370,7 @@ fn emit_element_content(
                 );
                 fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(fn_body),
                     r#async: false,
                     span: Span::ZERO,
@@ -22215,6 +22389,7 @@ fn emit_element_content(
                 );
                 fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params,
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(fn_body),
                     r#async: false,
                     span: Span::ZERO,
@@ -22324,6 +22499,7 @@ fn build_template_effect(
                 rewrite_expr_for_state(&mut dep_expr, state_bindings);
                 dep_fns.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(dep_expr),
                     r#async: false,
                     span: Span::ZERO,
@@ -22393,6 +22569,7 @@ fn extract_client_snippets(
                     }
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params,
+                        param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: Vec::new(),
                             span: Span::ZERO,
@@ -22470,6 +22647,7 @@ fn extract_client_snippets(
             }
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params,
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body,
                     span: Span::ZERO,
@@ -22558,6 +22736,7 @@ fn component_call_with(
                     value: Expression::Function(Box::new(FunctionExpression {
                         id: None,
                         params: Vec::new(),
+                        param_type_annotations: Vec::new(),
                         body: BlockStatement {
                             body: vec![Statement::Return(Box::new(ReturnStatement {
                                 argument: Some(getter_body),
@@ -22584,6 +22763,7 @@ fn component_call_with(
                     value: Expression::Function(Box::new(FunctionExpression {
                         id: None,
                         params: vec![t::pat_id("$$value")],
+                        param_type_annotations: Vec::new(),
                         body: BlockStatement {
                             body: vec![t::stmt(setter_body)],
                             span: Span::ZERO,

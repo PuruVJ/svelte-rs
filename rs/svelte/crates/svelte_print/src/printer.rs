@@ -20,7 +20,10 @@ use svelte_ast::tags::{
     AttachTag, ConstTag, DebugTag, ExpressionTag, HtmlTag, RenderTag,
 };
 
-use svelte_codegen_js::{print_expression_str, print_pattern_str, print_statements_str};
+use svelte_codegen_js::{
+    print_expression_str, print_pattern_str, print_statements_str,
+    print_statements_str_with_comments, TypedComment, TypedCommentKind,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct PrintOptions {
@@ -36,12 +39,28 @@ pub struct PrintResult {
 /// Print a `Root` AST node back to a `.svelte` source string.
 pub fn print(root: &Root, opts: PrintOptions) -> PrintResult {
     let mut p = Printer::new(opts);
+    p.root_comments = root_comments_to_typed(root);
     p.emit_root(root);
     // Ensure trailing newline matches upstream's output convention.
     if !p.out.ends_with('\n') {
         p.out.push('\n');
     }
     PrintResult { code: p.out }
+}
+
+fn root_comments_to_typed(root: &Root) -> Vec<TypedComment> {
+    root.comments
+        .iter()
+        .map(|c| TypedComment {
+            kind: match c.kind {
+                svelte_ast::root::JsCommentKind::Line => TypedCommentKind::Line,
+                svelte_ast::root::JsCommentKind::Block => TypedCommentKind::Block,
+            },
+            value: c.value.clone(),
+            start: c.start,
+            end: c.end,
+        })
+        .collect()
 }
 
 // ---- internals ----------------------------------------------------------
@@ -88,6 +107,10 @@ struct Printer {
     /// contains `\n` characters via `write` does NOT trigger this (e.g.
     /// a multi-line comment's data).
     multiline: bool,
+    /// All JS-side comments from the source. Threaded into the JS
+    /// codegen when printing script bodies so block-statement bodies
+    /// with only comments (`(node) => { /* … */ }`) round-trip.
+    root_comments: Vec<TypedComment>,
 }
 
 impl Printer {
@@ -97,6 +120,7 @@ impl Printer {
             indent: String::new(),
             indent_unit: opts.indent.unwrap_or_else(|| "\t".to_string()),
             multiline: false,
+            root_comments: Vec::new(),
         }
     }
 
@@ -186,7 +210,17 @@ impl Printer {
         self.indent_in();
         self.out.push('\n');
         self.out.push_str(&self.indent);
-        let body = print_statements_str(&s.content.body);
+        // Filter root_comments to those within the script's content span
+        // (so the JS codegen flushes only comments local to this script).
+        let s_start = s.content.span.start;
+        let s_end = s.content.span.end;
+        let script_comments: Vec<TypedComment> = self
+            .root_comments
+            .iter()
+            .filter(|c| c.start >= s_start && c.start < s_end)
+            .cloned()
+            .collect();
+        let body = print_statements_str_with_comments(&s.content.body, &script_comments);
         let body_trimmed = body.trim_end_matches('\n');
         // Re-indent each line of the body to our current indent level.
         // Blank lines stay blank (no trailing indent).
@@ -436,6 +470,7 @@ impl Printer {
             indent: self.indent.clone(),
             indent_unit: self.indent_unit.clone(),
             multiline: false,
+            root_comments: self.root_comments.clone(),
         };
         for n in seq {
             sub.emit_node(n);

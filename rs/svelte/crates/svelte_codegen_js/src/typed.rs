@@ -136,6 +136,13 @@ pub fn print_pattern_str(p: &Pattern) -> String {
 /// Print a list of top-level statements (`<script>` body, `{@const}` body)
 /// using the existing program emitter — preserves margin / formatting rules.
 pub fn print_statements_str(body: &[Statement]) -> String {
+    print_statements_str_with_comments(body, &[])
+}
+
+/// Same as [`print_statements_str`] but with a list of source comments
+/// to preserve. Comments inside empty block-statement bodies survive
+/// the round-trip (e.g. `() => { /* … */ }` → `() => { /* … */ }`).
+pub fn print_statements_str_with_comments(body: &[Statement], comments: &[TypedComment]) -> String {
     let prog = Program {
         source_type: svelte_js_ast::SourceType::Module,
         body: body.to_vec(),
@@ -143,7 +150,7 @@ pub fn print_statements_str(body: &[Statement]) -> String {
     };
     let opts = TypedPrintOptions::default();
     let comment_index = std::cell::Cell::new(0usize);
-    let mut emitter = Emitter::new(&opts, &opts.comments, &comment_index);
+    let mut emitter = Emitter::new(&opts, comments, &comment_index);
     emitter.emit_program(&prog);
     emitter.code
 }
@@ -428,7 +435,26 @@ impl<'a> Emitter<'a> {
 
     fn emit_block(&mut self, b: &BlockStatement) {
         if b.body.is_empty() {
-            self.write("{}");
+            // If there are pending comments inside the block's span, emit
+            // them so e.g. `() => { // ... }` round-trips.
+            let pending = self.has_pending_comments_in_span(b.span);
+            if !pending {
+                self.write("{}");
+                return;
+            }
+            self.write("{");
+            self.indent_in();
+            self.newline();
+            self.flush_comments_until(b.span.end, false);
+            // After the last comment flushed, we're on a fresh line at the
+            // INNER indent. Strip that trailing whitespace and re-indent at
+            // the OUTER level before emitting `}`.
+            while self.code.ends_with(' ') || self.code.ends_with('\t') {
+                self.code.pop();
+            }
+            self.indent_out();
+            self.code.push_str(&self.indent);
+            self.write("}");
             return;
         }
         self.write("{");
@@ -437,6 +463,14 @@ impl<'a> Emitter<'a> {
         self.indent_out();
         self.newline();
         self.write("}");
+    }
+
+    fn has_pending_comments_in_span(&self, span: Span) -> bool {
+        let idx = self.comment_index.get();
+        self.comments
+            .get(idx..)
+            .map(|s| s.iter().any(|c| c.start >= span.start && c.start < span.end))
+            .unwrap_or(false)
     }
 
     // -- comments ----------------------------------------------------------
@@ -596,6 +630,9 @@ impl<'a> Emitter<'a> {
                     self.flush_comments_until(start, false);
                 }
                 self.emit_pattern(&d.id);
+                if let Some(t) = &d.type_annotation {
+                    self.write(t);
+                }
                 if let Some(init) = &d.init {
                     self.write(" = ");
                     self.emit_expression(init);
@@ -608,6 +645,9 @@ impl<'a> Emitter<'a> {
                     self.write(", ");
                 }
                 self.emit_pattern(&d.id);
+                if let Some(t) = &d.type_annotation {
+                    self.write(t);
+                }
                 if let Some(init) = &d.init {
                     self.write(" = ");
                     self.emit_expression(init);
@@ -631,7 +671,7 @@ impl<'a> Emitter<'a> {
             self.map(id.span);
             self.write(&id.name);
         }
-        self.emit_params(&f.params);
+        self.emit_params(&f.params, &f.param_type_annotations);
         self.write(" ");
         self.emit_block(&f.body);
     }
@@ -648,12 +688,12 @@ impl<'a> Emitter<'a> {
             self.write(" ");
             self.write(&id.name);
         }
-        self.emit_params(&f.params);
+        self.emit_params(&f.params, &f.param_type_annotations);
         self.write(" ");
         self.emit_block(&f.body);
     }
 
-    fn emit_params(&mut self, params: &[Pattern]) {
+    fn emit_params(&mut self, params: &[Pattern], type_annotations: &[Option<String>]) {
         self.write("(");
         for (i, p) in params.iter().enumerate() {
             if i > 0 {
@@ -666,6 +706,9 @@ impl<'a> Emitter<'a> {
                 self.flush_comments_until(start, true);
             }
             self.emit_pattern(p);
+            if let Some(Some(t)) = type_annotations.get(i) {
+                self.write(t);
+            }
         }
         self.write(")");
     }
@@ -677,7 +720,7 @@ impl<'a> Emitter<'a> {
         // Always emit parens around params, even for a single bare
         // identifier — that's what esrap upstream does, and our existing
         // snapshot fixtures encode that convention.
-        self.emit_params(&a.params);
+        self.emit_params(&a.params, &a.param_type_annotations);
         self.write(" => ");
         match &a.body {
             ArrowBody::Block(b) => self.emit_block(b),
@@ -789,7 +832,7 @@ impl<'a> Emitter<'a> {
                     self.write("*");
                 }
                 self.emit_property_key(&md.key, md.computed);
-                self.emit_params(&md.value.params);
+                self.emit_params(&md.value.params, &md.value.param_type_annotations);
                 self.write(" ");
                 self.emit_block(&md.value.body);
             }
@@ -1603,7 +1646,7 @@ impl<'a> Emitter<'a> {
                 self.write("get ");
                 self.emit_property_key(&p.key, p.computed);
                 if let Expression::Function(f) = &p.value {
-                    self.emit_params(&f.params);
+                    self.emit_params(&f.params, &f.param_type_annotations);
                     self.write(" ");
                     self.emit_block(&f.body);
                 }
@@ -1613,7 +1656,7 @@ impl<'a> Emitter<'a> {
                 self.write("set ");
                 self.emit_property_key(&p.key, p.computed);
                 if let Expression::Function(f) = &p.value {
-                    self.emit_params(&f.params);
+                    self.emit_params(&f.params, &f.param_type_annotations);
                     self.write(" ");
                     self.emit_block(&f.body);
                 }
@@ -1630,7 +1673,7 @@ impl<'a> Emitter<'a> {
                     self.write("*");
                 }
                 self.emit_property_key(&p.key, p.computed);
-                self.emit_params(&f.params);
+                self.emit_params(&f.params, &f.param_type_annotations);
                 self.write(" ");
                 self.emit_block(&f.body);
                 return;

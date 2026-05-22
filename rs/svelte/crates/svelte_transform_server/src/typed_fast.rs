@@ -52,6 +52,7 @@ pub fn try_typed_server_with(
             span: Span::ZERO,
         }),
         params: vec![t::pat_id("$$renderer")],
+        param_type_annotations: Vec::new(),
         body: BlockStatement {
             body: func_body,
             span: Span::ZERO,

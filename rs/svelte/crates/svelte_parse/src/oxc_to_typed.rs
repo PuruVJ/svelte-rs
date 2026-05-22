@@ -26,6 +26,36 @@ fn span_of(s: oxc_span::Span, shift: Shift) -> Span {
     Span::new(s.start + shift.0, s.end + shift.0)
 }
 
+// Thread-local slice the OXC parser is operating on. Set by `set_slice`
+// (called from the parse bridge), read by helpers that need to capture
+// raw source text (e.g. TS type annotations).
+thread_local! {
+    static SLICE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_slice(s: &str) {
+    SLICE.with(|c| *c.borrow_mut() = Some(s.to_string()));
+}
+
+pub fn clear_slice() {
+    SLICE.with(|c| *c.borrow_mut() = None);
+}
+
+/// Extract a text range from the OXC slice using a local (unshifted) span.
+fn slice_text(span: oxc_span::Span) -> Option<String> {
+    SLICE.with(|c| {
+        c.borrow().as_ref().and_then(|s| {
+            let start = span.start as usize;
+            let end = span.end as usize;
+            if end <= s.len() && start <= end {
+                Some(s[start..end].to_string())
+            } else {
+                None
+            }
+        })
+    })
+}
+
 // -------------------------------------------------------------------------
 // Program
 // -------------------------------------------------------------------------
@@ -232,6 +262,7 @@ fn variable_declaration(
         .map(|d| VariableDeclarator {
             id: binding_pattern(&d.id, shift),
             init: d.init.as_ref().map(|e| expression(e, shift)),
+            type_annotation: d.type_annotation.as_ref().and_then(|t| slice_text(t.span)),
             span: span_of(d.span, shift),
         })
         .collect();
@@ -243,23 +274,11 @@ fn variable_declaration(
 }
 
 fn function_decl(f: &oxc::Function<'_>, shift: Shift) -> FunctionDeclaration {
+    let (params, type_annotations) = collect_params(f, shift);
     FunctionDeclaration {
         id: f.id.as_ref().map(|b| binding_identifier(b, shift)),
-        params: f.params.items.iter().map(|p| formal_param_pattern(p, shift)).collect::<Vec<_>>()
-            .into_iter()
-            .chain(
-                f.params
-                    .rest
-                    .as_ref()
-                    .map(|r| {
-                        Pattern::Rest(Box::new(RestElement {
-                            argument: binding_pattern(&r.rest.argument, shift),
-                            span: span_of(r.rest.span, shift),
-                        }))
-                    })
-                    .into_iter(),
-            )
-            .collect(),
+        params,
+        param_type_annotations: type_annotations,
         body: f.body.as_ref().map(|b| function_body(b, shift)).unwrap_or_else(|| {
             BlockStatement { body: Vec::new(), span: Span::ZERO }
         }),
@@ -270,23 +289,11 @@ fn function_decl(f: &oxc::Function<'_>, shift: Shift) -> FunctionDeclaration {
 }
 
 fn function_expression(f: &oxc::Function<'_>, shift: Shift) -> FunctionExpression {
+    let (params, type_annotations) = collect_params(f, shift);
     FunctionExpression {
         id: f.id.as_ref().map(|b| binding_identifier(b, shift)),
-        params: f.params.items.iter().map(|p| formal_param_pattern(p, shift)).collect::<Vec<_>>()
-            .into_iter()
-            .chain(
-                f.params
-                    .rest
-                    .as_ref()
-                    .map(|r| {
-                        Pattern::Rest(Box::new(RestElement {
-                            argument: binding_pattern(&r.rest.argument, shift),
-                            span: span_of(r.rest.span, shift),
-                        }))
-                    })
-                    .into_iter(),
-            )
-            .collect(),
+        params,
+        param_type_annotations: type_annotations,
         body: f.body.as_ref().map(|b| function_body(b, shift)).unwrap_or_else(|| {
             BlockStatement { body: Vec::new(), span: Span::ZERO }
         }),
@@ -294,6 +301,29 @@ fn function_expression(f: &oxc::Function<'_>, shift: Shift) -> FunctionExpressio
         r#async: f.r#async,
         span: span_of(f.span, shift),
     }
+}
+
+/// Walk OXC's FormalParameters into our `Vec<Pattern>` plus a parallel
+/// `Vec<Option<String>>` of TS type annotations (raw `": T"` text including
+/// the leading colon).
+fn collect_params(
+    f: &oxc::Function<'_>,
+    shift: Shift,
+) -> (Vec<Pattern>, Vec<Option<String>>) {
+    let mut params: Vec<Pattern> = Vec::with_capacity(f.params.items.len() + 1);
+    let mut types: Vec<Option<String>> = Vec::with_capacity(f.params.items.len() + 1);
+    for p in f.params.items.iter() {
+        params.push(formal_param_pattern(p, shift));
+        types.push(p.type_annotation.as_ref().and_then(|t| slice_text(t.span)));
+    }
+    if let Some(r) = f.params.rest.as_ref() {
+        params.push(Pattern::Rest(Box::new(RestElement {
+            argument: binding_pattern(&r.rest.argument, shift),
+            span: span_of(r.rest.span, shift),
+        })));
+        types.push(None);
+    }
+    (params, types)
 }
 
 fn function_body(b: &oxc::FunctionBody<'_>, shift: Shift) -> BlockStatement {
@@ -525,32 +555,44 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
             elements: a.elements.iter().map(|el| array_element(el, shift)).collect(),
             span: span_of(a.span, shift),
         })),
-        E::ArrowFunctionExpression(a) => Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: a
-                .params
-                .items
-                .iter()
-                .map(|p| formal_param_pattern(p, shift))
-                .chain(a.params.rest.as_ref().map(|r| {
-                    Pattern::Rest(Box::new(RestElement {
-                        argument: binding_pattern(&r.rest.argument, shift),
-                        span: span_of(r.rest.span, shift),
-                    }))
-                }))
-                .collect(),
-            body: if a.expression {
-                let stmt = a.body.statements.first();
-                let expr = match stmt {
-                    Some(oxc::Statement::ExpressionStatement(es)) => expression(&es.expression, shift),
-                    _ => Expression::Identifier(Identifier { name: String::new(), span: Span::ZERO }),
-                };
-                ArrowBody::Expression(expr)
-            } else {
-                ArrowBody::Block(Box::new(function_body(&a.body, shift)))
-            },
-            r#async: a.r#async,
-            span: span_of(a.span, shift),
-        })),
+        E::ArrowFunctionExpression(a) => {
+            let mut params: Vec<Pattern> = Vec::with_capacity(a.params.items.len() + 1);
+            let mut type_annotations: Vec<Option<String>> =
+                Vec::with_capacity(a.params.items.len() + 1);
+            for p in a.params.items.iter() {
+                params.push(formal_param_pattern(p, shift));
+                type_annotations
+                    .push(p.type_annotation.as_ref().and_then(|t| slice_text(t.span)));
+            }
+            if let Some(r) = a.params.rest.as_ref() {
+                params.push(Pattern::Rest(Box::new(RestElement {
+                    argument: binding_pattern(&r.rest.argument, shift),
+                    span: span_of(r.rest.span, shift),
+                })));
+                type_annotations.push(None);
+            }
+            Expression::Arrow(Box::new(ArrowFunctionExpression {
+                params,
+                param_type_annotations: type_annotations,
+                body: if a.expression {
+                    let stmt = a.body.statements.first();
+                    let expr = match stmt {
+                        Some(oxc::Statement::ExpressionStatement(es)) => {
+                            expression(&es.expression, shift)
+                        }
+                        _ => Expression::Identifier(Identifier {
+                            name: String::new(),
+                            span: Span::ZERO,
+                        }),
+                    };
+                    ArrowBody::Expression(expr)
+                } else {
+                    ArrowBody::Block(Box::new(function_body(&a.body, shift)))
+                },
+                r#async: a.r#async,
+                span: span_of(a.span, shift),
+            }))
+        }
         E::AssignmentExpression(a) => Expression::Assignment(Box::new(AssignmentExpression {
             left: assignment_target(&a.left, shift),
             operator: assignment_operator(a.operator),

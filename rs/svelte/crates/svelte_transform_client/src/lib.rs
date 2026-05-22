@@ -155,6 +155,7 @@ fn lower_single_component_client(
             // `$.bind_this(Foo(...), ($$value) => target = $$value, () => target)`
             let setter = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: vec![t::pat_id("$$value")],
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(Expression::Assignment(Box::new(
                     AssignmentExpression {
                         left: AssignmentTarget::Pattern(expr_to_pattern(&target_expr)?),
@@ -168,6 +169,7 @@ fn lower_single_component_client(
             }));
             let getter = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
+                param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(target_expr),
                 r#async: false,
                 span: Span::ZERO,

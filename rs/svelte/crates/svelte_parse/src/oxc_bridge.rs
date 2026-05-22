@@ -117,7 +117,9 @@ pub fn parse_program(
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
         return Err(js_diag(start, end, msg));
     }
+    walker::set_slice(slice);
     let prog = walker::program(&ret.program, Shift(start as u32));
+    walker::clear_slice();
     let comments = collect_comments(&ret.program.comments, slice, start as u32, true);
     Ok((prog, comments))
 }

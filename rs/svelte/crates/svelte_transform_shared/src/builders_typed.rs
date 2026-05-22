@@ -212,6 +212,7 @@ pub fn var(name: &str, init: Expression) -> Statement {
         declarations: vec![VariableDeclarator {
             id: pat_id(name),
             init: Some(init),
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -224,6 +225,7 @@ pub fn let_decl(name: &str, init: Option<Expression>) -> Statement {
         declarations: vec![VariableDeclarator {
             id: pat_id(name),
             init,
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -236,6 +238,7 @@ pub fn const_decl(name: &str, init: Expression) -> Statement {
         declarations: vec![VariableDeclarator {
             id: pat_id(name),
             init: Some(init),
+            type_annotation: None,
             span: Span::ZERO,
         }],
         span: Span::ZERO,
@@ -253,6 +256,7 @@ pub fn function_decl(
             span: Span::ZERO,
         }),
         params,
+        param_type_annotations: Vec::new(),
         body: BlockStatement {
             body,
             span: Span::ZERO,
@@ -275,6 +279,7 @@ pub fn export_default_function(
                 span: Span::ZERO,
             }),
             params,
+            param_type_annotations: Vec::new(),
             body: BlockStatement {
                 body,
                 span: Span::ZERO,
@@ -411,6 +416,7 @@ pub fn spread(argument: Expression) -> Expression {
 pub fn arrow(params: Vec<Pattern>, body: ArrowBody) -> Expression {
     Expression::Arrow(Box::new(ArrowFunctionExpression {
         params,
+        param_type_annotations: Vec::new(),
         body,
         r#async: false,
         span: Span::ZERO,

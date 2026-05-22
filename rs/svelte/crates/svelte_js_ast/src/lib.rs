@@ -249,6 +249,10 @@ impl VariableKind {
 pub struct VariableDeclarator {
     pub id: Pattern,
     pub init: Option<Expression>,
+    /// Raw TypeScript type annotation text including the leading `:`, e.g.
+    /// `": Attachment"`. Captured from OXC's `VariableDeclarator.type_annotation`
+    /// span at parse time so the printer can round-trip it.
+    pub type_annotation: Option<String>,
     pub span: Span,
 }
 
@@ -256,6 +260,10 @@ pub struct VariableDeclarator {
 pub struct FunctionDeclaration {
     pub id: Option<Identifier>,
     pub params: Vec<Pattern>,
+    /// Raw TypeScript type annotations for each param (parallel to `params`).
+    /// `None` when the param has no annotation. Empty `Vec` is also fine —
+    /// codegen treats missing entries as `None`.
+    pub param_type_annotations: Vec<Option<String>>,
     pub body: BlockStatement,
     pub generator: bool,
     pub r#async: bool,
@@ -574,6 +582,9 @@ pub struct PrivateIdentifier {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArrowFunctionExpression {
     pub params: Vec<Pattern>,
+    /// Per-param TS type annotation text including the leading `:` (e.g.
+    /// `": MouseEvent"`). Parallel to `params`. Empty = no annotations.
+    pub param_type_annotations: Vec<Option<String>>,
     pub body: ArrowBody,
     pub r#async: bool,
     pub span: Span,
@@ -589,6 +600,8 @@ pub enum ArrowBody {
 pub struct FunctionExpression {
     pub id: Option<Identifier>,
     pub params: Vec<Pattern>,
+    /// Per-param TS type annotation text — see [`FunctionDeclaration`].
+    pub param_type_annotations: Vec<Option<String>>,
     pub body: BlockStatement,
     pub generator: bool,
     pub r#async: bool,

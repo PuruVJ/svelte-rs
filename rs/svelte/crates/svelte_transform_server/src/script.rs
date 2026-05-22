@@ -249,6 +249,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                 };
                 groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(body_expr),
                     r#async: false,
                     span: Span::ZERO,
@@ -259,6 +260,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
         }
         groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: std::mem::take(current_sync),
                 span: Span::ZERO,
@@ -284,6 +286,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                 }));
                 groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(assign),
                     r#async: true,
                     span: Span::ZERO,
@@ -300,6 +303,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                 }
                 groups.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
+                    param_type_annotations: Vec::new(),
                     body: ArrowBody::Expression(arg),
                     r#async: false,
                     span: Span::ZERO,
@@ -332,6 +336,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                     span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
                 }),
                 init: None,
+                type_annotation: None,
                 span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
             })
             .collect();
@@ -508,6 +513,7 @@ fn rewrite_async_derived(e: &Expression) -> Option<Expression> {
     };
     let new_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: new_body,
         r#async: new_async,
         span: Span::ZERO,
@@ -786,6 +792,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
                                         let arrow = Expression::Arrow(Box::new(
                                             ArrowFunctionExpression {
                                                 params: Vec::new(),
+                                                param_type_annotations: Vec::new(),
                                                 body: ArrowBody::Expression(
                                                     Expression::Paren(Box::new(ParenthesizedExpression {
                                                         expression: def,
@@ -1595,6 +1602,7 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
                         new_decls.push(VariableDeclarator {
                             id: t::pat_id("tmp"),
                             init: Some(state_arg),
+                            type_annotation: None,
                             span: Span::ZERO,
                         });
                         new_decls.push(VariableDeclarator {
@@ -1603,6 +1611,7 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
                                 t::member_id(t::id("$"), "to_array"),
                                 vec![t::id("tmp"), t::lit_number(n as f64)],
                             )),
+                            type_annotation: None,
                             span: Span::ZERO,
                         });
                         for (i, slot) in elems.iter().enumerate() {
@@ -1616,6 +1625,7 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
                                         optional: false,
                                         span: Span::ZERO,
                                     }))),
+                                    type_annotation: None,
                                     span: Span::ZERO,
                                 });
                             }
@@ -1777,6 +1787,7 @@ fn rewrite_class_body(c: &mut ClassDeclaration, ctx: &mut Ctx) {
                         } else {
                             derived_call(Expression::Arrow(Box::new(ArrowFunctionExpression {
                                 params: Vec::new(),
+                                param_type_annotations: Vec::new(),
                                 body: ArrowBody::Expression(arg),
                                 r#async: false,
                                 span: Span::ZERO,
@@ -1874,6 +1885,7 @@ fn make_derived_getter(public_name: &str, private_name: &str) -> ClassMember {
         value: FunctionExpression {
             id: None,
             params: Vec::new(),
+            param_type_annotations: Vec::new(),
             body: BlockStatement { body, span: Span::ZERO },
             generator: false,
             r#async: false,
@@ -1920,6 +1932,7 @@ fn make_derived_setter(public_name: &str, private_name: &str) -> ClassMember {
                 name: "$$value".to_string(),
                 span: Span::ZERO,
             })],
+            param_type_annotations: Vec::new(),
             body: BlockStatement { body, span: Span::ZERO },
             generator: false,
             r#async: false,
@@ -2094,6 +2107,7 @@ fn wrap_derived_arrow(args: &[Argument]) -> Expression {
     let inner = first_arg_or_undefined(args);
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
+        param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(inner),
         r#async: false,
         span: Span::ZERO,
