@@ -81,6 +81,35 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
         };
     }
 
+    // 2.5. Detect reactive-statement reordering. If any `$:` statement
+    //      depends on a binding declared after it, upstream moves all
+    //      reactive statements to the end of the script block (their
+    //      Svelte 4 implicit topological reordering). We do this by
+    //      textually rewriting the source and re-parsing, so the rest
+    //      of the pipeline operates on the reordered source.
+    if let Some(new_source) = reorder_reactive_statements(source, &parsed) {
+        let new_parsed = match svelte_parse::parse(&new_source, false) {
+            Ok(r) => r,
+            Err(_) => {
+                // If reordering breaks parsing, just continue with original.
+                return run_pipeline(source, og_source, &parsed, &style_contents, &opts);
+            }
+        };
+        let leaked: &'static str = Box::leak(new_source.into_boxed_str());
+        return run_pipeline(leaked, og_source, &new_parsed, &style_contents, &opts);
+    }
+
+    run_pipeline(source, og_source, &parsed, &style_contents, &opts)
+}
+
+fn run_pipeline(
+    source: &str,
+    og_source: &str,
+    parsed: &Root,
+    style_contents: &[(usize, String)],
+    opts: &MigrateOptions,
+) -> MigrateResult {
+    let _ = og_source;
     // 3. Apply surface-level edits.
     let mut str = MagicString::new(source.to_string());
     strip_accessors_in_svelte_options(source, &mut str);
@@ -91,8 +120,12 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_svelte_component(source, &mut str, &parsed.fragment);
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
-    migrate_simple_state(source, &mut str, &parsed);
-    let derived_labeled_starts = migrate_simple_derivations(source, &mut str, &parsed);
+    // Run derivations first so we know which `$:` statements will become
+    // `let X = $derived(...)` (or `$state(LIT)`). State migration then skips
+    // bindings already consumed by the derivation pass.
+    let (derived_labeled_starts, derived_consumed_names) =
+        migrate_simple_derivations(source, &mut str, &parsed);
+    migrate_simple_state(source, &mut str, &parsed, &derived_consumed_names);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
     let slot_info = gather_slot_info(source, &parsed);
     apply_slot_template_edits(source, &mut str, &parsed, &slot_info);
@@ -104,7 +137,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
 
     // Restore the original `<style>` bodies that we blanked before parsing.
     // Apply the CSS `:has/:is/:where` `:global(...)` wrap as we go.
-    for (start, content) in &style_contents {
+    for (start, content) in style_contents.iter() {
         let end = start + STYLE_PLACEHOLDER.len();
         let migrated = migrate_css_body(content);
         str.overwrite(*start, end, &migrated);
@@ -116,6 +149,268 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
 }
 
 const STYLE_PLACEHOLDER: &str = "/*$$__STYLE_CONTENT__$$*/";
+
+// ---------------------------------------------------------------------------
+// Reactive-statement reorder pre-pass.
+//
+// Svelte 4 reordered `$:` statements topologically by their bindings. Svelte
+// 5's `$derived`/`$effect.pre` don't, so when migrating we must move any
+// `$:` whose deps are declared after it to the end of the script block.
+//
+// Upstream sets `needs_reordering = true` if ANY reactive statement has a
+// dep declared after it, and then moves ALL reactive statements (in their
+// original order) to the end of the script content.
+//
+// We implement this by rewriting the source text and returning the new
+// source so the rest of the pipeline can reparse and operate on it.
+// ---------------------------------------------------------------------------
+
+fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
+    let instance = root.instance.as_ref()?;
+    let body = &instance.content.body;
+    // Collect `$:` labeled statements with their dependency identifiers.
+    let mut labeled: Vec<(usize, usize, Vec<String>, Vec<String>)> = Vec::new();
+    for stmt in body {
+        if let Statement::Labeled(l) = stmt {
+            if l.label.name != "$" {
+                continue;
+            }
+            // Targets (LHS identifiers) for the labeled statement.
+            let mut targets: std::collections::HashSet<String> = Default::default();
+            collect_assignment_targets(&l.body, &mut targets);
+            // All identifiers referenced anywhere in the labeled body.
+            let mut all_ids: std::collections::HashSet<String> = Default::default();
+            collect_identifiers_in_statement(&l.body, &mut all_ids);
+            // Dependencies = all referenced ids minus targets and
+            // locally-declared identifiers within the body.
+            let mut locals: std::collections::HashSet<String> = Default::default();
+            collect_top_level_decl_names(&l.body, &mut locals);
+            let deps: Vec<String> = all_ids
+                .into_iter()
+                .filter(|n| !targets.contains(n) && !locals.contains(n))
+                .collect();
+            labeled.push((
+                l.span.start as usize,
+                l.span.end as usize,
+                targets.into_iter().collect(),
+                deps,
+            ));
+        }
+    }
+    if labeled.is_empty() {
+        return None;
+    }
+    // Build a map from binding name → its declaration's start byte (we use the
+    // span of `VariableDeclaration` containing the identifier). Also note
+    // `export let` and `function` declarations.
+    let mut decl_start: std::collections::HashMap<String, usize> = Default::default();
+    let mut prop_names: std::collections::HashSet<String> = Default::default();
+    for stmt in body {
+        match stmt {
+            Statement::Variable(v) => {
+                for d in &v.declarations {
+                    let mut names: std::collections::HashSet<String> = Default::default();
+                    collect_pattern_names(&d.id, &mut names);
+                    for n in names {
+                        decl_start
+                            .entry(n)
+                            .or_insert(v.span.start as usize);
+                    }
+                }
+            }
+            Statement::Function(f) => {
+                if let Some(id) = &f.id {
+                    decl_start
+                        .entry(id.name.clone())
+                        .or_insert(f.span.start as usize);
+                }
+            }
+            Statement::Class(c) => {
+                if let Some(id) = &c.id {
+                    decl_start
+                        .entry(id.name.clone())
+                        .or_insert(c.span.start as usize);
+                }
+            }
+            Statement::ExportNamed(en) => {
+                if let Some(decl) = &en.declaration {
+                    match decl {
+                        Statement::Variable(v) => {
+                            for d in &v.declarations {
+                                let mut names: std::collections::HashSet<String> = Default::default();
+                                collect_pattern_names(&d.id, &mut names);
+                                for n in names {
+                                    prop_names.insert(n.clone());
+                                    decl_start.entry(n).or_insert(en.span.start as usize);
+                                }
+                            }
+                        }
+                        Statement::Function(f) => {
+                            if let Some(id) = &f.id {
+                                decl_start
+                                    .entry(id.name.clone())
+                                    .or_insert(en.span.start as usize);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Determine `props_insertion_point` (where `let { … } = $props()` will go).
+    // For our heuristic, treat all `export let` props as if declared at the
+    // first labeled statement's position (so dependency on a prop counts as
+    // "before"). Upstream uses the actual `props_insertion_point` computed
+    // by analyze.
+    let _ = prop_names;
+    // Also register labeled statements that produce targets as the binding's
+    // declaration point. `$: mobile = …` introduces an implicit `mobile`.
+    for (s, _e, targets, _deps) in &labeled {
+        for t in targets {
+            decl_start.entry(t.clone()).or_insert(*s);
+        }
+    }
+    // Check if reordering is needed: any labeled stmt has a dep whose decl
+    // start is greater than the labeled stmt's start.
+    let needs_reorder = labeled.iter().any(|(start, _end, _targets, deps)| {
+        deps.iter().any(|dep| {
+            decl_start
+                .get(dep)
+                .map(|d| *d > *start)
+                .unwrap_or(false)
+        })
+    });
+    if !needs_reorder {
+        return None;
+    }
+    // Now textually move each labeled statement to the end of the instance
+    // script content. We compute extended ranges (line-start to line-end+\n)
+    // and reassemble the source.
+    let bytes = source.as_bytes();
+    let content_end = instance.content.span.end as usize;
+    // Compute extended start = back to line-start (only whitespace), end = forward to \n inclusive.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (s, e, _t, _d) in &labeled {
+        let mut start = *s;
+        // Walk back to line-start if only whitespace precedes on the line.
+        let mut idx = start;
+        while idx > 0 && bytes[idx - 1] != b'\n' && bytes[idx - 1] != b'\r' {
+            idx -= 1;
+            if bytes[idx] != b' ' && bytes[idx] != b'\t' {
+                idx = start;
+                break;
+            }
+        }
+        start = idx;
+        let mut end = *e;
+        // Extend end past trailing newline.
+        while end < bytes.len() && bytes[end] != b'\n' {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'\n' {
+            end += 1;
+        }
+        ranges.push((start, end));
+    }
+    // Topologically sort labeled statements: if A's body references a
+    // target produced by B, then B must come before A. We also keep the
+    // original-source order as a stable tiebreaker.
+    // Build node order via Kahn's algorithm. Original indices = 0..N.
+    let n = labeled.len();
+    let mut order: Vec<usize> = (0..n).collect();
+    // Map target name → producing labeled statement index.
+    let mut producer: std::collections::HashMap<String, usize> = Default::default();
+    for (i, (_s, _e, targets, _deps)) in labeled.iter().enumerate() {
+        for t in targets {
+            // Earliest producer wins (first to assign).
+            producer.entry(t.clone()).or_insert(i);
+        }
+    }
+    // Compute incoming edges count and adjacency.
+    let mut indeg: Vec<usize> = vec![0; n];
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, (_s, _e, _targets, deps)) in labeled.iter().enumerate() {
+        for d in deps {
+            if let Some(&p) = producer.get(d) {
+                if p != i {
+                    adj[p].push(i);
+                    indeg[i] += 1;
+                }
+            }
+        }
+    }
+    // Stable Kahn — pick the lowest-original-index node with indeg=0.
+    let mut sorted: Vec<usize> = Vec::with_capacity(n);
+    let mut available: std::collections::BTreeSet<usize> =
+        (0..n).filter(|i| indeg[*i] == 0).collect();
+    while let Some(&i) = available.iter().next() {
+        available.remove(&i);
+        sorted.push(i);
+        // Take adj snapshot to avoid borrow issues.
+        let neighbors: Vec<usize> = adj[i].clone();
+        for j in neighbors {
+            indeg[j] -= 1;
+            if indeg[j] == 0 {
+                available.insert(j);
+            }
+        }
+    }
+    // If cycle detected, fall back to original order for remaining nodes.
+    if sorted.len() != n {
+        for i in 0..n {
+            if !sorted.contains(&i) {
+                sorted.push(i);
+            }
+        }
+    }
+    order = sorted;
+    // Reorder ranges according to topo order.
+    let original_ranges = ranges.clone();
+    ranges = order
+        .iter()
+        .map(|&i| original_ranges[i])
+        .collect();
+    // For removal we want them in source order though.
+    let mut removal_ranges = original_ranges.clone();
+    removal_ranges.sort_by_key(|r| r.0);
+    // Build moved string in topo (target) order. The removal step uses
+    // source-order ranges (so we strip each region exactly once).
+    let mut moved = String::new();
+    for (rs, re) in &ranges {
+        moved.push_str(&source[*rs..*re]);
+    }
+    // Reset and build cleanly: <script>...body with ranges removed...moved chunks...</script>
+    let mut out = String::with_capacity(source.len());
+    let mut script_body = String::new();
+    let mut cur = instance.content.span.start as usize;
+    // Prepend everything before script content.
+    out.push_str(&source[..cur]);
+    for (rs, re) in &removal_ranges {
+        if *rs >= content_end {
+            continue;
+        }
+        if cur < *rs {
+            script_body.push_str(&source[cur..*rs]);
+        }
+        cur = (*re).min(content_end);
+    }
+    if cur < content_end {
+        script_body.push_str(&source[cur..content_end]);
+    }
+    out.push_str(&script_body);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&moved);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&source[content_end..]);
+    let _ = order;
+    Some(out)
+}
 
 /// Replace each `<style …>BODY</style>` body with a fixed-length placeholder.
 /// Returns the modified source and a list of `(placeholder_start_offset,
@@ -507,6 +802,69 @@ fn collect_identifiers_in_expr(expr: &Expression, out: &mut std::collections::Ha
                 collect_identifiers_in_statement(s, out);
             }
         }
+        Expression::Object(obj) => {
+            for m in &obj.properties {
+                match m {
+                    svelte_js_ast::ObjectMember::Property(p) => {
+                        if p.computed {
+                            if let svelte_js_ast::PropertyKey::Expression(e) = &p.key {
+                                collect_identifiers_in_expr(e, out);
+                            }
+                        }
+                        collect_identifiers_in_expr(&p.value, out);
+                    }
+                    svelte_js_ast::ObjectMember::Spread(sp) => {
+                        collect_identifiers_in_expr(&sp.argument, out);
+                    }
+                }
+            }
+        }
+        Expression::Array(arr) => {
+            for el in &arr.elements {
+                match el {
+                    svelte_js_ast::ArrayElement::Expression(e) => {
+                        collect_identifiers_in_expr(e, out)
+                    }
+                    svelte_js_ast::ArrayElement::Spread(sp) => {
+                        collect_identifiers_in_expr(&sp.argument, out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Expression::Conditional(c) => {
+            collect_identifiers_in_expr(&c.test, out);
+            collect_identifiers_in_expr(&c.consequent, out);
+            collect_identifiers_in_expr(&c.alternate, out);
+        }
+        Expression::Unary(u) => collect_identifiers_in_expr(&u.argument, out),
+        Expression::Update(u) => collect_identifiers_in_expr(&u.argument, out),
+        Expression::New(n) => {
+            collect_identifiers_in_expr(&n.callee, out);
+            for arg in &n.arguments {
+                if let svelte_js_ast::Argument::Expression(e) = arg {
+                    collect_identifiers_in_expr(e, out);
+                }
+            }
+        }
+        Expression::Sequence(s) => {
+            for e in &s.expressions {
+                collect_identifiers_in_expr(e, out);
+            }
+        }
+        Expression::Template(t) => {
+            for e in &t.expressions {
+                collect_identifiers_in_expr(e, out);
+            }
+        }
+        Expression::Tagged(tg) => {
+            collect_identifiers_in_expr(&tg.tag, out);
+            for e in &tg.quasi.expressions {
+                collect_identifiers_in_expr(e, out);
+            }
+        }
+        Expression::Spread(s) => collect_identifiers_in_expr(&s.argument, out),
+        Expression::Paren(p) => collect_identifiers_in_expr(&p.expression, out),
         _ => {}
     }
 }
@@ -2996,36 +3354,39 @@ fn guess_indent(source: &str, instance: &svelte_ast::root::Script) -> String {
     let s = instance.content.span.start as usize;
     let e = instance.content.span.end as usize;
     let body = &source[s.min(source.len())..e.min(source.len())];
-    for line in body.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let lead: String = line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
-        if !lead.is_empty() {
-            return lead;
-        }
-    }
-    guess_indent_from_source(source)
+    guess_indent_for_text(body)
 }
 
 /// Like `guess_indent` but scans the entire source.
 fn guess_indent_from_source(source: &str) -> String {
-    for line in source.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let lead: String = line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
-        if !lead.is_empty() {
-            return lead;
+    guess_indent_for_text(source)
+}
+
+/// Mirror upstream `guess_indent`: count tab-indented vs space-indented lines.
+/// If tabs >= spaces, use a tab. Otherwise compute the minimum leading spaces.
+fn guess_indent_for_text(text: &str) -> String {
+    let mut tabbed = 0usize;
+    let mut spaced = 0usize;
+    let mut min_spaces: usize = usize::MAX;
+    for line in text.split('\n') {
+        let bytes = line.as_bytes();
+        if bytes.first().copied() == Some(b'\t') {
+            tabbed += 1;
+        } else if bytes.len() >= 2 && bytes[0] == b' ' && bytes[1] == b' ' {
+            spaced += 1;
+            let count = bytes.iter().take_while(|c| **c == b' ').count();
+            if count < min_spaces {
+                min_spaces = count;
+            }
         }
     }
-    "\t".to_string()
+    if tabbed == 0 && spaced == 0 {
+        return "\t".to_string();
+    }
+    if tabbed >= spaced {
+        return "\t".to_string();
+    }
+    " ".repeat(min_spaces)
 }
 
 // ---------------------------------------------------------------------------
@@ -3990,27 +4351,13 @@ fn migrate_effects(
     // instance script content.
     let insertion_point = instance.content.span.start as usize;
     // Mirror upstream's indent: `\n${indent}${import}` appended right at
-    // content start. We get the indent from the first non-empty line.
-    let first_line_start = {
-        let mut p = insertion_point;
-        while p < bytes.len() && bytes[p] == b'\n' {
-            p += 1;
-        }
-        let mut s = p;
-        while s < bytes.len() && bytes[s].is_ascii_whitespace() && bytes[s] != b'\n' {
-            s += 1;
-        }
-        if s > p {
-            &source[p..s]
-        } else {
-            "\t"
-        }
-    };
+    // content start. Use the majority-based `guess_indent` over script body.
+    let indent = guess_indent(source, instance);
     str.append_right(
         insertion_point,
         format!(
             "\n{}import {{ run }} from 'svelte/legacy';\n",
-            first_line_start
+            indent
         ),
     );
 }
@@ -4181,10 +4528,14 @@ fn migrate_simple_derivations(
     source: &str,
     str: &mut MagicString,
     root: &Root,
-) -> std::collections::HashSet<usize> {
+) -> (
+    std::collections::HashSet<usize>,
+    std::collections::HashSet<String>,
+) {
     let mut consumed: std::collections::HashSet<usize> = Default::default();
+    let mut consumed_names: std::collections::HashSet<String> = Default::default();
     let Some(instance) = &root.instance else {
-        return consumed;
+        return (consumed, consumed_names);
     };
     let body = &instance.content.body;
 
@@ -4257,24 +4608,35 @@ fn migrate_simple_derivations(
     for stmt in body {
         if let Statement::Labeled(l) = stmt {
             if l.label.name == "$" {
-                if let Statement::Expression(es) = &l.body {
-                    if let Expression::Assignment(asn) = &es.expression {
-                        match &asn.left {
-                            svelte_js_ast::AssignmentTarget::Expression(
-                                Expression::Identifier(id),
-                            ) => {
-                                *dollar_assigns.entry(id.name.clone()).or_insert(0) += 1;
+                // Pull the AssignmentExpression from either an
+                // ExpressionStatement body or a single-stmt BlockStatement.
+                let asn_opt: Option<&svelte_js_ast::AssignmentExpression> = match &l.body {
+                    Statement::Expression(es) => match &es.expression {
+                        Expression::Assignment(a) => Some(a),
+                        _ => None,
+                    },
+                    Statement::Block(b) if b.body.len() == 1 => {
+                        if let Statement::Expression(es) = &b.body[0] {
+                            if let Expression::Assignment(a) = &es.expression {
+                                Some(a)
+                            } else {
+                                None
                             }
-                            svelte_js_ast::AssignmentTarget::Pattern(p) => {
-                                let mut names = std::collections::HashSet::new();
-                                collect_pattern_names(p, &mut names);
-                                for n in names {
-                                    *dollar_assigns.entry(n).or_insert(0) += 1;
-                                }
-                            }
-                            _ => {}
+                        } else {
+                            None
                         }
                     }
+                    _ => None,
+                };
+                if let Some(asn) = asn_opt {
+                    // Count ALL assignment targets within the labeled body
+                    // (for blocks, this is just the single assignment).
+                    let mut targets = std::collections::HashSet::new();
+                    collect_assignment_targets(&l.body, &mut targets);
+                    for n in targets {
+                        *dollar_assigns.entry(n).or_insert(0) += 1;
+                    }
+                    let _ = asn;
                 }
             }
         }
@@ -4287,20 +4649,38 @@ fn migrate_simple_derivations(
         if l.label.name != "$" {
             continue;
         }
-        let Statement::Expression(es) = &l.body else {
-            continue;
-        };
-        // Unwrap parens: `$: ({x} = …);` parses with Paren around AssignmentExpression.
-        let inner = match &es.expression {
-            Expression::Paren(p) => &p.expression,
-            other => other,
-        };
-        let Expression::Assignment(asn) = inner else {
-            continue;
+        // Find the AssignmentExpression. Either:
+        // (a) Body is ExpressionStatement(Assignment) — `$: x = expr`
+        // (b) Body is BlockStatement([ExpressionStatement(Assignment)]) —
+        //     `$: { x = expr; }`
+        let asn: &svelte_js_ast::AssignmentExpression = {
+            let inner_expr = match &l.body {
+                Statement::Expression(es) => match &es.expression {
+                    Expression::Paren(p) => &p.expression,
+                    other => other,
+                },
+                Statement::Block(b) if b.body.len() == 1 => {
+                    if let Statement::Expression(es) = &b.body[0] {
+                        match &es.expression {
+                            Expression::Paren(p) => &p.expression,
+                            other => other,
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                _ => continue,
+            };
+            if let Expression::Assignment(a) = inner_expr {
+                a
+            } else {
+                continue;
+            }
         };
         if asn.operator != svelte_js_ast::AssignmentOperator::Assign {
             continue;
         }
+        let is_block_body = matches!(&l.body, Statement::Block(_));
         // Identify target style.
         let (target_text, target_names): (String, Vec<String>) = match &asn.left {
             svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) => {
@@ -4329,11 +4709,23 @@ fn migrate_simple_derivations(
             }
             _ => continue,
         };
+        // Get RHS bounds.
+        let (rs, re) = expr_span(&asn.right);
+        let rhs_text = &source[rs as usize..re as usize];
+
+        // Determine if RHS has any identifier dependencies. If not (e.g.,
+        // `$: x = 42`), upstream treats this as `$state(...)` rather than
+        // `$derived(...)`. The state path also bypasses the outside_assigns
+        // check (because the binding can still be updated elsewhere).
+        let mut rhs_ids: std::collections::HashSet<String> = Default::default();
+        collect_identifiers_in_expr(&asn.right, &mut rhs_ids);
+        let should_be_state = rhs_ids.is_empty();
+
         // Skip if any target has outside assignment (state-like) or multiple
-        // `$:` assignments.
+        // `$:` assignments — UNLESS we're going down the state path.
         let mut skip = false;
         for n in &target_names {
-            if outside_assigns.get(n).copied().unwrap_or(0) > 0 {
+            if !should_be_state && outside_assigns.get(n).copied().unwrap_or(0) > 0 {
                 skip = true;
                 break;
             }
@@ -4346,12 +4738,9 @@ fn migrate_simple_derivations(
             continue;
         }
         // Also skip if any name clashes with a rune.
-        if target_names.iter().any(|n| n == "derived") {
+        if target_names.iter().any(|n| n == "derived" || n == "state") {
             continue;
         }
-        // Get RHS bounds.
-        let (rs, re) = expr_span(&asn.right);
-        let rhs_text = &source[rs as usize..re as usize];
 
         // Build the replacement for the labeled statement: `let TARGET = $derived(RHS)`
         let l_start = l.span.start as usize;
@@ -4403,19 +4792,36 @@ fn migrate_simple_derivations(
             continue;
         }
 
+        let rune = if should_be_state { "$state" } else { "$derived" };
         if let Some(id_end) = preceding_let_id_end {
-            // Upstream approach: append ` = $derived(RHS)` after the `let X`
-            // identifier and remove the labeled statement entirely. Keeps
-            // visual whitespace where `$:` used to be (the indent stays put,
-            // we only strip from `$` to end-of-statement so the blank line
-            // is `\t\n` not `\n`).
-            str.append_left(id_end, format!(" = $derived({})", rhs_text));
+            // Append ` = $derived(RHS)` (or `$state(RHS)`) after the `let X`
+            // identifier and remove the labeled statement entirely. This
+            // leaves the leading `\t` of the original `$:` line behind, which
+            // matches upstream output (the blank line with trailing tab).
+            str.append_left(id_end, format!(" = {}({})", rune, rhs_text));
+            str.remove(l_start, l_end);
+        } else if should_be_state {
+            // No preceding let, state path — upstream prepends
+            // `let X = $state(LIT);\n${indent}` before the labeled stmt and
+            // then removes the labeled stmt entirely, leaving the leading
+            // `\t` behind.
+            let indent = {
+                let mut p = l_start;
+                while p > 0 && bytes[p - 1] != b'\n' {
+                    p -= 1;
+                }
+                source[p..l_start].to_string()
+            };
+            str.prepend_left(
+                l_start,
+                format!("let {} = $state({});\n{}", target_clean, rhs_text, indent),
+            );
             str.remove(l_start, l_end);
         } else {
-            // No preceding let → replace the labeled statement with a fresh
-            // `let TARGET = $derived(RHS);` (preserving the trailing `;` if
-            // present).
-            let replacement = format!("let {} = $derived({})", target_clean, rhs_text);
+            // No preceding let, derived path — upstream replaces the labeled
+            // statement in place: `$: x = expr;` → `let x = $derived(expr);`.
+            // Preserves the line indent without leaving a blank line.
+            let replacement = format!("let {} = {}({})", target_clean, rune, rhs_text);
             let final_replacement = if bytes.get(l_end.saturating_sub(1)).copied() == Some(b';') {
                 format!("{};", replacement)
             } else {
@@ -4423,10 +4829,14 @@ fn migrate_simple_derivations(
             };
             str.update(l_start, l_end, &final_replacement);
         }
+        let _ = is_block_body;
         consumed.insert(l_start);
+        for n in &target_names {
+            consumed_names.insert(n.clone());
+        }
     }
     let _ = str;
-    consumed
+    (consumed, consumed_names)
 }
 
 // ---------------------------------------------------------------------------
@@ -4434,7 +4844,12 @@ fn migrate_simple_derivations(
 // reassigned somewhere → wrap with `$state(...)`.
 // ---------------------------------------------------------------------------
 
-fn migrate_simple_state(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_simple_state(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    derived_consumed_names: &std::collections::HashSet<String>,
+) {
     let Some(instance) = &root.instance else {
         return;
     };
@@ -4472,18 +4887,43 @@ fn migrate_simple_state(source: &str, str: &mut MagicString, root: &Root) {
     for stmt in &instance.content.body {
         if let Statement::Labeled(l) = stmt {
             if l.label.name == "$" {
-                if let Statement::Expression(es) = &l.body {
-                    if let Expression::Assignment(asn) = &es.expression {
-                        let mut local: std::collections::HashSet<String> = Default::default();
-                        if let svelte_js_ast::AssignmentTarget::Expression(
-                            Expression::Identifier(id),
-                        ) = &asn.left
-                        {
-                            local.insert(id.name.clone());
+                let asn_opt: Option<&svelte_js_ast::AssignmentExpression> = match &l.body {
+                    Statement::Expression(es) => match &es.expression {
+                        Expression::Assignment(a) => Some(a),
+                        _ => None,
+                    },
+                    Statement::Block(b) if b.body.len() == 1 => {
+                        if let Statement::Expression(es) = &b.body[0] {
+                            if let Expression::Assignment(a) = &es.expression {
+                                Some(a)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
                         }
-                        if let svelte_js_ast::AssignmentTarget::Pattern(p) = &asn.left {
-                            collect_pattern_names(p, &mut local);
-                        }
+                    }
+                    _ => None,
+                };
+                if let Some(asn) = asn_opt {
+                    let mut local: std::collections::HashSet<String> = Default::default();
+                    if let svelte_js_ast::AssignmentTarget::Expression(
+                        Expression::Identifier(id),
+                    ) = &asn.left
+                    {
+                        local.insert(id.name.clone());
+                    }
+                    if let svelte_js_ast::AssignmentTarget::Pattern(p) = &asn.left {
+                        collect_pattern_names(p, &mut local);
+                    }
+                    // We don't yet know whether the derivation pass will
+                    // consume this `$:`; that's a separate signal passed in
+                    // via `derived_consumed_names`. Only the original
+                    // ExpressionStatement-derived case is unconditionally
+                    // skipped here (matching legacy behavior).
+                    let asn_is_expr_stmt = matches!(&l.body, Statement::Expression(_));
+                    let _ = asn;
+                    if asn_is_expr_stmt {
                         for n in local {
                             if !decl_with_init.contains(&n) {
                                 derived_targets.insert(n);
@@ -4573,6 +5013,9 @@ fn migrate_simple_state(source: &str, str: &mut MagicString, root: &Root) {
                     continue;
                 }
                 if derived_targets.contains(&id.name) {
+                    continue;
+                }
+                if derived_consumed_names.contains(&id.name) {
                     continue;
                 }
                 if !reassigned.contains(&id.name) {
