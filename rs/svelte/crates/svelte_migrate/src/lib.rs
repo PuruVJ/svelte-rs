@@ -3867,11 +3867,91 @@ fn migrate_simple_props(
         return;
     };
 
-    // Bail if there's a `$$Props` type alias / interface in the script (we
-    // can't synthesize the interface yet).
-    if source_uses_dollar_dollar(source, "$$Props") {
-        return;
+    // If there's a `$$Props` type alias / interface, capture its body for
+    // the new Props typedef, then remove the original declaration. Also
+    // rename other `$$Props` references (like `$$Props['foo']`) to `Props`.
+    let has_dollar_props_type = source_uses_dollar_dollar(source, "$$Props");
+    let mut dollar_props_body: Option<String> = None;
+    let mut dollar_props_is_type_alias = false;
+    let mut dollar_props_span: Option<(usize, usize)> = None;
+    if has_dollar_props_type {
+        // Find `interface $$Props {…}` or `type $$Props = {…}` declaration.
+        let needle_iface = "interface $$Props";
+        let needle_type = "type $$Props";
+        let bytes_local = source.as_bytes();
+        let mut decl_start: Option<usize> = None;
+        let mut is_type_alias = false;
+        if let Some(pos) = source.find(needle_iface) {
+            decl_start = Some(pos);
+        } else if let Some(pos) = source.find(needle_type) {
+            decl_start = Some(pos);
+            is_type_alias = true;
+        }
+        if let Some(ds) = decl_start {
+            // Find the opening `{` and matching closing `}`.
+            let mut p = ds;
+            while p < bytes_local.len() && bytes_local[p] != b'{' {
+                p += 1;
+            }
+            if p < bytes_local.len() {
+                let body_start = p + 1;
+                let mut depth = 1i32;
+                let mut q = body_start;
+                while q < bytes_local.len() && depth > 0 {
+                    match bytes_local[q] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    q += 1;
+                }
+                if depth == 0 && q < bytes_local.len() {
+                    let body_end = q; // position of closing `}`
+                    let body = source[body_start..body_end].to_string();
+                    // Walk decl end: for `interface`, end is just past `}`.
+                    // For `type X = {...}`, there's a trailing `;` (optional).
+                    let mut decl_end = body_end + 1;
+                    if is_type_alias {
+                        while decl_end < bytes_local.len() && bytes_local[decl_end] == b';' {
+                            decl_end += 1;
+                        }
+                    }
+                    dollar_props_body = Some(body);
+                    dollar_props_is_type_alias = is_type_alias;
+                    dollar_props_span = Some((ds, decl_end));
+                    // Remove the entire declaration.
+                    str.remove(ds, decl_end);
+                }
+            }
+        }
+        // Rename remaining `$$Props` references to `Props` (e.g.
+        // `$$Props['foo']` in declarator type annotations).
+        let needle = b"$$Props";
+        let n = needle.len();
+        let mut i = 0;
+        while i + n <= bytes_local.len() {
+            let after_ok = i + n >= bytes_local.len()
+                || !(bytes_local[i + n].is_ascii_alphanumeric() || bytes_local[i + n] == b'_');
+            let before_ok = i == 0
+                || !(bytes_local[i - 1].is_ascii_alphanumeric() || bytes_local[i - 1] == b'_');
+            if &bytes_local[i..i + n] == needle && before_ok && after_ok {
+                // Skip if inside the removed declaration.
+                let inside_decl = dollar_props_span
+                    .map(|(s, e)| i >= s && i < e)
+                    .unwrap_or(false);
+                if !inside_decl {
+                    str.update(i, i + n, "Props");
+                }
+                i += n;
+            } else {
+                i += 1;
+            }
+        }
     }
+    let _ = dollar_props_is_type_alias;
     // Bail if uses_props ($$props). We'd need the rest-spread form which
     // isn't fully implemented yet, but we *can* handle a simple "no exports
     // but uses $$props" case → `let { ...props } = $props();`. Skip for now.
@@ -4192,8 +4272,52 @@ fn migrate_simple_props(
     let indent_str = guess_indent(source, instance);
     let indent = indent_str.as_str();
     let newline_sep = format!("\n{}{}", indent, indent);
-    // Total prop count including slots.
-    let total_props = props.len() + slots.props.len() + if uses_rest { 1 } else { 0 };
+    // Total prop count including slots and `$$Props`-only type_only members.
+    let dollar_props_type_only_count = dollar_props_body
+        .as_ref()
+        .map(|body| {
+            // Count `\b{name}\s*[?:]` occurrences NOT in props or slots.
+            let mut count = 0usize;
+            // Simple heuristic: count number of `;` outside string/template
+            // literals in the body. Each member ends with `;`.
+            let mut depth_paren = 0i32;
+            let mut depth_brace = 0i32;
+            let mut depth_bracket = 0i32;
+            let mut depth_angle = 0i32;
+            let mut in_str: Option<u8> = None;
+            for b in body.bytes() {
+                if let Some(quote) = in_str {
+                    if b == quote {
+                        in_str = None;
+                    }
+                    continue;
+                }
+                match b {
+                    b'\'' | b'"' | b'`' => in_str = Some(b),
+                    b'(' => depth_paren += 1,
+                    b')' => depth_paren -= 1,
+                    b'{' => depth_brace += 1,
+                    b'}' => depth_brace -= 1,
+                    b'[' => depth_bracket += 1,
+                    b']' => depth_bracket -= 1,
+                    b'<' => depth_angle += 1,
+                    b'>' => depth_angle -= 1,
+                    b';' if depth_paren == 0 && depth_brace == 0 && depth_bracket == 0 && depth_angle == 0 => {
+                        count += 1;
+                    }
+                    _ => {}
+                }
+            }
+            count.saturating_sub(
+                props.iter().filter(|p| body.contains(&p.local)).count()
+                    + slots.props.iter().filter(|s| body.contains(&s.name)).count(),
+            )
+        })
+        .unwrap_or(0);
+    let total_props = props.len()
+        + slots.props.len()
+        + if uses_rest { 1 } else { 0 }
+        + dollar_props_type_only_count;
     let many_props = total_props > 3;
     let prop_sep = if many_props { newline_sep.as_str() } else { " " };
 
@@ -4300,10 +4424,82 @@ fn migrate_simple_props(
         || all_props_are_slots
         || has_any_ts_type
         || (uses_ts && uses_rest)
-        || (uses_props && !slots.props.is_empty());
+        || (uses_props && !slots.props.is_empty())
+        || has_dollar_props_type;
 
     // Build the Props typedef/interface block.
-    let typedef_block: Option<String> = if need_props_type {
+    let typedef_block: Option<String> = if has_dollar_props_type {
+        // Reuse the body of the original `interface $$Props { ... }` /
+        // `type $$Props = { ... }`. Emit as `interface Props { <body> }`.
+        // Also merge in new prop entries (export let / slots) that aren't
+        // already in the body.
+        let body = dollar_props_body.clone().unwrap_or_default();
+        let mut merged_body = body.clone();
+        // Trim trailing newline/whitespace before the closing `}` so we can
+        // append entries cleanly.
+        let mut suffix = String::new();
+        while let Some(c) = merged_body.chars().last() {
+            if c == ' ' || c == '\t' || c == '\n' {
+                suffix.insert(0, c);
+                merged_body.pop();
+            } else {
+                break;
+            }
+        }
+        fn body_has_member_fn(body: &str, name: &str) -> bool {
+            let mut pos = 0;
+            while let Some(rel) = body[pos..].find(name) {
+                let abs = pos + rel;
+                let before_ok = abs == 0
+                    || !(body.as_bytes()[abs - 1].is_ascii_alphanumeric()
+                        || body.as_bytes()[abs - 1] == b'_');
+                let mut k = abs + name.len();
+                while k < body.len()
+                    && (body.as_bytes()[k] == b' '
+                        || body.as_bytes()[k] == b'\t')
+                {
+                    k += 1;
+                }
+                let after_ok = k < body.len()
+                    && (body.as_bytes()[k] == b'?' || body.as_bytes()[k] == b':');
+                if before_ok && after_ok {
+                    return true;
+                }
+                pos = abs + name.len();
+            }
+            false
+        }
+        // Append `\n{indent}{indent}{name}?: {type};` for each new prop.
+        for p in &props {
+            if body_has_member_fn(&merged_body, &p.local) {
+                continue;
+            }
+            let init_text: Option<String> = p
+                .init
+                .map(|(s, e)| source[s as usize..e as usize].to_string());
+            let ty = p
+                .ts_type
+                .clone()
+                .or_else(|| p.jsdoc_type.clone())
+                .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
+            let optional = init_text.is_some();
+            let opt = if optional { "?" } else { "" };
+            merged_body.push_str(&format!("\n{}{}{}{}: {};", indent, indent, p.local, opt, ty));
+        }
+        for sp in &slots.props {
+            if body_has_member_fn(&merged_body, &sp.name) {
+                continue;
+            }
+            let ty = if sp.has_props {
+                "import('svelte').Snippet<[any]>"
+            } else {
+                "import('svelte').Snippet"
+            };
+            merged_body.push_str(&format!("\n{}{}{}?: {};", indent, indent, sp.name, ty));
+        }
+        merged_body.push_str(&suffix);
+        Some(format!("interface Props {{{}}}", merged_body))
+    } else if need_props_type {
         if uses_ts {
             let mut s = format!("interface Props {{");
             let inner_sep = newline_sep.as_str();
@@ -4371,12 +4567,48 @@ fn migrate_simple_props(
         None
     };
 
+    // Detect `<svelte:options accessors ...>` (presence of the `accessors`
+    // word inside any svelte:options tag).
+    let has_accessors_option = {
+        let bytes = source.as_bytes();
+        let needle = b"<svelte:options";
+        let mut i = 0usize;
+        let mut found = false;
+        while i + needle.len() < bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let mut j = i + needle.len();
+                while j < bytes.len() && bytes[j] != b'>' {
+                    j += 1;
+                }
+                let span = &source[i + needle.len()..j];
+                if find_word(span, "accessors").is_some() {
+                    found = true;
+                    break;
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        found
+    };
+
     // Build the final block that replaces the FIRST export node.
     let final_block = if let Some(td) = &typedef_block {
         if uses_ts {
             // `interface Props {…}\n\n\tlet { … }: Props = $props();`
             let decl_with_ann = props_decl.replace(" = $props();", ": Props = $props();");
-            format!("{}\n\n{}{}", td, indent, decl_with_ann)
+            let mut block = format!("{}\n\n{}{}", td, indent, decl_with_ann);
+            if has_accessors_option && !props.is_empty() {
+                // Build `\n\n\texport {\n\t\t<name>,\n...\n\t}` block.
+                let mut e = format!("\n\n{}export {{", indent);
+                for p in &props {
+                    e.push_str(&format!("\n{}{}{},", indent, indent, p.local));
+                }
+                e.push_str(&format!("\n{}}}", indent));
+                block.push_str(&e);
+            }
+            block
         } else {
             let intersection = if uses_props || uses_rest {
                 if props.is_empty() && slots.props.is_empty() {
@@ -4391,7 +4623,6 @@ fn migrate_simple_props(
             format!("{}\n\n{}{}\n{}{}", td, indent, ann, indent, props_decl)
         }
     } else if uses_ts {
-        // No type block but TS — leave decl alone.
         props_decl.clone()
     } else {
         props_decl.clone()
