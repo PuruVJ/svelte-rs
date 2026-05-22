@@ -2290,10 +2290,17 @@ fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragm
             if let ElementAttribute::Attribute(attr) = a {
                 if attr.name == "slot" {
                     if let Some(name) = attribute_static_string(&attr.value) {
-                        let invalid_id = !is_valid_identifier_strict(&name);
+                        // Upstream renames `default` to `children` before
+                        // checking validity, so `slot="default"` is OK.
+                        let checked_name = if name == "default" {
+                            "children".to_string()
+                        } else {
+                            name.clone()
+                        };
+                        let invalid_id = !is_valid_identifier_strict(&checked_name);
                         let shadows_parent_prop = !invalid_id
                             && parent_attrs.iter().any(|pa| match pa {
-                                ElementAttribute::Attribute(a) => a.name == name,
+                                ElementAttribute::Attribute(a) => a.name == checked_name,
                                 _ => false,
                             });
                         let reason = if invalid_id {
@@ -3000,11 +3007,13 @@ fn apply_component_let_directive_wrap(
     }
     // Insert the closing snippet tag.
     // If there are named slots after default content (inner_end < last node),
-    // upstream uses just `{/snippet}\n{indent}` (without trailing dedent).
-    // Otherwise it includes the outer indent for the closing tag.
+    // upstream uses `{/snippet}\n{inner_indent}` (the indent so the next
+    // line — a named-slot `{#snippet}` — lands at the right level).
+    // Otherwise (no named slots after), the close uses `inner_indent` for
+    // itself + `outer_indent` for the trailing whitespace.
     let last_end = node_end(&c_frag.nodes[c_frag.nodes.len() - 1]);
     if inner_end < last_end {
-        str.prepend_left(inner_end, format!("{{/snippet}}\n{}", outer_indent));
+        str.prepend_left(inner_end, format!("{{/snippet}}\n{}", inner_indent));
     } else {
         str.prepend_left(
             inner_end,
@@ -3245,6 +3254,12 @@ fn apply_migrate_slot_usage(
         for (s, e) in &let_attrs {
             str.remove(*s, *e);
         }
+        // For `slot="default"` (→ children) on a non-svelte-fragment with no
+        // let directives, there's nothing more to do — just remove the
+        // attribute, no wrap. Upstream returns early in this case.
+        if snippet_name == "children" && !is_svelte_fragment && let_pairs.is_empty() {
+            continue;
+        }
 
         let props_text = if let_pairs.is_empty() {
             String::new()
@@ -3290,16 +3305,43 @@ fn apply_migrate_slot_usage(
         // examining a child of `frag` is `path.length - 1` (path was
         // [outer1, ..., outerN, frag]). So path.length - 2 = depth - 1.
         let outer_indent = indent.repeat(depth.saturating_sub(1));
+        let inner_indent = indent.repeat(depth);
         if std::env::var("MIGRATE_DEBUG_SLOT_WRAP").is_ok() {
             eprintln!("wrap depth={} c_start={} c_end={} name={}", depth, c_start, c_end, snippet_name);
         }
+        // For svelte:fragment with INLINE content (content doesn't begin
+        // with `\n`), we need an extra indent level on the prepend trailing
+        // indent so the content lands at col(inner_indent). For multi-line
+        // content (begins with `\n`), use outer_indent (the indent loop
+        // adds per-line indent itself).
+        let content_is_inline = if is_svelte_fragment {
+            if let Some(f) = c_frag {
+                if let Some(first) = f.nodes.first() {
+                    let inner_start = node_start(first);
+                    let b = source.as_bytes().get(inner_start).copied().unwrap_or(0);
+                    b != b'\n' && b != b'\r'
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let header_trail = if content_is_inline {
+            inner_indent.clone()
+        } else {
+            outer_indent.clone()
+        };
         str.prepend_left(
             c_start,
             format!(
                 "{{#snippet {}({})}}\n{}",
-                snippet_name, props_text, outer_indent
+                snippet_name, props_text, header_trail
             ),
         );
+        let _ = inner_indent;
         let close_str = format!("\n{}{{/snippet}}", outer_indent);
         // Append after the closing tag — for SlotElement, append RIGHT (after
         // any other rewrites that target node.end).
