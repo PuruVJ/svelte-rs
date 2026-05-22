@@ -93,7 +93,9 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_simple_state(source, &mut str, &parsed);
     let derived_labeled_starts = migrate_simple_derivations(source, &mut str, &parsed);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
-    migrate_simple_props(source, &mut str, &parsed);
+    let slot_info = gather_slot_info(source, &parsed);
+    apply_slot_template_edits(source, &mut str, &parsed, &slot_info);
+    migrate_simple_props(source, &mut str, &parsed, &slot_info, opts.use_ts);
     migrate_export_specifier_props(source, &mut str, &parsed);
     migrate_effects(source, &mut str, &parsed, &derived_labeled_starts);
     migrate_comments(source, &mut str, &parsed);
@@ -1776,6 +1778,674 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
 }
 
 // ---------------------------------------------------------------------------
+// Slot migration support: scan the template for `<slot>` / `<slot name="X">`
+// usages and `$$slots.X` references. Produces a `SlotInfo` consumed by
+// `migrate_simple_props` to extend the generated Props block, and by
+// `apply_slot_template_edits` to rewrite the template markup.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct SlotProp {
+    /// The local/exported name (after `default` → `children` mapping).
+    pub name: String,
+    /// `true` if the slot is rendered with a non-empty `slot_props` object.
+    pub has_props: bool,
+    /// Set when the slot was first discovered via a `$$slots.X` reference and
+    /// can still be refined by a later `<slot>` element visit.
+    pub needs_refine: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SlotInfo {
+    /// Slot props (in insertion order). For simple cases, the only entry is
+    /// `children`.
+    pub props: Vec<SlotProp>,
+    /// Whether the template uses `$$slots.X` references.
+    pub uses_dollar_slots: bool,
+}
+
+fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
+    let mut info = SlotInfo::default();
+    // Bail entirely if it's a custom element — slots stay as-is.
+    if is_custom_element(root) {
+        return info;
+    }
+
+    // Gather slot-related events in source order.
+    enum Event {
+        Slot {
+            start: usize,
+            name: String,
+            has_props: bool,
+        },
+        DollarSlots {
+            start: usize,
+            name: String,
+        },
+    }
+    let mut events: Vec<Event> = Vec::new();
+
+    walk_with_parent(&root.fragment, None, &mut |child, _parent| {
+        let FragmentChild::SlotElement(slot) = child else {
+            return;
+        };
+        let mut slot_name = String::from("default");
+        let mut has_props = false;
+        for a in &slot.attributes {
+            if let ElementAttribute::Attribute(attr) = a {
+                if attr.name == "name" {
+                    if let Some(name) = attribute_static_string(&attr.value) {
+                        slot_name = name;
+                    }
+                } else if attr.name != "slot" {
+                    has_props = true;
+                }
+            } else if matches!(a, ElementAttribute::SpreadAttribute(_)) {
+                has_props = true;
+            }
+        }
+        events.push(Event::Slot {
+            start: slot.start as usize,
+            name: slot_name,
+            has_props,
+        });
+    });
+
+    // Textual scan for `$$slots.X` / `$$slots['X']`.
+    let bytes = source.as_bytes();
+    let needle = b"$$slots";
+    let n = needle.len();
+    let mut i = 0;
+    while i + n <= bytes.len() {
+        if &bytes[i..i + n] == needle {
+            info.uses_dollar_slots = true;
+            let mut k = i + n;
+            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                k += 1;
+            }
+            let name_opt: Option<String> = if k < bytes.len() && bytes[k] == b'.' {
+                k += 1;
+                let s = k;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                if k > s {
+                    Some(source[s..k].to_string())
+                } else {
+                    None
+                }
+            } else if k < bytes.len() && bytes[k] == b'[' {
+                k += 1;
+                while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                    k += 1;
+                }
+                if k < bytes.len() && (bytes[k] == b'\'' || bytes[k] == b'"') {
+                    let quote = bytes[k];
+                    k += 1;
+                    let s = k;
+                    while k < bytes.len() && bytes[k] != quote {
+                        k += 1;
+                    }
+                    Some(source[s..k].to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(name) = name_opt {
+                if is_valid_identifier_strict(&name) || name == "default" {
+                    events.push(Event::DollarSlots {
+                        start: i,
+                        name,
+                    });
+                }
+            }
+            i = (i + n).max(k);
+        } else {
+            i += 1;
+        }
+    }
+
+    events.sort_by_key(|e| match e {
+        Event::Slot { start, .. } => *start,
+        Event::DollarSlots { start, .. } => *start,
+    });
+
+    if std::env::var("MIGRATE_DEBUG").ok().as_deref() == Some("slots") {
+        for e in &events {
+            match e {
+                Event::Slot { start, name, has_props } => eprintln!("SLOT @{} name={} hp={}", start, name, has_props),
+                Event::DollarSlots { start, name } => eprintln!("DD @{} name={}", start, name),
+            }
+        }
+    }
+
+    let debug = std::env::var("MIGRATE_DEBUG").ok().as_deref() == Some("slots");
+    for ev in events {
+        match ev {
+            Event::Slot {
+                name,
+                has_props,
+                ..
+            } => {
+                let slot_name = name.clone();
+                let local = if slot_name == "default" {
+                    "children".to_string()
+                } else {
+                    slot_name.clone()
+                };
+                if let Some(existing) = info.props.iter_mut().find(|p| p.name == local) {
+                    if existing.needs_refine {
+                        existing.has_props = has_props;
+                        existing.needs_refine = false;
+                    }
+                } else {
+                    info.props.push(SlotProp {
+                        name: local,
+                        has_props,
+                        needs_refine: false,
+                    });
+                }
+            }
+            Event::DollarSlots { name, .. } => {
+                let mut nm = name.clone();
+                if nm == "default" {
+                    nm = "children".to_string();
+                }
+                if !info.props.iter().any(|p| p.name == nm) {
+                    info.props.push(SlotProp {
+                        name: nm,
+                        has_props: true, // Snippet<[any]> initially
+                        needs_refine: true,
+                    });
+                }
+            }
+        }
+    }
+    if debug {
+        eprintln!("=== gather_slot_info DONE ===");
+        for p in &info.props {
+            eprintln!("FINAL: {} has_props={} needs_refine={}", p.name, p.has_props, p.needs_refine);
+        }
+    }
+    info
+}
+
+/// Replace `<slot>` markup and `$$slots.X` references in the template.
+fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, slots: &SlotInfo) {
+    if slots.props.is_empty() && !slots.uses_dollar_slots {
+        return;
+    }
+    if is_custom_element(root) {
+        return;
+    }
+    let uses_props = source_uses_dollar_dollar(source, "$$props");
+    let prefix = if uses_props { "props." } else { "" };
+
+    // Walk and rewrite each `<slot>` element. Track parents to detect when a
+    // slot lives directly inside a Component (those keep the slot=… anchor for
+    // snippet wrapping — defer that case).
+    walk_with_parent(&root.fragment, None, &mut |child, parent| {
+        let FragmentChild::SlotElement(slot) = child else {
+            return;
+        };
+        // Skip when parent is a Component or SvelteComponent — that case is
+        // handled differently (wraps in {#snippet name(props)}). For now we
+        // also handle the bare-`<slot>` case inside a Component (it just
+        // becomes `{@render children?.()}` like the non-component case).
+        let _parent_is_component = matches!(
+            parent,
+            Some(FragmentChild::Component(_)) | Some(FragmentChild::SvelteComponent(_))
+        );
+
+        // Compute the slot name and slot_props text.
+        let mut slot_name = String::from("default");
+        let mut prop_pairs: Vec<String> = Vec::new();
+        let mut has_inner_slot_attr = false;
+        for a in &slot.attributes {
+            if let ElementAttribute::Attribute(attr) = a {
+                if attr.name == "slot" {
+                    has_inner_slot_attr = true;
+                    continue;
+                }
+                if attr.name == "name" {
+                    if let Some(n) = attribute_static_string(&attr.value) {
+                        slot_name = n;
+                    }
+                    continue;
+                }
+                // Compute attribute value text.
+                let value = match &attr.value {
+                    AttributeValue::Empty => "true".to_string(),
+                    AttributeValue::Single(et) => {
+                        let (s, e) = expr_span(&et.expression);
+                        source[s as usize..e as usize].to_string()
+                    }
+                    AttributeValue::Many(parts) => {
+                        // Single-text → quoted string.
+                        if parts.len() == 1 {
+                            if let AttributeValuePart::Text(t) = &parts[0] {
+                                format!("\"{}\"", t.data)
+                            } else if let AttributeValuePart::ExpressionTag(et) = &parts[0] {
+                                let (s, e) = expr_span(&et.expression);
+                                source[s as usize..e as usize].to_string()
+                            } else {
+                                "true".to_string()
+                            }
+                        } else {
+                            // Template literal-ish. Use the original source span.
+                            let s = parts.first().map(|p| p.start_pos()).unwrap_or(0);
+                            let last_end = match parts.last() {
+                                Some(AttributeValuePart::Text(t)) => t.end,
+                                Some(AttributeValuePart::ExpressionTag(et)) => et.end,
+                                _ => 0,
+                            };
+                            format!("`{}`", &source[s as usize..last_end as usize])
+                        }
+                    }
+                };
+                let pair = if value == attr.name {
+                    format!("{},", value)
+                } else {
+                    format!("{}: {},", attr.name, value)
+                };
+                prop_pairs.push(pair);
+            } else if let ElementAttribute::SpreadAttribute(sp) = a {
+                let (s, e) = expr_span(&sp.expression);
+                prop_pairs.push(format!("...{},", &source[s as usize..e as usize]));
+            }
+        }
+        let _ = has_inner_slot_attr;
+
+        let local = if slot_name == "default" {
+            "children".to_string()
+        } else {
+            slot_name.clone()
+        };
+        // Build the @render text.
+        let render_args = if prop_pairs.is_empty() {
+            String::new()
+        } else {
+            format!("{{ {} }}", prop_pairs.join(" "))
+        };
+
+        let s = slot.start as usize;
+        let e = slot.end as usize;
+
+        // Apply `prefix.NAME` for $$props case.
+        if slot.fragment.nodes.is_empty() {
+            // <slot .../> → {@render prefix.NAME?.(args)}
+            let replacement = format!("{{@render {}{}?.({})}}", prefix, local, render_args);
+            str.update(s, e, &replacement);
+        } else {
+            // <slot>fallback</slot> → {#if NAME}{@render prefix.NAME(args)}{:else}fallback{/if}
+            let first = &slot.fragment.nodes[0];
+            let last = &slot.fragment.nodes[slot.fragment.nodes.len() - 1];
+            let inner_start = match first {
+                FragmentChild::Text(t) => t.start,
+                FragmentChild::RegularElement(e) => e.start,
+                FragmentChild::Component(c) => c.start,
+                FragmentChild::SvelteComponent(c) => c.start,
+                FragmentChild::SvelteElement(e) => e.start,
+                FragmentChild::SvelteFragment(e) => e.start,
+                FragmentChild::SlotElement(e) => e.start,
+                FragmentChild::ExpressionTag(et) => et.start,
+                _ => slot.start + 1,
+            } as usize;
+            let inner_end = match last {
+                FragmentChild::Text(t) => t.end,
+                FragmentChild::RegularElement(e) => e.end,
+                FragmentChild::Component(c) => c.end,
+                FragmentChild::SvelteComponent(c) => c.end,
+                FragmentChild::SvelteElement(e) => e.end,
+                FragmentChild::SvelteFragment(e) => e.end,
+                FragmentChild::SlotElement(e) => e.end,
+                FragmentChild::ExpressionTag(et) => et.end,
+                _ => (slot.end - 1) as u32,
+            } as usize;
+            let open = format!(
+                "{{#if {0}{1}}}{{@render {0}{1}({2})}}{{:else}}",
+                prefix, local, render_args
+            );
+            str.update(s, inner_start, &open);
+            str.update(inner_end, e, "{/if}");
+        }
+    });
+
+    // Replace `$$slots.X` and `$$slots['X']` / `$$slots["X"]` with `prefix + X`.
+    if slots.uses_dollar_slots {
+        let bytes = source.as_bytes();
+        let needle = b"$$slots";
+        let n = needle.len();
+        let mut i = 0;
+        while i + n <= bytes.len() {
+            if &bytes[i..i + n] == needle {
+                // Make sure it's a standalone identifier.
+                let before_ok = i == 0
+                    || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+                if !before_ok {
+                    i += 1;
+                    continue;
+                }
+                let mut k = i + n;
+                let mut name: Option<String> = None;
+                let mut end = k;
+                if k < bytes.len() && bytes[k] == b'.' {
+                    let s = k + 1;
+                    let mut e = s;
+                    while e < bytes.len() && (bytes[e].is_ascii_alphanumeric() || bytes[e] == b'_') {
+                        e += 1;
+                    }
+                    if e > s {
+                        name = Some(source[s..e].to_string());
+                        end = e;
+                    }
+                } else if k < bytes.len() && bytes[k] == b'[' {
+                    k += 1;
+                    while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if k < bytes.len() && (bytes[k] == b'\'' || bytes[k] == b'"') {
+                        let quote = bytes[k];
+                        k += 1;
+                        let s = k;
+                        while k < bytes.len() && bytes[k] != quote {
+                            k += 1;
+                        }
+                        if k < bytes.len() {
+                            name = Some(source[s..k].to_string());
+                            // Skip closing quote, whitespace, `]`.
+                            k += 1;
+                            while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                                k += 1;
+                            }
+                            if k < bytes.len() && bytes[k] == b']' {
+                                end = k + 1;
+                            } else {
+                                name = None;
+                            }
+                        }
+                    }
+                }
+                if let Some(mut nm) = name {
+                    if nm == "default" {
+                        nm = "children".to_string();
+                    }
+                    let after = end;
+                    str.update(i, after, &format!("{}{}", prefix, nm));
+                    i = after;
+                    continue;
+                }
+                i = end.max(i + n);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let _ = slots;
+}
+
+/// Emit a `<script>` block with the Props typedef + destructure at the very
+/// top of the source, when there's no existing instance script but slot
+/// migration requires a Props block.
+fn emit_props_script_no_instance(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    slots: &SlotInfo,
+    opt_use_ts: bool,
+) {
+    // Choose indent. Upstream's `guess_indent` looks at the first indented
+    // line in the source — same as ours.
+    let indent_owned = guess_indent_from_source(source);
+    let indent = indent_owned.as_str();
+    let has_lang_ts = root
+        .instance
+        .as_ref()
+        .map(|i| {
+            i.attributes
+                .iter()
+                .any(|a| a.name == "lang" && matches!(attribute_static_string(&a.value).as_deref(), Some("ts")))
+        })
+        .unwrap_or(false);
+    let has_jsdoc_type_anywhere = source.contains("@type {");
+    let uses_ts = has_lang_ts || (opt_use_ts && !has_jsdoc_type_anywhere);
+    let uses_props = source_uses_dollar_dollar(source, "$$props");
+    let uses_rest = source_uses_dollar_dollar(source, "$$restProps");
+
+    let block = build_props_block(slots, uses_props, uses_rest, uses_ts, indent, &[]);
+
+    // Prepend `<script>\n\t{block}\n</script>\n\n`.
+    let head = if uses_ts { "<script lang=\"ts\">" } else { "<script>" };
+    let full = format!("{}\n{}{}\n</script>\n\n", head, indent, block);
+    str.prepend_left(0, full);
+    let _ = source;
+}
+
+/// Build the textual Props block (typedef/interface + destructure).
+/// `extra_export_props` is a slice of `(name, init_or_empty, bindable, type_hint)`
+/// for `export let` declarations, in order.
+fn build_props_block(
+    slots: &SlotInfo,
+    uses_props: bool,
+    uses_rest: bool,
+    uses_ts: bool,
+    indent: &str,
+    export_props: &[ExportProp],
+) -> String {
+    // Compute all prop entries with `type`, `optional`.
+    struct Entry {
+        local: String,
+        exported: String,
+        init: String,
+        bindable: bool,
+        optional: bool,
+        ty: String,
+        slot_name: Option<String>,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for p in export_props {
+        entries.push(Entry {
+            local: p.local.clone(),
+            exported: p.exported.clone(),
+            init: p.init.clone(),
+            bindable: p.bindable,
+            optional: !p.init.is_empty() || p.bindable,
+            ty: p.ty.clone(),
+            slot_name: None,
+        });
+    }
+    for sp in &slots.props {
+        let ty = if sp.has_props {
+            "import('svelte').Snippet<[any]>".to_string()
+        } else {
+            "import('svelte').Snippet".to_string()
+        };
+        entries.push(Entry {
+            local: sp.name.clone(),
+            exported: sp.name.clone(),
+            init: String::new(),
+            bindable: false,
+            optional: true,
+            ty,
+            slot_name: Some(sp.name.clone()),
+        });
+    }
+
+    let many_props = entries.len() > 3;
+    let newline_sep = format!("\n{}{}", indent, indent);
+    let prop_sep = if many_props { newline_sep.as_str() } else { " " };
+
+    // Build the destructure RHS list.
+    let props_list = if uses_props {
+        format!("...{}", "props")
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        for e in &entries {
+            // Skip type-only entries (none here).
+            let mut s = if e.local == e.exported {
+                e.local.clone()
+            } else {
+                format!("{}: {}", e.exported, e.local)
+            };
+            if e.bindable {
+                if e.init.is_empty() {
+                    s.push_str(" = $bindable()");
+                } else {
+                    s.push_str(&format!(" = $bindable({})", e.init));
+                }
+            } else if !e.init.is_empty() {
+                s.push_str(&format!(" = {}", e.init));
+            }
+            parts.push(s);
+        }
+        let mut joined = parts.join(&format!(",{}", prop_sep));
+        if uses_rest {
+            if !joined.is_empty() {
+                joined.push_str(&format!(",{}", prop_sep));
+            }
+            joined.push_str("...rest");
+        }
+        joined
+    };
+
+    // Determine `has_type_or_fallback`: any prop has a typed annotation OR
+    // every prop is a slot (then we emit the Props type so users can fill it).
+    let has_type_or_fallback = entries.iter().any(|e| e.slot_name.is_some())
+        || export_props.iter().any(|p| !p.ty.is_empty() && p.ty != "any");
+    // Actually upstream's check is: `state.has_type_or_fallback ||
+    // state.props.every(p => p.slot_name)`. We emit when EVERY prop is a slot
+    // OR has_type_or_fallback.
+    let all_slots = !entries.is_empty() && entries.iter().all(|e| e.slot_name.is_some());
+    let emit_type = has_type_or_fallback || all_slots;
+
+    let type_name = "Props";
+    let type_block: Option<String> = if emit_type {
+        if uses_ts {
+            // `interface Props { ... }`
+            let mut s = format!("interface {} {{{}", type_name, newline_sep);
+            let mut parts: Vec<String> = Vec::new();
+            for e in &entries {
+                let optional = if e.optional { "?" } else { "" };
+                parts.push(format!("{}{}: {};", e.exported, optional, e.ty));
+            }
+            if uses_props || uses_rest {
+                if !entries.is_empty() {
+                    parts.push("[key: string]: any".to_string());
+                } else {
+                    parts.push("[key: string]: any".to_string());
+                }
+            }
+            s.push_str(&parts.join(&newline_sep));
+            s.push_str(&format!("\n{}}}", indent));
+            Some(s)
+        } else {
+            // JSDoc @typedef
+            let mut s = format!("/**\n{} * @typedef {{Object}} {}", indent, type_name);
+            for e in &entries {
+                let name = if e.optional {
+                    format!("[{}]", e.exported)
+                } else {
+                    e.exported.clone()
+                };
+                s.push_str(&format!("\n{} * @property {{{}}} {}", indent, e.ty, name));
+            }
+            s.push_str(&format!("\n{} */", indent));
+            Some(s)
+        }
+    } else {
+        None
+    };
+
+    let mut decl = if many_props {
+        format!("let {{{}{}{}{}}}", newline_sep, props_list, "\n", indent)
+    } else {
+        format!("let {{ {} }}", props_list)
+    };
+
+    if uses_ts {
+        if type_block.is_some() {
+            decl = format!("{}: {} = $props();", decl, type_name);
+        } else {
+            decl = format!("{} = $props();", decl);
+        }
+    } else {
+        decl = format!("{} = $props();", decl);
+    }
+
+    if let Some(t) = type_block {
+        if uses_ts {
+            format!("{}\n\n{}{}", t, indent, decl)
+        } else {
+            // JSDoc form needs the /** @type {Props} */ annotation between
+            // the typedef and the let. When uses_props/uses_rest, the
+            // annotation includes `& { [key: string]: any }`.
+            let intersection = if uses_props || uses_rest {
+                if entries.is_empty() {
+                    " { [key: string]: any }".to_string()
+                } else {
+                    format!(" & {{ [key: string]: any }}").to_string()
+                }
+            } else {
+                String::new()
+            };
+            let ann = format!("/** @type {{{}{}}} */", type_name, intersection);
+            format!("{}\n\n{}{}\n{}{}", t, indent, ann, indent, decl)
+        }
+    } else {
+        decl
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExportProp {
+    pub local: String,
+    pub exported: String,
+    pub init: String,
+    pub bindable: bool,
+    pub ty: String,
+}
+
+/// Best-effort indent guess. Looks for the first indented line inside the
+/// instance script and uses its leading whitespace. Defaults to `\t`.
+fn guess_indent(source: &str, instance: &svelte_ast::root::Script) -> String {
+    let s = instance.content.span.start as usize;
+    let e = instance.content.span.end as usize;
+    let body = &source[s.min(source.len())..e.min(source.len())];
+    for line in body.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lead: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        if !lead.is_empty() {
+            return lead;
+        }
+    }
+    guess_indent_from_source(source)
+}
+
+/// Like `guess_indent` but scans the entire source.
+fn guess_indent_from_source(source: &str) -> String {
+    for line in source.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let lead: String = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .collect();
+        if !lead.is_empty() {
+            return lead;
+        }
+    }
+    "\t".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Simple props migration: `export let X` → `let { X, … } = $props();`.
 // Only fires for the narrow case:
 //   - all exports are simple `export let X` (or `export let X = init`)
@@ -1788,8 +2458,18 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
 // a single field in the destructured `let { ... } = $props()`.
 // ---------------------------------------------------------------------------
 
-fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_simple_props(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    slots: &SlotInfo,
+    opt_use_ts: bool,
+) {
     let Some(instance) = &root.instance else {
+        // No <script> tag at all. If there are slots, we need to emit one.
+        if !slots.props.is_empty() {
+            emit_props_script_no_instance(source, str, root, slots, opt_use_ts);
+        }
         return;
     };
 
@@ -1919,22 +2599,37 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         }
     }
 
-    if props.is_empty() && !uses_props && !uses_rest {
+    if props.is_empty() && !uses_props && !uses_rest && slots.props.is_empty() {
         return;
     }
     // If there are NO `export let` decls AND only `$$props`/`$$restProps`,
     // we could still emit `let { ...props } = $props();`. Defer that path.
-    if props.is_empty() {
+    if props.is_empty() && slots.props.is_empty() {
         // Only handle pure $$restProps case — emit `let { ...rest } = $props();`.
         // Defer this for now since it requires picking an insertion point.
         return;
     }
 
     // Decide whether to emit a JSDoc `@typedef Props` block.
-    // We emit when (a) any prop has a JSDoc `@type` annotation, or (b)
-    // there's more than one prop (the >3-props formatting also triggers).
-    // For now: only emit the interface when at least one prop has jsdoc_type.
-    let has_any_jsdoc_type = props.iter().any(|p| p.jsdoc_type.is_some());
+    // Mirrors upstream's `has_type_or_fallback` flag:
+    //   * any prop has a JSDoc `@type` annotation
+    //   * OR any prop has a JSDoc comment (typedef-worthy comment)
+    //   * OR any prop's init is a trivially-typed Literal (string/number/bool)
+    let has_jsdoc_type = props.iter().any(|p| p.jsdoc_type.is_some());
+    let has_jsdoc_comment = props.iter().any(|p| p.jsdoc_span.is_some());
+    let has_literal_init = props.iter().any(|p| {
+        let Some((s, e)) = p.init else {
+            return false;
+        };
+        let t = source[s as usize..e as usize].trim();
+        t.starts_with('\'')
+            || t.starts_with('"')
+            || t.starts_with('`')
+            || t == "true"
+            || t == "false"
+            || t.parse::<f64>().is_ok()
+    });
+    let has_any_jsdoc_type = has_jsdoc_type || has_jsdoc_comment || has_literal_init;
 
     // Compute each prop's type & optional-ness for the JSDoc block.
     // - jsdoc_type wins
@@ -1964,13 +2659,31 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         "any".to_string()
     }
 
+    // Detect `<script lang="ts">` for TS mode. Honor the option as a fallback
+    // (when the script lacks the lang attribute, we use the option, BUT only
+    // when the source doesn't already use JSDoc `@type {…}` patterns).
+    let has_lang_ts = instance.attributes.iter().any(|a| {
+        a.name == "lang"
+            && matches!(
+                attribute_static_string(&a.value).as_deref(),
+                Some("ts") | Some("typescript")
+            )
+    });
+    let has_jsdoc_type_anywhere = source.contains("@type {");
+    let uses_ts = has_lang_ts || (opt_use_ts && !has_jsdoc_type_anywhere);
+    let needs_lang_ts_tag = uses_ts && !has_lang_ts;
+
     // Build the destructured `let { X, Y = INIT, ... } = $props();`.
     // When $$props is used, upstream emits a rest-only `let { ...props } = $props();`
     // and drops all `export let X` lines without their declarations becoming
     // fields.
-    let indent = "\t";
+    // Use the indent that the script content uses (default \t).
+    let indent_str = guess_indent(source, instance);
+    let indent = indent_str.as_str();
     let newline_sep = format!("\n{}{}", indent, indent);
-    let many_props = props.len() > 3;
+    // Total prop count including slots.
+    let total_props = props.len() + slots.props.len() + if uses_rest { 1 } else { 0 };
+    let many_props = total_props > 3;
     let prop_sep = if many_props { newline_sep.as_str() } else { " " };
 
     let props_decl = if uses_props {
@@ -1994,10 +2707,13 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
             };
             parts.push(entry);
         }
+        for sp in &slots.props {
+            parts.push(sp.name.clone());
+        }
         if uses_rest {
             parts.push("...rest".to_string());
         }
-        // Single-line if <=3 props.
+        // Single-line if total props <=3.
         if many_props {
             format!(
                 "let {{{}{}\n{}}} = $props();",
@@ -2010,42 +2726,100 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         }
     };
 
-    // If JSDoc-types are used, build the @typedef Props block + /** @type
-    // {Props} */ annotation that gets emitted before the props_decl.
-    let typedef_block: Option<String> = if has_any_jsdoc_type && !uses_props {
-        let mut lines: Vec<String> = Vec::new();
-        lines.push(format!("/**"));
-        lines.push(format!("{} * @typedef {{Object}} Props", indent));
-        for p in &props {
-            let init_text: Option<String> = p
-                .init
-                .map(|(s, e)| source[s as usize..e as usize].to_string());
-            let ty = p
-                .jsdoc_type
-                .clone()
-                .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
-            let optional = init_text.is_some();
-            let name = if optional {
-                format!("[{}]", p.local)
-            } else {
-                p.local.clone()
-            };
-            lines.push(format!("{} * @property {{{}}} {}", indent, ty, name));
+    // Upstream's rule: emit the Props type when `has_type_or_fallback` is set
+    // OR every prop is a slot. We treat `has_any_jsdoc_type` as our local
+    // has_type_or_fallback signal, AND additionally emit the type when every
+    // prop is a slot (slot-only components).
+    let all_props_are_slots = !slots.props.is_empty() && props.is_empty();
+    let need_props_type = (has_any_jsdoc_type || all_props_are_slots) && !uses_props;
+
+    // Build the Props typedef/interface block.
+    let typedef_block: Option<String> = if need_props_type {
+        if uses_ts {
+            let mut s = format!("interface Props {{");
+            let inner_sep = newline_sep.as_str();
+            let mut parts: Vec<String> = Vec::new();
+            for p in &props {
+                let init_text: Option<String> = p
+                    .init
+                    .map(|(s, e)| source[s as usize..e as usize].to_string());
+                let ty = p
+                    .jsdoc_type
+                    .clone()
+                    .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
+                let optional = init_text.is_some();
+                let opt = if optional { "?" } else { "" };
+                parts.push(format!("{}{}: {};", p.local, opt, ty));
+            }
+            for sp in &slots.props {
+                let ty = if sp.has_props {
+                    "import('svelte').Snippet<[any]>"
+                } else {
+                    "import('svelte').Snippet"
+                };
+                parts.push(format!("{}?: {};", sp.name, ty));
+            }
+            s.push_str(inner_sep);
+            s.push_str(&parts.join(inner_sep));
+            s.push_str(&format!("\n{}}}", indent));
+            Some(s)
+        } else {
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(format!("/**"));
+            lines.push(format!("{} * @typedef {{Object}} Props", indent));
+            for p in &props {
+                let init_text: Option<String> = p
+                    .init
+                    .map(|(s, e)| source[s as usize..e as usize].to_string());
+                let ty = p
+                    .jsdoc_type
+                    .clone()
+                    .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
+                let optional = init_text.is_some();
+                let name = if optional {
+                    format!("[{}]", p.local)
+                } else {
+                    p.local.clone()
+                };
+                lines.push(format!("{} * @property {{{}}} {}", indent, ty, name));
+            }
+            for sp in &slots.props {
+                let ty = if sp.has_props {
+                    "import('svelte').Snippet<[any]>"
+                } else {
+                    "import('svelte').Snippet"
+                };
+                lines.push(format!("{} * @property {{{}}} [{}]", indent, ty, sp.name));
+            }
+            lines.push(format!("{} */", indent));
+            Some(lines.join("\n"))
         }
-        lines.push(format!("{} */", indent));
-        Some(lines.join("\n"))
-    } else {
-        None
-    };
-    let type_annot: Option<String> = if typedef_block.is_some() {
-        Some(format!("/** @type {{Props}} */"))
     } else {
         None
     };
 
     // Build the final block that replaces the FIRST export node.
-    let final_block = if let (Some(td), Some(ta)) = (&typedef_block, &type_annot) {
-        format!("{}\n\n{}{}\n{}{}", td, indent, ta, indent, props_decl)
+    let final_block = if let Some(td) = &typedef_block {
+        if uses_ts {
+            // `interface Props {…}\n\n\tlet { … }: Props = $props();`
+            let decl_with_ann = props_decl.replace(" = $props();", ": Props = $props();");
+            format!("{}\n\n{}{}", td, indent, decl_with_ann)
+        } else {
+            let intersection = if uses_props || uses_rest {
+                if props.is_empty() && slots.props.is_empty() {
+                    "{ [key: string]: any }".to_string()
+                } else {
+                    "Props & { [key: string]: any }".to_string()
+                }
+            } else {
+                "Props".to_string()
+            };
+            let ann = format!("/** @type {{{}}} */", intersection);
+            format!("{}\n\n{}{}\n{}{}", td, indent, ann, indent, props_decl)
+        }
+    } else if uses_ts {
+        // No type block but TS — leave decl alone.
+        props_decl.clone()
     } else {
         props_decl.clone()
     };
@@ -2107,7 +2881,52 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         return;
     }
 
-    if has_any_jsdoc_type {
+    if props.is_empty() {
+        // Slot-only case: insert AFTER the last import declaration (upstream's
+        // props_insertion_point tracks this), else at the start of the script
+        // content.
+        let mut insert_after = instance.content.span.start as usize;
+        for stmt in &instance.content.body {
+            if let Statement::Import(imp) = stmt {
+                insert_after = insert_after.max(imp.span.end as usize);
+            }
+        }
+        // If the script body is otherwise empty (the original case for
+        // slot-use_ts-2 — has a comment), find a sensible insertion point.
+        let content_start = instance.content.span.start as usize;
+        if insert_after == content_start {
+            // No imports — find the first non-whitespace position so we can
+            // insert at the very top of the script body.
+            let after_ws = {
+                let mut k = content_start;
+                while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t' || bytes[k] == b'\n') {
+                    k += 1;
+                }
+                k
+            };
+            // If content is fully whitespace, append at end.
+            if after_ws >= instance.content.span.end as usize {
+                let block_with_lead = format!("\n{}{}", indent, final_block);
+                str.prepend_left(content_start, block_with_lead);
+            } else {
+                // Non-empty content (e.g. comments or other code) — insert at
+                // very top of body, then put existing content below (a single
+                // newline separator, like upstream).
+                str.prepend_left(after_ws, format!("{}\n{}", final_block, indent));
+            }
+        } else {
+            // Insert after last import — `\n${indent}${block}`.
+            str.append_left(insert_after, format!("\n{}{}", indent, final_block));
+        }
+        if needs_lang_ts_tag {
+            // `<script` → `<script lang="ts"`.
+            let s_start = instance.start as usize;
+            let bs = &source.as_bytes()[s_start..];
+            if bs.starts_with(b"<script") {
+                str.append_right(s_start + "<script".len(), " lang=\"ts\"".to_string());
+            }
+        }
+    } else if has_any_jsdoc_type {
         // Find the position of the first non-whitespace char of the instance
         // script (where the JSDoc / export starts).
         let mut after_ws = instance.content.span.start as usize;
@@ -3600,6 +4419,15 @@ mod tests {
         let src = "<svelte:options accessors immutable/>";
         let r = migrate(src, MigrateOptions::default());
         assert_eq!(r.code, "<svelte:options immutable/>");
+    }
+
+    #[test]
+    fn debug_slots_fixture() {
+        let src = std::fs::read_to_string("/Users/puruvijay/Projects/svelte-rs/packages/svelte/tests/migrate/samples/slots/input.svelte").unwrap();
+        let input = src.trim_end().replace('\r', "");
+        std::env::set_var("MIGRATE_DEBUG", "slots");
+        let r = migrate(&input, MigrateOptions::default());
+        eprintln!("OUTPUT:\n{}", r.code);
     }
 
     #[test]
