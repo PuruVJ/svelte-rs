@@ -1972,12 +1972,249 @@ fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
     info
 }
 
+/// Mirror upstream's `migrate_slot_usage`. For each child of a Component /
+/// SvelteComponent parent that has a `slot="X"` attribute, wrap that child in
+/// `{#snippet X(let_props)}...{/snippet}` and strip the `slot=` attribute.
+/// SvelteFragment children are unwrapped (only the inner content kept).
+fn apply_migrate_slot_usage(
+    source: &str,
+    str: &mut MagicString,
+    frag: &Fragment,
+    parent: Option<&FragmentChild>,
+    depth: usize,
+) {
+    let bytes = source.as_bytes();
+    let indent = guess_indent_from_source(source);
+    let parent_is_component = matches!(
+        parent,
+        Some(FragmentChild::Component(_)) | Some(FragmentChild::SvelteComponent(_))
+    );
+    for child in &frag.nodes {
+        // Recurse first into children so we don't miss nested cases.
+        let child_frag: Option<&Fragment> = match child {
+            FragmentChild::Component(c) => Some(&c.fragment),
+            FragmentChild::SvelteComponent(c) => Some(&c.fragment),
+            FragmentChild::RegularElement(e) => Some(&e.fragment),
+            FragmentChild::SvelteElement(e) => Some(&e.fragment),
+            FragmentChild::SvelteFragment(e) => Some(&e.fragment),
+            FragmentChild::SlotElement(e) => Some(&e.fragment),
+            FragmentChild::IfBlock(b) => Some(&b.consequent),
+            FragmentChild::EachBlock(b) => Some(&b.body),
+            _ => None,
+        };
+        if let Some(f) = child_frag {
+            apply_migrate_slot_usage(source, str, f, Some(child), depth + 1);
+        }
+
+        // We only apply migrate_slot_usage to children of a Component/SvelteComponent.
+        if !parent_is_component {
+            continue;
+        }
+        // Get attrs, start, end, and fragment.
+        let (attrs, c_start, c_end, c_frag, is_svelte_fragment): (
+            &Vec<ElementAttribute>,
+            usize,
+            usize,
+            Option<&Fragment>,
+            bool,
+        ) = match child {
+            FragmentChild::RegularElement(e) => {
+                (&e.attributes, e.start as usize, e.end as usize, Some(&e.fragment), false)
+            }
+            FragmentChild::SvelteElement(e) => {
+                (&e.attributes, e.start as usize, e.end as usize, Some(&e.fragment), false)
+            }
+            FragmentChild::SvelteFragment(e) => {
+                (&e.attributes, e.start as usize, e.end as usize, Some(&e.fragment), true)
+            }
+            FragmentChild::SlotElement(e) => {
+                (&e.attributes, e.start as usize, e.end as usize, Some(&e.fragment), false)
+            }
+            FragmentChild::Component(c) => {
+                (&c.attributes, c.start as usize, c.end as usize, Some(&c.fragment), false)
+            }
+            FragmentChild::SvelteComponent(c) => {
+                (&c.attributes, c.start as usize, c.end as usize, Some(&c.fragment), false)
+            }
+            _ => continue,
+        };
+
+        // Find slot=, name=, let directives.
+        let mut snippet_name: String = "children".to_string();
+        let mut slot_attr_span: Option<(usize, usize)> = None;
+        let mut let_pairs: Vec<String> = Vec::new();
+        let mut let_attrs: Vec<(usize, usize)> = Vec::new();
+        let mut invalid_id: Option<String> = None;
+        let mut shadowed: Option<String> = None;
+        for a in attrs {
+            match a {
+                ElementAttribute::Attribute(attr) if attr.name == "slot" => {
+                    if let Some(name) = attribute_static_string(&attr.value) {
+                        let mut nm = name.clone();
+                        if nm == "default" {
+                            nm = "children".to_string();
+                        }
+                        if !is_valid_identifier_strict(&nm) {
+                            invalid_id = Some(name.clone());
+                        } else {
+                            // Check parent's attributes — shadow detection.
+                            let parent_attrs: Option<&Vec<ElementAttribute>> = match parent {
+                                Some(FragmentChild::Component(c)) => Some(&c.attributes),
+                                Some(FragmentChild::SvelteComponent(c)) => Some(&c.attributes),
+                                _ => None,
+                            };
+                            if let Some(pa) = parent_attrs {
+                                let conflict = pa.iter().any(|p_attr| match p_attr {
+                                    ElementAttribute::Attribute(at) => at.name == nm,
+                                    ElementAttribute::BindDirective(bd) => bd.name == nm,
+                                    _ => false,
+                                });
+                                if conflict {
+                                    shadowed = Some(nm.clone());
+                                }
+                            }
+                            snippet_name = nm;
+                        }
+                        slot_attr_span = Some((attr.start as usize, attr.end as usize));
+                    }
+                }
+                ElementAttribute::LetDirective(ld) => {
+                    let pair = if let Some(expr) = &ld.expression {
+                        let (s, e) = expr_span(expr);
+                        format!("{}: {}", ld.name, &source[s as usize..e as usize])
+                    } else {
+                        ld.name.clone()
+                    };
+                    let_pairs.push(pair);
+                    let_attrs.push((ld.start as usize, ld.end as usize));
+                }
+                _ => {}
+            }
+        }
+
+        // Bail (don't wrap) if invalid/shadow — the comment has already been
+        // emitted by `migrate_invalid_named_slots`. We just skip the wrap and
+        // leave the original markup (slot attr + let directives) intact.
+        if invalid_id.is_some() || shadowed.is_some() {
+            continue;
+        }
+        let _ = bytes;
+
+        // If no slot attr → nothing to wrap.
+        let Some((slot_s, slot_e)) = slot_attr_span else {
+            continue;
+        };
+
+        // Remove the `slot=` attribute (upstream removes just the attribute,
+        // leaving the leading space, which produces e.g. `<div >` for
+        // `<div slot="X">`).
+        str.remove(slot_s, slot_e);
+        // Remove the let directives (upstream removes just the directive).
+        for (s, e) in &let_attrs {
+            str.remove(*s, *e);
+        }
+
+        let props_text = if let_pairs.is_empty() {
+            String::new()
+        } else {
+            format!("{{ {} }}", let_pairs.join(", "))
+        };
+
+        if is_svelte_fragment {
+            // Unwrap: remove the wrapper tags, keep content.
+            if let Some(f) = c_frag {
+                if !f.nodes.is_empty() {
+                    let inner_start = match &f.nodes[0] {
+                        FragmentChild::Text(t) => t.start as usize,
+                        FragmentChild::RegularElement(e) => e.start as usize,
+                        FragmentChild::Component(e) => e.start as usize,
+                        FragmentChild::SvelteComponent(e) => e.start as usize,
+                        FragmentChild::SvelteElement(e) => e.start as usize,
+                        FragmentChild::SvelteFragment(e) => e.start as usize,
+                        FragmentChild::SlotElement(e) => e.start as usize,
+                        FragmentChild::ExpressionTag(et) => et.start as usize,
+                        _ => c_start + 1,
+                    };
+                    let inner_end = match &f.nodes[f.nodes.len() - 1] {
+                        FragmentChild::Text(t) => t.end as usize,
+                        FragmentChild::RegularElement(e) => e.end as usize,
+                        FragmentChild::Component(e) => e.end as usize,
+                        FragmentChild::SvelteComponent(e) => e.end as usize,
+                        FragmentChild::SvelteElement(e) => e.end as usize,
+                        FragmentChild::SvelteFragment(e) => e.end as usize,
+                        FragmentChild::SlotElement(e) => e.end as usize,
+                        FragmentChild::ExpressionTag(et) => et.end as usize,
+                        _ => (c_end - 1),
+                    };
+                    str.remove(c_start, inner_start);
+                    str.remove(inner_end, c_end);
+                }
+            }
+        }
+
+        // Wrap in `{#snippet NAME(props)}` … `{/snippet}`.
+        // Compute the indent at the snippet wrap depth. Upstream: prepend is
+        // `\n${indent.repeat(path.length - 2)}`. Our depth at the point we're
+        // examining a child of `frag` is `path.length - 1` (path was
+        // [outer1, ..., outerN, frag]). So path.length - 2 = depth - 1.
+        let outer_indent = indent.repeat(depth.saturating_sub(1));
+        if std::env::var("MIGRATE_DEBUG_SLOT_WRAP").is_ok() {
+            eprintln!("wrap depth={} c_start={} c_end={} name={}", depth, c_start, c_end, snippet_name);
+        }
+        str.prepend_left(
+            c_start,
+            format!(
+                "{{#snippet {}({})}}\n{}",
+                snippet_name, props_text, outer_indent
+            ),
+        );
+        let close_str = format!("\n{}{{/snippet}}", outer_indent);
+        // Append after the closing tag — for SlotElement, append RIGHT (after
+        // any other rewrites that target node.end).
+        match child {
+            FragmentChild::SlotElement(_) => {
+                str.append_right(c_end, close_str);
+            }
+            _ => {
+                str.append_left(c_end, close_str);
+            }
+        }
+
+        // Indent the wrapped element content by one extra level. Upstream's
+        // `state.str.indent(indent, { exclude: [[0, start], [end, length]] })`
+        // indents every line start within `[start, end]`. The FIRST line —
+        // the line containing `<element ...>` — also gets indented (its line
+        // start is the position right after the most recent `\n` before
+        // `c_start`, which is just after the prepended snippet header).
+        // EXCEPTION: for svelte:fragment (unwrapped), the first line of
+        // content is the content AFTER `<svelte:fragment>`, which is what's
+        // kept after unwrap — that content's first line is fully kept and
+        // does NOT need an extra leading indent (its leading indent is
+        // preserved from the source, just like all other lines).
+        let body_bytes = source.as_bytes();
+        if !is_svelte_fragment {
+            str.append_left(c_start, indent.to_string());
+        }
+        let mut k = c_start;
+        while k < c_end {
+            if body_bytes[k] == b'\n' && k + 1 < c_end {
+                str.append_left(k + 1, indent.to_string());
+            }
+            k += 1;
+        }
+    }
+}
+
 /// Replace `<slot>` markup and `$$slots.X` references in the template.
 fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, slots: &SlotInfo) {
-    if slots.props.is_empty() && !slots.uses_dollar_slots {
+    if is_custom_element(root) {
         return;
     }
-    if is_custom_element(root) {
+    // Apply `migrate_slot_usage` first — wrap child-with-slot-attr inside
+    // Component parents in `{#snippet}` blocks.
+    apply_migrate_slot_usage(source, str, &root.fragment, None, 1);
+
+    if slots.props.is_empty() && !slots.uses_dollar_slots {
         return;
     }
     let uses_props = source_uses_dollar_dollar(source, "$$props");
@@ -2015,12 +2252,37 @@ fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, s
                     }
                     continue;
                 }
-                // Compute attribute value text.
+                // Compute attribute value text. When $$props is used, rewrite
+                // `$$props.X` → `props.X` in the expression text.
+                let rewrite_props = |s: &str| -> String {
+                    if uses_props {
+                        // Replace `$$props.X` / `$$props['X']` etc.
+                        let mut out = String::with_capacity(s.len());
+                        let bs = s.as_bytes();
+                        let mut i = 0;
+                        while i < bs.len() {
+                            if bs[i..].starts_with(b"$$props") {
+                                let before_ok = i == 0
+                                    || !(bs[i - 1].is_ascii_alphanumeric() || bs[i - 1] == b'_');
+                                if before_ok {
+                                    out.push_str("props");
+                                    i += "$$props".len();
+                                    continue;
+                                }
+                            }
+                            out.push(bs[i] as char);
+                            i += 1;
+                        }
+                        out
+                    } else {
+                        s.to_string()
+                    }
+                };
                 let value = match &attr.value {
                     AttributeValue::Empty => "true".to_string(),
                     AttributeValue::Single(et) => {
                         let (s, e) = expr_span(&et.expression);
-                        source[s as usize..e as usize].to_string()
+                        rewrite_props(&source[s as usize..e as usize])
                     }
                     AttributeValue::Many(parts) => {
                         // Single-text → quoted string.
@@ -2029,7 +2291,7 @@ fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, s
                                 format!("\"{}\"", t.data)
                             } else if let AttributeValuePart::ExpressionTag(et) = &parts[0] {
                                 let (s, e) = expr_span(&et.expression);
-                                source[s as usize..e as usize].to_string()
+                                rewrite_props(&source[s as usize..e as usize])
                             } else {
                                 "true".to_string()
                             }
@@ -2041,7 +2303,7 @@ fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, s
                                 Some(AttributeValuePart::ExpressionTag(et)) => et.end,
                                 _ => 0,
                             };
-                            format!("`{}`", &source[s as usize..last_end as usize])
+                            format!("`{}`", rewrite_props(&source[s as usize..last_end as usize]))
                         }
                     }
                 };
@@ -4426,6 +4688,15 @@ mod tests {
         let src = std::fs::read_to_string("/Users/puruvijay/Projects/svelte-rs/packages/svelte/tests/migrate/samples/slots/input.svelte").unwrap();
         let input = src.trim_end().replace('\r', "");
         std::env::set_var("MIGRATE_DEBUG", "slots");
+        let r = migrate(&input, MigrateOptions::default());
+        eprintln!("OUTPUT:\n{}", r.code);
+    }
+
+    #[test]
+    fn debug_slot_non_id() {
+        let src = std::fs::read_to_string("/Users/puruvijay/Projects/svelte-rs/packages/svelte/tests/migrate/samples/slot-non-identifier/input.svelte").unwrap();
+        let input = src.trim_end().replace('\r', "");
+        std::env::set_var("MIGRATE_DEBUG_SLOT_WRAP", "1");
         let r = migrate(&input, MigrateOptions::default());
         eprintln!("OUTPUT:\n{}", r.code);
     }
