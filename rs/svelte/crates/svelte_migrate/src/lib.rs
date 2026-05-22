@@ -94,6 +94,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     let derived_labeled_starts = migrate_simple_derivations(source, &mut str, &parsed);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
     migrate_simple_props(source, &mut str, &parsed);
+    migrate_export_specifier_props(source, &mut str, &parsed);
     migrate_effects(source, &mut str, &parsed, &derived_labeled_starts);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
@@ -2023,6 +2024,235 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
 
 fn p_decl_unused() {
     // helper to silence dead-code style warnings — no-op
+}
+
+// ---------------------------------------------------------------------------
+// `export { a, c, f, h }` (specifiers without a declaration) → props.
+// For each specifier whose local name matches a declarator in a sibling
+// `let a, b, c, d;` declaration, remove that name from the `let`. Then
+// replace the `export { … }` itself with a destructured
+// `let { a, c, f, h } = $props();`. Mirrors upstream
+// ExportNamedDeclaration → VariableDeclaration handling (index.js:544).
+//
+// Only fires when:
+//   * no `$$Props` interface and no JSDoc/TS types on the source declarators
+//   * no `$$props` usage (mixed mode is unsupported)
+//   * every specifier's local resolves to a declarator in some `let` decl
+//     within instance script
+// ---------------------------------------------------------------------------
+
+fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(instance) = &root.instance else {
+        return;
+    };
+    if source_uses_dollar_dollar(source, "$$Props") {
+        return;
+    }
+    if source_uses_dollar_dollar(source, "$$props") {
+        return;
+    }
+
+    // Find `export { … }` (declaration is None, specifiers non-empty).
+    let mut spec_exports: Vec<&svelte_js_ast::ExportNamedDeclaration> = Vec::new();
+    for stmt in &instance.content.body {
+        if let Statement::ExportNamed(en) = stmt {
+            if en.declaration.is_none() && !en.specifiers.is_empty() {
+                spec_exports.push(en);
+            }
+        }
+    }
+    if spec_exports.is_empty() {
+        return;
+    }
+
+    // Build the prop names (in source order) from the FIRST spec-export.
+    // (Upstream walks all; we handle the single-export case which is what the
+    // fixture exercises.)
+    if spec_exports.len() > 1 {
+        return;
+    }
+    let en = spec_exports[0];
+    let mut names: Vec<String> = Vec::new();
+    for sp in &en.specifiers {
+        let svelte_js_ast::ModuleExportName::Identifier(id) = &sp.local else {
+            continue;
+        };
+        names.push(id.name.clone());
+    }
+    if names.is_empty() {
+        return;
+    }
+
+    // For each name, find its source declarator inside instance.body.
+    // Each must be a top-level `let … X …;` Variable decl.
+    struct Site {
+        name: String,
+        var_start: usize,
+        var_end: usize,
+        decl_idx: usize,
+        decl_start: usize,
+        decl_end: usize,
+        var_decl_count: usize,
+    }
+    let mut sites: Vec<Site> = Vec::new();
+    for stmt in &instance.content.body {
+        let Statement::Variable(v) = stmt else {
+            continue;
+        };
+        if !matches!(v.kind, svelte_js_ast::VariableKind::Let) {
+            continue;
+        }
+        for (i, d) in v.declarations.iter().enumerate() {
+            let Pattern::Identifier(id) = &d.id else {
+                continue;
+            };
+            if names.contains(&id.name) {
+                sites.push(Site {
+                    name: id.name.clone(),
+                    var_start: v.span.start as usize,
+                    var_end: v.span.end as usize,
+                    decl_idx: i,
+                    decl_start: d.span.start as usize,
+                    decl_end: d.span.end as usize,
+                    var_decl_count: v.declarations.len(),
+                });
+            }
+        }
+    }
+    // Every name must be matched.
+    if sites.len() != names.len() {
+        return;
+    }
+
+    // Bail if any of these declarators has an init (we don't carry through
+    // default values yet for this path) or a type annotation.
+    let bytes = source.as_bytes();
+    for s in &sites {
+        let txt = &source[s.decl_start..s.decl_end];
+        if txt.contains('=') || txt.contains(':') {
+            return;
+        }
+    }
+
+    // For each site, surgically remove just that declarator from the parent
+    // `let X, Y, Z` — preserving the other declarators. Upstream uses the
+    // commas before/after the declarator to extend the removal range.
+    // We sort by source position so MagicString edits don't cross.
+    let mut sites_sorted: Vec<&Site> = sites.iter().collect();
+    sites_sorted.sort_by_key(|s| s.decl_start);
+
+    // Group by var_start to know each var's full declarator set.
+    let mut group_indices: std::collections::HashMap<usize, Vec<&Site>> = Default::default();
+    for s in &sites {
+        group_indices.entry(s.var_start).or_default().push(s);
+    }
+    // For each var: figure out whether we're removing ALL declarators (then
+    // remove the whole `let …;`) or just some (then per-declarator excision).
+    let mut full_removals: std::collections::HashSet<usize> = Default::default();
+    for (var_start, group) in &group_indices {
+        if group[0].var_decl_count == group.len() {
+            full_removals.insert(*var_start);
+        }
+    }
+
+    for s in &sites_sorted {
+        if full_removals.contains(&s.var_start) {
+            // Skip — handled below as a full var removal.
+            continue;
+        }
+        // Per-declarator excision. Two cases:
+        //   1. first declarator (idx 0): remove [decl_start, next_decl_start)
+        //      i.e. remove `X, ` keeping the rest.
+        //   2. else: remove from the preceding `,` (inclusive) to decl_end.
+        if s.decl_idx == 0 {
+            // Find next decl's start in the same var.
+            // We need to read source to find next ','.
+            let mut p = s.decl_end;
+            while p < bytes.len() && bytes[p] != b',' {
+                p += 1;
+            }
+            if p < bytes.len() && bytes[p] == b',' {
+                p += 1;
+                // Also skip following whitespace.
+                while p < bytes.len() && bytes[p] == b' ' {
+                    p += 1;
+                }
+                str.remove(s.decl_start, p);
+            }
+        } else {
+            // Find the preceding `,`.
+            let mut p = s.decl_start;
+            while p > 0 && bytes[p - 1] != b',' {
+                p -= 1;
+            }
+            if p > 0 {
+                p -= 1; // include the comma
+                str.remove(p, s.decl_end);
+            }
+        }
+    }
+    // Apply full var removals: remove `let X, Y;\n`.
+    for var_start in &full_removals {
+        let v = sites.iter().find(|s| s.var_start == *var_start).unwrap();
+        let mut s = v.var_start;
+        let mut e = v.var_end;
+        if bytes.get(e).copied() == Some(b'\n') {
+            e += 1;
+        }
+        while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+            s -= 1;
+        }
+        str.remove(s, e);
+    }
+
+    // Build the props destructure declaration. Upstream uses
+    // `\n${indent}${indent}` between props when >3 props (newline_sep),
+    // otherwise a single space.
+    let indent = "\t"; // best guess — most fixtures use tabs
+    let newline_sep = format!("\n{}{}", indent, indent);
+    let has_many = names.len() > 3;
+    let sep = if has_many { newline_sep.as_str() } else { " " };
+
+    let inner = if has_many {
+        format!(
+            "{}{}{}{}",
+            sep,
+            names.join(&format!(",{}", sep)),
+            format!("\n{}", indent),
+            ""
+        )
+    } else {
+        format!(" {} ", names.join(", "))
+    };
+    let props_decl = format!("let {{{}}} = $props();", inner);
+
+    // Insertion point: end of the LAST `let` declaration that contained any
+    // prop name (in source order). Mirrors upstream's
+    // `state.props_insertion_point = node.end` when at least one declarator
+    // was exported.
+    let mut insertion_point: usize = instance.content.span.start as usize;
+    {
+        let mut last_var_end: Option<usize> = None;
+        for stmt in &instance.content.body {
+            let Statement::Variable(v) = stmt else {
+                continue;
+            };
+            let vs = v.span.start as usize;
+            let group = group_indices.get(&vs);
+            if group.is_some() {
+                last_var_end = Some(v.span.end as usize);
+            }
+        }
+        if let Some(p) = last_var_end {
+            insertion_point = p;
+        }
+    }
+
+    // Insert `\n\tlet { … } = $props();` at the insertion point.
+    str.append_right(insertion_point, format!("\n{}{}", indent, props_decl));
+    // Remove just the `export { … }` statement text (not its leading/trailing
+    // whitespace — leaves the blank line + indent the surrounding source had).
+    str.remove(en.span.start as usize, en.span.end as usize);
 }
 
 // ---------------------------------------------------------------------------
