@@ -324,7 +324,8 @@ fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
     // and reassemble the source.
     let bytes = source.as_bytes();
     let content_end = instance.content.span.end as usize;
-    // Compute extended start = back to line-start (only whitespace), end = forward to \n inclusive.
+    // Compute extended start = back to line-start (only whitespace), then
+    // further back to include any immediately-preceding line/block comments.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (s, e, _t, _d) in &labeled {
         let mut start = *s;
@@ -338,6 +339,56 @@ fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
             }
         }
         start = idx;
+        // Now further extend back past preceding `// …` or `/* … */` comment
+        // lines that are ADJACENT (only whitespace between them and the $:).
+        loop {
+            // Skip blank lines? Upstream attaches comments that are
+            // contiguous; let's not skip blank lines.
+            if start == 0 {
+                break;
+            }
+            // Position immediately before start is `\n` (start is at line-start
+            // or 0). Look at the previous line.
+            if bytes[start - 1] != b'\n' {
+                break;
+            }
+            // Find prev line range [prev_line_start, start - 1).
+            let mut prev_line_start = start - 1;
+            while prev_line_start > 0 && bytes[prev_line_start - 1] != b'\n' {
+                prev_line_start -= 1;
+            }
+            // Trim leading whitespace.
+            let mut r = prev_line_start;
+            while r < start - 1 && (bytes[r] == b' ' || bytes[r] == b'\t') {
+                r += 1;
+            }
+            // Check if line is a `//` comment.
+            if r + 2 <= bytes.len() && &source[r..r + 2] == "//" {
+                start = prev_line_start;
+                continue;
+            }
+            // Check if line is `/* … */` block comment ending on the same line.
+            // (Skip multi-line block for now.)
+            if r + 2 <= bytes.len() && &source[r..r + 2] == "/*" {
+                // Find `*/` on the same line.
+                let mut q = r + 2;
+                while q + 1 < start - 1 && &source[q..q + 2] != "*/" {
+                    q += 1;
+                }
+                if q + 1 < start - 1 {
+                    // Confirm rest of line after `*/` is whitespace.
+                    let mut k = q + 2;
+                    while k < start - 1 && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                        k += 1;
+                    }
+                    if k == start - 1 {
+                        start = prev_line_start;
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
         let mut end = *e;
         // Extend end past trailing newline.
         while end < bytes.len() && bytes[end] != b'\n' {
@@ -3176,15 +3227,20 @@ fn apply_migrate_slot_usage(
         }
         let _ = bytes;
 
-        // If no slot attr → nothing to wrap.
-        let Some((slot_s, slot_e)) = slot_attr_span else {
-            continue;
-        };
-
-        // Remove the `slot=` attribute (upstream removes just the attribute,
-        // leaving the leading space, which produces e.g. `<div >` for
-        // `<div slot="X">`).
-        str.remove(slot_s, slot_e);
+        // No slot attr — only wrap if there are let directives on the
+        // svelte:fragment (default-slot fragment with let props). For other
+        // tags without slot=, nothing to do.
+        if slot_attr_span.is_none() {
+            if !is_svelte_fragment || let_pairs.is_empty() {
+                continue;
+            }
+        }
+        if let Some((slot_s, slot_e)) = slot_attr_span {
+            // Remove the `slot=` attribute (upstream removes just the
+            // attribute, leaving the leading space, which produces e.g.
+            // `<div >` for `<div slot="X">`).
+            str.remove(slot_s, slot_e);
+        }
         // Remove the let directives (upstream removes just the directive).
         for (s, e) in &let_attrs {
             str.remove(*s, *e);
