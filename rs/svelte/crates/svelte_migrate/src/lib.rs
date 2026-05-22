@@ -88,6 +88,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_self_closing_elements(source, &mut str, &parsed.fragment);
     migrate_svelte_self_no_filename(source, &mut str, &parsed.fragment, opts.filename.as_deref());
     migrate_svelte_element_static_this(source, &mut str, &parsed.fragment);
+    migrate_svelte_component(source, &mut str, &parsed.fragment);
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
     migrate_simple_state(source, &mut str, &parsed);
@@ -1482,6 +1483,120 @@ fn migrate_svelte_self_no_filename(
 // Only when `this`-value is a static Literal string.
 // ---------------------------------------------------------------------------
 
+/// `<svelte:component this={X}>...</svelte:component>` → `<X>...</X>` when X
+/// is a valid component-name identifier or MemberExpression. Otherwise leave
+/// alone (we don't yet generate `{@const SvelteComponentN = X}` derivations).
+fn migrate_svelte_component(source: &str, str: &mut MagicString, frag: &Fragment) {
+    walk_fragment(frag, &mut |child| {
+        if let FragmentChild::SvelteComponent(c) = child {
+            let (s, e) = expr_span(&c.expression);
+            let expr_text = source[s as usize..e as usize].to_string();
+            // Validate component-name regex: must start with uppercase or be a
+            // MemberExpression / dotted path with valid parts.
+            if !is_valid_component_name(&expr_text) {
+                return;
+            }
+            // Rewrite the open tag: replace `svelte:component` with `expr`.
+            // Open tag spans from `<` + name → at position c.start + 1 onwards.
+            let bytes = source.as_bytes();
+            let name = b"svelte:component";
+            let open_name_start = c.start as usize + 1;
+            if open_name_start + name.len() > bytes.len()
+                || &bytes[open_name_start..open_name_start + name.len()] != name
+            {
+                return;
+            }
+            str.update(
+                open_name_start,
+                open_name_start + name.len(),
+                &expr_text,
+            );
+            // Rewrite the close tag if present: `</svelte:component>`.
+            let close_seq = b"</svelte:component";
+            let mut k = c.end as usize;
+            // Look for close tag before c.end.
+            if k >= close_seq.len() + 1 {
+                let close_pos = k - close_seq.len() - 1;
+                // Verify.
+                if &bytes[close_pos..close_pos + close_seq.len()] == close_seq
+                    && bytes.get(close_pos + close_seq.len()).copied() == Some(b'>')
+                {
+                    str.update(
+                        close_pos + 2,
+                        close_pos + 2 + b"svelte:component".len(),
+                        &expr_text,
+                    );
+                }
+            }
+            // Remove `this={X}` attribute. Find `this` literal text before the
+            // expression position.
+            // Look for `this` literal preceded by whitespace, between
+            // `<svelte:component` and the expression.
+            let this_search_start = c.start as usize + 1 + name.len();
+            let mut p = s as usize;
+            // Walk backwards from expression's `{` to find `=`, then `this`.
+            // Scan backward from `s` for `this`.
+            let mut found_this = None;
+            let mut scan = s as usize;
+            while scan > this_search_start {
+                scan -= 1;
+                if scan + 4 <= bytes.len() && &bytes[scan..scan + 4] == b"this" {
+                    let before_ok = scan == 0
+                        || bytes[scan - 1].is_ascii_whitespace();
+                    let after = &bytes[scan + 4..];
+                    let after_ok = after.iter().take_while(|c| c.is_ascii_whitespace() || **c == b'=' || **c == b'{').next().is_some();
+                    if before_ok && after_ok {
+                        found_this = Some(scan);
+                        break;
+                    }
+                }
+            }
+            let _ = p;
+            if let Some(this_pos) = found_this {
+                // Eat leading whitespace.
+                let mut start = this_pos;
+                while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
+                    start -= 1;
+                }
+                // Find the closing `}` after the expression.
+                let mut end = e as usize;
+                while end < bytes.len() && bytes[end] != b'}' {
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    end += 1;
+                }
+                str.remove(start, end);
+            }
+        }
+    });
+}
+
+/// Match the regex `regex_valid_component_name` upstream: starts with
+/// `[A-Z]` OR `_`/`$` and contains valid identifier chars + dots.
+fn is_valid_component_name(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let first = bytes[0];
+    if !(first.is_ascii_uppercase() || first == b'_' || first == b'$') {
+        // Member expressions like `Math.random` could also be valid; allow if
+        // the first segment is uppercase/letter.
+        if !first.is_ascii_alphabetic() {
+            return false;
+        }
+    }
+    // Allow letters, digits, `_`, `$`, `.`.
+    for &c in bytes {
+        if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.') {
+            return false;
+        }
+    }
+    true
+}
+
 fn migrate_svelte_element_static_this(source: &str, str: &mut MagicString, frag: &Fragment) {
     walk_fragment(frag, &mut |child| {
         if let FragmentChild::SvelteElement(el) = child {
@@ -1972,6 +2087,206 @@ fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
     info
 }
 
+/// Handle the "Component has let: directives" case in upstream's
+/// `migrate_slot_usage`. Wrap the default-slot content of the Component in
+/// `{#snippet children({ let_props })}…{/snippet}`, removing the let:
+/// directives from the Component's opening tag.
+fn apply_component_let_directive_wrap(
+    source: &str,
+    str: &mut MagicString,
+    child: &FragmentChild,
+    depth: usize,
+) {
+    let bytes = source.as_bytes();
+    let indent = guess_indent_from_source(source);
+    let (attrs, c_frag): (&Vec<ElementAttribute>, &Fragment) = match child {
+        FragmentChild::Component(c) => (&c.attributes, &c.fragment),
+        FragmentChild::SvelteComponent(c) => (&c.attributes, &c.fragment),
+        _ => return,
+    };
+    // Gather let: directives.
+    let mut let_pairs: Vec<String> = Vec::new();
+    let mut let_attrs: Vec<(usize, usize)> = Vec::new();
+    for a in attrs {
+        if let ElementAttribute::LetDirective(ld) = a {
+            let pair = if let Some(expr) = &ld.expression {
+                let (s, e) = expr_span(expr);
+                format!("{}: {}", ld.name, &source[s as usize..e as usize])
+            } else {
+                ld.name.clone()
+            };
+            let_pairs.push(pair);
+            let_attrs.push((ld.start as usize, ld.end as usize));
+        }
+    }
+    if let_pairs.is_empty() {
+        return;
+    }
+    // Remove the let: directives from the Component opening tag.
+    for (s, e) in &let_attrs {
+        str.remove(*s, *e);
+    }
+
+    // Find the default-slot content range. Skip leading empty-text children
+    // and named-slot children at the start.
+    if c_frag.nodes.is_empty() {
+        return;
+    }
+    let mut inner_start: Option<usize> = None;
+    let mut inner_end: Option<usize> = None;
+    for n in &c_frag.nodes {
+        let is_empty_text = matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty());
+        let has_slot_attr = node_has_slot_attribute(n);
+        if has_slot_attr {
+            if let Some(_) = inner_start {
+                if inner_end.is_none() {
+                    inner_end = Some(node_start(n));
+                }
+            }
+        } else if !is_empty_text {
+            if inner_start.is_none() {
+                inner_start = Some(node_start(n));
+            } else if let Some(_) = inner_end {
+                // There was default content, then a named slot, now more
+                // default content — upstream moves it via str.move. Skip
+                // (the rare interleave case).
+            }
+        }
+    }
+    let Some(inner_start) = inner_start else {
+        return;
+    };
+    // If we never found a named-slot break, the default content goes to the
+    // last node.
+    let inner_end = inner_end.unwrap_or_else(|| {
+        let last = &c_frag.nodes[c_frag.nodes.len() - 1];
+        node_end(last)
+    });
+
+    let props_text = format!("{{ {} }}", let_pairs.join(", "));
+    // Compute path indent: upstream uses `state.indent.repeat(path.length)`
+    // for the inner indent. When this function is invoked for a Component at
+    // depth N, the walker's path.length matches N (the path excludes the
+    // Component itself but counts its ancestors).
+    let inner_indent = indent.repeat(depth);
+    let outer_indent = indent.repeat(depth.saturating_sub(1));
+
+    // Insert the {#snippet children(props)} marker.
+    str.append_left(
+        inner_start,
+        format!("{{#snippet children({})}}\n{}", props_text, inner_indent),
+    );
+    // Indent every line in [inner_start, inner_end].
+    // The FIRST line of content: the line where inner_start lives. Its line
+    // start is BEFORE inner_start (the leading indent of the source line).
+    // Magic-string's indent prepends the indent AT inner_start itself when the
+    // last `\n` before inner_start fell in the exclusion. We replicate that by
+    // calling `append_left(inner_start, indent)` (i.e. before the content's
+    // first non-whitespace char). This is in addition to the prepend's own
+    // `inner_indent`.
+    str.append_left(inner_start, indent.clone());
+    let mut k = inner_start;
+    while k < inner_end {
+        if bytes[k] == b'\n' && k + 1 < inner_end {
+            str.append_left(k + 1, indent.clone());
+        }
+        k += 1;
+    }
+    // Insert the closing snippet tag.
+    // If there are named slots after default content (inner_end < last node),
+    // upstream uses just `{/snippet}\n{indent}` (without trailing dedent).
+    // Otherwise it includes the outer indent for the closing tag.
+    let last_end = node_end(&c_frag.nodes[c_frag.nodes.len() - 1]);
+    if inner_end < last_end {
+        str.prepend_left(inner_end, format!("{{/snippet}}\n{}", outer_indent));
+    } else {
+        str.prepend_left(
+            inner_end,
+            format!("{}{{/snippet}}\n{}", inner_indent, outer_indent),
+        );
+    }
+}
+
+fn node_has_slot_attribute(n: &FragmentChild) -> bool {
+    let attrs: &Vec<ElementAttribute> = match n {
+        FragmentChild::RegularElement(e) => &e.attributes,
+        FragmentChild::SvelteElement(e) => &e.attributes,
+        FragmentChild::SvelteFragment(e) => &e.attributes,
+        FragmentChild::SlotElement(e) => &e.attributes,
+        FragmentChild::Component(c) => &c.attributes,
+        FragmentChild::SvelteComponent(c) => &c.attributes,
+        _ => return false,
+    };
+    attrs.iter().any(|a| {
+        matches!(a, ElementAttribute::Attribute(attr) if attr.name == "slot"
+            && attribute_static_string(&attr.value).is_some())
+    })
+}
+
+fn node_start(n: &FragmentChild) -> usize {
+    match n {
+        FragmentChild::Text(t) => t.start as usize,
+        FragmentChild::RegularElement(e) => e.start as usize,
+        FragmentChild::Component(c) => c.start as usize,
+        FragmentChild::SvelteComponent(c) => c.start as usize,
+        FragmentChild::SvelteElement(e) => e.start as usize,
+        FragmentChild::SvelteFragment(e) => e.start as usize,
+        FragmentChild::SvelteSelf(e) => e.start as usize,
+        FragmentChild::SvelteOptions(e) => e.start as usize,
+        FragmentChild::SvelteWindow(e) => e.start as usize,
+        FragmentChild::SvelteHead(e) => e.start as usize,
+        FragmentChild::SvelteBody(e) => e.start as usize,
+        FragmentChild::SvelteDocument(e) => e.start as usize,
+        FragmentChild::SvelteBoundary(e) => e.start as usize,
+        FragmentChild::SlotElement(e) => e.start as usize,
+        FragmentChild::TitleElement(e) => e.start as usize,
+        FragmentChild::ExpressionTag(et) => et.start as usize,
+        FragmentChild::HtmlTag(t) => t.start as usize,
+        FragmentChild::ConstTag(c) => c.start as usize,
+        FragmentChild::RenderTag(r) => r.start as usize,
+        FragmentChild::IfBlock(b) => b.start as usize,
+        FragmentChild::EachBlock(b) => b.start as usize,
+        FragmentChild::AwaitBlock(b) => b.start as usize,
+        FragmentChild::KeyBlock(b) => b.start as usize,
+        FragmentChild::SnippetBlock(b) => b.start as usize,
+        FragmentChild::Comment(c) => c.start as usize,
+        FragmentChild::DebugTag(d) => d.start as usize,
+        FragmentChild::AttachTag(a) => a.start as usize,
+    }
+}
+
+fn node_end(n: &FragmentChild) -> usize {
+    match n {
+        FragmentChild::Text(t) => t.end as usize,
+        FragmentChild::RegularElement(e) => e.end as usize,
+        FragmentChild::Component(c) => c.end as usize,
+        FragmentChild::SvelteComponent(c) => c.end as usize,
+        FragmentChild::SvelteElement(e) => e.end as usize,
+        FragmentChild::SvelteFragment(e) => e.end as usize,
+        FragmentChild::SvelteSelf(e) => e.end as usize,
+        FragmentChild::SvelteOptions(e) => e.end as usize,
+        FragmentChild::SvelteWindow(e) => e.end as usize,
+        FragmentChild::SvelteHead(e) => e.end as usize,
+        FragmentChild::SvelteBody(e) => e.end as usize,
+        FragmentChild::SvelteDocument(e) => e.end as usize,
+        FragmentChild::SvelteBoundary(e) => e.end as usize,
+        FragmentChild::SlotElement(e) => e.end as usize,
+        FragmentChild::TitleElement(e) => e.end as usize,
+        FragmentChild::ExpressionTag(et) => et.end as usize,
+        FragmentChild::HtmlTag(t) => t.end as usize,
+        FragmentChild::ConstTag(c) => c.end as usize,
+        FragmentChild::RenderTag(r) => r.end as usize,
+        FragmentChild::IfBlock(b) => b.end as usize,
+        FragmentChild::EachBlock(b) => b.end as usize,
+        FragmentChild::AwaitBlock(b) => b.end as usize,
+        FragmentChild::KeyBlock(b) => b.end as usize,
+        FragmentChild::SnippetBlock(b) => b.end as usize,
+        FragmentChild::Comment(c) => c.end as usize,
+        FragmentChild::DebugTag(d) => d.end as usize,
+        FragmentChild::AttachTag(a) => a.end as usize,
+    }
+}
+
 /// Mirror upstream's `migrate_slot_usage`. For each child of a Component /
 /// SvelteComponent parent that has a `slot="X"` attribute, wrap that child in
 /// `{#snippet X(let_props)}...{/snippet}` and strip the `slot=` attribute.
@@ -2004,6 +2319,12 @@ fn apply_migrate_slot_usage(
         };
         if let Some(f) = child_frag {
             apply_migrate_slot_usage(source, str, f, Some(child), depth + 1);
+        }
+
+        // Case: child is a Component/SvelteComponent with `let:` directives.
+        // Wrap its default-slot content in `{#snippet children(props)}…`.
+        if let FragmentChild::Component(_) | FragmentChild::SvelteComponent(_) = child {
+            apply_component_let_directive_wrap(source, str, child, depth);
         }
 
         // We only apply migrate_slot_usage to children of a Component/SvelteComponent.
