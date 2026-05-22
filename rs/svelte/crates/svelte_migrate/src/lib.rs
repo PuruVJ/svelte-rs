@@ -2403,6 +2403,10 @@ fn is_reserved_word(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment) {
+    // Pre-compute aliases by scanning the instance script for top-level
+    // bindings that clash with our legacy import names.
+    let aliases = compute_legacy_aliases(source);
+    let collected = std::cell::RefCell::new(LegacyEventState::default());
     walk_fragment(frag, &mut |child| {
         let attrs = match child {
             FragmentChild::RegularElement(e) => &e.attributes,
@@ -2413,47 +2417,234 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
             | FragmentChild::SvelteHead(e) => &e.attributes,
             _ => return,
         };
-        // First pass: bucket OnDirective by event name; only migrate buckets
-        // with exactly one entry, no modifiers, with an explicit expression.
-        let mut by_event: std::collections::HashMap<String, Vec<&svelte_ast::attributes::OnDirective>> = Default::default();
-        for a in attrs {
-            if let ElementAttribute::OnDirective(od) = a {
-                by_event.entry(od.name.clone()).or_default().push(od);
+        handle_events_on_element(source, str, attrs, &mut collected.borrow_mut(), &aliases);
+    });
+    let s = collected.into_inner();
+    if !s.legacy_imports.is_empty() {
+        apply_legacy_event_script(source, str, &s, &aliases);
+    }
+}
+
+/// Compute the alias names for legacy imports based on the instance script
+/// content. Returns a map from base name → alias (which may equal the base if
+/// no clash).
+fn compute_legacy_aliases(source: &str) -> std::collections::HashMap<String, String> {
+    let mut taken: std::collections::HashSet<String> = Default::default();
+    if let Ok(parsed) = svelte_parse::parse(source, false) {
+        if let Some(instance) = &parsed.instance {
+            for stmt in &instance.content.body {
+                collect_top_level_decl_names(stmt, &mut taken);
             }
         }
-        for (_name, list) in by_event {
-            if list.len() != 1 {
-                continue;
+    }
+    let bases = [
+        "createBubbler",
+        "handlers",
+        "preventDefault",
+        "stopPropagation",
+        "stopImmediatePropagation",
+        "self",
+        "trusted",
+        "once",
+        "passive",
+        "nonpassive",
+        "bubble",
+    ];
+    let mut reserved = taken.clone();
+    let mut out: std::collections::HashMap<String, String> = Default::default();
+    for base in &bases {
+        let mut name = base.to_string();
+        if reserved.contains(&name) {
+            let mut i = 1;
+            loop {
+                let cand = format!("{}_{}", base, i);
+                if !reserved.contains(&cand) {
+                    name = cand;
+                    break;
+                }
+                i += 1;
             }
-            let od = list[0];
-            if !od.modifiers.is_empty() {
-                continue;
+        }
+        reserved.insert(name.clone());
+        out.insert(base.to_string(), name);
+    }
+    out
+}
+
+#[derive(Default)]
+struct LegacyEventState {
+    /// Names from `svelte/legacy` we need to import (createBubbler, handlers,
+    /// preventDefault, etc.) — insertion order preserved.
+    legacy_imports: Vec<String>,
+    /// Script insertions like `const bubble = createBubbler();`.
+    script_insertions: Vec<String>,
+    /// Tracks whether we've placed a script bubble const yet.
+    used_bubble: bool,
+}
+
+impl LegacyEventState {
+    fn add_import(&mut self, name: &str) {
+        if !self.legacy_imports.iter().any(|n| n == name) {
+            self.legacy_imports.push(name.to_string());
+        }
+    }
+    fn add_insertion(&mut self, s: &str) {
+        if !self.script_insertions.iter().any(|n| n == s) {
+            self.script_insertions.push(s.to_string());
+        }
+    }
+}
+
+fn apply_legacy_event_script(
+    source: &str,
+    str: &mut MagicString,
+    state: &LegacyEventState,
+    aliases: &std::collections::HashMap<String, String>,
+) {
+    let Ok(parsed) = svelte_parse::parse(source, false) else {
+        return;
+    };
+    let root = parsed;
+
+    // Build the import line: `import { foo, bar as bar_1, … } from 'svelte/legacy';`
+    let mut parts: Vec<String> = Vec::new();
+    for imp in &state.legacy_imports {
+        let alias = aliases.get(imp).map(|s| s.as_str()).unwrap_or(imp.as_str());
+        if alias == imp.as_str() {
+            parts.push(imp.clone());
+        } else {
+            parts.push(format!("{} as {}", imp, alias));
+        }
+    }
+    let import_line = format!("import {{ {} }} from 'svelte/legacy';", parts.join(", "));
+
+    let indent_owned = if let Some(instance) = &root.instance {
+        guess_indent(source, instance)
+    } else {
+        "\t".to_string()
+    };
+    let indent = indent_owned.as_str();
+
+    if let Some(instance) = &root.instance {
+        let insertion_point = instance.content.span.start as usize;
+        let mut content = format!("\n{}{}\n", indent, import_line);
+        for ins in &state.script_insertions {
+            content.push_str(&format!("\n{}{}", indent, ins));
+        }
+        str.append_right(insertion_point, content);
+    } else {
+        let mut content = format!("<script>\n{}{}\n", indent, import_line);
+        for ins in &state.script_insertions {
+            content.push_str(&format!("\n{}{}", indent, ins));
+        }
+        content.push_str("\n</script>\n\n");
+        str.prepend_left(0, content);
+    }
+}
+
+/// Process all on: directives on a single element. Buckets by event name,
+/// applies modifiers, combines multiple handlers via `handlers(...)`.
+fn handle_events_on_element(
+    source: &str,
+    str: &mut MagicString,
+    attrs: &[ElementAttribute],
+    state: &mut LegacyEventState,
+    aliases: &std::collections::HashMap<String, String>,
+) {
+    let a = |k: &str| aliases.get(k).cloned().unwrap_or_else(|| k.to_string());
+    use std::collections::HashMap;
+    // Bucket by event name (with `capture` modifier appended).
+    let mut buckets: Vec<(String, Vec<&svelte_ast::attributes::OnDirective>)> = Vec::new();
+    let mut idx_of: HashMap<String, usize> = HashMap::new();
+    for a in attrs {
+        let ElementAttribute::OnDirective(od) = a else {
+            continue;
+        };
+        let mut name = format!("on{}", od.name);
+        if od.modifiers.iter().any(|m| m == "capture") {
+            name = format!("{}capture", name);
+        }
+        if let Some(&i) = idx_of.get(&name) {
+            buckets[i].1.push(od);
+        } else {
+            idx_of.insert(name.clone(), buckets.len());
+            buckets.push((name, vec![od]));
+        }
+    }
+
+    for (name, nodes) in &buckets {
+        // For each handler: build body text (handler expr or bubble('event')).
+        let mut handlers_list: Vec<String> = Vec::new();
+        let mut first: Option<&svelte_ast::attributes::OnDirective> = None;
+        for node in nodes {
+            let mut body = if let Some(expr) = &node.expression {
+                let (s, e) = expr_span(expr);
+                source[s as usize..e as usize].to_string()
+            } else {
+                state.add_import("createBubbler");
+                state.add_insertion(&format!("const {} = {}();", a("bubble"), a("createBubbler")));
+                state.used_bubble = true;
+                format!("{}('{}')", a("bubble"), node.name)
+            };
+
+            let has_passive = node.modifiers.iter().any(|m| m == "passive");
+            let has_nonpassive = node.modifiers.iter().any(|m| m == "nonpassive");
+
+            // Apply modifiers in canonical order.
+            const ORDER: &[&str] = &[
+                "preventDefault",
+                "stopPropagation",
+                "stopImmediatePropagation",
+                "self",
+                "trusted",
+                "once",
+            ];
+            for mo in ORDER {
+                if node.modifiers.iter().any(|m| m == mo) {
+                    state.add_import(mo);
+                    body = format!("{}({})", a(mo), body);
+                }
             }
-            let Some(expr) = &od.expression else {
+
+            if has_passive || has_nonpassive {
+                let action = if has_passive { "passive" } else { "nonpassive" };
+                state.add_import(action);
+                let replacement = format!("use:{}={{['{}', () => {}]}}", a(action), node.name, body);
+                str.overwrite(node.start as usize, node.end as usize, replacement);
+            } else {
+                if let Some(_f) = first {
+                    // Subsequent — remove the whole directive (and preceding ws).
+                    let mut s = node.start as usize;
+                    let e = node.end as usize;
+                    let bytes = source.as_bytes();
+                    while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t' || bytes[s - 1] == b'\n') {
+                        s -= 1;
+                    }
+                    str.remove(s, e);
+                } else {
+                    first = Some(node);
+                }
+                handlers_list.push(body);
+            }
+        }
+
+        if let Some(first_node) = first {
+            let replacement = if handlers_list.len() > 1 {
+                state.add_import("handlers");
+                format!("{}={{{}({})}}", name, a("handlers"), handlers_list.join(", "))
+            } else if handlers_list.len() == 1 {
+                let h = &handlers_list[0];
+                if h == name {
+                    format!("{{{}}}", h)
+                } else {
+                    format!("{}={{{}}}", name, h)
+                }
+            } else {
                 continue;
             };
-            // Replace `on:NAME` with `onNAME` (5+name bytes → 2+name bytes).
-            // The directive's start..start+3+namelen covers `on:NAME`, so we
-            // overwrite that with `on${NAME}`.
-            let start = od.start as usize;
-            let bytes = source.as_bytes();
-            // Find `on:` then NAME at `od.start`. Confirm.
-            if start + 3 >= bytes.len() || &bytes[start..start + 3] != b"on:" {
-                continue;
-            }
-            // Find the colon position to remove it.
-            // Overwrite just `on:NAME` portion to `onNAME`.
-            let name_len = od.name.len();
-            let kw_end = start + 3 + name_len;
-            // Sanity check: bytes after kw_end must be `=` or end-of-directive.
-            // We use `od.end` as the boundary.
-            // Replace `on:NAME` with `onNAME`.
-            let _ = kw_end;
-            let _ = expr;
-            // The simplest replacement: overwrite the colon at start+2 with empty.
-            str.remove(start + 2, start + 3);
+            str.overwrite(first_node.start as usize, first_node.end as usize, replacement);
         }
-    });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4938,6 +5129,8 @@ fn migrate_effects(
 
     let bytes = source.as_bytes();
     let mut had_effects = false;
+    // Pre-compute aliased name for `run`.
+    let run_name = unique_legacy_name(source, root, "run");
 
     for stmt in body {
         let Statement::Labeled(l) = stmt else {
@@ -4996,7 +5189,7 @@ fn migrate_effects(
         match &l.body {
             Statement::Block(_) => {
                 // Replace `$: ` (i.e. l_start..body_start) with `run(() => `.
-                str.update(l_start, body_start, "run(() => ");
+                str.update(l_start, body_start, &format!("{}(() => ", run_name));
                 // Replace trailing `}` with `});` — append `);` right after body_end.
                 str.append_right(body_end, ");");
             }
@@ -5005,7 +5198,7 @@ fn migrate_effects(
                 str.update(
                     l_start,
                     body_start,
-                    &format!("run(() => {{\n{}\t", indent),
+                    &format!("{}(() => {{\n{}\t", run_name, indent),
                 );
                 // Replace `;` (if present) at end with `;\n{indent}});`.
                 let ends_with_semi = bytes
@@ -5024,7 +5217,7 @@ fn migrate_effects(
                 str.update(
                     l_start,
                     body_start,
-                    &format!("run(() => {{\n{}\t", indent),
+                    &format!("{}(() => {{\n{}\t", run_name, indent),
                 );
                 str.append_right(body_end, &format!("\n{}}});", indent));
                 // Add a tab after each `\n` inside the body to bump the
@@ -5049,19 +5242,46 @@ fn migrate_effects(
         return;
     }
 
-    // Prepend `import { run } from 'svelte/legacy';\n\n` at the start of the
-    // instance script content.
+    // Prepend `import { run [as alias] } from 'svelte/legacy';\n` at the
+    // start of the instance script content.
     let insertion_point = instance.content.span.start as usize;
-    // Mirror upstream's indent: `\n${indent}${import}` appended right at
-    // content start. Use the majority-based `guess_indent` over script body.
     let indent = guess_indent(source, instance);
-    str.append_right(
-        insertion_point,
+    let import_text = if run_name == "run" {
         format!(
             "\n{}import {{ run }} from 'svelte/legacy';\n",
             indent
-        ),
-    );
+        )
+    } else {
+        format!(
+            "\n{}import {{ run as {} }} from 'svelte/legacy';\n",
+            indent, run_name
+        )
+    };
+    str.append_right(insertion_point, import_text);
+}
+
+/// Find a unique name for a legacy import. If `base` doesn't clash with any
+/// top-level binding in the instance script, returns `base` unchanged.
+/// Otherwise returns `base_1`, `base_2`, etc.
+fn unique_legacy_name(source: &str, root: &Root, base: &str) -> String {
+    let mut taken: std::collections::HashSet<String> = Default::default();
+    if let Some(instance) = &root.instance {
+        for stmt in &instance.content.body {
+            collect_top_level_decl_names(stmt, &mut taken);
+        }
+    }
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    let mut i = 1;
+    loop {
+        let candidate = format!("{}_{}", base, i);
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        i += 1;
+    }
+    let _ = source;
 }
 
 fn reindent_inside(s: &str, indent: &str) -> String {
