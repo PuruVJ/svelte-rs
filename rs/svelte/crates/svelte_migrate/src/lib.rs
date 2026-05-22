@@ -91,10 +91,10 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
     migrate_simple_state(source, &mut str, &parsed);
-    migrate_simple_derivations(source, &mut str, &parsed);
+    let derived_labeled_starts = migrate_simple_derivations(source, &mut str, &parsed);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
     migrate_simple_props(source, &mut str, &parsed);
-    migrate_effects(source, &mut str, &parsed);
+    migrate_effects(source, &mut str, &parsed, &derived_labeled_starts);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
@@ -2030,7 +2030,12 @@ fn p_decl_unused() {
 // Also rewrites `break $;` inside the body to `return` (upstream behavior).
 // ---------------------------------------------------------------------------
 
-fn migrate_effects(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_effects(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    derived_labeled_starts: &std::collections::HashSet<usize>,
+) {
     let Some(instance) = &root.instance else {
         return;
     };
@@ -2046,35 +2051,13 @@ fn migrate_effects(source: &str, str: &mut MagicString, root: &Root) {
         if l.label.name != "$" {
             continue;
         }
-        // Skip the simple assignment-to-Identifier form (already handled by
-        // migrate_simple_derivations) — but only when it was actually
-        // promoted to `$derived(...)`. We detect by looking at whether the
-        // current source at this position still starts with `$:`. Easier:
-        // re-check that derivations transform's criteria match — if so,
-        // skip; else, treat as effect.
         let l_start = l.span.start as usize;
         let l_end = l.span.end as usize;
-        // If labeled has an ExpressionStatement-Assignment-Identifier and
-        // appears to be a derivation candidate, skip.
-        let is_derivation = match &l.body {
-            Statement::Expression(es) => match &es.expression {
-                Expression::Assignment(asn) => matches!(
-                    &asn.left,
-                    svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(_))
-                        | svelte_js_ast::AssignmentTarget::Pattern(_)
-                ),
-                Expression::Paren(p) => {
-                    matches!(&p.expression, Expression::Assignment(_))
-                }
-                _ => false,
-            },
-            _ => false,
-        };
-        if is_derivation {
-            // We can't easily know if the derivation actually fired — but if
-            // it didn't (e.g. outside-assignment or multiple-$:), upstream
-            // *would* emit it as an effect. Simpler heuristic: skip
-            // derivation-shaped statements entirely. Refine later.
+        // Skip ONLY labeled statements that were actually consumed by
+        // migrate_simple_derivations. Everything else (including failed
+        // derivation candidates like store-prefix assigns or multi-$:) becomes
+        // an effect.
+        if derived_labeled_starts.contains(&l_start) {
             continue;
         }
 
@@ -2362,9 +2345,14 @@ fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root:
 // modifications inside the labeled statement, no multi-statement block.
 // ---------------------------------------------------------------------------
 
-fn migrate_simple_derivations(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_simple_derivations(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+) -> std::collections::HashSet<usize> {
+    let mut consumed: std::collections::HashSet<usize> = Default::default();
     let Some(instance) = &root.instance else {
-        return;
+        return consumed;
     };
     let body = &instance.content.body;
 
@@ -2500,6 +2488,11 @@ fn migrate_simple_derivations(source: &str, str: &mut MagicString, root: &Root) 
                 if names.is_empty() {
                     continue;
                 }
+                // Skip if any name is store-prefixed (`$store`) — those are
+                // Svelte 4 auto-subscriptions, not derivable.
+                if names.iter().any(|n| n.starts_with('$')) {
+                    continue;
+                }
                 (slice.to_string(), names.into_iter().collect())
             }
             _ => continue,
@@ -2592,8 +2585,10 @@ fn migrate_simple_derivations(source: &str, str: &mut MagicString, root: &Root) 
             };
             str.update(l_start, l_end, &final_replacement);
         }
+        consumed.insert(l_start);
     }
     let _ = str;
+    consumed
 }
 
 // ---------------------------------------------------------------------------
