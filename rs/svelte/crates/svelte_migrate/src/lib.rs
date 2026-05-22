@@ -1815,6 +1815,12 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         node_decl_count: usize,
         bindable: bool,
         has_type_annotation: bool,
+        // Type extracted from a leading JSDoc `@type {...}` block (without
+        // the wrapping `/** @type {...} */`). None ⇒ infer from init or
+        // fall back to `any`.
+        jsdoc_type: Option<String>,
+        // JSDoc *block* start/end if found above the export (so we can erase).
+        jsdoc_span: Option<(usize, usize)>,
     }
     let mut props: Vec<Prop> = Vec::new();
     // Collect bind:/updated targets for $bindable detection.
@@ -1865,19 +1871,33 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
                 k < bytes.len() && bytes[k] == b':'
             };
             // Detect a leading JSDoc block immediately before this export.
-            let has_jsdoc_above = {
+            let jsdoc_span = {
                 let mut p = en.span.start as usize;
-                // Walk back over whitespace.
                 while p > 0 && (bytes[p - 1] == b' ' || bytes[p - 1] == b'\t' || bytes[p - 1] == b'\n')
                 {
                     p -= 1;
                 }
-                p >= 2 && &source[p - 2..p] == "*/"
+                if p >= 2 && &source[p - 2..p] == "*/" {
+                    // Find matching `/**` start.
+                    let close = p;
+                    let prefix = &source[..close - 2];
+                    if let Some(rel) = prefix.rfind("/**") {
+                        Some((rel, close))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             };
 
-            // For now, bail on any prop with TS type or JSDoc — we don't yet
-            // emit the corresponding interface.
-            if has_type || has_jsdoc_above {
+            // Extract `@type {…}` from JSDoc if present.
+            let jsdoc_type = jsdoc_span.and_then(|(s, e)| extract_jsdoc_type(&source[s..e]));
+
+            // For now, bail on TS-typed exports (we don't synthesize the
+            // interface from TS annotations yet) — but accept JSDoc-typed
+            // exports going forward.
+            if has_type {
                 return;
             }
 
@@ -1892,6 +1912,8 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
                 node_decl_count: v.declarations.len(),
                 bindable: updated.contains(&id.name),
                 has_type_annotation: false,
+                jsdoc_type,
+                jsdoc_span,
             });
             let _ = i;
         }
@@ -1908,27 +1930,64 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         return;
     }
 
+    // Decide whether to emit a JSDoc `@typedef Props` block.
+    // We emit when (a) any prop has a JSDoc `@type` annotation, or (b)
+    // there's more than one prop (the >3-props formatting also triggers).
+    // For now: only emit the interface when at least one prop has jsdoc_type.
+    let has_any_jsdoc_type = props.iter().any(|p| p.jsdoc_type.is_some());
+
+    // Compute each prop's type & optional-ness for the JSDoc block.
+    // - jsdoc_type wins
+    // - else, infer from init: 'string' / number / boolean / Array literal / ...
+    //   Fall back to `any`.
+    // - optional = has init OR bindable.
+    fn infer_type_from_init(init_text: Option<&str>) -> String {
+        let Some(t) = init_text else {
+            return "any".to_string();
+        };
+        let t = t.trim();
+        if t.starts_with('\'') || t.starts_with('"') || t.starts_with('`') {
+            return "string".to_string();
+        }
+        if t == "true" || t == "false" {
+            return "boolean".to_string();
+        }
+        if t.parse::<f64>().is_ok() {
+            return "number".to_string();
+        }
+        if t.starts_with('[') {
+            return "any[]".to_string();
+        }
+        if t.starts_with('{') {
+            return "Record<string, any>".to_string();
+        }
+        "any".to_string()
+    }
+
     // Build the destructured `let { X, Y = INIT, ... } = $props();`.
     // When $$props is used, upstream emits a rest-only `let { ...props } = $props();`
     // and drops all `export let X` lines without their declarations becoming
     // fields.
+    let indent = "\t";
+    let newline_sep = format!("\n{}{}", indent, indent);
+    let many_props = props.len() > 3;
+    let prop_sep = if many_props { newline_sep.as_str() } else { " " };
+
     let props_decl = if uses_props {
         "let { ...props } = $props();".to_string()
     } else {
         let mut parts: Vec<String> = Vec::new();
         for p in &props {
-            let init_text = if let Some((s, e)) = p.init {
-                Some(source[s as usize..e as usize].to_string())
-            } else {
-                None
-            };
+            let init_text: Option<String> = p
+                .init
+                .map(|(s, e)| source[s as usize..e as usize].to_string());
             let entry = if p.bindable {
-                match init_text {
+                match init_text.as_deref() {
                     Some(init) => format!("{} = $bindable({})", p.local, init),
                     None => format!("{} = $bindable()", p.local),
                 }
             } else {
-                match init_text {
+                match init_text.as_deref() {
                     Some(init) => format!("{} = {}", p.local, init),
                     None => p.local.clone(),
                 }
@@ -1938,7 +1997,57 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         if uses_rest {
             parts.push("...rest".to_string());
         }
-        format!("let {{ {} }} = $props();", parts.join(", "))
+        // Single-line if <=3 props.
+        if many_props {
+            format!(
+                "let {{{}{}\n{}}} = $props();",
+                newline_sep,
+                parts.join(&format!(",{}", newline_sep)),
+                indent
+            )
+        } else {
+            format!("let {{ {} }} = $props();", parts.join(", "))
+        }
+    };
+
+    // If JSDoc-types are used, build the @typedef Props block + /** @type
+    // {Props} */ annotation that gets emitted before the props_decl.
+    let typedef_block: Option<String> = if has_any_jsdoc_type && !uses_props {
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("/**"));
+        lines.push(format!("{} * @typedef {{Object}} Props", indent));
+        for p in &props {
+            let init_text: Option<String> = p
+                .init
+                .map(|(s, e)| source[s as usize..e as usize].to_string());
+            let ty = p
+                .jsdoc_type
+                .clone()
+                .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
+            let optional = init_text.is_some();
+            let name = if optional {
+                format!("[{}]", p.local)
+            } else {
+                p.local.clone()
+            };
+            lines.push(format!("{} * @property {{{}}} {}", indent, ty, name));
+        }
+        lines.push(format!("{} */", indent));
+        Some(lines.join("\n"))
+    } else {
+        None
+    };
+    let type_annot: Option<String> = if typedef_block.is_some() {
+        Some(format!("/** @type {{Props}} */"))
+    } else {
+        None
+    };
+
+    // Build the final block that replaces the FIRST export node.
+    let final_block = if let (Some(td), Some(ta)) = (&typedef_block, &type_annot) {
+        format!("{}\n\n{}{}\n{}{}", td, indent, ta, indent, props_decl)
+    } else {
+        props_decl.clone()
     };
 
     // Replace `$$restProps` references with `rest` in template attributes.
@@ -1998,28 +2107,115 @@ fn migrate_simple_props(source: &str, str: &mut MagicString, root: &Root) {
         return;
     }
 
-    // Replace the first export node with `props_decl`, remove the rest.
-    let mut first = true;
-    for (_, group) in &node_groups {
-        let p = group[0];
-        if first {
-            str.update(p.node_start, p.node_end, &props_decl);
-            first = false;
-        } else {
-            // Remove this whole export statement.
+    if has_any_jsdoc_type {
+        // Find the position of the first non-whitespace char of the instance
+        // script (where the JSDoc / export starts).
+        let mut after_ws = instance.content.span.start as usize;
+        while after_ws < bytes.len()
+            && (bytes[after_ws] == b'\n' || bytes[after_ws] == b' ' || bytes[after_ws] == b'\t')
+        {
+            after_ws += 1;
+        }
+        // Use prepend_left at that position so the prepended text comes
+        // BEFORE the JSDoc (and stays even if JSDoc is later removed).
+        // The prepended text supplies its own preceding `\n${indent}` so that
+        // the output reads `<script>\n${indent}\n${indent}{block}…`. The
+        // original `\n${indent}` of the source already precedes that.
+        str.prepend_left(
+            after_ws,
+            format!("\n{}{}", indent, final_block),
+        );
+        for p in &props {
+            if let Some((s, e)) = p.jsdoc_span {
+                // Eat trailing whitespace + newline after JSDoc (the indent
+                // before the export gets preserved separately).
+                let mut ee = e;
+                while ee < bytes.len() && (bytes[ee] == b' ' || bytes[ee] == b'\t') {
+                    ee += 1;
+                }
+                if ee < bytes.len() && bytes[ee] == b'\n' {
+                    ee += 1;
+                }
+                str.remove(s, ee);
+            }
+        }
+        // Track which export node_starts we've already eaten (multi-decl).
+        // Sort by node_start so we can identify the last one.
+        let mut export_starts: Vec<usize> = props.iter().map(|p| p.node_start).collect();
+        export_starts.sort();
+        export_starts.dedup();
+        let last_export_start = *export_starts.last().unwrap();
+        let mut seen_node: std::collections::HashSet<usize> = Default::default();
+        for p in &props {
+            if !seen_node.insert(p.node_start) {
+                continue;
+            }
+            // Remove the export node + its leading indent + trailing newline.
+            // For the LAST export, don't eat the trailing newline — that
+            // newline is the source's separator from `</script>` and we want
+            // to preserve it.
             let mut s = p.node_start;
             let mut e = p.node_end;
-            if bytes.get(e).copied() == Some(b'\n') {
-                e += 1;
-            }
             while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
                 s -= 1;
             }
+            let is_last = p.node_start == last_export_start;
+            if !is_last && bytes.get(e).copied() == Some(b'\n') {
+                e += 1;
+            }
             str.remove(s, e);
+        }
+    } else {
+        // No JSDoc types — replace first node with final_block (single-line)
+        // and remove the rest. Preserves the historical behavior.
+        let mut first = true;
+        for (_, group) in &node_groups {
+            let p = group[0];
+            if first {
+                str.update(p.node_start, p.node_end, &final_block);
+                first = false;
+            } else {
+                let mut s = p.node_start;
+                let mut e = p.node_end;
+                if bytes.get(e).copied() == Some(b'\n') {
+                    e += 1;
+                }
+                while s > 0 && (bytes[s - 1] == b' ' || bytes[s - 1] == b'\t') {
+                    s -= 1;
+                }
+                str.remove(s, e);
+            }
         }
     }
     let _ = uses_props;
     let _ = p_decl_unused();
+}
+
+/// Extract the type expression from a JSDoc block's `@type {…}` tag.
+/// Returns `None` if no `@type` is present.
+fn extract_jsdoc_type(block: &str) -> Option<String> {
+    let idx = block.find("@type")?;
+    let after = &block[idx + "@type".len()..];
+    // Skip whitespace then expect `{`.
+    let s = after.trim_start();
+    if !s.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            depth += 1;
+        } else if bytes[i] == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(s[1..i].trim().to_string());
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn p_decl_unused() {
