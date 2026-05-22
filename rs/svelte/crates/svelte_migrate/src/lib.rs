@@ -3978,6 +3978,24 @@ fn migrate_simple_props(
         // Verbatim TS type annotation text (without the leading `:`). None
         // when the export has no inline type annotation.
         ts_type: Option<String>,
+        // Leading comment span (immediately before the export, on a separate
+        // line OR on the same line just before). Cleaned form computed
+        // on demand. Used for JSDoc typedef `- comment` suffix and TS
+        // interface comment preservation.
+        leading_comment_span: Option<(usize, usize)>,
+        leading_comment_kind: CommentKind,
+        // Trailing comment span (immediately AFTER the export's `;`, same
+        // line, OR multi-line block starting on the same line).
+        trailing_comment_span: Option<(usize, usize)>,
+        trailing_comment_kind: CommentKind,
+    }
+    #[derive(Clone, Copy, Default, PartialEq)]
+    enum CommentKind {
+        #[default]
+        None,
+        Line,
+        Block,
+        Jsdoc,
     }
     let mut props: Vec<Prop> = Vec::new();
     // Collect bind:/updated targets for $bindable detection.
@@ -4064,29 +4082,102 @@ fn migrate_simple_props(
                     (false, None)
                 }
             };
-            // Detect a leading JSDoc block immediately before this export.
-            let jsdoc_span = {
+            // Detect a leading comment immediately before this export
+            // (line comment OR block comment OR JSDoc). The comment must be
+            // adjacent (only whitespace/newlines between it and the export).
+            let (leading_comment_span, leading_comment_kind) = {
                 let mut p = en.span.start as usize;
                 while p > 0 && (bytes[p - 1] == b' ' || bytes[p - 1] == b'\t' || bytes[p - 1] == b'\n')
                 {
                     p -= 1;
                 }
                 if p >= 2 && &source[p - 2..p] == "*/" {
-                    // Find matching `/**` start.
                     let close = p;
                     let prefix = &source[..close - 2];
-                    if let Some(rel) = prefix.rfind("/**") {
-                        Some((rel, close))
+                    // The block comment that ends at `close` starts at the
+                    // LATEST `/*` in prefix. If that `/*` is followed by `*`
+                    // AND there's no `/*\n* ` interpretation, treat as JSDoc.
+                    if let Some(rel) = prefix.rfind("/*") {
+                        let kind = if rel + 2 < prefix.len() && prefix.as_bytes()[rel + 2] == b'*' {
+                            // Followed by `*` (so `/**`). Treat as JSDoc.
+                            CommentKind::Jsdoc
+                        } else {
+                            CommentKind::Block
+                        };
+                        (Some((rel, close)), kind)
                     } else {
-                        None
+                        (None, CommentKind::None)
+                    }
+                } else if p > 0 {
+                    // Maybe a `//` line comment whose content ends at the
+                    // last non-whitespace char before our walk-back position
+                    // (i.e. bytes[p-1] is on a `//`-prefixed line).
+                    // Walk to the start of the line containing p-1.
+                    let mut line_start = p;
+                    while line_start > 0 && bytes[line_start - 1] != b'\n' {
+                        line_start -= 1;
+                    }
+                    // Skip leading whitespace on that line.
+                    let mut r = line_start;
+                    while r < bytes.len() && (bytes[r] == b' ' || bytes[r] == b'\t') {
+                        r += 1;
+                    }
+                    if r + 2 <= bytes.len() && &source[r..r + 2] == "//" {
+                        // Line comment: span = [r, p) where p is one past the
+                        // last non-ws char on the line. Find end-of-comment
+                        // (= end-of-line).
+                        let mut e = r + 2;
+                        while e < bytes.len() && bytes[e] != b'\n' {
+                            e += 1;
+                        }
+                        (Some((r, e)), CommentKind::Line)
+                    } else {
+                        (None, CommentKind::None)
                     }
                 } else {
-                    None
+                    (None, CommentKind::None)
                 }
+            };
+            let jsdoc_span = if leading_comment_kind == CommentKind::Jsdoc {
+                leading_comment_span
+            } else {
+                None
             };
 
             // Extract `@type {…}` from JSDoc if present.
             let jsdoc_type = jsdoc_span.and_then(|(s, e)| extract_jsdoc_type(&source[s..e]));
+
+            // Detect a trailing comment: immediately after en.span.end (a `;`),
+            // on the same line OR a block comment starting on the same line.
+            let (trailing_comment_span, trailing_comment_kind) = {
+                let mut p = en.span.end as usize;
+                // Skip horizontal whitespace only.
+                while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+                    p += 1;
+                }
+                if p + 2 <= bytes.len() && &source[p..p + 2] == "//" {
+                    // Line comment to end of line.
+                    let mut q = p + 2;
+                    while q < bytes.len() && bytes[q] != b'\n' {
+                        q += 1;
+                    }
+                    (Some((p, q)), CommentKind::Line)
+                } else if p + 2 <= bytes.len() && &source[p..p + 2] == "/*" {
+                    // Block comment until `*/`.
+                    let mut q = p + 2;
+                    while q + 1 < bytes.len() && &source[q..q + 2] != "*/" {
+                        q += 1;
+                    }
+                    if q + 1 < bytes.len() {
+                        let end = q + 2;
+                        (Some((p, end)), CommentKind::Block)
+                    } else {
+                        (None, CommentKind::None)
+                    }
+                } else {
+                    (None, CommentKind::None)
+                }
+            };
 
             let init_span = d.init.as_ref().map(|e| expr_span(e));
             props.push(Prop {
@@ -4102,6 +4193,10 @@ fn migrate_simple_props(
                 jsdoc_type,
                 jsdoc_span,
                 ts_type,
+                leading_comment_span,
+                leading_comment_kind,
+                trailing_comment_span,
+                trailing_comment_kind,
             });
             let _ = i;
         }
@@ -4222,6 +4317,44 @@ fn migrate_simple_props(
     });
     let has_any_jsdoc_type = has_jsdoc_type || has_jsdoc_comment || has_literal_init;
 
+    // Clean a comment for JSDoc `- comment` form.
+    // Strips `// `, `/** `, `*/`, leading `*` per line. Joins multi-line.
+    // Stops at the first line starting with `@`.
+    fn clean_comment(raw: &str) -> Option<String> {
+        let mut lines: Vec<String> = Vec::new();
+        for line in raw.split('\n') {
+            let mut t = line.trim().to_string();
+            // Strip `// ` prefix.
+            if t.starts_with("//") {
+                t = t.trim_start_matches('/').trim_start().to_string();
+            }
+            // Strip `/** ` or `/* ` prefix.
+            if t.starts_with("/**") {
+                t = t.trim_start_matches("/**").trim_start().to_string();
+            } else if t.starts_with("/*") {
+                t = t.trim_start_matches("/*").trim_start().to_string();
+            }
+            // Strip `*/` suffix.
+            if t.ends_with("*/") {
+                t = t.trim_end_matches("*/").trim_end().to_string();
+            }
+            // Strip initial `* `.
+            if t.starts_with('*') {
+                t = t.trim_start_matches('*').trim_start().to_string();
+            }
+            if !t.is_empty() {
+                lines.push(t);
+            }
+        }
+        // Stop at first @-line.
+        let cutoff = lines.iter().position(|l| l.starts_with('@')).unwrap_or(lines.len());
+        let kept: Vec<&str> = lines.iter().take(cutoff).map(|s| s.as_str()).collect();
+        if kept.is_empty() {
+            None
+        } else {
+            Some(kept.join("\n"))
+        }
+    }
     // Compute each prop's type & optional-ness for the JSDoc block.
     // - jsdoc_type wins
     // - else, infer from init: 'string' / number / boolean / Array literal / ...
@@ -4241,12 +4374,9 @@ fn migrate_simple_props(
         if t.parse::<f64>().is_ok() {
             return "number".to_string();
         }
-        if t.starts_with('[') {
-            return "any[]".to_string();
-        }
-        if t.starts_with('{') {
-            return "Record<string, any>".to_string();
-        }
+        // For non-literal inits (arrays, objects, identifiers, calls, etc.),
+        // upstream returns `any` — only "trivial-to-infer" literals get a
+        // type (string/number/boolean).
         "any".to_string()
     }
 
@@ -4515,7 +4645,21 @@ fn migrate_simple_props(
                     .unwrap_or_else(|| infer_type_from_init(init_text.as_deref()));
                 let optional = init_text.is_some();
                 let opt = if optional { "?" } else { "" };
-                parts.push(format!("{}{}: {};", p.local, opt, ty));
+                // For TS: preserve raw leading and trailing comments verbatim
+                // (with the `interface_inner_sep` before the member name).
+                let mut entry = String::new();
+                if let Some((cs, ce)) = p.leading_comment_span {
+                    let raw = &source[cs..ce];
+                    entry.push_str(raw);
+                    entry.push_str(inner_sep);
+                }
+                entry.push_str(&format!("{}{}: {};", p.local, opt, ty));
+                if let Some((cs, ce)) = p.trailing_comment_span {
+                    let raw = &source[cs..ce];
+                    entry.push(' ');
+                    entry.push_str(raw);
+                }
+                parts.push(entry);
             }
             for sp in &slots.props {
                 let ty = if sp.has_props {
@@ -4550,7 +4694,130 @@ fn migrate_simple_props(
                 } else {
                     p.local.clone()
                 };
-                lines.push(format!("{} * @property {{{}}} {}", indent, ty, name));
+                // Build the comment suffix.
+                let mut suffix = String::new();
+                // Check for `@type {…} NAME - comment` form in JSDoc.
+                if let Some((cs, ce)) = p.jsdoc_span {
+                    let raw = &source[cs..ce];
+                    // First, try the `@type {…} NAME - comment` pattern
+                    // (single-line JSDoc).
+                    let after_at_type = raw.find("@type").map(|i| {
+                        let after = &raw[i + "@type".len()..];
+                        // Skip whitespace + `{ … }`.
+                        let s = after.trim_start();
+                        if !s.starts_with('{') {
+                            return None;
+                        }
+                        // Find matching `}`.
+                        let mut depth = 1i32;
+                        let mut p = 1;
+                        let bytes = s.as_bytes();
+                        while p < bytes.len() {
+                            match bytes[p] {
+                                b'{' => depth += 1,
+                                b'}' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            p += 1;
+                        }
+                        if p >= bytes.len() {
+                            return None;
+                        }
+                        Some(s[p + 1..].to_string())
+                    }).flatten();
+                    if let Some(after_type) = after_at_type {
+                        // After type, look for ` NAME - comment` or `- comment`.
+                        let t = after_type.trim_start();
+                        // Strip optional `NAME ` or `[NAME=…]`.
+                        let mut k = 0;
+                        let bytes = t.as_bytes();
+                        // Skip ident chars + `[]` pattern.
+                        let mut in_brackets = 0i32;
+                        while k < bytes.len() {
+                            let b = bytes[k];
+                            if b == b'[' {
+                                in_brackets += 1;
+                                k += 1;
+                            } else if b == b']' {
+                                in_brackets -= 1;
+                                k += 1;
+                                if in_brackets <= 0 {
+                                    break;
+                                }
+                            } else if in_brackets > 0 {
+                                k += 1;
+                            } else if b == b'-' && k > 0 && bytes[k - 1] == b' ' {
+                                break;
+                            } else if b == b'*' || b == b'\n' {
+                                break;
+                            } else {
+                                k += 1;
+                            }
+                        }
+                        let rest = t[k..].trim_start();
+                        if let Some(rest) = rest.strip_prefix('-') {
+                            // Comment after `-`.
+                            let s = rest.trim();
+                            // Strip trailing `*/`.
+                            let s = s.trim_end_matches("*/").trim();
+                            // Strip trailing `*`.
+                            let s = s.trim_end_matches('*').trim();
+                            if !s.is_empty() {
+                                suffix.push_str(" - ");
+                                suffix.push_str(s);
+                            }
+                        }
+                    }
+                    // If no inline comment from @type, try the cleaned leading
+                    // form (multi-line JSDoc with description).
+                    if suffix.is_empty() {
+                        if let Some(c) = clean_comment(raw) {
+                            // Filter out `@type {…}` line content.
+                            let filtered: Vec<&str> = c
+                                .split('\n')
+                                .filter(|l| !l.trim_start().starts_with("@"))
+                                .collect();
+                            let merged = filtered.join(" ");
+                            let merged = merged.trim();
+                            if !merged.is_empty() {
+                                suffix.push_str(" - ");
+                                suffix.push_str(merged);
+                            }
+                        }
+                    }
+                } else if let Some((cs, ce)) = p.leading_comment_span {
+                    let raw = &source[cs..ce];
+                    if let Some(c) = clean_comment(raw) {
+                        let merged = c.replace('\n', " ");
+                        let merged = merged.trim();
+                        if !merged.is_empty() {
+                            suffix.push_str(" - ");
+                            suffix.push_str(merged);
+                        }
+                    }
+                }
+                // Append trailing comment merged.
+                if let Some((cs, ce)) = p.trailing_comment_span {
+                    let raw = &source[cs..ce];
+                    if let Some(c) = clean_comment(raw) {
+                        let merged = c.replace('\n', " ");
+                        let merged = merged.trim();
+                        if !merged.is_empty() {
+                            if suffix.is_empty() {
+                                suffix.push_str(" - ");
+                            } else {
+                                suffix.push_str(" - ");
+                            }
+                            suffix.push_str(merged);
+                        }
+                    }
+                }
+                lines.push(format!("{} * @property {{{}}} {}{}", indent, ty, name, suffix));
             }
             for sp in &slots.props {
                 let ty = if sp.has_props {
@@ -4747,10 +5014,19 @@ fn migrate_simple_props(
         // props_declaration at the last declarator's end position.
         let any_real_jsdoc = props.iter().any(|p| p.jsdoc_span.is_some());
         for p in &props {
-            if let Some((s, e)) = p.jsdoc_span {
-                // Clear just the JSDoc text — upstream uses `update(s, e, '')`
-                // with NO surrounding whitespace eaten.
+            if let Some((s, e)) = p.leading_comment_span {
+                // For Line comments and Block comments (not JSDoc), the
+                // comment's line is on a separate line than the export.
+                // Clear the comment text. We use remove (not update) so
+                // it doesn't shift other indices.
                 str.remove(s, e);
+                let _ = p.leading_comment_kind;
+            }
+            if let Some((s, e)) = p.trailing_comment_span {
+                // Trailing comment is on the same line as the `;` (for Line)
+                // or a multi-line Block after `;`. Either way, remove it.
+                str.remove(s, e);
+                let _ = p.trailing_comment_kind;
             }
         }
         // For each export node: walk start back to the previous `\n` and end
