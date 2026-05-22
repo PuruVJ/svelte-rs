@@ -94,13 +94,16 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     migrate_simple_derivations(source, &mut str, &parsed);
     migrate_unused_beforeafter_imports(source, &mut str, &parsed);
     migrate_simple_props(source, &mut str, &parsed);
+    migrate_effects(source, &mut str, &parsed);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
 
     // Restore the original `<style>` bodies that we blanked before parsing.
+    // Apply the CSS `:has/:is/:where` `:global(...)` wrap as we go.
     for (start, content) in &style_contents {
         let end = start + STYLE_PLACEHOLDER.len();
-        str.overwrite(*start, end, content);
+        let migrated = migrate_css_body(content);
+        str.overwrite(*start, end, &migrated);
     }
 
     MigrateResult {
@@ -175,6 +178,140 @@ fn blank_style_blocks(source: &str) -> (String, Vec<(usize, String)>) {
 fn find_close_style(s: &str) -> Option<usize> {
     let lc = s.to_ascii_lowercase();
     lc.find("</style>")
+}
+
+// ---------------------------------------------------------------------------
+// CSS migration: wrap arguments of `:has(X)` / `:is(X)` / `:where(X)` with
+// `:global(...)` so that bare type selectors keep matching descendants under
+// the new scoping rules. Matches upstream `migrate_css` (index.js:41).
+// Operates on raw CSS text (one style body) using a simple linear scan; this
+// is a textual port — we don't have a CSS AST here.
+// ---------------------------------------------------------------------------
+fn migrate_css_body(css: &str) -> String {
+    let original = css.to_string();
+    let mut out = original.clone();
+    // We track absolute positions in the original; insertions go into `edits`.
+    // Each entry: (position, text_to_insert) with `prepend_left` semantics
+    // — i.e. inserted before the char at `position`.
+    let mut edits: Vec<(usize, String)> = Vec::new();
+
+    let bytes = original.as_bytes();
+    let mut starting: usize = 0;
+    while starting < bytes.len() {
+        let rest = &original[starting..];
+        let matched_kw = if rest.starts_with(":has") {
+            Some(":has")
+        } else if rest.starts_with(":is") {
+            Some(":is")
+        } else if rest.starts_with(":where") {
+            Some(":where")
+        } else if rest.starts_with(":not") {
+            Some(":not")
+        } else {
+            None
+        };
+        if matched_kw.is_none() {
+            starting += 1;
+            continue;
+        }
+        // Find `(` after the keyword.
+        let paren = match rest.find('(') {
+            Some(p) => p,
+            None => {
+                starting += 1;
+                continue;
+            }
+        };
+        let mut start_in_rest = paren + 1; // index inside `rest` of first char inside parens
+        // Skip whitespace between `(` and the inner selector.
+        let mut content_start = start_in_rest;
+        while content_start < rest.len()
+            && (rest.as_bytes()[content_start] == b' '
+                || rest.as_bytes()[content_start] == b'\t'
+                || rest.as_bytes()[content_start] == b'\n')
+        {
+            content_start += 1;
+        }
+        // Check if already starts with `:global`.
+        let is_global = rest[content_start..].starts_with(":global");
+        if is_global {
+            // Skip the `:global` so we don't re-wrap.
+            start_in_rest = content_start + ":global".len();
+        }
+        // Find closing `)` matching the opening paren at `paren`.
+        let end_rel = find_matching_paren(rest, paren + 1);
+        let end = match end_rel {
+            Some(e) => e, // index AFTER the closing ')'
+            None => {
+                starting += 1;
+                continue;
+            }
+        };
+
+        // Check whether we're inside the args of an enclosing :global(...) —
+        // i.e. the previous :global(...) range encloses our current position.
+        // Upstream tracks this via `prev_global` and `find_closing_parenthesis`.
+        let abs_pos = starting;
+        let mut inside_global = false;
+        // Search original up to `abs_pos` for the LAST `:global` whose paren
+        // group still encloses `abs_pos`.
+        let prefix = &original[..abs_pos];
+        if let Some(pg) = prefix.rfind(":global") {
+            // Find the `(` after `pg`.
+            if let Some(rel_open) = original[pg..].find('(') {
+                let open_abs = pg + rel_open;
+                if let Some(close_abs) = find_matching_paren(&original, open_abs + 1) {
+                    if close_abs > abs_pos {
+                        inside_global = true;
+                        // Skip ahead past the enclosing :global(...) close.
+                        starting = close_abs;
+                        continue;
+                    }
+                }
+            }
+        }
+        let _ = inside_global;
+
+        if !is_global && !rest.starts_with(":not") {
+            // Insert `:global(` at `starting + start_in_rest` and `)` at
+            // `starting + end - 1` (just before the closing paren).
+            let ins_pos = starting + start_in_rest;
+            let end_pos = starting + end - 1;
+            edits.push((ins_pos, ":global(".to_string()));
+            edits.push((end_pos, ")".to_string()));
+        }
+
+        // Move past the closing paren — but stay AT the `)` so outer scan
+        // also processes any tail. Upstream does `code = code.substring(end-1)`.
+        starting = starting + end - 1;
+    }
+
+    // Apply edits in reverse order (sorted by position desc, stable order).
+    edits.sort_by(|a, b| b.0.cmp(&a.0));
+    for (pos, text) in edits {
+        out.insert_str(pos, &text);
+    }
+    out
+}
+
+/// Find the index AFTER the matching closing `)` starting from `start`
+/// (assumes one `(` has already been consumed before `start`).
+fn find_matching_paren(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 1i32;
+    let mut i = start;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            depth += 1;
+        } else if bytes[i] == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i + 1);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1885,6 +2022,200 @@ fn p_decl_unused() {
 }
 
 // ---------------------------------------------------------------------------
+// Effects cluster: `$: SIDE_EFFECT;` / `$: { … }` / `$: if (…) { … }` →
+// `run(() => { … });`. Prepends `import { run } from 'svelte/legacy';` to
+// the instance script content. Skipped for `$: x = EXPR;` derivations which
+// `migrate_simple_derivations` already handled.
+//
+// Also rewrites `break $;` inside the body to `return` (upstream behavior).
+// ---------------------------------------------------------------------------
+
+fn migrate_effects(source: &str, str: &mut MagicString, root: &Root) {
+    let Some(instance) = &root.instance else {
+        return;
+    };
+    let body = &instance.content.body;
+
+    let bytes = source.as_bytes();
+    let mut had_effects = false;
+
+    for stmt in body {
+        let Statement::Labeled(l) = stmt else {
+            continue;
+        };
+        if l.label.name != "$" {
+            continue;
+        }
+        // Skip the simple assignment-to-Identifier form (already handled by
+        // migrate_simple_derivations) — but only when it was actually
+        // promoted to `$derived(...)`. We detect by looking at whether the
+        // current source at this position still starts with `$:`. Easier:
+        // re-check that derivations transform's criteria match — if so,
+        // skip; else, treat as effect.
+        let l_start = l.span.start as usize;
+        let l_end = l.span.end as usize;
+        // If labeled has an ExpressionStatement-Assignment-Identifier and
+        // appears to be a derivation candidate, skip.
+        let is_derivation = match &l.body {
+            Statement::Expression(es) => match &es.expression {
+                Expression::Assignment(asn) => matches!(
+                    &asn.left,
+                    svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(_))
+                        | svelte_js_ast::AssignmentTarget::Pattern(_)
+                ),
+                Expression::Paren(p) => {
+                    matches!(&p.expression, Expression::Assignment(_))
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if is_derivation {
+            // We can't easily know if the derivation actually fired — but if
+            // it didn't (e.g. outside-assignment or multiple-$:), upstream
+            // *would* emit it as an effect. Simpler heuristic: skip
+            // derivation-shaped statements entirely. Refine later.
+            continue;
+        }
+
+        // Wrap body in `run(() => { … });`. Two cases:
+        //   1. `$: { stmt; stmt; }` (block) — wrap as `run(() => { stmt; stmt; });`
+        //   2. `$: stmt;` (single statement) — wrap as `run(() => { stmt; });`
+        //   3. `$: if (cond) { … }` — wrap the whole if statement.
+        // Trailing-`break $` needs to become `return`.
+        let body_start = match &l.body {
+            Statement::Block(b) => b.span.start as usize,
+            Statement::Expression(es) => es.span.start as usize,
+            Statement::If(ifs) => ifs.span.start as usize,
+            _ => continue,
+        };
+        let body_end = match &l.body {
+            Statement::Block(b) => b.span.end as usize,
+            Statement::Expression(es) => es.span.end as usize,
+            Statement::If(ifs) => ifs.span.end as usize,
+            _ => continue,
+        };
+        // Indent of this labeled statement.
+        let mut line_start = l_start;
+        while line_start > 0 && bytes[line_start - 1] != b'\n' {
+            line_start -= 1;
+        }
+        let indent = &source[line_start..l_start];
+
+        // Build wrappers around the existing body text, preserving source
+        // formatting via MagicString edits rather than re-formatting.
+        // First, normalize `break $` → `return` inside the body via update().
+        // Find all `break $` substrings within the body span.
+        if let Statement::Block(_) = &l.body {
+            let body_text = &source[body_start..body_end];
+            let mut search = 0;
+            while let Some(rel) = body_text[search..].find("break $") {
+                let abs = body_start + search + rel;
+                str.update(abs, abs + "break $".len(), "return");
+                search += rel + "break $".len();
+            }
+        }
+        match &l.body {
+            Statement::Block(_) => {
+                // Replace `$: ` (i.e. l_start..body_start) with `run(() => `.
+                str.update(l_start, body_start, "run(() => ");
+                // Replace trailing `}` with `});` — append `);` right after body_end.
+                str.append_right(body_end, ");");
+            }
+            Statement::Expression(_) => {
+                // Replace `$: ` with `run(() => {\n{indent}\t`.
+                str.update(
+                    l_start,
+                    body_start,
+                    &format!("run(() => {{\n{}\t", indent),
+                );
+                // Replace `;` (if present) at end with `;\n{indent}});`.
+                let ends_with_semi = bytes
+                    .get(body_end.saturating_sub(1))
+                    .copied()
+                    == Some(b';');
+                let suffix = format!(";\n{}}});", indent);
+                if ends_with_semi {
+                    str.update(body_end - 1, body_end, &suffix);
+                } else {
+                    str.append_right(body_end, &suffix);
+                }
+            }
+            Statement::If(_) => {
+                // Replace `$: ` with `run(() => {\n{indent}\t`.
+                str.update(
+                    l_start,
+                    body_start,
+                    &format!("run(() => {{\n{}\t", indent),
+                );
+                str.append_right(body_end, &format!("\n{}}});", indent));
+                // Add a tab after each `\n` inside the body to bump the
+                // indent by one level (mirrors upstream's
+                // `state.str.indent(state.indent, …)` call).
+                let body_text = &source[body_start..body_end];
+                let mut search = 0;
+                while let Some(rel) = body_text[search..].find('\n') {
+                    let abs = body_start + search + rel + 1;
+                    if abs < bytes.len() {
+                        str.prepend_right(abs, "\t");
+                    }
+                    search += rel + 1;
+                }
+            }
+            _ => continue,
+        }
+        had_effects = true;
+    }
+
+    if !had_effects {
+        return;
+    }
+
+    // Prepend `import { run } from 'svelte/legacy';\n\n` at the start of the
+    // instance script content.
+    let insertion_point = instance.content.span.start as usize;
+    // Mirror upstream's indent: `\n${indent}${import}` appended right at
+    // content start. We get the indent from the first non-empty line.
+    let first_line_start = {
+        let mut p = insertion_point;
+        while p < bytes.len() && bytes[p] == b'\n' {
+            p += 1;
+        }
+        let mut s = p;
+        while s < bytes.len() && bytes[s].is_ascii_whitespace() && bytes[s] != b'\n' {
+            s += 1;
+        }
+        if s > p {
+            &source[p..s]
+        } else {
+            "\t"
+        }
+    };
+    str.append_right(
+        insertion_point,
+        format!(
+            "\n{}import {{ run }} from 'svelte/legacy';\n",
+            first_line_start
+        ),
+    );
+}
+
+fn reindent_inside(s: &str, indent: &str) -> String {
+    // Each line of `s` becomes `\t{indent}{line}` so it sits inside the
+    // `run(() => {` block at `indent`. We add `\t` to the existing `indent`
+    // for proper nesting.
+    let inner_indent = format!("{}\t", indent);
+    let mut out = String::new();
+    for line in s.lines() {
+        out.push_str(&inner_indent);
+        out.push_str(line.trim_start());
+        out.push('\n');
+    }
+    // No trailing newline strip — caller adds `});` after, on a new line.
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Remove unused `beforeUpdate` / `afterUpdate` specifiers from svelte imports.
 // If all specifiers in `import { beforeUpdate, afterUpdate } from "svelte"`
 // are removed, drop the entire import statement.
@@ -2153,6 +2484,11 @@ fn migrate_simple_derivations(source: &str, str: &mut MagicString, root: &Root) 
         // Identify target style.
         let (target_text, target_names): (String, Vec<String>) = match &asn.left {
             svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) => {
+                // Skip store-prefixed `$name` — those are Svelte 4 store
+                // auto-subscriptions, not derivable.
+                if id.name.starts_with('$') {
+                    continue;
+                }
                 (id.name.clone(), vec![id.name.clone()])
             }
             svelte_js_ast::AssignmentTarget::Pattern(p) => {
@@ -2820,6 +3156,21 @@ mod tests {
         let src = "<div>hi</div>";
         let r = migrate(src, MigrateOptions::default());
         assert_eq!(r.code, "<div>hi</div>");
+    }
+
+    #[test]
+    fn debug_effects_dollar_count() {
+        let src = r#"<script>
+	let count = 0;
+	$: $count = 1;
+</script>"#;
+        let r = svelte_parse::parse(src, false).unwrap();
+        let inst = r.instance.as_ref().unwrap();
+        for s in &inst.content.body {
+            if let svelte_js_ast::Statement::Labeled(l) = s {
+                eprintln!("labeled body: {:?}", l.body);
+            }
+        }
     }
 
 }
