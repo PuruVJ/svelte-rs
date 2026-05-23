@@ -42,7 +42,16 @@ Measure real pipeline: `bench_phases FIXTURE e2e 5000`.
 2. Transform → **`try_emit_client_program_direct`** — sparse / slab `Program` shapes.
 3. Fallback: `print_typed`.
 
-Scratch buffers use **`CompileBump`** (`svelte_transform_shared::compile_bump`) per compile call.
+## Arena-owned template AST
+
+Template nodes (`Fragment`, elements, blocks, attributes) allocate into a single
+[`TemplateArena`](crates/svelte_ast/src/arena.rs) (`bumpalo::Bump`) per parse/compile.
+
+- `svelte_parse::parse()` → [`AstBundle`](crates/svelte_parse/src/bundle.rs) (`self_cell`: arena + `Root`)
+- `svelte_compiler::compile()` → `parse_in_arena(&compile_bump.template, …)` then transform in place
+- JS subtrees (`Expression`, `Program`) remain heap-owned for now
+
+Scratch strings for direct codegen use the same bump via **`CompileBump`** (`compile_bump.template.bump`).
 
 ## Entry order (client walker)
 
