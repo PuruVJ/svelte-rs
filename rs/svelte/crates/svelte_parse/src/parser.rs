@@ -249,6 +249,9 @@ impl<'src> Parser<'src> {
 /// we never need to land on multibyte char boundaries.
 fn detect_typescript(template: &str) -> bool {
     let bytes = template.as_bytes();
+    if !bytes.windows(7).any(|w| w.eq_ignore_ascii_case(b"<script")) {
+        return false;
+    }
     let mut i = 0;
     while i < bytes.len() {
         if starts_with(bytes, i, b"<!--") {

@@ -5466,30 +5466,31 @@ fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
     if matches!(el.name.as_str(), "option" | "select" | "textarea") {
         return false;
     }
-    if element_has_async_directive(el) || has_option_child(el) {
+    if el.name == "select" || element_has_async_directive(el) {
+        return false;
+    }
+    if el.attributes.iter().any(|a| !matches!(a, ElementAttribute::Attribute(_))) {
         return false;
     }
     for attr in &el.attributes {
-        match attr {
-            ElementAttribute::Attribute(a) => {
-                if is_event_handler_name(&a.name) {
-                    continue;
-                }
-                match &a.value {
-                    AttributeValue::Empty => {}
-                    AttributeValue::Many(parts) => {
-                        if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
-                            return false;
-                        }
-                    }
-                    AttributeValue::Single(tag) => {
-                        if literal_expr_to_string(&tag.expression).is_none() {
-                            return false;
-                        }
-                    }
+        let ElementAttribute::Attribute(a) = attr else {
+            return false;
+        };
+        if is_event_handler_name(&a.name) {
+            continue;
+        }
+        match &a.value {
+            AttributeValue::Empty => {}
+            AttributeValue::Many(parts) => {
+                if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                    return false;
                 }
             }
-            _ => return false,
+            AttributeValue::Single(tag) => {
+                if literal_expr_to_string(&tag.expression).is_none() {
+                    return false;
+                }
+            }
         }
     }
     let children = trim_boundary_whitespace(&el.fragment.nodes);

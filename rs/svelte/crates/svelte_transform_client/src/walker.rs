@@ -16468,10 +16468,17 @@ struct DeepCounters {
 
 fn allocate_named(prefix: &str, names: &mut HashMap<String, usize>) -> String {
     // Sanitize: replace `-` and other special chars with `_`.
-    let safe: String = prefix
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-        .collect();
+    let safe: String = if prefix
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        prefix.to_string()
+    } else {
+        prefix
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect()
+    };
     let cnt = names.entry(safe.clone()).or_insert(0);
     let n = *cnt;
     *cnt += 1;
@@ -22899,12 +22906,18 @@ fn fold_node_with_consts(n: &mut FragmentChild, consts: &HashMap<String, Express
         // script-constant identifiers.
         FragmentChild::HtmlTag(_) => {}
         FragmentChild::RegularElement(el) => {
+            if consts.is_empty() && !element_may_contain_foldable_expr(el) {
+                return;
+            }
             for attr in &mut el.attributes {
                 fold_attr_with_consts(attr, consts);
             }
             fold_fragment_with_consts(&mut el.fragment, consts);
         }
         FragmentChild::Component(c) => {
+            if consts.is_empty() && !component_may_contain_foldable_expr(c) {
+                return;
+            }
             for attr in &mut c.attributes {
                 fold_attr_with_consts(attr, consts);
             }
@@ -23095,6 +23108,16 @@ fn fold_in_node(n: &mut FragmentChild) {
         FragmentChild::ExpressionTag(t) => fold_expr(&mut t.expression),
         FragmentChild::HtmlTag(t) => fold_expr(&mut t.expression),
         FragmentChild::RegularElement(el) => {
+            if el.attributes.is_empty()
+                && el.fragment.nodes.iter().all(|n| {
+                    matches!(n, FragmentChild::Text(_) | FragmentChild::Comment(_))
+                })
+            {
+                return;
+            }
+            if !element_may_contain_foldable_expr(el) {
+                return;
+            }
             for attr in &mut el.attributes {
                 fold_in_attr(attr);
             }
@@ -23103,6 +23126,9 @@ fn fold_in_node(n: &mut FragmentChild) {
             }
         }
         FragmentChild::Component(c) => {
+            if !component_may_contain_foldable_expr(c) {
+                return;
+            }
             for attr in &mut c.attributes {
                 fold_in_attr(attr);
             }
@@ -23111,6 +23137,56 @@ fn fold_in_node(n: &mut FragmentChild) {
             }
         }
         _ => {}
+    }
+}
+
+fn element_may_contain_foldable_expr(el: &svelte_ast::elements::RegularElement) -> bool {
+    el.attributes
+        .iter()
+        .any(|a| attr_may_contain_foldable_expr(a))
+        || el
+            .fragment
+            .nodes
+            .iter()
+            .any(fragment_child_may_contain_foldable_expr)
+}
+
+fn component_may_contain_foldable_expr(c: &svelte_ast::elements::Component) -> bool {
+    c.attributes
+        .iter()
+        .any(|a| attr_may_contain_foldable_expr(a))
+        || c
+            .fragment
+            .nodes
+            .iter()
+            .any(fragment_child_may_contain_foldable_expr)
+}
+
+fn fragment_child_may_contain_foldable_expr(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::Text(_) | FragmentChild::Comment(_) => false,
+        FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => true,
+        FragmentChild::RegularElement(el) => element_may_contain_foldable_expr(el),
+        FragmentChild::Component(c) => component_may_contain_foldable_expr(c),
+        FragmentChild::EachBlock(_)
+        | FragmentChild::IfBlock(_)
+        | FragmentChild::AwaitBlock(_)
+        | FragmentChild::KeyBlock(_) => true,
+        _ => true,
+    }
+}
+
+fn attr_may_contain_foldable_expr(attr: &ElementAttribute) -> bool {
+    match attr {
+        ElementAttribute::Attribute(a) => match &a.value {
+            AttributeValue::Empty => false,
+            AttributeValue::Many(parts) => parts
+                .iter()
+                .any(|p| matches!(p, AttributeValuePart::ExpressionTag(_))),
+            AttributeValue::Single(_) => true,
+        },
+        ElementAttribute::SpreadAttribute(_) => true,
+        _ => true,
     }
 }
 

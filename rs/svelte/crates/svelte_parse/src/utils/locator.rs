@@ -10,11 +10,15 @@
 //! sources may yield columns that differ from acorn's output — to be fixed
 //! in a follow-up.
 
+use std::cell::Cell;
+
 use svelte_ast::Position;
 
 pub struct LineMap {
     /// Byte offsets at which each line begins. `line_starts[0]` is always 0.
     line_starts: Vec<usize>,
+    /// Hint for monotonic forward scans (parser walks source left-to-right).
+    hint_line: Cell<usize>,
 }
 
 impl LineMap {
@@ -28,16 +32,29 @@ impl LineMap {
         }
         Self {
             line_starts: starts,
+            hint_line: Cell::new(0),
         }
     }
 
     /// Locate a byte offset. Returns `(line, column)` with 1-based line and
     /// 0-based column — matches acorn's `loc` convention.
     pub fn locate(&self, offset: usize) -> (u32, u32) {
-        let idx = self.line_starts.partition_point(|&s| s <= offset);
-        let line = idx.saturating_sub(1);
+        let line = self.line_index(offset);
         let col = offset.saturating_sub(self.line_starts[line]);
         (line as u32 + 1, col as u32)
+    }
+
+    fn line_index(&self, offset: usize) -> usize {
+        let mut line = self.hint_line.get();
+        if offset < self.line_starts[line] {
+            line = self.line_starts.partition_point(|&s| s <= offset) - 1;
+        } else {
+            while line + 1 < self.line_starts.len() && self.line_starts[line + 1] <= offset {
+                line += 1;
+            }
+        }
+        self.hint_line.set(line);
+        line
     }
 
     /// Build a full `Position` including `character` (= byte offset).

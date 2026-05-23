@@ -122,7 +122,11 @@ pub fn template_raw(parts: Vec<String>, exprs: Vec<Expression>) -> Expression {
     let len = parts.len();
     let mut quasis = Vec::with_capacity(len);
     for (i, cooked) in parts.into_iter().enumerate() {
-        let raw = escape_template_quasi(&cooked);
+        let raw = if template_quasi_needs_escape(&cooked) {
+            escape_template_quasi(&cooked)
+        } else {
+            cooked.clone()
+        };
         quasis.push(TemplateElement {
             cooked,
             raw,
@@ -137,7 +141,20 @@ pub fn template_raw(parts: Vec<String>, exprs: Vec<Expression>) -> Expression {
     }))
 }
 
+fn template_quasi_needs_escape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'\\' | b'`' => return true,
+            b'$' if i + 1 < bytes.len() && bytes[i + 1] == b'{' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 fn escape_template_quasi(s: &str) -> String {
+    debug_assert!(template_quasi_needs_escape(s));
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
