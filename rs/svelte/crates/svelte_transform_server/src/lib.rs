@@ -146,7 +146,8 @@ pub fn try_typed_server_component_full(
     // sets `needs_context = true` in those cases (CallExpression.js line 31,
     // MemberExpression.js line 23), and the server emits `$$renderer.component`
     // wrap when `needs_context` is true.
-    if fragment_has_unsafe_call(&root.fragment) {
+    let entry_flags = scan_fragment_entry_flags(&root.fragment);
+    if entry_flags.has_unsafe_call {
         needs_component_wrap = true;
     }
     // Script-side unsafe-call check: any `new Expression`, IIFE, method
@@ -254,15 +255,14 @@ pub fn try_typed_server_component_full(
 
     // Detect Component-with-bind:value at top level — triggers the
     // do-while `$$settled` wrap pattern.
-    let needs_bind_wrap = fragment_has_component_bind(&root.fragment);
+    let needs_bind_wrap = entry_flags.has_component_bind;
 
     // is_standalone: top-level fragment trims to exactly one RenderTag.
     // Mirrors upstream's clean_nodes is_standalone flag, which suppresses
     // the trailing `<!---->` anchor for the lone render tag.
     let top_is_standalone = {
-        let trimmed = trim_boundary_text(&trim_boundary_whitespace(&root.fragment.nodes));
-        trimmed.len() == 1
-            && matches!(trimmed[0], FragmentChild::RenderTag(_))
+        let trimmed = trim_boundary_whitespace(&root.fragment.nodes);
+        trimmed.len() == 1 && matches!(trimmed[0], FragmentChild::RenderTag(_))
     };
     IS_STANDALONE.with(|s| s.set(top_is_standalone));
 
@@ -498,6 +498,13 @@ pub fn try_typed_server_component_full(
 fn extract_and_lower_snippets(
     fragment: &mut svelte_ast::fragment::Fragment,
 ) -> Option<Vec<Statement>> {
+    if !fragment
+        .nodes
+        .iter()
+        .any(|n| matches!(n, FragmentChild::SnippetBlock(_)))
+    {
+        return Some(Vec::new());
+    }
     let mut out: Vec<Statement> = Vec::with_capacity(fragment.nodes.len());
     let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
     for n in std::mem::take(&mut fragment.nodes) {
@@ -671,6 +678,42 @@ fn lower_fragment_server_async(
         "$$promises",
         blocker_bindings,
     )
+}
+
+/// Flags computed in one pass over the top-level fragment (entry checks).
+#[derive(Default)]
+struct FragmentEntryFlags {
+    has_unsafe_call: bool,
+    has_component_bind: bool,
+}
+
+fn scan_fragment_entry_flags(f: &svelte_ast::fragment::Fragment) -> FragmentEntryFlags {
+    let mut flags = FragmentEntryFlags::default();
+    for n in &f.nodes {
+        scan_fragment_entry_node(n, &mut flags);
+        if flags.has_unsafe_call && flags.has_component_bind {
+            break;
+        }
+    }
+    flags
+}
+
+fn scan_fragment_entry_node(n: &FragmentChild, flags: &mut FragmentEntryFlags) {
+    if flags.has_unsafe_call && flags.has_component_bind {
+        return;
+    }
+    if !flags.has_unsafe_call && node_has_unsafe_call(n) {
+        flags.has_unsafe_call = true;
+    }
+    if !flags.has_component_bind {
+        if let FragmentChild::Component(c) = n {
+            if c.attributes.iter().any(|a| {
+                matches!(a, ElementAttribute::BindDirective(b) if b.name != "this")
+            }) {
+                flags.has_component_bind = true;
+            }
+        }
+    }
 }
 
 /// Returns true if any CallExpression in the fragment has a non-safe-identifier
@@ -5474,11 +5517,7 @@ fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
 /// `trim_boundary_whitespace` on a sub-slice and drops inter-element spaces.
 fn is_static_template_batchable(n: &FragmentChild) -> bool {
     match n {
-        FragmentChild::RegularElement(el) => {
-            is_fully_static_element(el)
-                && !has_option_child(el)
-                && !element_has_async_directive(el)
-        }
+        FragmentChild::RegularElement(el) => is_fully_static_element(el),
         _ => false,
     }
 }
@@ -5803,24 +5842,34 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
 
 /// After `trim_boundary_whitespace`, trim leading whitespace inside the
 /// FIRST surviving Text node and trailing whitespace inside the LAST.
-/// Returns owned Vec since the first/last text may need to be cloned.
-fn trim_boundary_text(nodes: &[FragmentChild]) -> Vec<FragmentChild> {
-    let mut out: Vec<FragmentChild> = nodes.to_vec();
-    if let Some(FragmentChild::Text(t)) = out.first_mut() {
-        let trimmed = t.data.trim_start().to_string();
-        if trimmed != t.data {
+fn trim_boundary_text(nodes: &[FragmentChild]) -> Cow<'_, [FragmentChild]> {
+    let needs_first = matches!(
+        nodes.first(),
+        Some(FragmentChild::Text(t)) if t.data.len() != t.data.trim_start().len()
+    );
+    let needs_last = matches!(
+        nodes.last(),
+        Some(FragmentChild::Text(t)) if t.data.len() != t.data.trim_end().len()
+    );
+    if !needs_first && !needs_last {
+        return Cow::Borrowed(nodes);
+    }
+    let mut out = nodes.to_vec();
+    if needs_first {
+        if let Some(FragmentChild::Text(t)) = out.first_mut() {
+            let trimmed = t.data.trim_start().to_string();
             t.data = trimmed.clone();
             t.raw = trimmed;
         }
     }
-    if let Some(FragmentChild::Text(t)) = out.last_mut() {
-        let trimmed = t.data.trim_end().to_string();
-        if trimmed != t.data {
+    if needs_last {
+        if let Some(FragmentChild::Text(t)) = out.last_mut() {
+            let trimmed = t.data.trim_end().to_string();
             t.data = trimmed.clone();
             t.raw = trimmed;
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Skip leading + trailing whitespace-only Text nodes (and Comments,
@@ -5845,7 +5894,14 @@ fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
 /// Collapse all consecutive whitespace runs in `s` to a single space.
 /// Matches upstream's `regex_starts_with_whitespaces` / collapse-whitespace
 /// behavior at preserveWhitespace=false.
-fn collapse_ws(s: &str) -> String {
+fn collapse_ws(s: &str) -> Cow<'_, str> {
+    if !s
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_whitespace() && w[1].is_ascii_whitespace())
+    {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut in_ws = false;
     for c in s.chars() {
@@ -5859,7 +5915,7 @@ fn collapse_ws(s: &str) -> String {
             in_ws = false;
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Server-side: serialize one element attribute or directive into the

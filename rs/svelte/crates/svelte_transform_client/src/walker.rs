@@ -11704,7 +11704,7 @@ fn emit_single_element_with_folded_prefix_program(
     for n in &el.fragment.nodes {
         match (state, n) {
             (0, FragmentChild::Text(t)) => {
-                folded.push_str(&collapse_ws_client(&t.data));
+                folded.push_str(collapse_ws_client(&t.data).as_ref());
                 had_text = true;
             }
             (0, FragmentChild::ExpressionTag(et)) => {
@@ -13597,7 +13597,7 @@ fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
             _ => return false,
         }
     }
-    for n in &el.fragment.nodes {
+    for n in trim_boundary_whitespace_children(&el.fragment.nodes) {
         match n {
             FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
             FragmentChild::ExpressionTag(et) => {
@@ -13616,6 +13616,50 @@ fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
         }
     }
     true
+}
+
+/// Skip leading/trailing whitespace-only text and comments (no allocation).
+fn trim_boundary_whitespace_children(nodes: &[FragmentChild]) -> &[FragmentChild] {
+    let is_boundary_skip = |n: &FragmentChild| match n {
+        FragmentChild::Text(t) => t.data.trim().is_empty(),
+        FragmentChild::Comment(_) => true,
+        _ => false,
+    };
+    let mut start = 0;
+    let mut end = nodes.len();
+    while start < end && is_boundary_skip(&nodes[start]) {
+        start += 1;
+    }
+    while end > start && is_boundary_skip(&nodes[end - 1]) {
+        end -= 1;
+    }
+    &nodes[start..end]
+}
+
+/// True when the element subtree contains `{expr}` or `{@html ...}` (any depth).
+fn element_tree_has_expr_or_html(el: &svelte_ast::elements::RegularElement) -> bool {
+    for n in trim_boundary_whitespace_children(&el.fragment.nodes) {
+        match n {
+            FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => return true,
+            FragmentChild::RegularElement(child) => {
+                if element_tree_has_expr_or_html(child) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement) -> bool {
+    if element_has_reactive_attr(child_el) {
+        return true;
+    }
+    if is_element_fully_static(child_el) {
+        return element_tree_has_expr_or_html(child_el);
+    }
+    fragment_has_deep_reactive(&child_el.fragment)
 }
 
 fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
@@ -16036,11 +16080,7 @@ fn emit_deep_static_walker_program(
         let mut el_idx = 0usize;
         for n in &trimmed {
             match n {
-                FragmentChild::Text(t) => {
-                    // Non-whitespace text → contributes to a text-node anchor.
-                    // Pure whitespace BETWEEN elements is a "gap" creating a
-                    // single text node when followed by another element.
-                    let _ = t;
+                FragmentChild::Text(_) => {
                     if !pending_text {
                         pending_text = true;
                     }
@@ -16067,9 +16107,7 @@ fn emit_deep_static_walker_program(
     }
 
     for (i, el) in top_elements.iter().enumerate() {
-        let has_reactive_inside = fragment_has_deep_reactive(&el.fragment);
-        let has_reactive_attr = element_has_reactive_attr(el);
-        let needs_visit = has_reactive_inside || has_reactive_attr;
+        let needs_visit = element_child_is_deep_reactive(el);
         if !needs_visit {
             // Skip purely static element. We don't emit anything for it.
             continue;
@@ -16156,7 +16194,7 @@ fn emit_deep_static_walker_program(
                 }
             }
         }
-        if has_reactive_inside {
+        if fragment_has_deep_reactive(&el.fragment) {
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
                 vec![t::id_owned(var.to_string())],
@@ -16539,9 +16577,7 @@ fn walk_element_interior(
     for (i, c) in children.iter().enumerate() {
         let r = match c {
             FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => true,
-            FragmentChild::RegularElement(child_el) => {
-                element_has_reactive_attr(child_el) || fragment_has_deep_reactive(&child_el.fragment)
-            }
+            FragmentChild::RegularElement(child_el) => element_child_is_deep_reactive(child_el),
             _ => false,
         };
         if r {
@@ -16936,37 +16972,35 @@ fn serialize_fragment_to_html(
     let last_idx = nodes.len().saturating_sub(1);
     let mut last_was_text_with_space = false;
     for (i, n) in nodes.iter().enumerate() {
-        match n {
+        match *n {
             FragmentChild::Text(t) => {
                 let mut collapsed = collapse_ws_client(&t.data);
-                // Trim leading whitespace if at start of fragment body.
                 if i == 0 {
-                    collapsed = collapsed.trim_start().to_string();
+                    let trimmed = collapsed.trim_start();
+                    if trimmed.len() != collapsed.len() {
+                        collapsed = Cow::Owned(trimmed.to_string());
+                    }
                 }
-                // Trim trailing whitespace if at end of fragment body.
                 if i == last_idx {
-                    collapsed = collapsed.trim_end().to_string();
+                    let trimmed = collapsed.trim_end();
+                    if trimmed.len() != collapsed.len() {
+                        collapsed = Cow::Owned(trimmed.to_string());
+                    }
                 }
                 if collapsed.is_empty() {
                     continue;
                 }
-                // Don't emit duplicate spaces.
                 if last_was_text_with_space && collapsed.starts_with(' ') {
                     let rest = collapsed.trim_start_matches(' ');
                     if !rest.is_empty() {
                         out.push_str(rest);
                     }
                 } else {
-                    out.push_str(&collapsed);
+                    out.push_str(collapsed.as_ref());
                 }
                 last_was_text_with_space = collapsed.ends_with(' ');
             }
             FragmentChild::Comment(c) => {
-                // Strip `<!-- svelte-ignore ... -->` directives — they're
-                // analyzer hints, not real comments. Keep everything else
-                // (e.g. `<!-- test -->` inside elements is meaningful for
-                // hydration claim).
-                let _ = i;
                 let trimmed = c.data.trim();
                 if trimmed.starts_with("svelte-ignore") {
                     continue;
@@ -16981,11 +17015,6 @@ fn serialize_fragment_to_html(
                 last_was_text_with_space = false;
             }
             FragmentChild::ExpressionTag(_) => {
-                // Both literal-foldable and non-literal expressions inside
-                // an element body emit nothing in the template. The text
-                // value (if reactive) is set via template_effect at runtime;
-                // literal values are statically known but upstream still
-                // emits an empty template position.
                 let _ = last_was_text_with_space;
             }
             FragmentChild::RegularElement(el) => {
@@ -17225,13 +17254,23 @@ fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
 /// and drops `svelte-ignore` directive comments. Real comments (e.g.
 /// `<!-- test -->` inside an element) are preserved.
 fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
-    let mut filtered: Vec<&FragmentChild> = nodes
-        .iter()
-        .filter(|n| match n {
-            FragmentChild::Comment(c) => !c.data.trim().starts_with("svelte-ignore"),
-            _ => true,
-        })
-        .collect();
+    let has_ignore_comment = nodes.iter().any(|n| {
+        matches!(
+            n,
+            FragmentChild::Comment(c) if c.data.trim().starts_with("svelte-ignore")
+        )
+    });
+    let mut filtered: Vec<&FragmentChild> = if has_ignore_comment {
+        nodes
+            .iter()
+            .filter(|n| match n {
+                FragmentChild::Comment(c) => !c.data.trim().starts_with("svelte-ignore"),
+                _ => true,
+            })
+            .collect()
+    } else {
+        nodes.iter().collect()
+    };
     let mut start = 0;
     let mut end = filtered.len();
     while start < end {
@@ -17251,7 +17290,14 @@ fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
     filtered
 }
 
-fn collapse_ws_client(s: &str) -> String {
+fn collapse_ws_client(s: &str) -> Cow<'_, str> {
+    if !s
+        .as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_whitespace() && w[1].is_ascii_whitespace())
+    {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut in_ws = false;
     for c in s.chars() {
@@ -17265,7 +17311,7 @@ fn collapse_ws_client(s: &str) -> String {
             in_ws = false;
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn is_void_client(name: &str) -> bool {
