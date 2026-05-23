@@ -55,7 +55,8 @@ svelte_compiler = { path = "crates/svelte_compiler" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-bumpalo = { version = "3", features = ["collections"] }
+bumpalo = { version = "3", features = ["collections", "boxed"] }
+self_cell = "1.2"
 
 # OXC family (JS/TS parser, AST, semantic). Pinned to 0.130 — the 0.34 line
 # has a broken `serialize` feature (uses removed serde internals). 0.130

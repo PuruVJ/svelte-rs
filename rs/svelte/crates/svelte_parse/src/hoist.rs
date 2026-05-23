@@ -11,8 +11,11 @@
 //! Mid-fragment scripts/styles (technically invalid) are also hoisted — upstream
 //! is lenient here; phase 2 validators handle the diagnostic.
 
-use svelte_ast::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute, FragmentChild,
-    RegularElement, Root, Script, ScriptContext};
+use bumpalo::Bump;
+use svelte_ast::{
+    Attribute, AttributeValue, AttributeValuePart, ElementAttribute, FragmentChild,
+    RegularElement, Root, Script, ScriptContext,
+};
 use svelte_diagnostics::CompileDiagnostic;
 
 use oxc_allocator::Allocator;
@@ -20,9 +23,10 @@ use oxc_allocator::Allocator;
 use crate::oxc_bridge;
 use crate::utils::locator::LineMap;
 
-pub fn hoist_scripts_and_styles(
+pub fn hoist_scripts_and_styles<'a>(
     alloc: &mut Allocator,
-    root: &mut Root,
+    bump: &'a Bump,
+    root: &mut Root<'a>,
     source: &str,
     line_map: &LineMap,
     ts: bool,
@@ -45,7 +49,7 @@ pub fn hoist_scripts_and_styles(
             };
             let is_module = is_module_script(&el.attributes);
             let (script, comments) =
-                build_script_with_comments(alloc, el, source, line_map, ts)?;
+                build_script_with_comments(alloc, bump, el, source, line_map, ts)?;
             // Append script comments to root.comments for downstream
             // codegen (inter-declarator preservation).
             for c in comments {
@@ -97,13 +101,14 @@ pub fn hoist_scripts_and_styles(
     Ok(())
 }
 
-fn build_script_with_comments(
+fn build_script_with_comments<'a>(
     alloc: &mut Allocator,
-    el: RegularElement,
+    bump: &'a Bump,
+    el: RegularElement<'a>,
     source: &str,
     line_map: &LineMap,
     ts_default: bool,
-) -> Result<(Script, Vec<oxc_bridge::RawComment>), CompileDiagnostic> {
+) -> Result<(Script<'a>, Vec<oxc_bridge::RawComment>), CompileDiagnostic> {
     let (body_start, body_end) = body_bounds(&el).unwrap_or((el.end as usize, el.end as usize));
     let ts = ts_default
         || attribute_string_value(&el.attributes, "lang")
@@ -116,14 +121,7 @@ fn build_script_with_comments(
     } else {
         ScriptContext::Default
     };
-    let attributes = el
-        .attributes
-        .into_iter()
-        .filter_map(|a| match a {
-            ElementAttribute::Attribute(attr) => Some(attr),
-            _ => None,
-        })
-        .collect();
+    let attributes = script_attributes(bump, el.attributes);
     Ok((
         Script {
             start: el.start,
@@ -136,69 +134,35 @@ fn build_script_with_comments(
     ))
 }
 
-fn build_script(
-    alloc: &mut Allocator,
-    el: RegularElement,
+fn build_style<'a>(
+    el: RegularElement<'a>,
     source: &str,
-    line_map: &LineMap,
-    ts_default: bool,
-) -> Result<Script, CompileDiagnostic> {
-    // Body bounds: the Text child written by `read_raw_until_close_tag`.
-    let (body_start, body_end) = body_bounds(&el).unwrap_or((el.end as usize, el.end as usize));
-
-    // `lang="ts"` flips on TypeScript parsing for this block specifically.
-    let ts = ts_default
-        || attribute_string_value(&el.attributes, "lang")
-            .map(|s| s == "ts" || s == "typescript")
-            .unwrap_or(false);
-
-    let (content, _comments) =
-        oxc_bridge::parse_program(alloc, source, line_map, body_start, body_end, ts)?;
-    // Note: comments are captured by `build_script_with_comments` below;
-    // callers using `build_script` (legacy entry) drop them.
-
-    let context = if is_module_script(&el.attributes) {
-        ScriptContext::Module
-    } else {
-        ScriptContext::Default
-    };
-
-    // Collect attributes as svelte_ast `Attribute`s only (drop directives —
-    // `<script>` elements never carry them in practice).
-    let attributes = el
-        .attributes
-        .into_iter()
-        .filter_map(|a| match a {
-            ElementAttribute::Attribute(attr) => Some(attr),
-            _ => None,
-        })
-        .collect();
-
-    Ok(Script {
-        start: el.start,
-        end: el.end,
-        context,
-        content,
-        attributes,
-    })
-}
-
-fn build_style(
-    el: RegularElement,
-    source: &str,
-) -> Result<Option<svelte_ast::css::StyleSheet>, CompileDiagnostic> {
+) -> Result<Option<svelte_ast::css::StyleSheet<'a>>, CompileDiagnostic> {
     let (body_start, _body_end) = match body_bounds(&el) {
         Some(b) => b,
         None => return Ok(None),
     };
     let start = el.start;
-    let attributes = el.attributes;
+    let attributes: Vec<_> = el.attributes.into_iter().collect();
     let (sheet, _end) =
         svelte_css_parser::read_style(source, start, body_start, attributes, None)?;
     Ok(Some(sheet))
 }
 
-fn body_bounds(el: &RegularElement) -> Option<(usize, usize)> {
+fn script_attributes<'a>(
+    bump: &'a Bump,
+    attrs: bumpalo::collections::Vec<'a, ElementAttribute<'a>>,
+) -> bumpalo::collections::Vec<'a, Attribute<'a>> {
+    let mut out = bumpalo::collections::Vec::new_in(bump);
+    for a in attrs.into_iter() {
+        if let ElementAttribute::Attribute(attr) = a {
+            out.push(attr);
+        }
+    }
+    out
+}
+
+fn body_bounds<'a>(el: &RegularElement<'a>) -> Option<(usize, usize)> {
     let first = el.fragment.nodes.first()?;
     if let FragmentChild::Text(t) = first {
         Some((t.start as usize, t.end as usize))
@@ -207,7 +171,7 @@ fn body_bounds(el: &RegularElement) -> Option<(usize, usize)> {
     }
 }
 
-fn is_module_script(attrs: &[ElementAttribute]) -> bool {
+fn is_module_script<'a>(attrs: &[ElementAttribute<'a>]) -> bool {
     attribute_string_value(attrs, "context").as_deref() == Some("module")
         || attrs.iter().any(|a| {
             matches!(
@@ -218,25 +182,25 @@ fn is_module_script(attrs: &[ElementAttribute]) -> bool {
         })
 }
 
-fn attribute_string_value(attrs: &[ElementAttribute], name: &str) -> Option<String> {
+fn attribute_string_value<'a>(attrs: &[ElementAttribute<'a>], name: &str) -> Option<String> {
     for a in attrs {
         if let ElementAttribute::Attribute(attr) = a {
             if attr.name == name {
-                return attribute_value_as_str(&attr.value).map(|s| s.into());
+                return attribute_value_as_str(&attr.value).map(|s| s.to_string());
             }
         }
     }
     None
 }
 
-fn attribute_value_as_str(v: &AttributeValue) -> Option<&str> {
+fn attribute_value_as_str<'a>(v: &'a AttributeValue<'a>) -> Option<&'a str> {
     match v {
         AttributeValue::Empty => None,
         AttributeValue::Single(_) => None,
         AttributeValue::Many(parts) => {
             if parts.len() == 1 {
                 if let AttributeValuePart::Text(t) = &parts[0] {
-                    return Some(&t.data);
+                    return Some(t.data.as_str());
                 }
             }
             None

@@ -48,9 +48,9 @@ use crate::utils::element_names::{is_svelte_meta_name, is_valid_tag_name, is_voi
 /// Returns `FragmentChild::Comment` for `<!-- -->`, otherwise a
 /// `FragmentChild::RegularElement` (component / special-element variants are
 /// deferred — they fall back to `RegularElement` shape for now).
-pub fn read_element_or_comment(
-    parser: &mut Parser<'_>,
-) -> Result<FragmentChild, CompileDiagnostic> {
+pub fn read_element_or_comment<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     debug_assert!(parser.match_str("<"));
     let start = parser.index;
 
@@ -107,11 +107,12 @@ pub fn read_element_or_comment(
         ));
     }
 
-    let name = read_tag_name(parser)?;
+    let name_cow = read_tag_name(parser)?;
+    let name = parser.alloc_str(&name_cow);
     parser.element_depth += 1;
     // Drop-guard so every early return decrements element_depth.
-    struct DepthGuard<'p, 'src: 'p>(&'p mut Parser<'src>);
-    impl Drop for DepthGuard<'_, '_> {
+    struct DepthGuard<'p, 'a, 'src: 'p>(&'p mut Parser<'a, 'src>);
+    impl Drop for DepthGuard<'_, '_, '_> {
         fn drop(&mut self) {
             self.0.element_depth = self.0.element_depth.saturating_sub(1);
             // Clear last_auto_closed_tag if we've popped past where it
@@ -188,12 +189,13 @@ pub fn read_element_or_comment(
     // Void elements never have a body.
     if self_closing || is_void(&name) {
         return Ok(build_element(
-            name.into_owned(),
+            parser,
+            name,
             start as u32,
             parser.index as u32,
             name_loc,
             attributes,
-            Fragment::empty(),
+            Fragment::empty_in(parser.bump),
             parser.shadowroot_depth > 0,
         ));
     }
@@ -264,7 +266,8 @@ pub fn read_element_or_comment(
             depth: parser.element_depth.saturating_sub(1),
         });
         return Ok(build_element(
-            name.into_owned(),
+            parser,
+            name,
             start as u32,
             parser.index as u32,
             name_loc,
@@ -274,7 +277,7 @@ pub fn read_element_or_comment(
         ));
     }
 
-    // `<textarea>` has a relaxed close-tag form: `</textarea(\s[^>]*)?>`. We
+    // Consume `</name>`. `</textarea(\s[^>]*)?>`. We
     // already located it via `textarea_close_at`; consume the whole regex
     // here rather than going through `read_tag_name` which would reject the
     // junk between `</textarea` and `>`.
@@ -291,7 +294,8 @@ pub fn read_element_or_comment(
             parser.index += 1; // past `>`
         }
         return Ok(build_element(
-            name.into_owned(),
+            parser,
+            name,
             start as u32,
             parser.index as u32,
             name_loc,
@@ -330,12 +334,11 @@ pub fn read_element_or_comment(
         // that diagnostic surfaces FIRST, before the unclosed-tag error.
         if name == "style" {
             if let Some(FragmentChild::Text(t)) = fragment.nodes.first() {
-                let css_attrs: Vec<svelte_ast::ElementAttribute> = attributes.clone();
                 if let Err(css_err) = svelte_css_parser::read_style(
                     parser.template,
                     start as u32,
                     t.start as usize,
-                    css_attrs,
+                    attributes,
                     None,
                 ) {
                     return Err(css_err);
@@ -364,7 +367,8 @@ pub fn read_element_or_comment(
     }
 
     Ok(build_element(
-        name.into_owned(),
+        parser,
+        name,
         start as u32,
         parser.index as u32,
         name_loc,
@@ -382,99 +386,100 @@ pub fn read_element_or_comment(
 /// `svelte:*` meta tags and uppercase Component invocations fall through to
 /// `RegularElement` for now — Phase 2c follow-up will route them to their
 /// dedicated AST variants.
-fn build_element(
-    name: String,
+fn build_element<'a, 'src>(
+    parser: &Parser<'a, 'src>,
+    name: &'a str,
     start: u32,
     end: u32,
     name_loc: SourceLocation,
-    attributes: Vec<ElementAttribute>,
-    fragment: Fragment,
+    attributes: Vec<ElementAttribute<'a>>,
+    fragment: Fragment<'a>,
     inside_shadowroot: bool,
-) -> FragmentChild {
-    match name.as_str() {
+) -> FragmentChild<'a> {
+    match name {
         // `<slot>` inside a `<template shadowrootmode>` ancestor is a real
         // DOM slot element, not Svelte's SlotElement (element.js:174).
         "slot" if !inside_shadowroot => FragmentChild::SlotElement(SlotElement {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "title" => FragmentChild::TitleElement(TitleElement {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:body" => FragmentChild::SvelteBody(SvelteBody {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:boundary" => FragmentChild::SvelteBoundary(SvelteBoundary {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:document" => FragmentChild::SvelteDocument(SvelteDocument {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:fragment" => FragmentChild::SvelteFragment(SvelteFragment {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:head" => FragmentChild::SvelteHead(SvelteHead {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:options" => FragmentChild::SvelteOptions(SvelteOptionsRaw {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:self" => FragmentChild::SvelteSelf(SvelteSelf {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         "svelte:window" => FragmentChild::SvelteWindow(SvelteWindow {
             start,
             end,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
         }),
         // `<svelte:component this={...}>` — extract `this` attribute as
         // `expression`. Mirrors element.js:265-281.
         "svelte:component" => {
             let (mut attrs, this_value) = extract_this_attribute(attributes);
-            let expression = build_svelte_this_expression(&this_value, &name);
+            let expression = build_svelte_this_expression(&this_value, name);
             let _ = &mut attrs;
-            FragmentChild::SvelteComponent(Box::new(svelte_ast::SvelteComponent {
+            FragmentChild::SvelteComponent(parser.boxed(svelte_ast::SvelteComponent {
                 start,
                 end,
                 name_loc,
-                attributes: attrs,
+                attributes: parser.bump_vec(attrs),
                 fragment,
                 expression,
             }))
@@ -483,22 +488,22 @@ fn build_element(
         // `tag`. Mirrors element.js:283-326.
         "svelte:element" => {
             let (attrs, this_value) = extract_this_attribute(attributes);
-            let tag = build_svelte_this_expression(&this_value, &name);
-            FragmentChild::SvelteElement(Box::new(svelte_ast::SvelteElement {
+            let tag = build_svelte_this_expression(&this_value, name);
+            FragmentChild::SvelteElement(parser.boxed(svelte_ast::SvelteElement {
                 start,
                 end,
                 name_loc,
-                attributes: attrs,
+                attributes: parser.bump_vec(attrs),
                 fragment,
                 tag,
             }))
         }
-        n if is_component_name(n) => FragmentChild::Component(Box::new(svelte_ast::Component {
+        n if is_component_name(n) => FragmentChild::Component(parser.boxed(svelte_ast::Component {
             start,
             end,
             name,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
             metadata: Default::default(),
         })),
@@ -507,7 +512,7 @@ fn build_element(
             end,
             name,
             name_loc,
-            attributes,
+            attributes: parser.bump_vec(attributes),
             fragment,
             metadata: Default::default(),
         }),
@@ -516,9 +521,9 @@ fn build_element(
 
 /// Find the `this` attribute in `attributes` and splice it out, returning
 /// its value separately. Mirrors `findIndex + splice` in element.js:266-275.
-fn extract_this_attribute(
-    mut attributes: Vec<ElementAttribute>,
-) -> (Vec<ElementAttribute>, Option<AttributeValue>) {
+fn extract_this_attribute<'a>(
+    mut attributes: Vec<ElementAttribute<'a>>,
+) -> (Vec<ElementAttribute<'a>>, Option<AttributeValue<'a>>) {
     let idx = attributes
         .iter()
         .position(|a| matches!(a, ElementAttribute::Attribute(attr) if attr.name == "this"));
@@ -536,8 +541,8 @@ fn extract_this_attribute(
 /// values builds a `StringLiteral`. Falls back to a placeholder Identifier
 /// when missing — upstream errors via `e.svelte_*_missing_this`, but we
 /// keep parsing.
-fn build_svelte_this_expression(
-    value: &Option<AttributeValue>,
+fn build_svelte_this_expression<'a>(
+    value: &Option<AttributeValue<'a>>,
     _tag_name: &str,
 ) -> svelte_js_ast::Expression {
     fn placeholder() -> svelte_js_ast::Expression {
@@ -564,7 +569,7 @@ fn build_svelte_this_expression(
                     AttributeValuePart::Text(t) => {
                         svelte_js_ast::Expression::Literal(Box::new(
                             svelte_js_ast::Literal::String(svelte_js_ast::StringLiteral {
-                                value: Cow::Owned(t.data.clone()),
+                                value: Cow::Owned(t.data.to_string()),
                                 raw: Some(format!("'{}'", t.raw)),
                                 span: svelte_js_ast::Span::new(t.start, t.end),
                             }),
@@ -668,7 +673,9 @@ fn is_svg_foreign(name: &str) -> bool {
     )
 }
 
-fn read_tag_name<'src>(parser: &mut Parser<'src>) -> Result<std::borrow::Cow<'src, str>, CompileDiagnostic> {
+fn read_tag_name<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<std::borrow::Cow<'src, str>, CompileDiagnostic> {
     let start = parser.index;
     if parser.index >= parser.template.len() {
         return Err(svelte_diagnostics::errors::unexpected_eof(Some((
@@ -704,10 +711,10 @@ fn read_tag_name<'src>(parser: &mut Parser<'src>) -> Result<std::borrow::Cow<'sr
 /// `static_only` is set for `<script>` / `<style>` opening tags — those use
 /// `read_static_attribute` upstream, which doesn't honour `{...}`
 /// interpolations inside quoted values.
-fn read_attributes(
-    parser: &mut Parser<'_>,
+fn read_attributes<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     static_only: bool,
-) -> Result<Vec<ElementAttribute>, CompileDiagnostic> {
+) -> Result<Vec<ElementAttribute<'a>>, CompileDiagnostic> {
     let mut out = Vec::with_capacity(4);
     loop {
         parser.allow_whitespace();
@@ -751,8 +758,8 @@ fn read_attributes(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for a in &out {
         let (name, span) = match a {
-            ElementAttribute::Attribute(att) => (att.name.clone(), (att.start, att.end)),
-            ElementAttribute::BindDirective(b) => (b.name.clone(), (b.start, b.end)),
+            ElementAttribute::Attribute(att) => (att.name.to_string(), (att.start, att.end)),
+            ElementAttribute::BindDirective(b) => (b.name.to_string(), (b.start, b.end)),
             _ => continue,
         };
         if !seen.insert(name) {
@@ -764,9 +771,9 @@ fn read_attributes(
 
 /// Parse a `{...spread}` or `{name}` shorthand attribute. Caller has
 /// confirmed the cursor is on `{`.
-fn read_braced_attribute(
-    parser: &mut Parser<'_>,
-) -> Result<ElementAttribute, CompileDiagnostic> {
+fn read_braced_attribute<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<ElementAttribute<'a>, CompileDiagnostic> {
     debug_assert_eq!(parser.peek(), Some(b'{'));
     let start = parser.index;
     parser.index += 1; // `{`
@@ -842,7 +849,7 @@ fn read_braced_attribute(
     Ok(ElementAttribute::Attribute(Attribute {
         start: start as u32,
         end: parser.index as u32,
-        name: id_name,
+        name: parser.alloc_str(&id_name),
         name_loc: Some(name_loc),
         value: AttributeValue::Single(expression_tag),
     }))
@@ -861,7 +868,7 @@ fn position_to_json(p: &svelte_ast::Position) -> serde_json::Value {
 /// Try to read a JS-style comment (`//...` or `/* ... */`) at the current
 /// position. Returns true if a comment was consumed (and pushed onto
 /// `parser.comments`). Mirrors `read_comment` in `element.js:730-768`.
-fn read_attr_comment(parser: &mut Parser<'_>) -> bool {
+fn read_attr_comment<'a, 'src>(parser: &mut Parser<'a, 'src>) -> bool {
     let bytes = parser.template.as_bytes();
     let i = parser.index;
     if i + 2 > bytes.len() {
@@ -910,7 +917,7 @@ fn read_attr_comment(parser: &mut Parser<'_>) -> bool {
 }
 
 /// Peek: does the cursor sit on `{` followed by (ws) `@<keyword>`?
-fn peek_at_tag_keyword(parser: &Parser<'_>, keyword: &str) -> bool {
+fn peek_at_tag_keyword<'a, 'src>(parser: &Parser<'a, 'src>, keyword: &str) -> bool {
     let after = match parser.template[parser.index..].strip_prefix('{') {
         Some(s) => s.trim_start(),
         None => return false,
@@ -932,7 +939,9 @@ fn peek_at_tag_keyword(parser: &Parser<'_>, keyword: &str) -> bool {
 
 /// Parse `{@attach <expression>}` in an element attribute list. Caller has
 /// confirmed the cursor is at `{`.
-fn read_attach_tag(parser: &mut Parser<'_>) -> Result<AttachTag, CompileDiagnostic> {
+fn read_attach_tag<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<AttachTag, CompileDiagnostic> {
     debug_assert_eq!(parser.peek(), Some(b'{'));
     let start = parser.index;
     parser.index += 1; // `{`
@@ -961,7 +970,9 @@ fn read_attach_tag(parser: &mut Parser<'_>) -> Result<AttachTag, CompileDiagnost
 
 /// Parse `{expression}` inside an attribute value. Caller has confirmed
 /// the cursor is at `{`. Returns the constructed `ExpressionTag`.
-fn read_expression_tag(parser: &mut Parser<'_>) -> Result<ExpressionTag, CompileDiagnostic> {
+fn read_expression_tag<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<ExpressionTag, CompileDiagnostic> {
     debug_assert_eq!(parser.peek(), Some(b'{'));
     let start = parser.index;
     parser.index += 1; // `{`
@@ -1026,10 +1037,10 @@ fn directive_kind(prefix: &str) -> Option<DirectiveKind> {
     }
 }
 
-fn read_attribute(
-    parser: &mut Parser<'_>,
+fn read_attribute<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     static_only: bool,
-) -> Result<ElementAttribute, CompileDiagnostic> {
+) -> Result<ElementAttribute<'a>, CompileDiagnostic> {
     let start = parser.index;
 
     // Attribute name: any byte that isn't whitespace, `=`, `/`, `>`, `"`, `'`.
@@ -1064,12 +1075,9 @@ fn read_attribute(
         {
             let char_start = parser.index;
             parser.index += 1;
-            AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-                start: char_start as u32,
-                end: (char_start + 1) as u32,
-                raw: "/".to_string(),
-                data: "/".to_string(),
-            })])
+            AttributeValue::Many(parser.bump_vec([AttributeValuePart::Text(
+                parser.make_text(char_start, char_start + 1, true),
+            )]))
         } else if static_only {
             read_static_attribute_value(parser)?
         } else {
@@ -1099,6 +1107,7 @@ fn read_attribute(
             }
 
             return Ok(build_directive(
+                parser,
                 kind,
                 &raw_name,
                 colon_index,
@@ -1116,7 +1125,7 @@ fn read_attribute(
     Ok(ElementAttribute::Attribute(Attribute {
         start: start as u32,
         end: end as u32,
-        name: raw_name,
+        name: parser.alloc_str(&raw_name),
         name_loc: Some(name_loc),
         value,
     }))
@@ -1125,9 +1134,9 @@ fn read_attribute(
 /// Read an attribute value treating any `{`/`}` inside as literal text.
 /// Used for `<script>` / `<style>` attributes. Mirrors
 /// `read_static_attribute` in element.js:475-514.
-fn read_static_attribute_value(
-    parser: &mut Parser<'_>,
-) -> Result<AttributeValue, CompileDiagnostic> {
+fn read_static_attribute_value<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<AttributeValue<'a>, CompileDiagnostic> {
     // Quoted form: read until matching quote, no interpolations.
     let opener = parser.peek();
     let quote: Option<u8> = match opener {
@@ -1150,13 +1159,9 @@ fn read_static_attribute_value(
             ));
         }
         parser.index += 1; // closing quote
-        let raw: String = parser.template[text_start..text_end].into();
-        return Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-            start: text_start as u32,
-            end: text_end as u32,
-            raw: raw.clone(),
-            data: raw,
-        })]));
+        return Ok(AttributeValue::Many(parser.bump_vec([AttributeValuePart::Text(
+            parser.make_text(text_start, text_end, true),
+        )])));
     }
 
     // Unquoted: read until `>` or whitespace. No interpolations.
@@ -1174,39 +1179,40 @@ fn read_static_attribute_value(
             "attribute value",
         ));
     }
-    Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-        start: start as u32,
-        end: end as u32,
-        raw: raw.into(),
-        data: raw.into(),
-    })]))
+    Ok(AttributeValue::Many(parser.bump_vec([AttributeValuePart::Text(
+        parser.make_text(start, end, true),
+    )])))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_directive(
+fn build_directive<'a, 'src>(
+    parser: &Parser<'a, 'src>,
     kind: DirectiveKind,
     raw_name: &str,
     colon_index: usize,
     directive_name: String,
     modifiers: Vec<String>,
     name_loc: SourceLocation,
-    value: AttributeValue,
+    value: AttributeValue<'a>,
     start: usize,
     end: usize,
-) -> Result<ElementAttribute, CompileDiagnostic> {
+) -> Result<ElementAttribute<'a>, CompileDiagnostic> {
+    let name = parser.alloc_str(&directive_name);
+    let modifiers = parser.alloc_modifiers(modifiers);
     // StyleDirective keeps the `value: AttributeValue` shape verbatim
     // (element.js:654-666).
     if matches!(kind, DirectiveKind::Style) {
         return Ok(ElementAttribute::StyleDirective(StyleDirective {
             start: start as u32,
             end: end as u32,
-            name: directive_name,
+            name,
             name_loc: Some(name_loc),
             value,
             modifiers,
         }));
     }
 
+    let directive_name_owned = directive_name.clone();
     // Non-style directives extract a single expression from the value.
     // (element.js:669-684.) Bare attribute → expression: None. Single
     // mustache → expression: Some(expr). Quoted value containing exactly one
@@ -1250,7 +1256,7 @@ fn build_directive(
         DirectiveKind::Use => ElementAttribute::UseDirective(UseDirective {
             start: start as u32,
             end: end as u32,
-            name: directive_name,
+            name,
             name_loc: Some(name_loc),
             expression,
             modifiers,
@@ -1258,7 +1264,7 @@ fn build_directive(
         DirectiveKind::Animate => ElementAttribute::AnimateDirective(AnimateDirective {
             start: start as u32,
             end: end as u32,
-            name: directive_name,
+            name,
             name_loc: Some(name_loc),
             expression,
             modifiers,
@@ -1269,7 +1275,7 @@ fn build_directive(
             // and `end` but no `loc`.
             let expr = expression.unwrap_or_else(|| {
                 svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
-                    name: Cow::Owned(directive_name.clone()),
+                    name: Cow::Owned(directive_name_owned.clone()),
                     span: svelte_js_ast::Span::new(
                         (start + colon_index + 1) as u32,
                         end as u32,
@@ -1279,7 +1285,7 @@ fn build_directive(
             ElementAttribute::BindDirective(BindDirective {
                 start: start as u32,
                 end: end as u32,
-                name: directive_name,
+                name,
                 name_loc: Some(name_loc),
                 expression: expr,
                 modifiers,
@@ -1288,7 +1294,7 @@ fn build_directive(
         DirectiveKind::Class => {
             let expr = expression.unwrap_or_else(|| {
                 svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
-                    name: Cow::Owned(directive_name.clone()),
+                    name: Cow::Owned(directive_name_owned.clone()),
                     span: svelte_js_ast::Span::new(
                         (start + colon_index + 1) as u32,
                         end as u32,
@@ -1298,7 +1304,7 @@ fn build_directive(
             ElementAttribute::ClassDirective(ClassDirective {
                 start: start as u32,
                 end: end as u32,
-                name: directive_name,
+                name,
                 name_loc: Some(name_loc),
                 expression: expr,
                 modifiers,
@@ -1307,7 +1313,7 @@ fn build_directive(
         DirectiveKind::On => ElementAttribute::OnDirective(OnDirective {
             start: start as u32,
             end: end as u32,
-            name: directive_name,
+            name,
             name_loc: Some(name_loc),
             expression,
             modifiers,
@@ -1315,7 +1321,7 @@ fn build_directive(
         DirectiveKind::Let => ElementAttribute::LetDirective(LetDirective {
             start: start as u32,
             end: end as u32,
-            name: directive_name,
+            name,
             name_loc: Some(name_loc),
             expression,
             modifiers,
@@ -1327,7 +1333,7 @@ fn build_directive(
             ElementAttribute::TransitionDirective(TransitionDirective {
                 start: start as u32,
                 end: end as u32,
-                name: directive_name,
+                name,
                 name_loc: Some(name_loc),
                 expression,
                 modifiers,
@@ -1352,7 +1358,9 @@ fn build_directive(
 ///   `/>`).
 ///
 /// For the unquoted form, mustache interpolations (`name=a{b}c`) are allowed.
-fn read_attribute_value(parser: &mut Parser<'_>) -> Result<AttributeValue, CompileDiagnostic> {
+fn read_attribute_value<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<AttributeValue<'a>, CompileDiagnostic> {
     // Mustache-only value: `name={expr}` → `AttributeValue::Single(ExpressionTag)`.
     if parser.peek() == Some(b'{') {
         let tag = read_expression_tag(parser)?;
@@ -1394,12 +1402,9 @@ fn read_attribute_value(parser: &mut Parser<'_>) -> Result<AttributeValue, Compi
         if parser.peek() == Some(q) {
             let pos = parser.index;
             parser.index += 1;
-            return Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
-                start: pos as u32,
-                end: pos as u32,
-                raw: String::new(),
-                data: String::new(),
-            })]));
+            return Ok(AttributeValue::Many(parser.bump_vec([AttributeValuePart::Text(
+                parser.make_text(pos, pos, true),
+            )])));
         }
     }
 
@@ -1430,32 +1435,26 @@ fn read_attribute_value(parser: &mut Parser<'_>) -> Result<AttributeValue, Compi
             return Ok(AttributeValue::Single(tag));
         }
     }
-    Ok(AttributeValue::Many(parts))
+    Ok(AttributeValue::Many(parser.bump_vec(parts)))
 }
 
 /// Read a sequence of Text/ExpressionTag chunks until a stop condition.
 /// Mirrors `read_sequence` in element.js:849+ — its callback `done()`
 /// determines termination based on context (quote char, or
 /// `regex_invalid_unquoted_attribute_value`).
-fn read_attr_sequence(
-    parser: &mut Parser<'_>,
+fn read_attr_sequence<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     quote: Option<u8>,
-) -> Result<Vec<AttributeValuePart>, CompileDiagnostic> {
-    let mut parts: Vec<AttributeValuePart> = Vec::with_capacity(2);
+) -> Result<Vec<AttributeValuePart<'a>>, CompileDiagnostic> {
+    let mut parts: Vec<AttributeValuePart<'a>> = Vec::with_capacity(2);
     let mut text_start = parser.index;
 
-    let flush_text = |parts: &mut Vec<AttributeValuePart>,
+    let flush_text = |parser: &Parser<'a, 'src>,
+                      parts: &mut Vec<AttributeValuePart<'a>>,
                       start: usize,
-                      end: usize,
-                      tpl: &str| {
+                      end: usize| {
         if end > start {
-            let raw = &tpl[start..end];
-            parts.push(AttributeValuePart::Text(Text {
-                start: start as u32,
-                end: end as u32,
-                raw: raw.into(),
-                data: crate::utils::entities::decode_character_references(raw, true),
-            }));
+            parts.push(AttributeValuePart::Text(parser.make_text(start, end, true)));
         }
     };
 
@@ -1511,7 +1510,7 @@ fn read_attr_sequence(
                 });
             }
             // Flush any pending text, then parse the mustache.
-            flush_text(&mut parts, text_start, parser.index, parser.template);
+            flush_text(parser, &mut parts, text_start, parser.index);
             let tag = read_expression_tag(parser)?;
             parts.push(AttributeValuePart::ExpressionTag(tag));
             text_start = parser.index;
@@ -1521,7 +1520,7 @@ fn read_attr_sequence(
         parser.index += 1;
     }
 
-    flush_text(&mut parts, text_start, parser.index, parser.template);
+    flush_text(parser, &mut parts, text_start, parser.index);
     Ok(parts)
 }
 
@@ -1531,21 +1530,18 @@ fn read_attr_sequence(
 /// `</textarea>` (case-insensitive on the closing tag, like upstream's
 /// regex_closing_textarea_tag). Caller is responsible for consuming the
 /// closing tag.
-fn read_textarea_fragment(
-    parser: &mut Parser<'_>,
-) -> Result<Fragment, CompileDiagnostic> {
-    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(8);
+fn read_textarea_fragment<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<Fragment<'a>, CompileDiagnostic> {
+    let mut nodes: Vec<FragmentChild<'a>> = Vec::with_capacity(8);
     let mut text_start = parser.index;
 
-    let flush_text = |nodes: &mut Vec<FragmentChild>, start: usize, end: usize, tpl: &str| {
+    let flush_text = |parser: &Parser<'a, 'src>,
+                      nodes: &mut Vec<FragmentChild<'a>>,
+                      start: usize,
+                      end: usize| {
         if end > start {
-            let raw = &tpl[start..end];
-            nodes.push(FragmentChild::Text(Text {
-                start: start as u32,
-                end: end as u32,
-                raw: raw.into(),
-                data: crate::utils::entities::decode_character_references(raw, false),
-            }));
+            nodes.push(FragmentChild::Text(parser.make_text(start, end, false)));
         }
     };
 
@@ -1584,7 +1580,7 @@ fn read_textarea_fragment(
                     )
                 });
             }
-            flush_text(&mut nodes, text_start, parser.index, parser.template);
+            flush_text(parser, &mut nodes, text_start, parser.index);
             let tag = read_expression_tag(parser)?;
             nodes.push(FragmentChild::ExpressionTag(tag));
             text_start = parser.index;
@@ -1595,11 +1591,8 @@ fn read_textarea_fragment(
         parser.index += ch.len_utf8();
     }
 
-    flush_text(&mut nodes, text_start, parser.index, parser.template);
-    Ok(Fragment {
-        nodes,
-        metadata: Default::default(),
-    })
+    flush_text(parser, &mut nodes, text_start, parser.index);
+    Ok(parser.fragment_from(nodes))
 }
 
 /// Check whether `template[i..]` matches `</textarea(\s[^>]*)?>` (case-
@@ -1639,10 +1632,10 @@ fn textarea_close_at(template: &str, i: usize) -> bool {
 /// Returns an empty `Fragment` (the body is intentionally not exposed as a
 /// child of the element — Phase 2f/2g will set `Root.instance` / `Root.css`
 /// instead from this raw text).
-fn read_raw_until_close_tag(
-    parser: &mut Parser<'_>,
+fn read_raw_until_close_tag<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     tag_name: &str,
-) -> Result<Fragment, CompileDiagnostic> {
+) -> Result<Fragment<'a>, CompileDiagnostic> {
     let start = parser.index;
     let close_marker = format!("</{tag_name}");
     while parser.index < parser.template.len() {
@@ -1664,16 +1657,7 @@ fn read_raw_until_close_tag(
     // Text node with empty `raw`/`data`. Required for fixtures like
     // `<svelte:head><style></style></svelte:head>`.
     let end = parser.index;
-    let raw: String = parser.template[start..end].into();
-    Ok(Fragment {
-        nodes: vec![FragmentChild::Text(Text {
-            start: start as u32,
-            end: end as u32,
-            raw: raw.clone(),
-            data: raw,
-        })],
-        metadata: Default::default(),
-    })
+    Ok(parser.fragment_from([FragmentChild::Text(parser.make_text(start, end, false))]))
 }
 
 /// Recursively parse a fragment until the parser cursor sits at `</tag_name>`.
@@ -1709,11 +1693,11 @@ fn peek_opening_tag_name(template: &str, i: usize) -> Option<&str> {
 /// Result of parsing a fragment until close tag. The second component is
 /// `true` if the loop terminated because of an HTML implicit-close
 /// (e.g. `<li>...<li>` — caller should NOT consume a close tag).
-fn parse_fragment_until_close_tag(
-    parser: &mut Parser<'_>,
+fn parse_fragment_until_close_tag<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     tag_name: &str,
-) -> Result<(Fragment, bool), CompileDiagnostic> {
-    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(8);
+) -> Result<(Fragment<'a>, bool), CompileDiagnostic> {
+    let mut nodes: Vec<FragmentChild<'a>> = Vec::with_capacity(8);
     let mut implicit_close = false;
     loop {
         if parser.index >= parser.template.len() {
@@ -1815,10 +1799,7 @@ fn parse_fragment_until_close_tag(
         nodes.push(FragmentChild::Text(t));
     }
     Ok((
-        Fragment {
-            nodes,
-            metadata: Default::default(),
-        },
+        parser.fragment_from(nodes),
         implicit_close,
     ))
 }
@@ -1828,15 +1809,18 @@ mod tests {
     use super::*;
     use crate::parse;
 
-    fn first_node(input: &str) -> FragmentChild {
-        let r = parse(input, false).unwrap();
-        r.fragment.nodes.into_iter().next().unwrap()
+    fn parse_first(input: &str) -> crate::AstBundle {
+        parse(input, false).unwrap()
+    }
+
+    fn first_node<'a>(bundle: &'a crate::AstBundle) -> &'a FragmentChild<'a> {
+        &bundle.root().fragment.nodes[0]
     }
 
     #[test]
     fn empty_div() {
-        let n = first_node("<div></div>");
-        match n {
+        let bundle = parse_first("<div></div>");
+        match first_node(&bundle) {
             FragmentChild::RegularElement(el) => {
                 assert_eq!(el.name, "div");
                 assert_eq!(el.start, 0);
@@ -1854,8 +1838,8 @@ mod tests {
 
     #[test]
     fn self_closing_br() {
-        let n = first_node("<br/>");
-        match n {
+        let bundle = parse_first("<br/>");
+        match first_node(&bundle) {
             FragmentChild::RegularElement(el) => {
                 assert_eq!(el.name, "br");
                 assert_eq!(el.end, 5);
@@ -1867,8 +1851,8 @@ mod tests {
 
     #[test]
     fn void_element_without_slash() {
-        let n = first_node("<br>");
-        match n {
+        let bundle = parse_first("<br>");
+        match first_node(&bundle) {
             FragmentChild::RegularElement(el) => {
                 assert_eq!(el.name, "br");
                 assert_eq!(el.end, 4);
@@ -1879,8 +1863,8 @@ mod tests {
 
     #[test]
     fn element_with_text_child() {
-        let n = first_node("<p>hello</p>");
-        match n {
+        let bundle = parse_first("<p>hello</p>");
+        match first_node(&bundle) {
             FragmentChild::RegularElement(el) => {
                 assert_eq!(el.name, "p");
                 assert_eq!(el.fragment.nodes.len(), 1);
@@ -1895,8 +1879,8 @@ mod tests {
 
     #[test]
     fn nested_elements() {
-        let n = first_node("<div><span>x</span></div>");
-        let outer = match n {
+        let bundle = parse_first("<div><span>x</span></div>");
+        let outer = match first_node(&bundle) {
             FragmentChild::RegularElement(el) => el,
             other => panic!("got {other:?}"),
         };
@@ -1912,8 +1896,8 @@ mod tests {
 
     #[test]
     fn bare_attribute() {
-        let n = first_node("<input disabled>");
-        match n {
+        let bundle = parse_first("<input disabled>");
+        match first_node(&bundle) {
             FragmentChild::RegularElement(el) => {
                 assert_eq!(el.attributes.len(), 1);
                 match &el.attributes[0] {
@@ -1930,8 +1914,8 @@ mod tests {
 
     #[test]
     fn quoted_attribute_value() {
-        let n = first_node(r#"<div class="foo bar"></div>"#);
-        let el = match n {
+        let bundle = parse_first(r#"<div class="foo bar"></div>"#);
+        let el = match first_node(&bundle) {
             FragmentChild::RegularElement(e) => e,
             other => panic!("got {other:?}"),
         };
@@ -1958,8 +1942,8 @@ mod tests {
 
     #[test]
     fn multiple_attributes() {
-        let n = first_node(r#"<input type="text" name="email" required>"#);
-        match n {
+        let bundle = parse_first(r#"<input type="text" name="email" required>"#);
+        match first_node(&bundle) {
             FragmentChild::RegularElement(el) => {
                 assert_eq!(el.attributes.len(), 3);
             }

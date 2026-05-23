@@ -24,10 +24,10 @@ use crate::utils::bracket::{find_matching_bracket, find_matching_pointy};
 
 /// Entry point: caller has consumed `{` and confirmed the next byte is `#`.
 /// `start` is the position of the original `{`.
-pub fn read_block_open(
-    parser: &mut Parser<'_>,
+pub fn read_block_open<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     debug_assert_eq!(parser.peek(), Some(b'#'));
     parser.index += 1; // consume `#`
 
@@ -59,10 +59,10 @@ pub fn read_block_open(
 ///   each-expression. This covers the fixtures we currently have; the
 ///   no-context case (`{#each foo, i}`) and TSAsExpression edge cases are
 ///   left for follow-up.
-fn read_each_block(
-    parser: &mut Parser<'_>,
+fn read_each_block<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     parser.allow_whitespace();
     let expr_start = parser.index;
 
@@ -128,7 +128,7 @@ fn read_each_block(
 
     parser.allow_whitespace();
 
-    let mut index_name: Option<String> = None;
+    let mut index_name: Option<&'a str> = None;
     if parser.eat(",") {
         parser.allow_whitespace();
         let id_start = parser.index;
@@ -141,7 +141,7 @@ fn read_each_block(
                 "identifier",
             ));
         }
-        index_name = Some(id.into());
+        index_name = Some(parser.alloc_str(id));
         parser.allow_whitespace();
     }
 
@@ -196,7 +196,7 @@ fn read_each_block(
 
     consume_block_close(parser, "each")?;
 
-    Ok(FragmentChild::EachBlock(Box::new(EachBlock {
+    Ok(FragmentChild::EachBlock(parser.boxed(EachBlock {
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -212,10 +212,10 @@ fn read_each_block(
 /// Also: `{#await EXPR then [PAT]}...{/await}` and `{#await EXPR catch [PAT]}...{/await}`.
 ///
 /// Ported from `phases/1-parse/state/tag.js:235-318`.
-fn read_await_block(
-    parser: &mut Parser<'_>,
+fn read_await_block<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     parser.allow_whitespace();
     let expr_start = parser.index;
 
@@ -267,9 +267,9 @@ fn read_await_block(
     //   - `{#await expr catch [pat]}` (catch fragment first)
     let mut value: Option<svelte_js_ast::Pattern> = None;
     let mut error: Option<svelte_js_ast::Pattern> = None;
-    let mut pending: Option<Fragment> = None;
-    let mut then: Option<Fragment> = None;
-    let mut catch: Option<Fragment> = None;
+    let mut pending: Option<Fragment<'a>> = None;
+    let mut then: Option<Fragment<'a>> = None;
+    let mut catch: Option<Fragment<'a>> = None;
     let _ = expression_end_in_template;
 
     let mut have_then_inline = false;
@@ -347,7 +347,7 @@ fn read_await_block(
 
     consume_block_close(parser, "await")?;
 
-    Ok(FragmentChild::AwaitBlock(Box::new(AwaitBlock {
+    Ok(FragmentChild::AwaitBlock(parser.boxed(AwaitBlock {
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -361,7 +361,7 @@ fn read_await_block(
 
 /// Check whether the cursor sits on a bare keyword followed by whitespace
 /// or `}`. Used to detect inline `then`/`catch` in `{#await expr then ...}`.
-fn terminator_after_keyword(parser: &Parser<'_>, keyword: &str) -> bool {
+fn terminator_after_keyword<'a, 'src>(parser: &Parser<'a, 'src>, keyword: &str) -> bool {
     let after = parser.index + keyword.len();
     matches!(
         parser.template.as_bytes().get(after),
@@ -375,7 +375,9 @@ fn terminator_after_keyword(parser: &Parser<'_>, keyword: &str) -> bool {
 /// patterns short-circuit to a hand-built Identifier (so the `loc` uses the
 /// original-source line/column via `LineMap`), and only `{...}` / `[...]`
 /// patterns go through the synthetic-source `(<pattern> = 1)` trick.
-fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::Pattern, CompileDiagnostic> {
+fn read_pattern_with_advance<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<svelte_js_ast::Pattern, CompileDiagnostic> {
     let pat_start = parser.index;
     let bytes = parser.template.as_bytes();
     if pat_start >= bytes.len() {
@@ -497,10 +499,10 @@ fn find_top_level_keyword(template: &str, from: usize, keyword: &str) -> Option<
 /// `{#snippet name[<T>](params)}...{/snippet}`
 ///
 /// Ported from `phases/1-parse/state/tag.js:347-419`.
-fn read_snippet_block(
-    parser: &mut Parser<'_>,
+fn read_snippet_block<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     parser.allow_whitespace();
 
     let id_start = parser.index;
@@ -523,14 +525,12 @@ fn read_snippet_block(
     parser.allow_whitespace();
 
     // TypeScript generic parameters: `<T extends ...>`
-    let mut type_params: Option<String> = None;
+    let mut type_params: Option<&'a str> = None;
     if parser.ts && parser.peek() == Some(b'<') {
         let lt_pos = parser.index;
         match find_matching_pointy(parser.template, lt_pos) {
             Some(gt_pos) => {
-                // Slice between `<` and `>` (exclusive on both).
-                let tp: String = parser.template[lt_pos + 1..gt_pos].into();
-                type_params = Some(tp);
+                type_params = Some(parser.alloc_str(&parser.template[lt_pos + 1..gt_pos]));
                 parser.index = gt_pos + 1;
             }
             None => {
@@ -586,11 +586,11 @@ fn read_snippet_block(
     let body = parse_fragment_until_block_boundary(parser, &["/snippet"])?;
     consume_block_close(parser, "snippet")?;
 
-    Ok(FragmentChild::SnippetBlock(Box::new(SnippetBlock {
+    Ok(FragmentChild::SnippetBlock(parser.boxed(SnippetBlock {
         start: start as u32,
         end: parser.index as u32,
         expression,
-        parameters,
+        parameters: parser.bump_vec(parameters),
         type_params,
         body,
     })))
@@ -734,11 +734,11 @@ fn skip_template_literal(bytes: &[u8], mut i: usize) -> usize {
 /// recursive chain is responsible for eventually consuming the single
 /// shared `{/if}` at the end. Both the outermost and every nested elseif
 /// IfBlock end at the same position (just past `{/if}`).
-fn read_if_block(
-    parser: &mut Parser<'_>,
+fn read_if_block<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
     elseif: bool,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     parser.allow_whitespace();
     let (test, expr_end) = parser.parse_expression_at(parser.index)?;
     parser.index = expr_end;
@@ -764,10 +764,7 @@ fn read_if_block(
             // The recursive call will eventually consume the shared `{/if}`.
             parser.index += 2;
             let nested = read_if_block(parser, else_brace_pos, true)?;
-            Some(Fragment {
-                nodes: vec![nested],
-                metadata: Default::default(),
-            })
+            Some(parser.fragment_from([nested]))
         } else {
             // `{:else}` — eat `}` then parse the else body up to `{/if}`.
             if !parser.eat("}") {
@@ -787,7 +784,7 @@ fn read_if_block(
     };
 
     let _ = elseif; // kept for the field on the AST; no longer affects close-consumption.
-    Ok(FragmentChild::IfBlock(Box::new(IfBlock {
+    Ok(FragmentChild::IfBlock(parser.boxed(IfBlock {
         start: start as u32,
         end: parser.index as u32,
         elseif,
@@ -798,10 +795,10 @@ fn read_if_block(
 }
 
 /// `{#key expr}...{/key}`
-fn read_key_block(
-    parser: &mut Parser<'_>,
+fn read_key_block<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     parser.allow_whitespace();
     let (expression, expr_end) = parser.parse_expression_at(parser.index)?;
     parser.index = expr_end;
@@ -827,11 +824,11 @@ fn read_key_block(
 /// Parse children until the parser cursor sits at `{:keyword}` (for any
 /// keyword in `boundaries`) or `{/keyword}`. Does NOT consume the boundary
 /// marker; that's the caller's job.
-fn parse_fragment_until_block_boundary(
-    parser: &mut Parser<'_>,
+fn parse_fragment_until_block_boundary<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     boundaries: &[&str],
-) -> Result<Fragment, CompileDiagnostic> {
-    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(8);
+) -> Result<Fragment<'a>, CompileDiagnostic> {
+    let mut nodes: Vec<FragmentChild<'a>> = Vec::with_capacity(8);
     loop {
         if parser.index >= parser.template.len() {
             // Find the position of the enclosing block-open `{#...`. The
@@ -864,15 +861,12 @@ fn parse_fragment_until_block_boundary(
         let t = super::text::read_text(parser);
         nodes.push(FragmentChild::Text(t));
     }
-    Ok(Fragment {
-        nodes,
-        metadata: Default::default(),
-    })
+    Ok(parser.fragment_from(nodes))
 }
 
 /// Peek: is the cursor on `{:KW` or `{/KW` for any keyword in `boundaries`?
 /// `boundaries` entries that start with `/` are close-tag matches.
-fn peek_is_boundary(parser: &Parser<'_>, boundaries: &[&str]) -> bool {
+fn peek_is_boundary<'a, 'src>(parser: &Parser<'a, 'src>, boundaries: &[&str]) -> bool {
     let after = match parser.template[parser.index..].strip_prefix('{') {
         Some(s) => s,
         None => return false,
@@ -914,8 +908,8 @@ fn terminator_ok_after(rest: &str, is_close: bool) -> bool {
 }
 
 /// Consume `{:keyword` (caller will handle whitespace and `}` separately).
-fn consume_block_continuation(
-    parser: &mut Parser<'_>,
+fn consume_block_continuation<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     keyword: &str,
 ) -> Result<(), CompileDiagnostic> {
     if !parser.eat("{") {
@@ -941,8 +935,8 @@ fn consume_block_continuation(
 }
 
 /// Consume `{/keyword}`.
-fn consume_block_close(
-    parser: &mut Parser<'_>,
+fn consume_block_close<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     keyword: &str,
 ) -> Result<(), CompileDiagnostic> {
     if !parser.eat("{") {
@@ -974,7 +968,7 @@ fn consume_block_close(
     Ok(())
 }
 
-impl<'a> Parser<'a> {
+impl<'a, 'src> Parser<'a, 'src> {
     /// Cheap predicate: does the cursor sit on `{:kw` or `{ :kw` (with
     /// allowed whitespace)?
     pub fn peek_block_keyword(&self, kw: &str) -> bool {

@@ -11,14 +11,14 @@ use crate::fragment::Comment;
 use crate::position::Offset;
 
 /// Top-level `<style>` block. Mirrors `CSS.StyleSheet` in css.d.ts:17-27.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StyleSheet {
+#[derive(Debug, PartialEq)]
+pub struct StyleSheet<'a> {
     pub kind: StyleSheetKind,
     pub start: Offset,
     pub end: Offset,
-    pub attributes: Vec<crate::ElementAttribute>,
+    pub attributes: Vec<crate::ElementAttribute<'a>>,
     pub children: Vec<StyleSheetChild>,
-    pub content: StyleSheetContent,
+    pub content: StyleSheetContent<'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,12 +29,12 @@ pub enum StyleSheetKind {
 /// `content` field on `StyleSheet`. Carries the raw style text for source-
 /// map purposes and a possible HTML comment that immediately precedes the
 /// `<style>` element.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StyleSheetContent {
+#[derive(Debug, PartialEq)]
+pub struct StyleSheetContent<'a> {
     pub start: Offset,
     pub end: Offset,
     pub styles: String,
-    pub comment: Option<Comment>,
+    pub comment: Option<Comment<'a>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

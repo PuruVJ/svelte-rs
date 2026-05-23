@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod arena;
 pub mod attributes;
 pub mod blocks;
 pub mod css;
@@ -15,6 +16,7 @@ pub mod position;
 pub mod root;
 pub mod tags;
 
+pub use arena::*;
 pub use attributes::*;
 pub use blocks::*;
 pub use elements::*;

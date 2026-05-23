@@ -20,13 +20,13 @@ use svelte_diagnostics::{errors, CompileDiagnostic};
 ///
 /// Returns the parsed `StyleSheet` and the byte offset immediately AFTER the
 /// closing `</style>` (i.e. where the next sibling starts).
-pub fn read_style(
+pub fn read_style<'a>(
     template: &str,
     start: u32,
     content_start: usize,
-    attributes: Vec<ElementAttribute>,
-    preceding_comment: Option<Comment>,
-) -> Result<(StyleSheet, usize), CompileDiagnostic> {
+    attributes: Vec<ElementAttribute<'a>>,
+    preceding_comment: Option<Comment<'a>>,
+) -> Result<(StyleSheet<'a>, usize), CompileDiagnostic> {
     let mut p = CssParser::new(template, content_start);
     let children = p.read_body(|p| {
         p.template[p.index..].starts_with("</style") || p.index >= p.template.len()

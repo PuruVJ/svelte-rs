@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bundle;
 pub mod hoist;
 pub mod oxc_bridge;
 pub mod oxc_to_typed;
@@ -14,28 +15,31 @@ pub mod parser;
 pub mod state;
 pub mod utils;
 
-use std::borrow::Cow;
-
 use svelte_ast::{
-    Fragment, FragmentChild, JsComment, JsCommentKind, Position, Root, SourceLocation,
+    FragmentChild, JsComment, JsCommentKind, Position, Root, SourceLocation, TemplateArena,
 };
 use svelte_diagnostics::CompileDiagnostic;
 
+pub use bundle::AstBundle;
 pub use parser::Parser;
 
-/// Parse a `.svelte` source string. Mirrors the entry point at
-/// `packages/svelte/src/compiler/phases/1-parse/index.js::parse`.
-///
-/// Status: handles BOM stripping + text + HTML comments at the top level.
-/// Anything else falls through to text consumption — wrong, but harmless for
-/// the cases this slice targets. Real element/tag/block/script parsing lands
-/// in Phase 2c+.
-pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
+/// Parse a `.svelte` source string into an arena-backed AST bundle.
+pub fn parse(source: &str, loose: bool) -> Result<AstBundle, CompileDiagnostic> {
+    AstBundle::try_parse(source, loose)
+}
+
+/// Parse into a [`Root`] allocated in `arena`.
+pub fn parse_in_arena<'a>(
+    arena: &'a TemplateArena,
+    source: &str,
+    loose: bool,
+) -> Result<Root<'a>, CompileDiagnostic> {
     let source = Parser::strip_bom(source);
-    let mut parser = Parser::new(source, loose);
+    let mut parser = Parser::new(&arena.bump, source, loose);
 
     let fragment_start = parser.index as u32;
-    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(32);
+    let mut nodes: bumpalo::collections::Vec<'_, FragmentChild<'_>> =
+        bumpalo::collections::Vec::new_in(&arena.bump);
 
     while parser.index < parser.template.len() {
         if parser.match_str("<") {
@@ -44,7 +48,9 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
             match state::element::read_element_or_comment(&mut parser) {
                 Ok(n) => nodes.push(n),
                 Err(d) => {
-                    if !parser.loose { return Err(d); }
+                    if !parser.loose {
+                        return Err(d);
+                    }
                     // Recovery: if we haven't made progress, skip one byte
                     // past the `<` so we don't loop forever.
                     if parser.index == start_idx {
@@ -81,7 +87,9 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
             match state::tag::read_tag(&mut parser) {
                 Ok(n) => nodes.push(n),
                 Err(d) => {
-                    if !parser.loose { return Err(d); }
+                    if !parser.loose {
+                        return Err(d);
+                    }
                     // Recovery: skip to the matching `}` (or one byte past
                     // `{` if no close found) so the outer loop can continue.
                     if parser.index == start_idx {
@@ -105,7 +113,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
         js: vec![],
         start: 0,
         end: source.len() as u32,
-        fragment: Fragment {
+        fragment: svelte_ast::Fragment {
             // `fragment_start` is unused at the moment but will matter once
             // we track fragment boundaries inside blocks.
             nodes: {
@@ -126,6 +134,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
     // `phases/1-parse/index.js:153-168`.
     hoist::hoist_scripts_and_styles(
         &mut parser.oxc_alloc,
+        &arena.bump,
         &mut root,
         source,
         &parser.line_map,
@@ -185,7 +194,8 @@ mod tests {
 
     #[test]
     fn parses_empty_input() {
-        let r = parse("", false).unwrap();
+        let bundle = parse("", false).unwrap();
+        let r = bundle.root();
         assert_eq!(r.start, 0);
         assert_eq!(r.end, 0);
         assert!(r.fragment.nodes.is_empty());
@@ -193,11 +203,13 @@ mod tests {
 
     #[test]
     fn parses_plain_text() {
-        let r = parse("hello", false).unwrap();
+        let bundle = parse("hello", false).unwrap();
+        let r = bundle.root();
         assert_eq!(r.fragment.nodes.len(), 1);
         match &r.fragment.nodes[0] {
             FragmentChild::Text(t) => {
                 assert_eq!(t.raw, "hello");
+                assert_eq!(t.data.as_str(), "hello");
                 assert_eq!(t.start, 0);
                 assert_eq!(t.end, 5);
             }
@@ -207,7 +219,8 @@ mod tests {
 
     #[test]
     fn parses_top_level_comment() {
-        let r = parse("<!-- foo -->", false).unwrap();
+        let bundle = parse("<!-- foo -->", false).unwrap();
+        let r = bundle.root();
         assert_eq!(r.fragment.nodes.len(), 1);
         match &r.fragment.nodes[0] {
             FragmentChild::Comment(c) => {
@@ -227,13 +240,13 @@ mod tests {
     /// `packages/svelte/tests/parser-modern/test.ts:14-17`).
     #[test]
     fn root_end_is_original_input_length() {
-        let r = parse("hi\n  \n", false).unwrap();
-        assert_eq!(r.end, 6);
+        let bundle = parse("hi\n  \n", false).unwrap();
+        assert_eq!(bundle.root().end, 6);
     }
 
     #[test]
     fn strips_bom() {
-        let r = parse("\u{feff}hi", false).unwrap();
-        assert_eq!(r.end, 2);
+        let bundle = parse("\u{feff}hi", false).unwrap();
+        assert_eq!(bundle.root().end, 2);
     }
 }

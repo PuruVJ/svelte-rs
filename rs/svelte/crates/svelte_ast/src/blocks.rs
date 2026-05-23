@@ -1,58 +1,60 @@
 //! `{#each}`, `{#if}`, `{#await}`, `{#key}`, `{#snippet}` blocks.
 
+use bumpalo::collections::Vec as BumpVec;
+
 use svelte_js_ast::{Expression, Identifier, Pattern};
 
 use crate::fragment::Fragment;
 use crate::position::Offset;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct EachBlock {
+#[derive(Debug, PartialEq)]
+pub struct EachBlock<'a> {
     pub start: Offset,
     pub end: Offset,
     pub expression: Expression,
     pub context: Option<Pattern>,
-    pub body: Fragment,
-    pub fallback: Option<Fragment>,
-    pub index: Option<String>,
+    pub body: Fragment<'a>,
+    pub fallback: Option<Fragment<'a>>,
+    pub index: Option<&'a str>,
     pub key: Option<Expression>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct IfBlock {
+#[derive(Debug, PartialEq)]
+pub struct IfBlock<'a> {
     pub start: Offset,
     pub end: Offset,
     pub elseif: bool,
     pub test: Expression,
-    pub consequent: Fragment,
-    pub alternate: Option<Fragment>,
+    pub consequent: Fragment<'a>,
+    pub alternate: Option<Fragment<'a>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct AwaitBlock {
+#[derive(Debug, PartialEq)]
+pub struct AwaitBlock<'a> {
     pub start: Offset,
     pub end: Offset,
     pub expression: Expression,
     pub value: Option<Pattern>,
     pub error: Option<Pattern>,
-    pub pending: Option<Fragment>,
-    pub then: Option<Fragment>,
-    pub catch_: Option<Fragment>,
+    pub pending: Option<Fragment<'a>>,
+    pub then: Option<Fragment<'a>>,
+    pub catch_: Option<Fragment<'a>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct KeyBlock {
+#[derive(Debug, PartialEq)]
+pub struct KeyBlock<'a> {
     pub start: Offset,
     pub end: Offset,
     pub expression: Expression,
-    pub fragment: Fragment,
+    pub fragment: Fragment<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SnippetBlock {
+#[derive(Debug, PartialEq)]
+pub struct SnippetBlock<'a> {
     pub start: Offset,
     pub end: Offset,
     pub expression: Identifier,
-    pub parameters: Vec<Pattern>,
-    pub type_params: Option<String>,
-    pub body: Fragment,
+    pub parameters: BumpVec<'a, Pattern>,
+    pub type_params: Option<&'a str>,
+    pub body: Fragment<'a>,
 }

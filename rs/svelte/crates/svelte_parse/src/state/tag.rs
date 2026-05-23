@@ -123,7 +123,9 @@ fn shift_positions(node: &mut serde_json::Value, delta: i64) {
 }
 
 /// Reads a `{...}` mustache. Assumes the cursor sits on `{`.
-pub fn read_tag(parser: &mut Parser<'_>) -> Result<FragmentChild, CompileDiagnostic> {
+pub fn read_tag<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     debug_assert!(parser.match_str("{"));
     let start = parser.index;
     parser.index += 1; // consume `{`
@@ -178,10 +180,10 @@ pub fn read_tag(parser: &mut Parser<'_>) -> Result<FragmentChild, CompileDiagnos
     }))
 }
 
-fn read_at_tag(
-    parser: &mut Parser<'_>,
+fn read_at_tag<'a, 'src>(
+    parser: &mut Parser<'a, 'src>,
     start: usize,
-) -> Result<FragmentChild, CompileDiagnostic> {
+) -> Result<FragmentChild<'a>, CompileDiagnostic> {
     debug_assert_eq!(parser.peek(), Some(b'@'));
     parser.index += 1; // consume `@`
     let name_start = parser.index;

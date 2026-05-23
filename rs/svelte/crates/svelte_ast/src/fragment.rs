@@ -1,4 +1,6 @@
-//! `Fragment` and its children.
+//! `Fragment` and its children — allocated in a [`TemplateArena`](crate::arena::TemplateArena).
+
+use bumpalo::collections::Vec as BumpVec;
 
 use crate::blocks::{AwaitBlock, EachBlock, IfBlock, KeyBlock, SnippetBlock};
 use crate::elements::{
@@ -16,62 +18,65 @@ pub struct FragmentMetadata {
     pub dynamic: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Fragment {
-    pub nodes: Vec<FragmentChild>,
+#[derive(Debug, PartialEq)]
+pub struct Fragment<'a> {
+    pub nodes: BumpVec<'a, FragmentChild<'a>>,
     pub metadata: FragmentMetadata,
 }
 
-impl Fragment {
-    pub fn empty() -> Self {
-        Self::default()
+impl<'a> Fragment<'a> {
+    pub fn empty_in(bump: &'a bumpalo::Bump) -> Self {
+        Self {
+            nodes: BumpVec::new_in(bump),
+            metadata: FragmentMetadata::default(),
+        }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum FragmentChild {
-    Text(Text),
-    Comment(Comment),
+#[derive(Debug, PartialEq)]
+pub enum FragmentChild<'a> {
+    Text(Text<'a>),
+    Comment(Comment<'a>),
     AttachTag(AttachTag),
     ConstTag(ConstTag),
     DebugTag(DebugTag),
     ExpressionTag(ExpressionTag),
     HtmlTag(HtmlTag),
     RenderTag(RenderTag),
-    Component(Box<Component>),
-    RegularElement(RegularElement),
-    SlotElement(SlotElement),
-    TitleElement(TitleElement),
-    SvelteBody(SvelteBody),
-    SvelteBoundary(SvelteBoundary),
-    SvelteComponent(Box<SvelteComponent>),
-    SvelteDocument(SvelteDocument),
-    SvelteElement(Box<SvelteElement>),
-    SvelteFragment(SvelteFragment),
-    SvelteHead(SvelteHead),
-    SvelteOptions(SvelteOptionsRaw),
-    SvelteSelf(SvelteSelf),
-    SvelteWindow(SvelteWindow),
-    AwaitBlock(Box<AwaitBlock>),
-    EachBlock(Box<EachBlock>),
-    IfBlock(Box<IfBlock>),
-    KeyBlock(KeyBlock),
-    SnippetBlock(Box<SnippetBlock>),
+    Component(bumpalo::boxed::Box<'a, Component<'a>>),
+    RegularElement(RegularElement<'a>),
+    SlotElement(SlotElement<'a>),
+    TitleElement(TitleElement<'a>),
+    SvelteBody(SvelteBody<'a>),
+    SvelteBoundary(SvelteBoundary<'a>),
+    SvelteComponent(bumpalo::boxed::Box<'a, SvelteComponent<'a>>),
+    SvelteDocument(SvelteDocument<'a>),
+    SvelteElement(bumpalo::boxed::Box<'a, SvelteElement<'a>>),
+    SvelteFragment(SvelteFragment<'a>),
+    SvelteHead(SvelteHead<'a>),
+    SvelteOptions(SvelteOptionsRaw<'a>),
+    SvelteSelf(SvelteSelf<'a>),
+    SvelteWindow(SvelteWindow<'a>),
+    AwaitBlock(bumpalo::boxed::Box<'a, AwaitBlock<'a>>),
+    EachBlock(bumpalo::boxed::Box<'a, EachBlock<'a>>),
+    IfBlock(bumpalo::boxed::Box<'a, IfBlock<'a>>),
+    KeyBlock(KeyBlock<'a>),
+    SnippetBlock(bumpalo::boxed::Box<'a, SnippetBlock<'a>>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Text {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Text<'a> {
     pub start: Offset,
     pub end: Offset,
-    pub raw: String,
-    pub data: String,
+    pub raw: &'a str,
+    pub data: bumpalo::collections::String<'a>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Comment {
+#[derive(Debug, PartialEq, Eq)]
+pub struct Comment<'a> {
     pub start: Offset,
     pub end: Offset,
-    pub data: String,
+    pub data: &'a str,
 }
 
-pub type ScriptAttributes = Vec<crate::attributes::Attribute>;
+pub type ScriptAttributes<'a> = BumpVec<'a, crate::attributes::Attribute<'a>>;

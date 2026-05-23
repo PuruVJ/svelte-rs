@@ -20,6 +20,8 @@ oxc_syntax = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 unicode-ident = "1"
+bumpalo = { workspace = true }
+self_cell = { workspace = true }
 
 [dev-dependencies]
 svelte_analyze = { workspace = true }

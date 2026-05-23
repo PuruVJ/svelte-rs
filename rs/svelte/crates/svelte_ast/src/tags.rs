@@ -1,5 +1,7 @@
 //! `{...}` template tags.
 
+use bumpalo::collections::Vec as BumpVec;
+
 use svelte_js_ast::{Expression, Identifier, VariableDeclaration};
 
 use crate::position::Offset;

@@ -1,48 +1,29 @@
 //! `Root`, `Script`, `SvelteOptions`, `JsComment`.
 
+use bumpalo::collections::Vec as BumpVec;
+
 use svelte_js_ast::{Program, Statement};
 
 use crate::attributes::Attribute;
 use crate::fragment::Fragment;
 use crate::position::{Offset, SourceLocation};
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Root {
-    pub css: Option<crate::css::StyleSheet>,
+#[derive(Debug, PartialEq)]
+pub struct Root<'a> {
+    pub css: Option<crate::css::StyleSheet<'a>>,
     pub js: Vec<Statement>,
     pub start: Offset,
     pub end: Offset,
-    pub fragment: Fragment,
-    pub options: Option<SvelteOptions>,
+    pub fragment: Fragment<'a>,
+    pub options: Option<SvelteOptions<'a>>,
     pub comments: Vec<JsComment>,
-    pub instance: Option<Script>,
-    pub module: Option<Script>,
-    /// Soft diagnostics emitted during parsing (treated as warnings by
-    /// analyze). Examples: `element_invalid_self_closing_tag`,
-    /// `element_implicitly_closed`. Hard errors are surfaced via the
-    /// Result return; these are recoverable.
+    pub instance: Option<Script<'a>>,
+    pub module: Option<Script<'a>>,
     pub parse_warnings: Vec<svelte_diagnostics::CompileDiagnostic>,
 }
 
-impl Root {
-    pub fn empty() -> Self {
-        Self {
-            css: None,
-            js: Vec::new(),
-            start: 0,
-            end: 0,
-            fragment: Fragment::empty(),
-            options: None,
-            comments: Vec::new(),
-            instance: None,
-            module: None,
-            parse_warnings: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SvelteOptions {
+#[derive(Debug, PartialEq)]
+pub struct SvelteOptions<'a> {
     pub start: Offset,
     pub end: Offset,
     pub runes: Option<bool>,
@@ -51,13 +32,13 @@ pub struct SvelteOptions {
     pub preserve_whitespace: Option<bool>,
     pub namespace: Option<Namespace>,
     pub css: Option<SvelteOptionsCss>,
-    pub custom_element: Option<CustomElementOpts>,
-    pub attributes: Vec<Attribute>,
+    pub custom_element: Option<CustomElementOpts<'a>>,
+    pub attributes: BumpVec<'a, Attribute<'a>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CustomElementOpts {
-    pub tag: Option<String>,
+#[derive(Debug, PartialEq)]
+pub struct CustomElementOpts<'a> {
+    pub tag: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,13 +53,13 @@ pub enum SvelteOptionsCss {
     Injected,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Script {
+#[derive(Debug, PartialEq)]
+pub struct Script<'a> {
     pub start: Offset,
     pub end: Offset,
     pub context: ScriptContext,
     pub content: Program,
-    pub attributes: Vec<Attribute>,
+    pub attributes: BumpVec<'a, Attribute<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

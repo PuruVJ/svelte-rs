@@ -5,7 +5,9 @@
 //! upstream behavior. Where Rust diverges from JS (e.g. recursive descent
 //! instead of a `state, stack, fragments` triple), the divergence is noted.
 
+use bumpalo::Bump;
 use oxc_allocator::Allocator;
+use svelte_ast::{Fragment, FragmentChild, Text};
 use svelte_diagnostics::CompileDiagnostic;
 use svelte_js_ast::Expression;
 
@@ -15,7 +17,9 @@ use crate::utils::whitespace::is_whitespace;
 
 pub type ParseResult<T> = Result<T, CompileDiagnostic>;
 
-pub struct Parser<'src> {
+pub struct Parser<'a, 'src> {
+    /// Bump allocator for template AST nodes and strings.
+    pub bump: &'a Bump,
     /// The template source after `trim_end` (matches upstream
     /// `index.js:95`: `this.template = template.trimEnd()`).
     pub template: &'src str,
@@ -65,12 +69,13 @@ pub struct LastAutoClosed {
     pub depth: usize,
 }
 
-impl<'src> Parser<'src> {
-    pub fn new(template: &'src str, loose: bool) -> Self {
+impl<'a, 'src> Parser<'a, 'src> {
+    pub fn new(bump: &'a Bump, template: &'src str, loose: bool) -> Self {
         let template = template.trim_end();
         let line_map = LineMap::new(template);
         let ts = detect_typescript(template);
         Self {
+            bump,
             template,
             index: 0,
             loose,
@@ -83,6 +88,61 @@ impl<'src> Parser<'src> {
             element_depth: 0,
             oxc_alloc: Allocator::default(),
         }
+    }
+
+    pub fn alloc_str(&self, s: &str) -> &'a str {
+        self.bump.alloc_str(s)
+    }
+
+    pub fn bump_vec<T>(&self, items: impl IntoIterator<Item = T>) -> bumpalo::collections::Vec<'a, T> {
+        let mut v = bumpalo::collections::Vec::new_in(self.bump);
+        v.extend(items);
+        v
+    }
+
+    pub fn fragment_from(
+        &self,
+        nodes: impl IntoIterator<Item = FragmentChild<'a>>,
+    ) -> Fragment<'a> {
+        Fragment {
+            nodes: self.bump_vec(nodes),
+            metadata: Default::default(),
+        }
+    }
+
+    pub fn make_text(
+        &self,
+        start: usize,
+        end: usize,
+        is_attribute_value: bool,
+    ) -> Text<'a> {
+        let slice = &self.template[start..end];
+        let raw = self.bump.alloc_str(slice);
+        let decoded =
+            crate::utils::entities::decode_character_references(slice, is_attribute_value);
+        let data = bumpalo::collections::String::from_str_in(&decoded, self.bump);
+        Text {
+            start: start as u32,
+            end: end as u32,
+            raw,
+            data,
+        }
+    }
+
+    pub fn alloc_modifiers(
+        &self,
+        modifiers: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> bumpalo::collections::Vec<'a, &'a str> {
+        let mut v = bumpalo::collections::Vec::new_in(self.bump);
+        for m in modifiers {
+            let s: &str = m.as_ref();
+            v.push(self.alloc_str(s));
+        }
+        v
+    }
+
+    pub fn boxed<T>(&self, value: T) -> bumpalo::boxed::Box<'a, T> {
+        bumpalo::boxed::Box::new_in(value, self.bump)
     }
 
     /// Parse a JS/TS expression starting at `start`, accumulating any
