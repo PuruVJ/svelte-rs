@@ -16,6 +16,7 @@ mod deep_static_js_tests;
 mod direct_codegen_tests;
 mod script_fast;
 mod sparse_compile;
+mod sparse_multi_if_js;
 mod sparse_pipeline;
 mod static_html_cache;
 mod typed_fast;

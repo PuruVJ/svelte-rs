@@ -5,7 +5,7 @@
 | Shape | Detection | Emitter |
 |-------|-----------|---------|
 | **Fully static** | `try_typed_client` | `$.from_html` + `$.append` |
-| **Sparse islands** | `sparse_pipeline::try_sparse_islands_program` (early) | `emit_top_level_multi_if_program` |
+| **Sparse islands** | `sparse_pipeline` / `emit_top_level_multi_if_parts` (early) | Direct module JS or `emit_top_level_multi_if_program` |
 | **General** | `try_typed_client_walker` | Full walker |
 
 ## Metadata (analyze-once)
@@ -29,7 +29,8 @@ so each static element’s outer HTML is serialized once into
 
 1. Fast `analyze_script_props_only` for `$props()`-only scripts
 2. **`try_emit_deep_static_walker_js`** — string emission for `skip-static-subtree` class (no `Program` AST, no `print_typed`)
-3. Fallback: `try_sparse_islands_program` + `try_emit_client_program_direct`
+3. **`try_emit_sparse_multi_if_js`** — top-level multi-anchor templates; skips wrapping a full `Program` (still builds function-body `Statement`s, printed via direct printer)
+4. Fallback: `try_sparse_islands_program` + `try_emit_client_program_direct`
 
 Measure real pipeline: `bench_phases FIXTURE e2e 5000`.
 

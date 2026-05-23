@@ -8346,11 +8346,27 @@ fn emit_single_element_wrapping_ifs_program(
 ///     $.append($$anchor, fragment);
 ///     ...
 ///   }
+pub(crate) struct TopLevelMultiIfEmit {
+    pub(crate) func_body: Vec<Statement>,
+    pub(crate) root_decls: Vec<Statement>,
+    pub(crate) html: String,
+    pub(crate) needs_import_node: bool,
+}
+
 pub(crate) fn emit_top_level_multi_if_program(
     nodes: &[FragmentChild],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
+    let parts = emit_top_level_multi_if_parts(nodes, component_name, script)?;
+    Some(program_from_top_level_multi_if(&parts, component_name, script))
+}
+
+pub(crate) fn emit_top_level_multi_if_parts(
+    nodes: &[FragmentChild],
+    _component_name: &str,
+    script: &ScriptInfo,
+) -> Option<TopLevelMultiIfEmit> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.derived_bindings.is_empty()
@@ -9996,12 +10012,6 @@ pub(crate) fn emit_top_level_multi_if_program(
         })));
     }
 
-    let mut params = vec![t::pat_id_anchor()];
-    if script.uses_props || !script.legacy_export_props.is_empty() {
-        params.push(t::pat_id("$$props"));
-    }
-    let export = t::export_default_function(component_name, params, func_body);
-
     // Build the wrapper template: each slot becomes itself (static element
     // serialized to HTML, `<!>` for if-block / each-block, or literal text).
     // A space is inserted between consecutive slots iff the source had
@@ -10335,6 +10345,25 @@ pub(crate) fn emit_top_level_multi_if_program(
     // — this matches upstream's text node merging.
     let html = collapse_template_inter_element_ws(&html);
 
+    Some(TopLevelMultiIfEmit {
+        func_body,
+        root_decls,
+        html,
+        needs_import_node,
+    })
+}
+
+fn program_from_top_level_multi_if(
+    parts: &TopLevelMultiIfEmit,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Program {
+    let mut params = vec![t::pat_id_anchor()];
+    if script.uses_props_param() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, parts.func_body.clone());
+
     let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
@@ -10342,17 +10371,20 @@ pub(crate) fn emit_top_level_multi_if_program(
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
-    prog.extend(root_decls);
-    let flag = if needs_import_node { 3.0 } else { 1.0 };
+    prog.extend(parts.root_decls.iter().cloned());
+    let flag = if parts.needs_import_node { 3.0 } else { 1.0 };
     prog.push(t::var(
         "root",
         t::call(
             t::member_id(t::id_dollar(), "from_html"),
-            vec![t::template_raw(vec![html], vec![]), t::lit_number(flag)],
+            vec![
+                t::template_raw(vec![parts.html.clone()], vec![]),
+                t::lit_number(flag),
+            ],
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    t::program(prog)
 }
 
 /// Emit a runes/legacy-mode program for the shape:
@@ -19235,7 +19267,7 @@ fn trim_boundary_ws(nodes: &[FragmentChild]) -> &[FragmentChild] {
 
 pub(crate) struct ScriptInfo {
     /// Hoisted imports go above the `var root = ...` declaration.
-    imports: Vec<Statement>,
+    pub(crate) imports: Vec<Statement>,
     /// Rewritten body statements emitted at the start of the function.
     body: Vec<Statement>,
     /// Whether to emit `import 'svelte/internal/flags/legacy';`
@@ -19285,6 +19317,10 @@ pub(crate) struct ScriptInfo {
 }
 
 impl ScriptInfo {
+    pub(crate) fn uses_props_param(&self) -> bool {
+        self.uses_props || !self.legacy_export_props.is_empty()
+    }
+
     /// Fast path for `let { … } = $props();` only scripts.
     pub(crate) fn props_only(props_destructured: HashSet<String>) -> Self {
         ScriptInfo {

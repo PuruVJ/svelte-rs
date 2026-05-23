@@ -6,6 +6,7 @@ use svelte_transform_shared::compile_bump::CompileBump;
 use crate::deep_static_js::try_emit_deep_static_walker_js;
 use crate::direct_codegen::try_emit_client_program_direct;
 use crate::script_fast::analyze_script_props_only;
+use crate::sparse_multi_if_js::try_emit_sparse_multi_if_js;
 use crate::sparse_pipeline::try_sparse_islands_program;
 use crate::walker::{analyze_script, fold_fragment_with_consts, scan_fragment_assignments};
 
@@ -32,7 +33,12 @@ pub fn try_emit_sparse_islands_client_js(
         return Some(js);
     }
 
-    // Multi-if sparse islands: Program + direct printer fallback.
+    // Multi-if sparse islands: direct module JS (no `Program` wrapper / `print_typed`).
+    if let Some(js) = try_emit_sparse_multi_if_js(&root.fragment, component_name, &script, bump) {
+        return Some(js);
+    }
+
+    // Fallback: full `Program` + direct printer.
     let program = try_sparse_islands_program(&root.fragment, component_name, &script)?;
     try_emit_client_program_direct(&program)
 }
