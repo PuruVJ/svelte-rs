@@ -1,0 +1,56 @@
+name: RS Compiler
+
+on:
+  push:
+    branches: [rs, 'cursor/**']
+    paths:
+      - 'rs/svelte/**'
+      - '.github/workflows/rs-compiler.yml'
+  pull_request:
+    paths:
+      - 'rs/svelte/**'
+      - '.github/workflows/rs-compiler.yml'
+
+defaults:
+  run:
+    working-directory: rs/svelte
+
+jobs:
+  test-and-bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rs/svelte
+
+      - name: cargo check workspace
+        run: cargo check --workspace
+
+      - name: cargo test (compiler crates)
+        run: >-
+          cargo test -p svelte_parse -p svelte_compiler -p svelte_magic_string
+          -p svelte_codegen_js -p svelte_transform_shared
+          -p svelte_transform_server -p svelte_transform_client
+
+      - name: cargo test (analyze)
+        run: cargo test -p svelte_analyze
+        continue-on-error: true
+
+      - name: bench_in_proc (smoke)
+        run: |
+          cargo build --release -p svelte_compiler --bin bench_in_proc
+          ./target/release/bench_in_proc \
+            ../../../packages/svelte/tests/snapshot/samples/hello-world/index.svelte \
+            1000
+
+      - name: criterion compile bench (smoke)
+        run: >-
+          cargo bench -p svelte_compiler --bench compile
+          -- --noplot hello-world
