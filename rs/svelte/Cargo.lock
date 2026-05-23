@@ -1811,6 +1811,7 @@ name = "svelte_transform_client"
 version = "0.0.0"
 dependencies = [
  "svelte_ast",
+ "svelte_codegen_js",
  "svelte_js_ast",
  "svelte_parse",
  "svelte_transform_shared",

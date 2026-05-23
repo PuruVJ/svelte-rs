@@ -28,8 +28,8 @@ so each static element’s outer HTML is serialized once into
 `try_emit_sparse_islands_client_js` runs in `compile()` before the walker:
 
 1. Fast `analyze_script_props_only` for `$props()`-only scripts
-2. `try_sparse_islands_program` + `try_emit_client_program_direct`
-3. Returns JS without `print_typed` or walker PRE-DETECT
+2. **`try_emit_deep_static_walker_js`** — string emission for `skip-static-subtree` class (no `Program` AST, no `print_typed`)
+3. Fallback: `try_sparse_islands_program` + `try_emit_client_program_direct`
 
 Measure real pipeline: `bench_phases FIXTURE e2e 5000`.
 

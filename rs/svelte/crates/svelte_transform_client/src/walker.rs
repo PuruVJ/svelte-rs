@@ -13683,7 +13683,7 @@ fn element_tree_has_expr_or_html(el: &svelte_ast::elements::RegularElement) -> b
     false
 }
 
-fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement) -> bool {
+pub(crate) fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement) -> bool {
     if element_has_reactive_attr(child_el) {
         return true;
     }
@@ -13693,7 +13693,7 @@ fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElemen
     fragment_has_deep_reactive(&child_el.fragment)
 }
 
-fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
+pub(crate) fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(node_has_deep_reactive)
 }
 
@@ -15174,7 +15174,7 @@ fn emit_rich_content_reactivity(
     out
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect()
@@ -16997,7 +16997,7 @@ fn single_expression_in_element(
     None
 }
 
-fn serialize_fragment_to_html(
+pub(crate) fn serialize_fragment_to_html(
     f: &svelte_ast::fragment::Fragment,
     out: &mut String,
     needs_import_node: &mut bool,
@@ -17315,7 +17315,7 @@ fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
 /// template-text serializer: trims leading/trailing pure-whitespace text
 /// and drops `svelte-ignore` directive comments. Real comments (e.g.
 /// `<!-- test -->` inside an element) are preserved.
-fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
+pub(crate) fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
     let has_ignore_comment = nodes.iter().any(|n| {
         matches!(
             n,
@@ -17387,7 +17387,7 @@ fn is_void_client(name: &str) -> bool {
 /// Rewrite every Identifier in `e` that's in `names` to `$$props.NAME`.
 /// Used for `let { title, content } = $props()`-style destructure: the
 /// declaration is dropped and references become direct member access.
-fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expression {
+pub(crate) fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expression {
     fn go(e: &Expression, names: &HashSet<String>) -> Expression {
         match e {
             Expression::Identifier(id) if names.contains(id.name.as_ref()) => {
@@ -19239,7 +19239,7 @@ pub(crate) struct ScriptInfo {
     /// Rewritten body statements emitted at the start of the function.
     body: Vec<Statement>,
     /// Whether to emit `import 'svelte/internal/flags/legacy';`
-    emit_legacy_flag: bool,
+    pub(crate) emit_legacy_flag: bool,
     /// Bindings that became `$.state(...)` — references to them in reactive
     /// contexts (template_effect deps, function bodies) need `$.get(X)` /
     /// `$.set(X, V)` wrapping.
@@ -19249,7 +19249,7 @@ pub(crate) struct ScriptInfo {
     pub(crate) constants: HashMap<String, Expression>,
     /// Whether `$props()` was destructured — the component function needs
     /// `$$props` as its second parameter.
-    uses_props: bool,
+    pub(crate) uses_props: bool,
     /// Whether the script contains a class with rune fields. Triggers
     /// `$.push($$props, true); ...; $.pop();` wrap around the function body.
     pub(crate) has_class_with_runes: bool,
@@ -19271,7 +19271,7 @@ pub(crate) struct ScriptInfo {
     /// Names destructured from `let { a, b, c } = $props()`. Template
     /// reads of these names get rewritten to `$$props.NAME` and the
     /// declaration itself is dropped from the script body.
-    props_destructured: HashSet<String>,
+    pub(crate) props_destructured: HashSet<String>,
     /// Legacy-mode `export let X [= INIT]` declarations. Each entry is
     /// `(name, default_init)`. Stripped from `body` in `analyze_script`;
     /// emitters that support legacy props rebuild the
@@ -21795,7 +21795,7 @@ enum ElementContent<'a> {
 }
 
 #[derive(Debug, Clone)]
-enum TextPart<'a> {
+pub(crate) enum TextPart<'a> {
     Static(String),
     Expr(&'a Expression),
 }
@@ -22539,7 +22539,7 @@ fn emit_element_content(
 /// - The deps array entries `() => exprN`.
 /// Inline form: emit a template literal containing each expression as
 /// `${EXPR ?? ''}` (with state reads rewritten to `$.get(...)`).
-fn build_inline_template(
+pub(crate) fn build_inline_template(
     parts: &[TextPart],
     state_bindings: &HashSet<String>,
 ) -> Expression {
