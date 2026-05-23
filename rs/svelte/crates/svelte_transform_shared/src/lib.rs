@@ -5,3 +5,5 @@
 #![forbid(unsafe_code)]
 
 pub mod builders_typed;
+pub mod template_meta;
+pub mod template_slab;

@@ -112,6 +112,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
                 let _ = fragment_start;
                 nodes
             },
+            metadata: Default::default(),
         },
         options: None,
         comments: vec![],

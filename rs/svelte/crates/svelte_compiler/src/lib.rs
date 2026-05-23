@@ -50,6 +50,7 @@ pub fn compile(
     options: CompileOptions,
 ) -> Result<CompileResult, CompileDiagnostic> {
     let mut root = svelte_parse::parse(source, false)?;
+    svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
     // The pipeline is typed end-to-end: parse -> typed transform -> typed
     // print. If no typed transform can handle the input shape, we surface
     // an unsupported error (rather than fall back to a Value-based path —

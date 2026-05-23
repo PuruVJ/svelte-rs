@@ -8,8 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+mod direct_codegen;
+mod sparse_pipeline;
 mod typed_fast;
 mod walker;
+
+pub use sparse_pipeline::try_sparse_islands_program;
 
 pub use typed_fast::try_typed_client;
 pub use walker::try_typed_client_walker;

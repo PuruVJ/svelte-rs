@@ -6,6 +6,11 @@ use crate::attributes::ElementAttribute;
 use crate::fragment::Fragment;
 use crate::position::{Offset, SourceLocation};
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComponentMetadata {
+    pub dynamic: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Component {
     pub start: Offset,
@@ -14,6 +19,15 @@ pub struct Component {
     pub name_loc: SourceLocation,
     pub attributes: Vec<ElementAttribute>,
     pub fragment: Fragment,
+    pub metadata: ComponentMetadata,
+}
+
+/// Compile-time metadata on elements (set by `mark_template_metadata`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElementMetadata {
+    pub dynamic: bool,
+    /// Set when the element and subtree are fully static for client hydration (mirrors upstream `is_static_element`).
+    pub is_static_element: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +38,7 @@ pub struct RegularElement {
     pub name_loc: SourceLocation,
     pub attributes: Vec<ElementAttribute>,
     pub fragment: Fragment,
+    pub metadata: ElementMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq)]

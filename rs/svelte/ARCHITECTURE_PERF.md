@@ -1,0 +1,27 @@
+# Compiler architecture (performance)
+
+## Pipeline shapes
+
+| Shape | Detection | Emitter |
+|-------|-----------|---------|
+| **Fully static** | `try_typed_client` | `$.from_html` + `$.append` |
+| **Sparse islands** | `sparse_pipeline::try_sparse_islands_program` (early) | `emit_top_level_multi_if_program` |
+| **General** | `try_typed_client_walker` | Full walker |
+
+## Metadata (analyze-once)
+
+`mark_template_metadata(&mut Root)` sets:
+
+- `fragment.metadata.dynamic`
+- `element.metadata.dynamic` / `element.metadata.is_static_element`
+
+Client and server transforms read these flags before re-walking subtrees.
+
+## Entry order (client walker)
+
+1. `analyze_script`
+2. `mark_template_metadata` + `fold_fragment_with_consts`
+3. **Sparse islands early return** (skips PRE-DETECT funnel)
+4. Legacy PRE-DETECT + general walker
+
+Reproduce: `cd rs/svelte && ./scripts/bench_loop.sh 5000`
