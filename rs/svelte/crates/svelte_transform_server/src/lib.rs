@@ -5459,6 +5459,17 @@ fn lower_element_with_non_inline_children(
     Some(())
 }
 
+/// Plain static leaf (`<p>text</p>`) — cheap check before `is_fully_static_element`.
+fn is_trivial_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
+    !matches!(el.name.as_str(), "option" | "select" | "textarea")
+        && el.attributes.is_empty()
+        && el
+            .fragment
+            .nodes
+            .iter()
+            .all(|n| matches!(n, FragmentChild::Text(_) | FragmentChild::Comment(_)))
+}
+
 /// True when `el` and its entire subtree can be serialized to HTML without
 /// building per-element AST nodes — no dynamic attrs, blocks, components,
 /// or special-case elements (`<option>`, `<select>`, `<textarea>`).
@@ -5518,7 +5529,9 @@ fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
 /// `trim_boundary_whitespace` on a sub-slice and drops inter-element spaces.
 fn is_static_template_batchable(n: &FragmentChild) -> bool {
     match n {
-        FragmentChild::RegularElement(el) => is_fully_static_element(el),
+        FragmentChild::RegularElement(el) => {
+            is_trivial_static_element(el) || is_fully_static_element(el)
+        }
         _ => false,
     }
 }
@@ -6477,6 +6490,10 @@ fn format_number(n: f64) -> String {
 }
 
 fn escape_text_into(out: &mut String, s: &str) {
+    if !s.bytes().any(|b| b == b'`' || b == b'\\') {
+        out.push_str(s);
+        return;
+    }
     for c in s.chars() {
         match c {
             '`' => out.push_str("\\`"),
@@ -7384,9 +7401,22 @@ fn substitute_consts_in_fragment(
     f: &mut svelte_ast::fragment::Fragment,
     consts: &std::collections::HashMap<String, Expression>,
 ) {
+    if consts.is_empty() && fragment_is_const_substitution_inert(f) {
+        return;
+    }
     for n in &mut f.nodes {
         substitute_consts_in_node(n, consts);
     }
+}
+
+fn fragment_is_const_substitution_inert(f: &svelte_ast::fragment::Fragment) -> bool {
+    f.nodes.iter().all(|n| match n {
+        FragmentChild::Text(_) | FragmentChild::Comment(_) => true,
+        FragmentChild::RegularElement(el) => {
+            is_trivial_static_element(el) || is_fully_static_element(el)
+        }
+        _ => false,
+    })
 }
 
 fn substitute_consts_in_node(
@@ -7398,7 +7428,9 @@ fn substitute_consts_in_node(
         FragmentChild::ExpressionTag(t) => script::substitute_and_fold(&mut t.expression, consts),
         FragmentChild::HtmlTag(t) => script::substitute_and_fold(&mut t.expression, consts),
         FragmentChild::RegularElement(el) => {
-            if consts.is_empty() && is_fully_static_element(el) {
+            if consts.is_empty()
+                && (is_trivial_static_element(el) || is_fully_static_element(el))
+            {
                 return;
             }
             for attr in &mut el.attributes {
