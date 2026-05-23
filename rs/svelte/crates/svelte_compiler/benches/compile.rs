@@ -41,9 +41,10 @@ fn bench_analyze(c: &mut Criterion) {
     for (label, name) in &fixtures {
         let source = load_fixture(name);
         let root = svelte_parse::parse(&source, false).unwrap();
-        group.bench_with_input(BenchmarkId::new("analyze", label), &root, |b, root| {
+        group.bench_with_input(BenchmarkId::new("analyze", label), &source, |b, src| {
             b.iter(|| {
-                svelte_analyze::analyze_component(black_box(root), None).unwrap()
+                let root = svelte_parse::parse(black_box(src), false).unwrap();
+                svelte_analyze::analyze_component(&root, None).unwrap()
             });
         });
     }

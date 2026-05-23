@@ -5,6 +5,7 @@
 //! upstream behavior. Where Rust diverges from JS (e.g. recursive descent
 //! instead of a `state, stack, fragments` triple), the divergence is noted.
 
+use oxc_allocator::Allocator;
 use svelte_diagnostics::CompileDiagnostic;
 use svelte_js_ast::Expression;
 
@@ -47,6 +48,9 @@ pub struct Parser<'src> {
     /// surfaced `last_auto_closed_tag` can be cleared once we've popped
     /// past the element it was set inside of.
     pub element_depth: usize,
+    /// Reused OXC bump allocator for JS/TS expression and script parsing.
+    /// Reset after each OXC parse once the typed AST is materialized.
+    pub oxc_alloc: Allocator,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +81,7 @@ impl<'src> Parser<'src> {
             warnings: Vec::with_capacity(4),
             last_auto_closed_tag: None,
             element_depth: 0,
+            oxc_alloc: Allocator::default(),
         }
     }
 
@@ -87,8 +92,13 @@ impl<'src> Parser<'src> {
         &mut self,
         start: usize,
     ) -> Result<(Expression, usize), CompileDiagnostic> {
-        let (expr, end, comments) =
-            parse_expression_at_with_comments(self.template, &self.line_map, start, self.ts)?;
+        let (expr, end, comments) = parse_expression_at_with_comments(
+            &mut self.oxc_alloc,
+            self.template,
+            &self.line_map,
+            start,
+            self.ts,
+        )?;
         self.comments.extend(comments);
         Ok((expr, end))
     }
@@ -99,7 +109,14 @@ impl<'src> Parser<'src> {
         start: usize,
         end: usize,
     ) -> Result<svelte_js_ast::VariableDeclaration, CompileDiagnostic> {
-        crate::oxc_bridge::parse_const_decl_at(self.template, &self.line_map, start, end, self.ts)
+        crate::oxc_bridge::parse_const_decl_at(
+            &mut self.oxc_alloc,
+            self.template,
+            &self.line_map,
+            start,
+            end,
+            self.ts,
+        )
     }
 
     pub fn template_remaining(&self) -> &'src str {

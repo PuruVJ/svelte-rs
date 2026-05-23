@@ -83,6 +83,7 @@ fn read_each_block(
             }
         }
         let expression = parse_expression(
+            &mut parser.oxc_alloc,
             parser.template,
             &parser.line_map,
             expr_start,
@@ -114,6 +115,7 @@ fn read_each_block(
             }
         }
         let expression = parse_expression(
+            &mut parser.oxc_alloc,
             parser.template,
             &parser.line_map,
             expr_start,
@@ -242,6 +244,7 @@ fn read_await_block(
             }
         }
         let expr = parse_expression(
+            &mut parser.oxc_alloc,
             parser.template,
             &parser.line_map,
             expr_start,
@@ -423,7 +426,14 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::P
             "destructuring pattern",
         ));
     }
-    let (pat, _) = parse_pattern_at(parser.template, &parser.line_map, pat_start, pat_end, parser.ts)?;
+    let (pat, _) = parse_pattern_at(
+        &mut parser.oxc_alloc,
+        parser.template,
+        &parser.line_map,
+        pat_start,
+        pat_end,
+        parser.ts,
+    )?;
     parser.index = pat_end;
     Ok(pat)
 }
@@ -557,6 +567,7 @@ fn read_snippet_block(
     };
 
     let (parameters, _) = crate::oxc_bridge::parse_arrow_params_at(
+        &mut parser.oxc_alloc,
         parser.template,
         &parser.line_map,
         params_start,

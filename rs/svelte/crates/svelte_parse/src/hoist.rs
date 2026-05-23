@@ -15,10 +15,13 @@ use svelte_ast::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute
     RegularElement, Root, Script, ScriptContext};
 use svelte_diagnostics::CompileDiagnostic;
 
+use oxc_allocator::Allocator;
+
 use crate::oxc_bridge;
 use crate::utils::locator::LineMap;
 
 pub fn hoist_scripts_and_styles(
+    alloc: &mut Allocator,
     root: &mut Root,
     source: &str,
     line_map: &LineMap,
@@ -41,7 +44,8 @@ pub fn hoist_scripts_and_styles(
                 _ => unreachable!(),
             };
             let is_module = is_module_script(&el.attributes);
-            let (script, comments) = build_script_with_comments(el, source, line_map, ts)?;
+            let (script, comments) =
+                build_script_with_comments(alloc, el, source, line_map, ts)?;
             // Append script comments to root.comments for downstream
             // codegen (inter-declarator preservation).
             for c in comments {
@@ -94,6 +98,7 @@ pub fn hoist_scripts_and_styles(
 }
 
 fn build_script_with_comments(
+    alloc: &mut Allocator,
     el: RegularElement,
     source: &str,
     line_map: &LineMap,
@@ -105,7 +110,7 @@ fn build_script_with_comments(
             .map(|s| s == "ts" || s == "typescript")
             .unwrap_or(false);
     let (content, comments) =
-        oxc_bridge::parse_program(source, line_map, body_start, body_end, ts)?;
+        oxc_bridge::parse_program(alloc, source, line_map, body_start, body_end, ts)?;
     let context = if is_module_script(&el.attributes) {
         ScriptContext::Module
     } else {
@@ -132,6 +137,7 @@ fn build_script_with_comments(
 }
 
 fn build_script(
+    alloc: &mut Allocator,
     el: RegularElement,
     source: &str,
     line_map: &LineMap,
@@ -147,7 +153,7 @@ fn build_script(
             .unwrap_or(false);
 
     let (content, _comments) =
-        oxc_bridge::parse_program(source, line_map, body_start, body_end, ts)?;
+        oxc_bridge::parse_program(alloc, source, line_map, body_start, body_end, ts)?;
     // Note: comments are captured by `build_script_with_comments` below;
     // callers using `build_script` (legacy entry) drop them.
 

@@ -288,6 +288,10 @@ impl<'a> Emitter<'a> {
 
     fn write(&mut self, s: &str) {
         self.flush_indent();
+        if self.line_map.is_none() {
+            self.code.push_str(s);
+            return;
+        }
         self.code.push_str(s);
         for ch in s.bytes() {
             if ch == b'\n' {
