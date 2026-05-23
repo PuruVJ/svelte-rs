@@ -23,7 +23,7 @@ fn debug_basic() {
     let root = parse(&src, false).unwrap();
     let mut analysis = analyze_component(&root, None).unwrap();
     analysis.css_hash = "svelte-xyz".to_string();
-    let sheet = analysis.css.as_ref().unwrap();
+    let sheet = analysis.root.css.as_ref().unwrap();
     eprintln!("content range: {}..{}", sheet.content.start, sheet.content.end);
     eprintln!("snippet=<<{}>>", &src[sheet.content.start as usize..sheet.content.end as usize]);
     eprintln!("scoped_elements={:?}", analysis.css_meta.scoped_elements);
@@ -81,7 +81,7 @@ fn sweep_css_fixtures() {
             let root = parse(&source, false)?;
             let mut analysis = analyze_component(&root, None)?;
             analysis.css_hash = hash_str.clone();
-            let stylesheet = match analysis.css.as_ref() {
+            let stylesheet = match analysis.root.css.as_ref() {
                 Some(s) => s,
                 None => return Ok::<_, svelte_diagnostics::CompileDiagnostic>(String::new()),
             };

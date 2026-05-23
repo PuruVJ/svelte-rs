@@ -86,7 +86,7 @@ pub fn compile(
                     svelte_transform_server::svelte_filename_hash_pub(basis)
                 );
                 analysis.css_hash = hash.clone();
-                let rendered = analysis.css.as_ref().map(|sheet| {
+                let rendered = analysis.root.css.as_ref().map(|sheet| {
                     let raw = svelte_analyze::css_render::render_stylesheet_with_opts_minify(
                         source, sheet, &analysis.css_meta, &hash, false, true,
                     );
@@ -106,7 +106,7 @@ pub fn compile(
                 p
             } else if let Some(p) =
                 svelte_transform_server::try_typed_server_component_full(
-                    &root, component_name, exp_async, filename, preserve_comments,
+                    &mut root, component_name, exp_async, filename, preserve_comments,
                     css_inject_args,
                 )
             {

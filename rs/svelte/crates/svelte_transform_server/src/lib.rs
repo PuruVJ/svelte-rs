@@ -24,13 +24,13 @@ use svelte_transform_shared::builders_typed as t;
 use std::borrow::Cow;
 
 /// Backwards-compatible entry — defaults `experimental_async = false`.
-pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_server_component(root: &mut Root, component_name: &str) -> Option<Program> {
     try_typed_server_component_with_filename(root, component_name, false, None)
 }
 
 /// Compatibility shim — defaults filename to None, preserve_comments to false.
 pub fn try_typed_server_component_with(
-    root: &Root,
+    root: &mut Root,
     component_name: &str,
     experimental_async: bool,
 ) -> Option<Program> {
@@ -41,7 +41,7 @@ pub fn try_typed_server_component_with(
 
 /// Compatibility shim — preserve_comments defaults to false.
 pub fn try_typed_server_component_with_filename(
-    root: &Root,
+    root: &mut Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -53,7 +53,7 @@ pub fn try_typed_server_component_with_filename(
 
 /// Compatibility shim — css_inject defaults to None.
 pub fn try_typed_server_component_with_opts(
-    root: &Root,
+    root: &mut Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -76,7 +76,7 @@ pub fn svelte_filename_hash_pub(s: &str) -> String {
 /// - "single <Component bind:this={x}/>"
 /// - "<svelte:element this={tag}>"
 pub fn try_typed_server_component_full(
-    root: &Root,
+    root: &mut Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -193,7 +193,7 @@ pub fn try_typed_server_component_full(
         // Rewrite `$X` identifiers (where X is a top-level binding) into
         // `$.store_get($$store_subs ??= {}, '$X', X)` — both in the script
         // and in the template fragment (the fragment rewrite happens just
-        // below, after we've cloned the fragment for transformation).
+        // below, in-place on root.fragment).
         script::rewrite_store_refs_in_stmts(
             &mut content.body,
             &script_top_bindings,
@@ -235,17 +235,16 @@ pub fn try_typed_server_component_full(
     };
     // Apply template-only transforms: substitute script constants AND
     // call-wrap every Identifier that refers to a $derived binding.
-    let mut fragment = root.fragment.clone();
     // Always run: even with no consts, the fold pass folds pure Math.*
     // calls into number literals.
-    substitute_consts_in_fragment(&mut fragment, &consts);
+    substitute_consts_in_fragment(&mut root.fragment, &consts);
     let derived = &derived_bindings;
     if !derived.is_empty() {
-        call_derived_in_fragment(&mut fragment, derived);
+        call_derived_in_fragment(&mut root.fragment, derived);
     }
     // Rewrite `$X` identifiers in the fragment (template position) — the
     // script-side pass already mutated content.body before partition.
-    rewrite_store_refs_in_fragment(&mut fragment, &script_top_bindings, &mut store_refs);
+    rewrite_store_refs_in_fragment(&mut root.fragment, &script_top_bindings, &mut store_refs);
     if !store_refs.is_empty() {
         needs_component_wrap = true;
     }
@@ -253,17 +252,17 @@ pub fn try_typed_server_component_full(
     // Extract top-level SnippetBlocks to hoist as separate `function` decls
     // outside the export. Removed from fragment so they don't flow through
     // the template lowering.
-    let snippet_decls = extract_and_lower_snippets(&mut fragment)?;
+    let snippet_decls = extract_and_lower_snippets(&mut root.fragment)?;
 
     // Detect Component-with-bind:value at top level — triggers the
     // do-while `$$settled` wrap pattern.
-    let needs_bind_wrap = fragment_has_component_bind(&fragment);
+    let needs_bind_wrap = fragment_has_component_bind(&root.fragment);
 
     // is_standalone: top-level fragment trims to exactly one RenderTag.
     // Mirrors upstream's clean_nodes is_standalone flag, which suppresses
     // the trailing `<!---->` anchor for the lone render tag.
     let top_is_standalone = {
-        let trimmed = trim_boundary_text(&trim_boundary_whitespace(&fragment.nodes));
+        let trimmed = trim_boundary_text(&trim_boundary_whitespace(&root.fragment.nodes));
         trimmed.len() == 1
             && matches!(trimmed[0], FragmentChild::RenderTag(_))
     };
@@ -271,13 +270,13 @@ pub fn try_typed_server_component_full(
 
     let template_body = if let Some(ai) = &async_info {
         lower_fragment_server_async(
-            &fragment,
+            &root.fragment,
             &ai.async_bindings,
             ai.last_group_idx,
             &ai.blocker_bindings,
         )?
     } else {
-        lower_fragment_server(&fragment)?
+        lower_fragment_server(&root.fragment)?
     };
 
     // After lowering the top-level fragment, clear so nested arrow bodies
@@ -298,7 +297,7 @@ pub fn try_typed_server_component_full(
     // need to prepend `const $$sanitized_props = $.sanitize_props($$props);
     // const $$restProps = $.rest_props($$sanitized_props, ['name', ...]);`
     // The names list is the legacy export prop names.
-    if fragment_uses_rest_props(&fragment) && !legacy_export_props.is_empty() {
+    if fragment_uses_rest_props(&root.fragment) && !legacy_export_props.is_empty() {
         let name_array = Expression::Array(Box::new(ArrayExpression {
             elements: legacy_export_props
                 .iter()

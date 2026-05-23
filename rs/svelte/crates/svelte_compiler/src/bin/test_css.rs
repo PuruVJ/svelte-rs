@@ -23,7 +23,7 @@ fn main() {
             );
         }
     }
-    if let Some(sheet) = analysis.css.as_ref() {
+    if let Some(sheet) = analysis.root.css.as_ref() {
         let out = render_stylesheet(&src, sheet, &analysis.css_meta, "svelte-xyz");
         println!("=={}==\n{}", path, out);
     }

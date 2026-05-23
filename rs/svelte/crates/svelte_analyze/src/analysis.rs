@@ -8,7 +8,6 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use svelte_ast::css::StyleSheet;
 use svelte_ast::Root;
 use svelte_diagnostics::CompileDiagnostic;
 
@@ -30,8 +29,6 @@ pub struct Analysis {
     /// `$bindable`, `$inspect`, `$host`) was detected in the instance or
     /// module script.
     pub runes: bool,
-    /// Parsed `<style>` block, if any.
-    pub css: Option<StyleSheet>,
     /// Sidecar metadata for the parsed CSS, populated by `analyze_css`.
     /// Each Rule / ComplexSelector / RelativeSelector is tagged with its
     /// global / global-like / scoped state.

@@ -60,8 +60,7 @@ pub fn analyze_component(
     }
 
     let runes = walker::detect_runes(&root);
-    let css = root.css.clone();
-    let (mut css_meta, css_err) = match css.as_ref() {
+    let (mut css_meta, css_err) = match root.css.as_ref() {
         Some(sheet) => css_analyze::analyze_css_with_errors(sheet),
         None => (Default::default(), None),
     };
@@ -72,7 +71,7 @@ pub fn analyze_component(
     // CSS prune — match each selector against template elements, then
     // emit `css_unused_selector` warnings for the leftovers.
     let mut warnings: Vec<CompileDiagnostic> = Vec::new();
-    if let Some(sheet) = css.as_ref() {
+    if let Some(sheet) = root.css.as_ref() {
         let elements = template_elements::collect(&root.fragment);
         css_prune::prune(sheet, &elements, &mut css_meta);
         warnings.extend(css_warn::warn_unused(sheet, &css_meta));
@@ -90,7 +89,6 @@ pub fn analyze_component(
         module,
         scope_root,
         runes,
-        css,
         css_meta,
         filename: filename.map(|s| s.to_string()),
         name,
@@ -107,7 +105,7 @@ pub fn analyze_component(
     // ...). Mirrors the `walk(root, visitors)` call in upstream
     // `phases/2-analyze/index.js`.
     // Parser-emitted soft diagnostics surface as analysis warnings.
-    analysis.warnings.extend(analysis.root.parse_warnings.clone());
+    analysis.warnings.extend(std::mem::take(&mut analysis.root.parse_warnings));
     let (validator_warnings, validator_errors) = validate::validate(&analysis.root, &analysis);
     analysis.warnings.extend(validator_warnings);
     // Apply top-of-file `<!-- svelte-ignore X -->` to script + CSS warnings
@@ -461,7 +459,7 @@ mod tests {
         let a = analyze_component(&r, None).unwrap();
         assert!(a.has_global_css());
         // The single rule should be marked as has_global_selectors.
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -479,7 +477,7 @@ mod tests {
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
         assert!(!a.has_global_css());
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -496,7 +494,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -536,7 +534,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -557,7 +555,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -578,7 +576,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -607,7 +605,7 @@ mod tests {
 
     fn complex_used(a: &Analysis, source: &str, css_selector: &str) -> bool {
         let _ = (source, css_selector);
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             return false;
         };
@@ -693,7 +691,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -716,7 +714,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -740,7 +738,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -763,7 +761,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -804,7 +802,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -1182,7 +1180,7 @@ mod tests {
         )
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
         };
@@ -1204,7 +1202,7 @@ mod tests {
         .unwrap();
         let a = analyze_component(&r, None).unwrap();
         // `:root` is global-like, so the rule's complex selector is_global.
-        let css = a.css.as_ref().unwrap();
+        let css = a.root.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
             panic!("expected rule");
         };
