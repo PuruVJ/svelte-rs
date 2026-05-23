@@ -2,6 +2,28 @@
 
 Generated from measured runs on this branch, not assumptions.
 
+## JS vs WASM vs native (`bench/bench.mjs`)
+
+Compares upstream `packages/svelte` `compile()` with Rust WASM (`svelte_wasm`) and the release `svelte-rs --bench` CLI (in-process loop, no process spawn per iter).
+
+```sh
+cd rs/svelte
+cargo build --release -p svelte_compiler --bin svelte-rs
+wasm-pack build crates/svelte_wasm --target nodejs --release
+node bench/bench.mjs --iter 3000
+node bench/bench.mjs --iter 3000 --fixture packages/svelte/tests/snapshot/samples/skip-static-subtree/index.svelte
+```
+
+Example (3000 iter, client):
+
+| Fixture | JS ms/iter | WASM | Native |
+|---------|------------|------|--------|
+| hello-world | 0.068 | 0.17× | 0.01× |
+| skip-static-subtree | 0.699 | 0.07× | 0.04× |
+| props-identifier | 0.201 | 0.13× | 0.08× |
+
+Full `compile()` e2e (native only): `cargo run --release -p svelte_compiler --bin bench_phases -- skip-static-subtree e2e 5000` → **~0.031 ms/iter**; hello-world → **~0.0008 ms/iter**.
+
 ## How to reproduce
 
 ```sh

@@ -5,6 +5,7 @@ use svelte_js_ast::*;
 use svelte_transform_shared::compile_bump::{BumpString, CompileBump};
 
 use crate::typed_fast;
+use crate::walker::{ScriptInfo, TopLevelMultiIfEmit};
 
 /// Try emitting fully-static client JS from the Svelte AST (no `Program`, no `print_typed`).
 pub fn try_emit_fully_static_client_js(
@@ -18,7 +19,7 @@ pub fn try_emit_fully_static_client_js(
     let (inner_var, html, top_count) = typed_fast::static_root_info(&root.fragment)?;
     let mut out = bump.string();
     emit_static_client_prelude(&mut out);
-    emit_from_html_var(&mut out, &html, top_count > 1);
+    emit_from_html_var(&mut out, &html, top_count > 1, 1);
     out.push_str("\nexport default function ");
     out.push_str(component_name);
     out.push_str("($$anchor) {\n");
@@ -35,6 +36,102 @@ pub fn try_emit_fully_static_client_js(
     out.push_str(&inner_var);
     out.push_str(");\n}\n");
     Some(out.into_owned())
+}
+
+/// Emit sparse top-level multi-if client JS without building a full `Program` AST.
+pub(crate) fn emit_top_level_multi_if_module_js(
+    parts: &TopLevelMultiIfEmit,
+    component_name: &str,
+    script: &ScriptInfo,
+    bump: &CompileBump,
+) -> Option<String> {
+    for s in &parts.func_body {
+        if !function_stmt_direct_printable(s) {
+            return None;
+        }
+    }
+    for s in &parts.root_decls {
+        if !root_decl_direct_printable(s) {
+            return None;
+        }
+    }
+
+    let mut out = String::with_capacity(
+        parts.html.len() + parts.func_body.len() * 96 + 512,
+    );
+    for imp in &script.imports {
+        if let Statement::Import(i) = imp {
+            emit_import_direct(i, &mut out);
+            out.push('\n');
+        }
+    }
+    if !script.imports.is_empty() {
+        out.push('\n');
+    }
+    emit_sparse_client_prelude_string(&mut out, script);
+    for s in &parts.root_decls {
+        emit_root_decl_direct(s, &mut out)?;
+        out.push('\n');
+    }
+    if !parts.root_decls.is_empty() {
+        out.push('\n');
+    }
+    let from_html_flag = if parts.needs_import_node { 3 } else { 1 };
+    emit_from_html_var(&mut out, &parts.html, true, from_html_flag);
+    out.push('\n');
+    out.push_str("export default function ");
+    out.push_str(component_name);
+    out.push('(');
+    let mut params = vec!["$$anchor"];
+    if script.uses_props_param() {
+        params.push("$$props");
+    }
+    out.push_str(&params.join(", "));
+    out.push_str(") {\n");
+    for stmt in &parts.func_body {
+        emit_function_stmt_direct(stmt, &mut out, 1)?;
+    }
+    out.push_str("}\n");
+    let _ = bump;
+    Some(out)
+}
+
+fn emit_sparse_client_prelude_string(out: &mut String, script: &ScriptInfo) {
+    out.push_str("import 'svelte/internal/disclose-version';\n");
+    if script.emit_legacy_flag {
+        out.push_str("import 'svelte/internal/flags/legacy';\n");
+    }
+    out.push_str("import * as $ from 'svelte/internal/client';\n\n");
+}
+
+fn root_decl_direct_printable(s: &Statement) -> bool {
+    match s {
+        Statement::Variable(d) => {
+            d.kind == VariableKind::Var
+                && d.declarations.len() == 1
+                && d.declarations[0].init.is_some()
+        }
+        Statement::Expression(e) => expr_stmt_direct_printable(&e.expression),
+        Statement::Empty(_) => true,
+        _ => false,
+    }
+}
+
+fn emit_root_decl_direct(s: &Statement, out: &mut String) -> Option<()> {
+    match s {
+        Statement::Variable(d) => {
+            emit_var_decl_direct(d, out, false);
+            out.push_str(";\n");
+            Some(())
+        }
+        Statement::Expression(e) => {
+            emit_expression_direct(&e.expression, out)?;
+            out.push_str(";\n");
+            Some(())
+        }
+        Statement::Empty(_) => Some(()),
+        _ => None,
+    }
 }
 
 /// Try emitting client JS directly from a typed `Program` (sparse / static slab shapes).
@@ -57,7 +154,7 @@ fn emit_static_client_prelude(out: &mut BumpString<'_>) {
     out.push_str("import * as $ from 'svelte/internal/client';\n\n");
 }
 
-fn emit_from_html_var(out: &mut impl StringSink, html: &str, multi_root: bool) {
+fn emit_from_html_var(out: &mut impl StringSink, html: &str, multi_root: bool, from_html_flag: u32) {
     out.push_str("var root = $.from_html(`");
     for ch in html.chars() {
         match ch {
@@ -68,7 +165,8 @@ fn emit_from_html_var(out: &mut impl StringSink, html: &str, multi_root: bool) {
     }
     out.push('`');
     if multi_root {
-        out.push_str(", 1");
+        out.push_str(", ");
+        out.push_str(&from_html_flag.to_string());
     }
     out.push_str(");\n");
 }

@@ -8346,11 +8346,27 @@ fn emit_single_element_wrapping_ifs_program(
 ///     $.append($$anchor, fragment);
 ///     ...
 ///   }
+pub(crate) struct TopLevelMultiIfEmit {
+    pub(crate) func_body: Vec<Statement>,
+    pub(crate) root_decls: Vec<Statement>,
+    pub(crate) html: String,
+    pub(crate) needs_import_node: bool,
+}
+
 pub(crate) fn emit_top_level_multi_if_program(
     nodes: &[FragmentChild],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
+    let parts = emit_top_level_multi_if_parts(nodes, component_name, script)?;
+    Some(program_from_top_level_multi_if(&parts, component_name, script))
+}
+
+pub(crate) fn emit_top_level_multi_if_parts(
+    nodes: &[FragmentChild],
+    _component_name: &str,
+    script: &ScriptInfo,
+) -> Option<TopLevelMultiIfEmit> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.derived_bindings.is_empty()
@@ -9996,12 +10012,6 @@ pub(crate) fn emit_top_level_multi_if_program(
         })));
     }
 
-    let mut params = vec![t::pat_id_anchor()];
-    if script.uses_props || !script.legacy_export_props.is_empty() {
-        params.push(t::pat_id("$$props"));
-    }
-    let export = t::export_default_function(component_name, params, func_body);
-
     // Build the wrapper template: each slot becomes itself (static element
     // serialized to HTML, `<!>` for if-block / each-block, or literal text).
     // A space is inserted between consecutive slots iff the source had
@@ -10017,7 +10027,7 @@ pub(crate) fn emit_top_level_multi_if_program(
                 html.push_str("<!>")
             }
             Slot::StaticEl(el) => {
-                serialize_element_to_html(el, &mut html, &mut needs_import_node)?;
+                crate::static_html_cache::push_element_html(el, &mut html, &mut needs_import_node)?;
             }
             Slot::ElementWithHtml(el, _) => {
                 // Emit `<TAG STATIC_ATTRS></TAG>` (no body content).
@@ -10335,6 +10345,25 @@ pub(crate) fn emit_top_level_multi_if_program(
     // — this matches upstream's text node merging.
     let html = collapse_template_inter_element_ws(&html);
 
+    Some(TopLevelMultiIfEmit {
+        func_body,
+        root_decls,
+        html,
+        needs_import_node,
+    })
+}
+
+fn program_from_top_level_multi_if(
+    parts: &TopLevelMultiIfEmit,
+    component_name: &str,
+    script: &ScriptInfo,
+) -> Program {
+    let mut params = vec![t::pat_id_anchor()];
+    if script.uses_props_param() {
+        params.push(t::pat_id("$$props"));
+    }
+    let export = t::export_default_function(component_name, params, parts.func_body.clone());
+
     let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
@@ -10342,17 +10371,20 @@ pub(crate) fn emit_top_level_multi_if_program(
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
-    prog.extend(root_decls);
-    let flag = if needs_import_node { 3.0 } else { 1.0 };
+    prog.extend(parts.root_decls.iter().cloned());
+    let flag = if parts.needs_import_node { 3.0 } else { 1.0 };
     prog.push(t::var(
         "root",
         t::call(
             t::member_id(t::id_dollar(), "from_html"),
-            vec![t::template_raw(vec![html], vec![]), t::lit_number(flag)],
+            vec![
+                t::template_raw(vec![parts.html.clone()], vec![]),
+                t::lit_number(flag),
+            ],
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    t::program(prog)
 }
 
 /// Emit a runes/legacy-mode program for the shape:
@@ -13683,7 +13715,7 @@ fn element_tree_has_expr_or_html(el: &svelte_ast::elements::RegularElement) -> b
     false
 }
 
-fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement) -> bool {
+pub(crate) fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement) -> bool {
     if element_has_reactive_attr(child_el) {
         return true;
     }
@@ -13693,7 +13725,7 @@ fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElemen
     fragment_has_deep_reactive(&child_el.fragment)
 }
 
-fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
+pub(crate) fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
     f.nodes.iter().any(node_has_deep_reactive)
 }
 
@@ -15174,7 +15206,7 @@ fn emit_rich_content_reactivity(
     out
 }
 
-fn sanitize_name(name: &str) -> String {
+pub(crate) fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect()
@@ -16997,7 +17029,7 @@ fn single_expression_in_element(
     None
 }
 
-fn serialize_fragment_to_html(
+pub(crate) fn serialize_fragment_to_html(
     f: &svelte_ast::fragment::Fragment,
     out: &mut String,
     needs_import_node: &mut bool,
@@ -17065,7 +17097,31 @@ fn serialize_fragment_to_html(
     Some(())
 }
 
+/// Serialize element HTML, using `metadata.cached_static_html` when present.
+pub(crate) fn serialize_element_to_html_cached(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    if let Some(cached) = &el.metadata.cached_static_html {
+        if el.name.contains('-') || el.name == "video" {
+            *needs_import_node = true;
+        }
+        out.push_str(cached);
+        return Some(());
+    }
+    serialize_element_to_html_inner(el, out, needs_import_node)
+}
+
 fn serialize_element_to_html(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    serialize_element_to_html_cached(el, out, needs_import_node)
+}
+
+pub(crate) fn serialize_element_to_html_inner(
     el: &svelte_ast::elements::RegularElement,
     out: &mut String,
     needs_import_node: &mut bool,
@@ -17291,7 +17347,7 @@ fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
 /// template-text serializer: trims leading/trailing pure-whitespace text
 /// and drops `svelte-ignore` directive comments. Real comments (e.g.
 /// `<!-- test -->` inside an element) are preserved.
-fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
+pub(crate) fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
     let has_ignore_comment = nodes.iter().any(|n| {
         matches!(
             n,
@@ -17363,7 +17419,7 @@ fn is_void_client(name: &str) -> bool {
 /// Rewrite every Identifier in `e` that's in `names` to `$$props.NAME`.
 /// Used for `let { title, content } = $props()`-style destructure: the
 /// declaration is dropped and references become direct member access.
-fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expression {
+pub(crate) fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expression {
     fn go(e: &Expression, names: &HashSet<String>) -> Expression {
         match e {
             Expression::Identifier(id) if names.contains(id.name.as_ref()) => {
@@ -19211,21 +19267,21 @@ fn trim_boundary_ws(nodes: &[FragmentChild]) -> &[FragmentChild] {
 
 pub(crate) struct ScriptInfo {
     /// Hoisted imports go above the `var root = ...` declaration.
-    imports: Vec<Statement>,
+    pub(crate) imports: Vec<Statement>,
     /// Rewritten body statements emitted at the start of the function.
     body: Vec<Statement>,
     /// Whether to emit `import 'svelte/internal/flags/legacy';`
-    emit_legacy_flag: bool,
+    pub(crate) emit_legacy_flag: bool,
     /// Bindings that became `$.state(...)` — references to them in reactive
     /// contexts (template_effect deps, function bodies) need `$.get(X)` /
     /// `$.set(X, V)` wrapping.
     pub(crate) state_bindings: HashSet<String>,
     /// Plain `let X = LITERAL` bindings that are never assigned. Template
     /// references can be substituted with the literal value at compile time.
-    constants: HashMap<String, Expression>,
+    pub(crate) constants: HashMap<String, Expression>,
     /// Whether `$props()` was destructured — the component function needs
     /// `$$props` as its second parameter.
-    uses_props: bool,
+    pub(crate) uses_props: bool,
     /// Whether the script contains a class with rune fields. Triggers
     /// `$.push($$props, true); ...; $.pop();` wrap around the function body.
     pub(crate) has_class_with_runes: bool,
@@ -19247,7 +19303,7 @@ pub(crate) struct ScriptInfo {
     /// Names destructured from `let { a, b, c } = $props()`. Template
     /// reads of these names get rewritten to `$$props.NAME` and the
     /// declaration itself is dropped from the script body.
-    props_destructured: HashSet<String>,
+    pub(crate) props_destructured: HashSet<String>,
     /// Legacy-mode `export let X [= INIT]` declarations. Each entry is
     /// `(name, default_init)`. Stripped from `body` in `analyze_script`;
     /// emitters that support legacy props rebuild the
@@ -19258,6 +19314,32 @@ pub(crate) struct ScriptInfo {
     /// anywhere. Init wrapped in `$.mutable_source(...)`. Reads + writes
     /// flow through the same state_bindings rewriting as `$state` runes.
     legacy_mutable_bindings: HashSet<String>,
+}
+
+impl ScriptInfo {
+    pub(crate) fn uses_props_param(&self) -> bool {
+        self.uses_props || !self.legacy_export_props.is_empty()
+    }
+
+    /// Fast path for `let { … } = $props();` only scripts.
+    pub(crate) fn props_only(props_destructured: HashSet<String>) -> Self {
+        ScriptInfo {
+            imports: Vec::new(),
+            body: Vec::new(),
+            emit_legacy_flag: false,
+            state_bindings: HashSet::new(),
+            constants: HashMap::new(),
+            uses_props: true,
+            has_class_with_runes: false,
+            rest_props_bindings: HashSet::new(),
+            async_info: None,
+            proxy_bindings: HashSet::new(),
+            derived_bindings: HashSet::new(),
+            props_destructured,
+            legacy_export_props: Vec::new(),
+            legacy_mutable_bindings: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -21449,7 +21531,7 @@ fn scan_stmt_for_assignments(s: &Statement, out: &mut HashSet<String>) {
     }
 }
 
-fn scan_fragment_assignments(f: &Fragment) -> HashSet<String> {
+pub(crate) fn scan_fragment_assignments(f: &Fragment) -> HashSet<String> {
     let mut out = HashSet::new();
     scan_nodes_for_assignments(&f.nodes, &mut out);
     out
@@ -21749,7 +21831,7 @@ enum ElementContent<'a> {
 }
 
 #[derive(Debug, Clone)]
-enum TextPart<'a> {
+pub(crate) enum TextPart<'a> {
     Static(String),
     Expr(&'a Expression),
 }
@@ -22493,7 +22575,7 @@ fn emit_element_content(
 /// - The deps array entries `() => exprN`.
 /// Inline form: emit a template literal containing each expression as
 /// `${EXPR ?? ''}` (with state reads rewritten to `$.get(...)`).
-fn build_inline_template(
+pub(crate) fn build_inline_template(
     parts: &[TextPart],
     state_bindings: &HashSet<String>,
 ) -> Expression {
@@ -22923,7 +23005,7 @@ pub fn fold_in_fragment(f: &mut Fragment) {
 /// Math.X, and nullish-coalesce rules. The fragment shape is preserved —
 /// expressions that fold to literals remain inside their ExpressionTag so
 /// `classify` can still distinguish "static body" from "had-expressions".
-fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expression>) {
+pub(crate) fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expression>) {
     for child in &mut f.nodes {
         fold_node_with_consts(child, consts);
     }

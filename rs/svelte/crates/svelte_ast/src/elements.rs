@@ -28,6 +28,8 @@ pub struct ElementMetadata {
     pub dynamic: bool,
     /// Set when the element and subtree are fully static for client hydration (mirrors upstream `is_static_element`).
     pub is_static_element: bool,
+    /// Pre-serialized outer HTML for static elements (filled by client `precompute_static_html_cache`).
+    pub cached_static_html: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
