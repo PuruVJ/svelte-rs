@@ -111,14 +111,12 @@ fn build_script_with_comments(
     } else {
         ScriptContext::Default
     };
-    let attributes: Vec<Attribute> = el
-        .attributes
-        .iter()
-        .filter_map(|a| match a {
-            ElementAttribute::Attribute(attr) => Some(attr.clone()),
-            _ => None,
-        })
-        .collect();
+    let mut attributes: Vec<Attribute> = Vec::with_capacity(el.attributes.len());
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            attributes.push(attr.clone());
+        }
+    }
     Ok((
         Script {
             start: el.start,
@@ -159,14 +157,12 @@ fn build_script(
 
     // Collect attributes as svelte_ast `Attribute`s only (drop directives —
     // `<script>` elements never carry them in practice).
-    let attributes: Vec<Attribute> = el
-        .attributes
-        .iter()
-        .filter_map(|a| match a {
-            ElementAttribute::Attribute(attr) => Some(attr.clone()),
-            _ => None,
-        })
-        .collect();
+    let mut attributes: Vec<Attribute> = Vec::with_capacity(el.attributes.len());
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            attributes.push(attr.clone());
+        }
+    }
 
     Ok(Script {
         start: el.start,
@@ -215,7 +211,7 @@ fn attribute_string_value(attrs: &[ElementAttribute], name: &str) -> Option<Stri
     for a in attrs {
         if let ElementAttribute::Attribute(attr) = a {
             if attr.name == name {
-                return attribute_value_as_str(&attr.value).map(|s| s.to_string());
+                return attribute_value_as_str(&attr.value).map(|s| s.into());
             }
         }
     }

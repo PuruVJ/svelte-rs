@@ -69,7 +69,7 @@ pub fn read_element_or_comment(
         let close_name = parser.read_while(|b| {
             b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b':' || b == b'!'
         });
-        let close_name = close_name.to_string();
+        let close_name: String = close_name.into();
         if is_void(&close_name) {
             return Err(svelte_diagnostics::errors::void_element_invalid_content(
                 Some((start as u32, start as u32)),
@@ -704,7 +704,7 @@ fn read_attributes(
     parser: &mut Parser<'_>,
     static_only: bool,
 ) -> Result<Vec<ElementAttribute>, CompileDiagnostic> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(4);
     loop {
         parser.allow_whitespace();
         // Drain any number of `//` / `/* */` comments that sit between
@@ -807,7 +807,7 @@ fn read_braced_attribute(
             "identifier",
         ));
     }
-    let id_name = id_bytes.to_string();
+    let id_name: String = id_bytes.into();
     let id_end = parser.index;
     parser.allow_whitespace();
     if !parser.eat("}") {
@@ -869,7 +869,7 @@ fn read_attr_comment(parser: &mut Parser<'_>) -> bool {
         while j < bytes.len() && bytes[j] != b'\n' {
             j += 1;
         }
-        let value = parser.template[start + 2..j].to_string();
+        let value = parser.template[start + 2..j].into();
         parser.index = j;
         parser.comments.push(crate::oxc_bridge::RawComment {
             line: true,
@@ -891,7 +891,7 @@ fn read_attr_comment(parser: &mut Parser<'_>) -> bool {
         if j + 1 < bytes.len() && bytes[j] == b'*' && bytes[j + 1] == b'/' {
             j += 2;
         }
-        let value = parser.template[start + 2..value_end].to_string();
+        let value = parser.template[start + 2..value_end].into();
         parser.index = j;
         parser.comments.push(crate::oxc_bridge::RawComment {
             line: false,
@@ -1041,7 +1041,7 @@ fn read_attribute(
         ));
     }
     let name_end = parser.index;
-    let raw_name = name.to_string();
+    let raw_name: String = name.into();
 
     // Per upstream `read_tag` (element.js:935-950), name_loc spans the entire
     // raw name (including any directive prefix like `bind:`).
@@ -1084,8 +1084,8 @@ fn read_attribute(
             // After the colon: `name|modifier1|modifier2`.
             let rest = &raw_name[colon_index + 1..];
             let mut parts = rest.split('|');
-            let directive_name = parts.next().unwrap_or("").to_string();
-            let modifiers: Vec<String> = parts.map(|s| s.to_string()).collect();
+            let directive_name: String = parts.next().unwrap_or("").into();
+            let modifiers: Vec<String> = parts.map(|s| s.into()).collect();
 
             if directive_name.is_empty() {
                 return Err(errors::directive_missing_name(
@@ -1146,7 +1146,7 @@ fn read_static_attribute_value(
             ));
         }
         parser.index += 1; // closing quote
-        let raw = parser.template[text_start..text_end].to_string();
+        let raw: String = parser.template[text_start..text_end].into();
         return Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
             start: text_start as u32,
             end: text_end as u32,
@@ -1173,8 +1173,8 @@ fn read_static_attribute_value(
     Ok(AttributeValue::Many(vec![AttributeValuePart::Text(Text {
         start: start as u32,
         end: end as u32,
-        raw: raw.to_string(),
-        data: raw.to_string(),
+        raw: raw.into(),
+        data: raw.into(),
     })]))
 }
 
@@ -1437,7 +1437,7 @@ fn read_attr_sequence(
     parser: &mut Parser<'_>,
     quote: Option<u8>,
 ) -> Result<Vec<AttributeValuePart>, CompileDiagnostic> {
-    let mut parts: Vec<AttributeValuePart> = Vec::new();
+    let mut parts: Vec<AttributeValuePart> = Vec::with_capacity(2);
     let mut text_start = parser.index;
 
     let flush_text = |parts: &mut Vec<AttributeValuePart>,
@@ -1449,7 +1449,7 @@ fn read_attr_sequence(
             parts.push(AttributeValuePart::Text(Text {
                 start: start as u32,
                 end: end as u32,
-                raw: raw.to_string(),
+                raw: raw.into(),
                 data: crate::utils::entities::decode_character_references(raw, true),
             }));
         }
@@ -1530,7 +1530,7 @@ fn read_attr_sequence(
 fn read_textarea_fragment(
     parser: &mut Parser<'_>,
 ) -> Result<Fragment, CompileDiagnostic> {
-    let mut nodes: Vec<FragmentChild> = Vec::new();
+    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(8);
     let mut text_start = parser.index;
 
     let flush_text = |nodes: &mut Vec<FragmentChild>, start: usize, end: usize, tpl: &str| {
@@ -1539,7 +1539,7 @@ fn read_textarea_fragment(
             nodes.push(FragmentChild::Text(Text {
                 start: start as u32,
                 end: end as u32,
-                raw: raw.to_string(),
+                raw: raw.into(),
                 data: crate::utils::entities::decode_character_references(raw, false),
             }));
         }
@@ -1659,7 +1659,7 @@ fn read_raw_until_close_tag(
     // Text node with empty `raw`/`data`. Required for fixtures like
     // `<svelte:head><style></style></svelte:head>`.
     let end = parser.index;
-    let raw = parser.template[start..end].to_string();
+    let raw: String = parser.template[start..end].into();
     Ok(Fragment {
         nodes: vec![FragmentChild::Text(Text {
             start: start as u32,
@@ -1707,7 +1707,7 @@ fn parse_fragment_until_close_tag(
     parser: &mut Parser<'_>,
     tag_name: &str,
 ) -> Result<(Fragment, bool), CompileDiagnostic> {
-    let mut nodes: Vec<FragmentChild> = Vec::new();
+    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(8);
     let mut implicit_close = false;
     loop {
         if parser.index >= parser.template.len() {

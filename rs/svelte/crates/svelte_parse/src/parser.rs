@@ -72,9 +72,9 @@ impl<'src> Parser<'src> {
             loose,
             ts,
             line_map,
-            comments: Vec::new(),
+            comments: Vec::with_capacity(4),
             shadowroot_depth: 0,
-            warnings: Vec::new(),
+            warnings: Vec::with_capacity(4),
             last_auto_closed_tag: None,
             element_depth: 0,
         }
@@ -159,7 +159,7 @@ impl<'src> Parser<'src> {
                 while j < bytes_len && self.template.as_bytes()[j] != b'\n' {
                     j += 1;
                 }
-                let value = self.template[start + 2..j].to_string();
+                let value = self.template[start + 2..j].into();
                 self.index = j;
                 self.comments.push(crate::oxc_bridge::RawComment {
                     line: true,
@@ -183,7 +183,7 @@ impl<'src> Parser<'src> {
                 if j + 1 < bytes_len {
                     j += 2;
                 }
-                let value = self.template[start + 2..value_end].to_string();
+                let value = self.template[start + 2..value_end].into();
                 self.index = j;
                 self.comments.push(crate::oxc_bridge::RawComment {
                     line: false,

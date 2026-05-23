@@ -27,7 +27,7 @@ pub fn read_text(parser: &mut Parser<'_>) -> Text {
     Text {
         start,
         end: parser.index as u32,
-        raw: raw.to_string(),
+        raw: raw.into(),
         data: decode_character_references(raw, false),
     }
 }

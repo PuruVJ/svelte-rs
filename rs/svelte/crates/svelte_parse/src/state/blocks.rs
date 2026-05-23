@@ -32,7 +32,7 @@ pub fn read_block_open(
     parser.index += 1; // consume `#`
 
     let name = parser.read_while(|b| b.is_ascii_alphanumeric() || b == b'_');
-    let name = name.to_string();
+    let name: String = name.into();
 
     match name.as_str() {
         "if" => read_if_block(parser, start, false),
@@ -139,7 +139,7 @@ fn read_each_block(
                 "identifier",
             ));
         }
-        index_name = Some(id.to_string());
+        index_name = Some(id.into());
         parser.allow_whitespace();
     }
 
@@ -389,7 +389,7 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::P
             i += 1;
         }
         let pat_end = i;
-        let name = parser.template[pat_start..pat_end].to_string();
+        let name: String = parser.template[pat_start..pat_end].into();
         // Reject JS reserved words used as `as` patterns. Mirrors
         // `is_reserved` in 1-parse/utils/names.js.
         if is_reserved_word(&name) {
@@ -503,7 +503,7 @@ fn read_snippet_block(
             id_start as u32,
         ))));
     }
-    let id_name = id_name_bytes.to_string();
+    let id_name: String = id_name_bytes.into();
     let id_end = parser.index;
     let expression = svelte_js_ast::Identifier {
         name: id_name,
@@ -519,7 +519,7 @@ fn read_snippet_block(
         match find_matching_pointy(parser.template, lt_pos) {
             Some(gt_pos) => {
                 // Slice between `<` and `>` (exclusive on both).
-                let tp = parser.template[lt_pos + 1..gt_pos].to_string();
+                let tp: String = parser.template[lt_pos + 1..gt_pos].into();
                 type_params = Some(tp);
                 parser.index = gt_pos + 1;
             }
@@ -819,7 +819,7 @@ fn parse_fragment_until_block_boundary(
     parser: &mut Parser<'_>,
     boundaries: &[&str],
 ) -> Result<Fragment, CompileDiagnostic> {
-    let mut nodes: Vec<FragmentChild> = Vec::new();
+    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(8);
     loop {
         if parser.index >= parser.template.len() {
             // Find the position of the enclosing block-open `{#...`. The

@@ -32,7 +32,7 @@ pub fn read_comment(parser: &mut Parser<'_>) -> Result<Comment, CompileDiagnosti
     };
 
     parser.index += end_rel;
-    let data = parser.template[data_start..parser.index].to_string();
+    let data: String = parser.template[data_start..parser.index].into();
     parser.index += 3; // skip `-->`
 
     Ok(Comment {

@@ -88,8 +88,9 @@ pub fn try_typed_server_component_full(
     // `<script module>` content is hoisted above the export default
     // function. Statements are pulled in source order; imports flow to
     // `script_imports` so they're emitted with the regular instance imports.
-    let mut module_imports: Vec<Statement> = Vec::new();
-    let mut module_rest: Vec<Statement> = Vec::new();
+    let module_body_len = root.module.as_ref().map(|m| m.content.body.len()).unwrap_or(0);
+    let mut module_imports: Vec<Statement> = Vec::with_capacity(module_body_len);
+    let mut module_rest: Vec<Statement> = Vec::with_capacity(module_body_len);
     let mut module_bindings: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     if let Some(m) = root.module.as_ref() {
@@ -129,8 +130,9 @@ pub fn try_typed_server_component_full(
     });
 
     // Process the instance script: rewrite runes, split imports vs rest.
-    let mut script_imports: Vec<Statement> = Vec::new();
-    let mut script_rest: Vec<Statement> = Vec::new();
+    let script_body_len = root.instance.as_ref().map(|s| s.content.body.len()).unwrap_or(0);
+    let mut script_imports: Vec<Statement> = Vec::with_capacity(script_body_len);
+    let mut script_rest: Vec<Statement> = Vec::with_capacity(script_body_len);
     let mut uses_props = false;
     let mut needs_component_wrap = false;
     let mut consts: std::collections::HashMap<String, Expression> =
@@ -281,6 +283,7 @@ pub fn try_typed_server_component_full(
     // (option, select callbacks) don't inherit the standalone flag.
     IS_STANDALONE.with(|s| s.set(false));
 
+    func_body.reserve(template_body.len() + if needs_bind_wrap { 8 } else { 0 });
     if needs_bind_wrap {
         // Script bindings stay at the outer function-body level; only the
         // template-rendering statements move into `$$render_inner`.
@@ -497,7 +500,7 @@ pub fn try_typed_server_component_full(
 fn extract_and_lower_snippets(
     fragment: &mut svelte_ast::fragment::Fragment,
 ) -> Option<Vec<Statement>> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(fragment.nodes.len());
     let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
     for n in std::mem::take(&mut fragment.nodes) {
         if let FragmentChild::SnippetBlock(sb) = &n {
@@ -576,7 +579,7 @@ fn fragment_has_component_bind(f: &svelte_ast::fragment::Fragment) -> bool {
 /// Wrap the function body for `bind:` on Components: declare \$\$settled +
 /// \$\$inner_renderer + \$\$render_inner, then loop do/while + subsume.
 fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(8);
     // `let $$settled = true;`
     out.push(Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Let,
@@ -610,7 +613,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
     ));
     // `do { $$settled = true; $$inner_renderer = $$renderer.copy();
     //      $$render_inner($$inner_renderer); } while (!$$settled);`
-    let mut do_body: Vec<Statement> = Vec::new();
+    let mut do_body: Vec<Statement> = Vec::with_capacity(4);
     do_body.push(t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
         left: AssignmentTarget::Expression(t::id("$$settled")),
         operator: AssignmentOperator::Assign,
@@ -1424,7 +1427,7 @@ fn lower_fragment_server_async_with(
     promises_var: &str,
     blocker_bindings: &std::collections::HashMap<String, usize>,
 ) -> Option<Vec<Statement>> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     let nodes = trim_boundary_whitespace(&f.nodes);
     let nodes = trim_boundary_text(nodes);
@@ -1740,7 +1743,7 @@ fn lower_fragment_with_const_await_with(
     blocker_bindings: &std::collections::HashMap<String, usize>,
     promises_var: &str,
 ) -> Option<Vec<Statement>> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut const_names: Vec<String> = Vec::new();
     let mut groups: Vec<Expression> = Vec::new();
     let mut rest_nodes: Vec<FragmentChild> = Vec::new();
@@ -2330,7 +2333,7 @@ fn lower_svelte_head_server_inner(
 fn lower_svelte_boundary_server(
     sb: &svelte_ast::elements::SvelteBoundary,
 ) -> Option<Vec<Statement>> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(sb.fragment.nodes.len() + 16);
 
     // 1. Extract `failed`/`pending` snippet attributes (compile-time names
     //    that map to a snippet binding).
@@ -2543,7 +2546,7 @@ fn lower_svelte_boundary_server(
 fn lower_head_fragment(
     f: &svelte_ast::fragment::Fragment,
 ) -> Option<Vec<Statement>> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     let nodes = trim_boundary_whitespace(&f.nodes);
     let nodes = trim_boundary_text(nodes);
@@ -2693,7 +2696,7 @@ fn lower_fragment_with_marker(
     f: &svelte_ast::fragment::Fragment,
     needs_marker: bool,
 ) -> Option<Vec<Statement>> {
-    let mut out = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     if needs_marker {
         buf.push_str("<!---->");
@@ -3317,7 +3320,7 @@ fn lower_textarea_server(
     });
     let body_var = if idx == 0 { "$$body".to_string() } else { format!("$$body_{idx}") };
 
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(8);
     // Open tag push.
     if let Some(s) = open_buf.flush() {
         out.push(s);
@@ -3885,7 +3888,7 @@ fn lower_each_for_select(
         prefix: false,
         span: Span::ZERO,
     }));
-    let mut body_stmts: Vec<Statement> = Vec::new();
+    let mut body_stmts: Vec<Statement> = Vec::with_capacity(eb.body.nodes.len() + 16);
     if let Some(ctx) = &eb.context {
         body_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Let,
@@ -4098,7 +4101,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
     }));
 
     // Inside the loop: `let PATTERN = each_array[INDEX];` then body.
-    let mut body_stmts: Vec<Statement> = Vec::new();
+    let mut body_stmts: Vec<Statement> = Vec::with_capacity(eb.body.nodes.len() + 16);
     if let Some(ctx) = &eb.context {
         body_stmts.push(Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Let,
@@ -4246,7 +4249,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         // When there's no fallback, the outer `<!--[-->` push stays outside
         // (matches non-fallback expected). With a fallback, the marker is
         // emitted from inside the conditional.
-        let mut out: Vec<Statement> = Vec::new();
+        let mut out: Vec<Statement> = Vec::with_capacity(4);
         if eb.fallback.is_none() {
             out.push(push_template("<!--[-->"));
         }
@@ -4715,7 +4718,7 @@ fn wrap_async_test(test: &Expression) -> Expression {
 fn lower_fragment_for_async_block(
     f: &svelte_ast::fragment::Fragment,
 ) -> Option<Vec<Statement>> {
-    let mut out: Vec<Statement> = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     let in_head = IN_SVELTE_HEAD.with(|c| c.get());
     let nodes = trim_boundary_whitespace(&f.nodes);
@@ -4860,7 +4863,7 @@ fn has_option_child(el: &svelte_ast::elements::RegularElement) -> bool {
 fn lower_select_element_server(
     el: &svelte_ast::elements::RegularElement,
 ) -> Option<Vec<Statement>> {
-    let mut out = Vec::new();
+    let mut out: Vec<Statement> = Vec::with_capacity(el.fragment.nodes.len() + el.attributes.len() + 8);
     // Open tag — serialize into a small TemplateBuf, flush.
     let mut buf = TemplateBuf::new();
     buf.push_str("<");
@@ -5224,7 +5227,7 @@ fn lower_element_with_async_directive(
     let push_stmt = buf.flush()?;
 
     // Build the const-hoist decls.
-    let mut body: Vec<Statement> = Vec::new();
+    let mut body: Vec<Statement> = Vec::with_capacity(hoists.len() + 1);
     for (i, expr) in hoists.iter().enumerate() {
         let placeholder = if i == 0 { "$$0".to_string() } else { format!("$${i}") };
         let saved = wrap_async_test(expr);
@@ -6648,7 +6651,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
     LAST_COMPONENT_WAS_ASYNC.with(|c| c.set(false));
     if !await_hoists.is_empty() {
         LAST_COMPONENT_WAS_ASYNC.with(|c| c.set(true));
-        let mut body: Vec<Statement> = Vec::new();
+        let mut body: Vec<Statement> = Vec::with_capacity(await_hoists.len() + 1);
         for (i, expr) in await_hoists.iter().enumerate() {
             let placeholder = if i == 0 {
                 "$$0".to_string()

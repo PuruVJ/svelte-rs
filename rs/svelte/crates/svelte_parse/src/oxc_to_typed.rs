@@ -48,7 +48,7 @@ fn slice_text(span: oxc_span::Span) -> Option<String> {
             let start = span.start as usize;
             let end = span.end as usize;
             if end <= s.len() && start <= end {
-                Some(s[start..end].to_string())
+                Some(s[start..end].into())
             } else {
                 None
             }
@@ -61,7 +61,8 @@ fn slice_text(span: oxc_span::Span) -> Option<String> {
 // -------------------------------------------------------------------------
 
 pub fn program(p: &oxc::Program<'_>, shift: Shift) -> Program {
-    let body = p.body.iter().map(|s| statement(s, shift)).collect();
+    let mut body = Vec::with_capacity(p.body.len());
+    body.extend(p.body.iter().map(|s| statement(s, shift)));
     Program {
         source_type: SourceType::Module,
         body,
@@ -207,7 +208,11 @@ pub fn statement(s: &oxc::Statement<'_>, shift: Shift) -> Statement {
 
 fn block_statement(b: &oxc::BlockStatement<'_>, shift: Shift) -> BlockStatement {
     BlockStatement {
-        body: b.body.iter().map(|s| statement(s, shift)).collect(),
+        body: {
+            let mut body = Vec::with_capacity(b.body.len());
+            body.extend(b.body.iter().map(|s| statement(s, shift)));
+            body
+        },
         span: span_of(b.span, shift),
     }
 }
@@ -328,7 +333,11 @@ fn collect_params(
 
 fn function_body(b: &oxc::FunctionBody<'_>, shift: Shift) -> BlockStatement {
     BlockStatement {
-        body: b.statements.iter().map(|s| statement(s, shift)).collect(),
+        body: {
+            let mut body = Vec::with_capacity(b.statements.len());
+            body.extend(b.statements.iter().map(|s| statement(s, shift)));
+            body
+        },
         span: span_of(b.span, shift),
     }
 }
@@ -484,7 +493,7 @@ fn export_default_declaration(
         K::ClassDeclaration(c) => ExportDefault::Class(Box::new(class_decl(c, shift))),
         K::TSInterfaceDeclaration(_) => {
             ExportDefault::Expression(Expression::Identifier(Identifier {
-                name: "__ts_interface__".to_string(),
+                name: "__ts_interface__".into(),
                 span: Span::ZERO,
             }))
         }
@@ -530,15 +539,15 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::NullLiteral(n) => Expression::Literal(Box::new(Literal::Null(span_of(n.span, shift)))),
         E::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
             value: n.value,
-            raw: n.raw.as_ref().map(|s| s.as_str().to_string()),
+            raw: n.raw.as_ref().map(|s| s.as_str().into()),
             span: span_of(n.span, shift),
         }))),
         E::BigIntLiteral(b) => Expression::Literal(Box::new(Literal::BigInt(BigIntLiteral {
-            raw: b.raw.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default(),
+            raw: b.raw.as_ref().map(|s| s.as_str().into()).unwrap_or_default(),
             span: span_of(b.span, shift),
         }))),
         E::RegExpLiteral(r) => Expression::Literal(Box::new(Literal::Regex(RegexLiteral {
-            pattern: r.regex.pattern.text.as_str().to_string(),
+            pattern: r.regex.pattern.text.as_str().into(),
             flags: format!("{}", r.regex.flags),
             span: span_of(r.span, shift),
         }))),
@@ -552,7 +561,11 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::Super(s) => Expression::Super(span_of(s.span, shift)),
         E::ArrayExpression(a) => Expression::Array(Box::new(ArrayExpression {
-            elements: a.elements.iter().map(|el| array_element(el, shift)).collect(),
+            elements: {
+                let mut elements = Vec::with_capacity(a.elements.len());
+                elements.extend(a.elements.iter().map(|el| array_element(el, shift)));
+                elements
+            },
             span: span_of(a.span, shift),
         })),
         E::ArrowFunctionExpression(a) => {
@@ -648,7 +661,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                 Expression::Member(Box::new(MemberExpression {
                     object: expression(&m.object, shift),
                     property: MemberProperty::Private(PrivateIdentifier {
-                        name: m.field.name.as_str().to_string(),
+                        name: m.field.name.as_str().into(),
                         span: span_of(m.field.span, shift),
                     }),
                     computed: false,
@@ -657,7 +670,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                 }))
             }
             _ => Expression::Identifier(Identifier {
-                name: "__unhandled_chain__".to_string(),
+                name: "__unhandled_chain__".into(),
                 span: Span::ZERO,
             }),
         },
@@ -671,7 +684,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::FunctionExpression(f) => Expression::Function(Box::new(function_expression(f, shift))),
         E::ImportExpression(i) => Expression::Call(Box::new(CallExpression {
             callee: Expression::Identifier(Identifier {
-                name: "import".to_string(),
+                name: "import".into(),
                 span: Span::ZERO,
             }),
             arguments: std::iter::once(Argument::Expression(expression(&i.source, shift)))
@@ -783,7 +796,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::PrivateFieldExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Private(PrivateIdentifier {
-                name: m.field.name.as_str().to_string(),
+                name: m.field.name.as_str().into(),
                 span: span_of(m.field.span, shift),
             }),
             computed: false,
@@ -793,11 +806,11 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
 
         // JSX (not supported in Svelte scripts — emit a placeholder).
         E::JSXElement(j) => Expression::Identifier(Identifier {
-            name: "__jsx_element__".to_string(),
+            name: "__jsx_element__".into(),
             span: span_of(j.span, shift),
         }),
         E::JSXFragment(j) => Expression::Identifier(Identifier {
-            name: "__jsx_fragment__".to_string(),
+            name: "__jsx_fragment__".into(),
             span: span_of(j.span, shift),
         }),
 
@@ -827,7 +840,7 @@ fn expression_from_for_init(init: &oxc::ForStatementInit<'_>, shift: Shift) -> E
         F::NullLiteral(n) => Expression::Literal(Box::new(Literal::Null(span_of(n.span, shift)))),
         F::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
             value: n.value,
-            raw: n.raw.as_ref().map(|s| s.as_str().to_string()),
+            raw: n.raw.as_ref().map(|s| s.as_str().into()),
             span: span_of(n.span, shift),
         }))),
         F::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
@@ -848,7 +861,7 @@ fn expression_from_for_init(init: &oxc::ForStatementInit<'_>, shift: Shift) -> E
         _ => {
             let s = init.span();
             Expression::Identifier(Identifier {
-                name: "__for_init__".to_string(),
+                name: "__for_init__".into(),
                 span: span_of(s, shift),
             })
         }
@@ -885,7 +898,7 @@ fn expression_from_for_left(left: &oxc::ForStatementLeft<'_>, shift: Shift) -> E
         _ => {
             let s = left.span();
             Expression::Identifier(Identifier {
-                name: "__for_left__".to_string(),
+                name: "__for_left__".into(),
                 span: span_of(s, shift),
             })
         }
@@ -901,7 +914,7 @@ fn expression_from_default_kind(
         K::FunctionDeclaration(_) | K::ClassDeclaration(_) | K::TSInterfaceDeclaration(_) => {
             // Already handled by caller; fallback shouldn't reach here.
             Expression::Identifier(Identifier {
-                name: "__default_declaration__".to_string(),
+                name: "__default_declaration__".into(),
                 span: Span::ZERO,
             })
         }
@@ -912,13 +925,17 @@ fn expression_from_default_kind(
         K::NullLiteral(n) => Expression::Literal(Box::new(Literal::Null(span_of(n.span, shift)))),
         K::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
             value: n.value,
-            raw: n.raw.as_ref().map(|s| s.as_str().to_string()),
+            raw: n.raw.as_ref().map(|s| s.as_str().into()),
             span: span_of(n.span, shift),
         }))),
         K::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
         K::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
         K::ArrayExpression(a) => Expression::Array(Box::new(ArrayExpression {
-            elements: a.elements.iter().map(|el| array_element(el, shift)).collect(),
+            elements: {
+                let mut elements = Vec::with_capacity(a.elements.len());
+                elements.extend(a.elements.iter().map(|el| array_element(el, shift)));
+                elements
+            },
             span: span_of(a.span, shift),
         })),
         K::ObjectExpression(o) => Expression::Object(Box::new(ObjectExpression {
@@ -952,14 +969,14 @@ fn expression_from_default_kind(
             // path by upcasting to Expression. We need a reborrow.
             let s = k.span();
             Expression::Identifier(Identifier {
-                name: "__default_complex__".to_string(),
+                name: "__default_complex__".into(),
                 span: span_of(s, shift),
             })
         }
         _ => {
             let s = k.span();
             Expression::Identifier(Identifier {
-                name: "__default_other__".to_string(),
+                name: "__default_other__".into(),
                 span: span_of(s, shift),
             })
         }
@@ -996,7 +1013,7 @@ fn expression_from_simple_target(
         T::PrivateFieldExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Private(PrivateIdentifier {
-                name: m.field.name.as_str().to_string(),
+                name: m.field.name.as_str().into(),
                 span: span_of(m.field.span, shift),
             }),
             computed: false,
@@ -1004,7 +1021,7 @@ fn expression_from_simple_target(
             span: span_of(m.span, shift),
         })),
         _ => Expression::Identifier(Identifier {
-            name: "__simple_target__".to_string(),
+            name: "__simple_target__".into(),
             span: Span::ZERO,
         }),
     }
@@ -1079,17 +1096,17 @@ fn formal_param_pattern(p: &oxc::FormalParameter<'_>, shift: Shift) -> Pattern {
 
 fn binding_identifier(b: &oxc::BindingIdentifier<'_>, shift: Shift) -> Identifier {
     Identifier {
-        name: b.name.as_str().to_string(),
+        name: b.name.as_str().into(),
         span: span_of(b.span, shift),
     }
 }
 
 fn ident_from_name(name: &str, sp: oxc_span::Span, shift: Shift) -> Identifier {
-    Identifier { name: name.to_string(), span: span_of(sp, shift) }
+    Identifier { name: name.into(), span: span_of(sp, shift) }
 }
 
 fn ident_from_label(name: &str, sp: oxc_span::Span, shift: Shift) -> Identifier {
-    Identifier { name: name.to_string(), span: span_of(sp, shift) }
+    Identifier { name: name.into(), span: span_of(sp, shift) }
 }
 
 fn property_key(k: &oxc::PropertyKey<'_>, shift: Shift) -> PropertyKey {
@@ -1097,7 +1114,7 @@ fn property_key(k: &oxc::PropertyKey<'_>, shift: Shift) -> PropertyKey {
     match k {
         K::StaticIdentifier(n) => PropertyKey::Identifier(ident_from_name(n.name.as_str(), n.span, shift)),
         K::PrivateIdentifier(p) => PropertyKey::Private(PrivateIdentifier {
-            name: p.name.as_str().to_string(),
+            name: p.name.as_str().into(),
             span: span_of(p.span, shift),
         }),
         // The Expression-inherited variants — convert via expression().
@@ -1118,7 +1135,7 @@ fn property_key_as_expr(k: &oxc::PropertyKey<'_>, shift: Shift) -> Expression {
         K::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
         K::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
             value: n.value,
-            raw: n.raw.as_ref().map(|s| s.as_str().to_string()),
+            raw: n.raw.as_ref().map(|s| s.as_str().into()),
             span: span_of(n.span, shift),
         }))),
         K::TemplateLiteral(t) => Expression::Template(Box::new(template_literal(t, shift))),
@@ -1132,8 +1149,8 @@ fn property_key_as_expr(k: &oxc::PropertyKey<'_>, shift: Shift) -> Expression {
 
 fn string_literal(s: &oxc::StringLiteral<'_>, shift: Shift) -> StringLiteral {
     StringLiteral {
-        value: s.value.as_str().to_string(),
-        raw: s.raw.as_ref().map(|r| r.as_str().to_string()),
+        value: s.value.as_str().into(),
+        raw: s.raw.as_ref().map(|r| r.as_str().into()),
         span: span_of(s.span, shift),
     }
 }
@@ -1146,8 +1163,8 @@ fn template_literal(t: &oxc::TemplateLiteral<'_>, shift: Shift) -> TemplateLiter
             .iter()
             .enumerate()
             .map(|(i, q)| TemplateElement {
-                cooked: q.value.cooked.as_ref().map(|s| s.as_str().to_string()).unwrap_or_default(),
-                raw: q.value.raw.as_str().to_string(),
+                cooked: q.value.cooked.as_ref().map(|s| s.as_str().into()).unwrap_or_default(),
+                raw: q.value.raw.as_str().into(),
                 tail: q.tail || i == last,
                 span: span_of(q.span, shift),
             })
@@ -1215,7 +1232,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
         A::NullLiteral(n) => Expression::Literal(Box::new(Literal::Null(span_of(n.span, shift)))),
         A::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
             value: n.value,
-            raw: n.raw.as_ref().map(|s| s.as_str().to_string()),
+            raw: n.raw.as_ref().map(|s| s.as_str().into()),
             span: span_of(n.span, shift),
         }))),
         A::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
@@ -1261,7 +1278,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
         _ => {
             let s = a.span();
             Expression::Identifier(Identifier {
-                name: "__argument__".to_string(),
+                name: "__argument__".into(),
                 span: span_of(s, shift),
             })
         }
@@ -1295,7 +1312,7 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
         T::PrivateFieldExpression(m) => AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Private(PrivateIdentifier {
-                name: m.field.name.as_str().to_string(),
+                name: m.field.name.as_str().into(),
                 span: span_of(m.field.span, shift),
             }),
             computed: false,
@@ -1395,7 +1412,7 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
             })))
         }
         _ => AssignmentTarget::Expression(Expression::Identifier(Identifier {
-            name: "__assignment_target__".to_string(),
+            name: "__assignment_target__".into(),
             span: Span::ZERO,
         })),
     }
@@ -1408,7 +1425,7 @@ fn assignment_target_to_pattern(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> 
         AssignmentTarget::Expression(e) => match e {
             Expression::Identifier(i) => Pattern::Identifier(i),
             _ => Pattern::Identifier(Identifier {
-                name: "__bad_target__".to_string(),
+                name: "__bad_target__".into(),
                 span: Span::ZERO,
             }),
         },
@@ -1452,12 +1469,12 @@ fn assignment_target_maybe_default_to_pattern(
             // Cheaply emit a placeholder; nested destructure-as-target is rare.
             let s = t.span();
             Pattern::Identifier(Identifier {
-                name: "__nested_destructure__".to_string(),
+                name: "__nested_destructure__".into(),
                 span: span_of(s, shift),
             })
         }
         _ => Pattern::Identifier(Identifier {
-            name: "__amd__".to_string(),
+            name: "__amd__".into(),
             span: Span::ZERO,
         }),
     }

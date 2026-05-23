@@ -248,8 +248,8 @@ fn emit_svelte_head_program(
         span: Span::ZERO,
     }));
 
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     if body_el.is_some() {
         func_body.push(t::var(&body_tag, t::call(t::id("root"), Vec::new())));
     }
@@ -292,7 +292,7 @@ fn emit_svelte_head_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     // root_1 (head) and root (body).
     if !head_non_ws.is_empty() {
         let head_args: Vec<Expression> = if head_flag != 0.0 {
@@ -560,8 +560,8 @@ fn emit_head_if_block_program(
     }));
 
     // Outer func body: $.head(HASH, head_arrow); BodyComponent($$anchor, {});
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "head"),
         vec![
@@ -587,13 +587,13 @@ fn emit_head_if_block_program(
     let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     // root_2 = consequent template.
     let cons_args: Vec<Expression> = if cons_flag != 0.0 {
         vec![t::template_raw(vec![cons_template], vec![]), t::lit_number(cons_flag)]
@@ -689,8 +689,8 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     let outer_var = sanitize_name(&outer.name);
     let inner_var = format!("{}_1", sanitize_name(&inner_el.name));
 
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
     func_body.push(t::var(
         &inner_var,
@@ -765,10 +765,10 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     }
     let export = t::export_default_function(component_name, params, func_body);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -899,8 +899,8 @@ fn emit_select_with_rich_options_static(
     select_html.push_str("</select>");
 
     // Build the function body.
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var("select", t::call(t::id("root"), Vec::new())));
     let mut rich_idx = 0usize;
     for (i, info) in infos.iter().enumerate() {
@@ -1016,13 +1016,13 @@ fn emit_select_with_rich_options_static(
     }
     let export = t::export_default_function(component_name, params, func_body);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     // option_content_N templates for rich options.
     let mut rich_idx = 0usize;
     for info in &infos {
@@ -2030,8 +2030,8 @@ fn emit_boundary_pending_attribute_program(
     }));
 
     // Main function body.
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var("fragment", t::call(t::member_id(t::id_dollar(), "comment"), Vec::new())));
     func_body.push(t::var(
         "node",
@@ -2049,11 +2049,11 @@ fn emit_boundary_pending_attribute_program(
     let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(snippet_const);
     prog.push(export);
     Some(t::program(prog))
@@ -2905,8 +2905,8 @@ fn emit_select_with_optgroup_rich(
     }
 
     // Build function body.
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
     func_body.push(t::var(
         "select",
@@ -3077,13 +3077,13 @@ fn emit_select_with_optgroup_rich(
     }
     let export = t::export_default_function(component_name, params, func_body);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     // option_content_N templates.
     for (name, html) in &content_templates {
         prog.push(t::var(
@@ -3560,8 +3560,8 @@ fn emit_select_with_rich_reactive_and_trailing(
     }
 
     // Build function body.
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     // var fragment = root();
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
     // var select = $.first_child(fragment);
@@ -3695,13 +3695,13 @@ fn emit_select_with_rich_reactive_and_trailing(
     }
     let export = t::export_default_function(component_name, params, func_body);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     // option_content_N templates.
     for rich in &rich_options {
         prog.push(t::var(
@@ -4584,11 +4584,11 @@ pub fn try_typed_client_walker_with(
         return emit_tree_program(&classified, component_name, is_multi_root);
     }
     let mut html = String::with_capacity(64);
-    let mut body_stmts: Vec<Statement> = Vec::new();
+    let mut body_stmts: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     let mut effects: Vec<Statement> = Vec::new(); // emitted after navigation
 
     // Start the function body with the rewritten script body.
-    body_stmts.extend(script.body.clone());
+    body_stmts.extend(script.body.iter().cloned());
 
     // var_counts was pre-seeded by extract_client_snippets so any name it
     // consumed (e.g. `text`) gets numbered (`text_1`) when used again here.
@@ -4950,7 +4950,7 @@ pub fn try_typed_client_walker_with(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.extend(snippet_decls);
     prog.push(root_decl);
     prog.push(export);
@@ -5241,7 +5241,7 @@ fn collapse_ws(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<Program> {
-    let mut body: Vec<Statement> = Vec::new();
+    let mut body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     // `$.push($$props, true);`
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "push"),
@@ -5253,7 +5253,7 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
             }))),
         ],
     )));
-    body.extend(script.body.clone());
+    body.extend(script.body.iter().cloned());
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "pop"),
         Vec::new(),
@@ -5268,7 +5268,7 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -5541,8 +5541,8 @@ fn emit_single_component_program(
                 optional: false,
                 span: Span::ZERO,
             }));
-            let mut func_body: Vec<Statement> = Vec::new();
-            func_body.extend(script.body.clone());
+            let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+            func_body.extend(script.body.iter().cloned());
             func_body.push(t::stmt(component_call));
             let mut params = vec![t::pat_id_anchor()];
             if script.uses_props {
@@ -5556,7 +5556,7 @@ fn emit_single_component_program(
                 prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
             }
             prog.push(t::import_namespace("$", "svelte/internal/client"));
-            prog.extend(script.imports.clone());
+            prog.extend(script.imports.iter().cloned());
             prog.extend(module_extras);
             prog.push(export);
             return Some(t::program(prog));
@@ -5640,8 +5640,8 @@ fn emit_single_component_program(
                         optional: false,
                         span: Span::ZERO,
                     }));
-                    let mut func_body: Vec<Statement> = Vec::new();
-                    func_body.extend(script.body.clone());
+                    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+                    func_body.extend(script.body.iter().cloned());
                     func_body.push(t::stmt(component_call));
                     let mut params = vec![t::pat_id_anchor()];
                     if script.uses_props {
@@ -5656,7 +5656,7 @@ fn emit_single_component_program(
                         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
                     }
                     prog.push(t::import_namespace("$", "svelte/internal/client"));
-                    prog.extend(script.imports.clone());
+                    prog.extend(script.imports.iter().cloned());
                     prog.push(export);
                     return Some(t::program(prog));
                 }
@@ -5792,8 +5792,8 @@ fn emit_single_component_program(
         span: Span::ZERO,
     }));
 
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::stmt(component_call));
 
     let mut params = vec![t::pat_id_anchor()];
@@ -5808,7 +5808,7 @@ fn emit_single_component_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -5821,8 +5821,8 @@ fn emit_single_async_expr_program(
     script: &ScriptInfo,
     ai: &AsyncInfo,
 ) -> Option<Program> {
-    let mut body: Vec<Statement> = Vec::new();
-    body.extend(script.body.clone());
+    let mut body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    body.extend(script.body.iter().cloned());
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "next"),
         Vec::new(),
@@ -5875,7 +5875,7 @@ fn emit_single_async_expr_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -6755,7 +6755,7 @@ fn emit_single_vanilla_if_program(
     )));
 
     // Top-level function body.
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     // Legacy props prelude.
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
@@ -6786,7 +6786,7 @@ fn emit_single_vanilla_if_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -6828,7 +6828,7 @@ fn emit_single_vanilla_if_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     // Module-level `var root_N = $.from_html(...)` for any element
     // branches captured.
     prog.extend(root_decls);
@@ -6901,7 +6901,7 @@ fn emit_top_level_html_tag_program(
         rewrite_legacy_prop_reads(&inner, &legacy_prop_names)
     };
 
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -6931,7 +6931,7 @@ fn emit_top_level_html_tag_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -6984,7 +6984,7 @@ fn emit_top_level_html_tag_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -7033,7 +7033,7 @@ fn emit_top_level_render_tag_program(
         span: Span::ZERO,
     }));
 
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     let needs_legacy_wrap = script.emit_legacy_flag;
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
@@ -7046,7 +7046,7 @@ fn emit_top_level_render_tag_program(
             ],
         )));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "init"),
@@ -7073,7 +7073,7 @@ fn emit_top_level_render_tag_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -7216,7 +7216,7 @@ fn emit_single_element_wrapping_html_tag_program(
     html.push('>');
 
     let tag_var = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -7246,7 +7246,7 @@ fn emit_single_element_wrapping_html_tag_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "html"),
@@ -7288,7 +7288,7 @@ fn emit_single_element_wrapping_html_tag_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -7326,8 +7326,8 @@ fn emit_top_level_single_text_program(
     {
         return None;
     }
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "next"),
         Vec::new(),
@@ -7356,7 +7356,7 @@ fn emit_top_level_single_text_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -7395,7 +7395,7 @@ fn emit_top_level_single_expression_program(
     let inner = rewrite_props_destructured(expr, &script.props_destructured);
     let inner = rewrite_legacy_prop_reads(&inner, &legacy_prop_names);
 
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -7425,7 +7425,7 @@ fn emit_top_level_single_expression_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "next"),
         Vec::new(),
@@ -7475,7 +7475,7 @@ fn emit_top_level_single_expression_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -7592,8 +7592,8 @@ fn emit_single_element_with_component_program(
     html.push('>');
 
     let tag_var = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     func_body.push(t::var(
         "node",
@@ -7630,7 +7630,7 @@ fn emit_single_element_with_component_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -7766,8 +7766,8 @@ fn emit_single_element_with_inner_snippet_program(
     }
 
     let tag_var = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     // Snippets go inside a block, not at module-level for inside-element snippets.
     if !snippet_block.is_empty() {
@@ -7853,7 +7853,7 @@ fn emit_single_element_with_inner_snippet_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -8200,7 +8200,7 @@ fn emit_single_element_wrapping_ifs_program(
 
     // Top-level function body.
     let tag_var = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -8230,7 +8230,7 @@ fn emit_single_element_wrapping_ifs_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     // Navigate to first if-block anchor inside this element.
     let child_call = t::call(
@@ -8295,7 +8295,7 @@ fn emit_single_element_wrapping_ifs_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.extend(root_decls);
     prog.push(t::var(
         "root",
@@ -9725,7 +9725,7 @@ fn emit_top_level_multi_if_program(
     }
 
     // Top-level function body.
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -9755,7 +9755,7 @@ fn emit_top_level_multi_if_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     // Helper: full text content for a LiteralAnchor slot (literal + leading/
     // trailing whitespace gaps that contribute to the same text run).
     let literal_full_text = |slot_i: usize| -> String {
@@ -10325,7 +10325,7 @@ fn emit_top_level_multi_if_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.extend(root_decls);
     let flag = if needs_import_node { 3.0 } else { 1.0 };
     prog.push(t::var(
@@ -10724,7 +10724,7 @@ fn emit_single_element_wrapping_each_program(
             item_arrow,
         ],
     ));
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -10754,7 +10754,7 @@ fn emit_single_element_wrapping_each_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     // `$.init()` is needed when the each-block reads a legacy prop deeply
     // (e.g. `things().foo`) — mirrors upstream's emitter that calls
     // `state.init = true` whenever `deep_read_state` is materialized.
@@ -10797,7 +10797,7 @@ fn emit_single_element_wrapping_each_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root_1",
         t::call(
@@ -11412,8 +11412,8 @@ fn emit_single_element_with_spread_program(
     }));
 
     let var_name = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "attribute_effect"),
@@ -11436,7 +11436,7 @@ fn emit_single_element_with_spread_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -11603,7 +11603,7 @@ fn emit_single_element_with_bind_this_program(
         span: Span::ZERO,
     }));
 
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -11633,7 +11633,7 @@ fn emit_single_element_with_bind_this_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "bind_this"),
@@ -11665,7 +11665,7 @@ fn emit_single_element_with_bind_this_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -11804,8 +11804,8 @@ fn emit_single_element_with_folded_prefix_program(
     html.push('>');
 
     let tag_var = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     // var text = $.child(TAG[, true]);
     // The `true` flag is emitted when the body has no raw Text nodes —
@@ -11881,7 +11881,7 @@ fn emit_single_element_with_folded_prefix_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -12089,7 +12089,7 @@ fn emit_single_dynamic_element_program(
 
     // Build function body.
     let tag_var = sanitize_name(&el.name);
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     // Legacy props prelude: `$.push($$props, false); let X = $.prop($$props, 'X', N [, INIT]);`
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
@@ -12122,7 +12122,7 @@ fn emit_single_dynamic_element_program(
         let exports_obj = build_legacy_exports_object(&script.legacy_export_props);
         func_body.push(t::var("$$exports", exports_obj));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     if body_has_expression {
         func_body.push(t::var(
@@ -12246,7 +12246,7 @@ fn emit_single_dynamic_element_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(t::var(
         "root",
         t::call(
@@ -12377,8 +12377,8 @@ fn emit_single_async_if_program(
         ],
     ));
 
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -12406,7 +12406,7 @@ fn emit_single_async_if_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -12484,7 +12484,7 @@ fn emit_async_const_chain_program(
         ),
     );
 
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if needs_push_pop {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -12498,7 +12498,7 @@ fn emit_async_const_chain_program(
         )));
     }
     // Script body already contains async setup.
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
 
     func_body.push(t::var(
         "fragment",
@@ -12610,7 +12610,7 @@ fn emit_async_const_chain_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
     Some(t::program(prog))
@@ -13135,8 +13135,8 @@ fn emit_const_async_if_program(
     }));
 
     // Build the function body.
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -13175,7 +13175,7 @@ fn emit_const_async_if_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
     Some(t::program(prog))
@@ -13268,10 +13268,10 @@ fn emit_async_if_chain_program(
         ),
     );
 
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     // `script.body` already contains the async setup statements when
     // `async_info.is_some()` (set by `analyze_script`).
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::id("root"), Vec::new()),
@@ -13332,7 +13332,7 @@ fn emit_async_if_chain_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
     Some(t::program(prog))
@@ -13725,8 +13725,8 @@ fn emit_select_rich_content_program(
     // arrows get `fragment_1`, `fragment_2`, ... — matches upstream.
     let _ = ctx.next_named("fragment");
     let mut root_html = String::new();
-    let mut func_body_stmts: Vec<Statement> = Vec::new();
-    func_body_stmts.extend(script.body.clone());
+    let mut func_body_stmts: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body_stmts.extend(script.body.iter().cloned());
     func_body_stmts.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
 
     let mut prev_select: Option<String> = None;
@@ -13808,7 +13808,7 @@ fn emit_select_rich_content_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.extend(snippet_consts);
     prog.extend(ctx.module_decls.clone());
     prog.push(root_decl);
@@ -16358,7 +16358,7 @@ fn emit_deep_static_walker_program(
     }
     // Splice script body before the template body, plus legacy push/init/pop
     // wrap when there are legacy mutable bindings or export-let props.
-    let mut func_body: Vec<Statement> = Vec::new();
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "push"),
@@ -16393,7 +16393,7 @@ fn emit_deep_static_walker_program(
             build_legacy_exports_object(&script.legacy_export_props),
         ));
     }
-    func_body.extend(script.body.clone());
+    func_body.extend(script.body.iter().cloned());
     // `$.init()` is emitted only when the component holds legacy mutable
     // bindings (mutable_source) — legacy export props alone don't need it.
     if has_legacy_mutable {
@@ -16425,7 +16425,7 @@ fn emit_deep_static_walker_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
     Some(t::program(prog))
@@ -18234,8 +18234,8 @@ fn emit_single_async_each_program(
         ],
     ));
 
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -18263,7 +18263,7 @@ fn emit_single_async_each_program(
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     prog.push(t::import_side_effect("svelte/internal/flags/async"));
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -18364,8 +18364,8 @@ fn emit_single_svelte_element_program(
         }));
         element_args.push(render_arrow);
     }
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -18398,7 +18398,7 @@ fn emit_single_svelte_element_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.push(export);
     Some(t::program(prog))
 }
@@ -18549,8 +18549,8 @@ fn emit_single_each_preserve_whitespace_program(
     ));
 
     // Function body.
-    let mut body_stmts: Vec<Statement> = Vec::new();
-    body_stmts.extend(script.body.clone());
+    let mut body_stmts: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    body_stmts.extend(script.body.iter().cloned());
     body_stmts.push(t::stmt(t::call(t::member_id(t::id_dollar(), "next"), vec![])));
     body_stmts.push(t::var("fragment", t::call(t::id("root"), vec![])));
     body_stmts.push(t::var(
@@ -18657,13 +18657,13 @@ fn emit_single_each_preserve_whitespace_program(
     let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, body_stmts);
 
-    let mut prog: Vec<Statement> = Vec::new();
+    let mut prog: Vec<Statement> = Vec::with_capacity(script.imports.len() + 16);
     prog.push(t::import_side_effect("svelte/internal/disclose-version"));
     if script.emit_legacy_flag {
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.extend(hoisted);
     prog.push(export);
     Some(t::program(prog))
@@ -18988,8 +18988,8 @@ fn emit_single_each_program(
     }));
 
     // Build top-level function body.
-    let mut func_body: Vec<Statement> = Vec::new();
-    func_body.extend(script.body.clone());
+    let mut func_body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
+    func_body.extend(script.body.iter().cloned());
     func_body.push(t::var(
         "fragment",
         t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
@@ -19081,7 +19081,7 @@ fn emit_single_each_program(
         prog.push(t::import_side_effect("svelte/internal/flags/legacy"));
     }
     prog.push(t::import_namespace("$", "svelte/internal/client"));
-    prog.extend(script.imports.clone());
+    prog.extend(script.imports.iter().cloned());
     prog.extend(hoisted);
     prog.push(export);
     if !delegated_events.is_empty() {

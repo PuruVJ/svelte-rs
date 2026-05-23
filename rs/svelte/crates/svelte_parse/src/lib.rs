@@ -33,7 +33,7 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
     let mut parser = Parser::new(source, loose);
 
     let fragment_start = parser.index as u32;
-    let mut nodes: Vec<FragmentChild> = Vec::new();
+    let mut nodes: Vec<FragmentChild> = Vec::with_capacity(32);
 
     while parser.index < parser.template.len() {
         if parser.match_str("<") {
