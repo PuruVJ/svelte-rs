@@ -36,7 +36,7 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
     if root.css.is_some() {
         return None;
     }
-    let (root_var_name, html, multi_root_count) = static_root(&root.fragment)?;
+    let (root_var_name, html, multi_root_count) = static_root_info(&root.fragment)?;
     let is_multi_root = multi_root_count > 1;
 
     let import_disclose = t::import_side_effect("svelte/internal/disclose-version");
@@ -89,7 +89,7 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
 /// Returns `(var_name, html, top_count)` for a fully-static fragment.
 /// `var_name` is the tag name for single-root templates, `"fragment"` for
 /// multi-root. `top_count` is the number of top-level element-like roots.
-fn static_root(fragment: &Fragment) -> Option<(String, String, usize)> {
+pub(crate) fn static_root_info(fragment: &Fragment) -> Option<(String, String, usize)> {
     let non_ws: Vec<&FragmentChild> = fragment
         .nodes
         .iter()

@@ -50,6 +50,7 @@ pub fn compile(
     options: CompileOptions,
 ) -> Result<CompileResult, CompileDiagnostic> {
     let mut root = svelte_parse::parse(source, false)?;
+    let compile_bump = svelte_transform_shared::compile_bump::CompileBump::new();
     svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
     // The pipeline is typed end-to-end: parse -> typed transform -> typed
     // print. If no typed transform can handle the input shape, we surface
@@ -127,6 +128,19 @@ pub fn compile(
             // before pattern matching so the walker sees constants.
             svelte_transform_client::walker_fold_in_fragment(&mut root.fragment);
             let use_tree = matches!(options.fragments, FragmentsStrategy::Tree);
+            // Fully-static: emit JS directly (no Program, no print_typed).
+            if !use_tree {
+                if let Some(js) = svelte_transform_client::try_emit_fully_static_client_js(
+                    &root,
+                    component_name,
+                    &compile_bump,
+                ) {
+                    return Ok(CompileResult {
+                        js,
+                        warnings: Vec::new(),
+                    });
+                }
+            }
             // In tree mode, skip typed_client (static-only $.from_html path)
             // and route directly to the walker which knows the tree shape.
             let fast = if use_tree {
@@ -159,6 +173,18 @@ pub fn compile(
             }
         }
     };
+
+    if matches!(
+        options.module.generate,
+        Some(Generate::Client) | None
+    ) {
+        if let Some(js) = svelte_transform_client::try_emit_client_program_direct(&typed) {
+            return Ok(CompileResult {
+                js,
+                warnings: Vec::new(),
+            });
+        }
+    }
 
     let mut typed_opts = svelte_codegen_js::TypedPrintOptions::default();
     typed_opts.comments = comments

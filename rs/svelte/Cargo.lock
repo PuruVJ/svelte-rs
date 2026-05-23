@@ -1695,6 +1695,7 @@ dependencies = [
  "svelte_print",
  "svelte_transform_client",
  "svelte_transform_server",
+ "svelte_transform_shared",
 ]
 
 [[package]]
@@ -1829,6 +1830,8 @@ dependencies = [
 name = "svelte_transform_shared"
 version = "0.0.0"
 dependencies = [
+ "bumpalo",
+ "svelte_ast",
  "svelte_js_ast",
 ]
 

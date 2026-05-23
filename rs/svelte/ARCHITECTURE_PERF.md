@@ -17,6 +17,16 @@
 
 Client and server transforms read these flags before re-walking subtrees.
 
+## Direct codegen (skip `print_typed`)
+
+`compile()` tries, in order:
+
+1. **`try_emit_fully_static_client_js`** — static-only templates; no `Program` allocation.
+2. Transform → **`try_emit_client_program_direct`** — sparse / slab `Program` shapes.
+3. Fallback: `print_typed`.
+
+Scratch buffers use **`CompileBump`** (`svelte_transform_shared::compile_bump`) per compile call.
+
 ## Entry order (client walker)
 
 1. `analyze_script`

@@ -13,3 +13,4 @@ svelte_transform_shared = { workspace = true }
 
 [dev-dependencies]
 svelte_parse = { workspace = true }
+svelte_transform_shared = { workspace = true }
