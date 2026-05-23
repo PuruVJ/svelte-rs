@@ -284,6 +284,78 @@ impl MagicString {
         self
     }
 
+    /// Move the chunks covering source range `[start, end)` so they appear
+    /// immediately before the chunk starting at `index`. Mirrors
+    /// `MagicString.move(start, end, index)`.
+    pub fn move_range(&mut self, start: usize, end: usize, index: usize) -> &mut Self {
+        let start = start + self.offset;
+        let end = end + self.offset;
+        let index = index + self.offset;
+        if index >= start && index <= end {
+            panic!("Cannot move a selection inside itself");
+        }
+        if start == end {
+            return self;
+        }
+        self._split(start);
+        self._split(end);
+        self._split(index);
+
+        let first = match self.by_start.get(&start).copied() {
+            Some(id) => id,
+            None => return self,
+        };
+        let last = match self.by_end.get(&end).copied() {
+            Some(id) => id,
+            None => return self,
+        };
+
+        let old_left = self.chunks[first].previous;
+        let old_right = self.chunks[last].next;
+
+        let new_right = self.by_start.get(&index).copied();
+        if new_right.is_none() && last == self.last_chunk {
+            return self;
+        }
+        let new_left = match new_right {
+            Some(nr) => self.chunks[nr].previous,
+            None => Some(self.last_chunk),
+        };
+
+        if let Some(ol) = old_left {
+            self.chunks[ol].next = old_right;
+        }
+        if let Some(or) = old_right {
+            self.chunks[or].previous = old_left;
+        }
+        if let Some(nl) = new_left {
+            self.chunks[nl].next = Some(first);
+        }
+        if let Some(nr) = new_right {
+            self.chunks[nr].previous = Some(last);
+        }
+        if self.chunks[first].previous.is_none() {
+            // first was firstChunk — now first's old next becomes firstChunk
+            self.first_chunk = old_right.unwrap_or(first);
+        }
+        if self.chunks[last].next.is_none() {
+            // last was lastChunk — its predecessor becomes lastChunk
+            self.last_chunk = old_left.unwrap_or(last);
+            self.chunks[self.last_chunk].next = None;
+        }
+
+        self.chunks[first].previous = new_left;
+        self.chunks[last].next = new_right;
+
+        if new_left.is_none() {
+            self.first_chunk = first;
+        }
+        if new_right.is_none() {
+            self.last_chunk = last;
+        }
+        self
+    }
+
     /// Remove `start..end`. Intro / outro on affected chunks are cleared.
     /// Mirrors `MagicString.remove`.
     pub fn remove(&mut self, start: usize, end: usize) -> &mut Self {

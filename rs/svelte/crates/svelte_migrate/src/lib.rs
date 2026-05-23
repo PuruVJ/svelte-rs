@@ -118,7 +118,6 @@ fn run_pipeline(
     migrate_svelte_self_no_filename(source, &mut str, &parsed.fragment, opts.filename.as_deref());
     migrate_svelte_self_with_filename(source, &mut str, &parsed, opts.filename.as_deref());
     migrate_svelte_element_static_this(source, &mut str, &parsed.fragment);
-    migrate_svelte_component(source, &mut str, &parsed.fragment);
     migrate_invalid_named_slots(source, &mut str, &parsed.fragment);
     migrate_simple_on_events(source, &mut str, &parsed.fragment);
     // Gather slot info early so we can do the `$$slots.X` → `X` global
@@ -126,6 +125,16 @@ fn run_pipeline(
     // updates that would otherwise clobber when MagicString splits chunks).
     let slot_info = gather_slot_info(source, &parsed);
     apply_slot_template_edits(source, &mut str, &parsed, &slot_info);
+    // Collect top-level names in scope (script-level declarations) so the
+    // `<svelte:component>` alias generator can avoid clashes.
+    let mut scope_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(instance) = &parsed.instance {
+        for stmt in &instance.content.body {
+            collect_top_level_decl_names(stmt, &mut scope_names);
+        }
+    }
+    let (svelte_component_derived, sv_component_removed_ranges) =
+        migrate_svelte_component(source, &mut str, &parsed, &scope_names);
     // Run derivations first so we know which `$:` statements will become
     // `let X = $derived(...)` (or `$state(LIT)`). State migration then skips
     // bindings already consumed by the derivation pass.
@@ -140,8 +149,10 @@ fn run_pipeline(
         &slot_info,
         opts.use_ts,
         opts.filename.as_deref(),
+        &sv_component_removed_ranges,
     );
     migrate_export_specifier_props(source, &mut str, &parsed);
+    emit_svelte_component_derived(source, &mut str, &parsed, &svelte_component_derived);
     migrate_effects(source, &mut str, &parsed, &derived_labeled_starts);
     migrate_comments(source, &mut str, &parsed);
     migrate_block_whitespace(source, &mut str, &parsed.fragment);
@@ -2101,94 +2112,342 @@ fn migrate_svelte_self_with_filename(
 /// `<svelte:component this={X}>...</svelte:component>` → `<X>...</X>` when X
 /// is a valid component-name identifier or MemberExpression. Otherwise leave
 /// alone (we don't yet generate `{@const SvelteComponentN = X}` derivations).
-fn migrate_svelte_component(source: &str, str: &mut MagicString, frag: &Fragment) {
-    walk_fragment(frag, &mut |child| {
-        if let FragmentChild::SvelteComponent(c) = child {
-            let (s, e) = expr_span(&c.expression);
-            let expr_text = source[s as usize..e as usize].to_string();
-            // Validate component-name regex: must start with uppercase or be a
-            // MemberExpression / dotted path with valid parts.
-            if !is_valid_component_name(&expr_text) {
-                return;
+/// Path element types we care about for `<svelte:component>` aliasing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SvCompPathKind {
+    EachBlock,
+    AwaitBlock,
+    IfBlock,
+    SnippetBlock,
+    Component,
+    SvelteComponent,
+    /// An element-with-start node that's NOT a container (RegularElement,
+    /// SvelteElement, SvelteFragment, SlotElement, etc.). We track these so
+    /// we can find the "first child of container along the path".
+    OtherWithStart,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SvCompPath {
+    kind: SvCompPathKind,
+    start: usize,
+}
+
+/// Rewrite all `<svelte:component this={EXPR}>` occurrences:
+///   - If EXPR is a valid component name (`Identifier`/`MemberExpression`
+///     matching `regex_valid_component_name`): no alias, swap tag to `EXPR`.
+///   - Else: generate a unique `SvelteComponent_N` and either:
+///     * Emit `{@const ALIAS = EXPR}` at the start of the closest containing
+///       block-like ancestor (EachBlock/AwaitBlock/IfBlock/SnippetBlock/
+///       Component/SvelteComponent), OR
+///     * Record into `derived_components` so the script pass emits
+///       `const ALIAS = $derived(EXPR);` (returned to caller).
+///
+/// Returns a `Vec<(alias, expr_text)>` for the no-container-parent (derived)
+/// case so the caller can emit them in the script body.
+fn migrate_svelte_component(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    scope_names: &std::collections::HashSet<String>,
+) -> (Vec<(String, String)>, Vec<(usize, usize)>) {
+    let mut counter: usize = 0;
+    let mut derived_components: std::collections::HashMap<String, String> =
+        Default::default(); // expr_text → alias
+    let mut derived_emit: Vec<(String, String)> = Vec::new(); // (alias, expr_text) in insertion order
+    let mut removed_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut used_names: std::collections::HashSet<String> = scope_names.clone();
+
+    // Compute a fresh `SvelteComponent_N` name not yet used, incrementing the
+    // counter once per call (matching upstream's `state.scope.generate`).
+    let mut generate = |counter: &mut usize, used: &mut std::collections::HashSet<String>| -> String {
+        loop {
+            let name = if *counter == 0 {
+                "SvelteComponent".to_string()
+            } else {
+                format!("SvelteComponent_{}", counter)
+            };
+            *counter += 1;
+            if !used.contains(&name) {
+                used.insert(name.clone());
+                return name;
             }
-            // Rewrite the open tag: replace `svelte:component` with `expr`.
-            // Open tag spans from `<` + name → at position c.start + 1 onwards.
-            let bytes = source.as_bytes();
-            let name = b"svelte:component";
-            let open_name_start = c.start as usize + 1;
-            if open_name_start + name.len() > bytes.len()
-                || &bytes[open_name_start..open_name_start + name.len()] != name
-            {
-                return;
+        }
+    };
+
+    // Path-aware walk of the fragment tree. We track only relevant ancestors.
+    fn visit<F: FnMut(&svelte_ast::SvelteComponent, &[SvCompPath])>(
+        frag: &Fragment,
+        path: &mut Vec<SvCompPath>,
+        callback: &mut F,
+    ) {
+        for child in &frag.nodes {
+            let kind: Option<SvCompPathKind> = match child {
+                FragmentChild::EachBlock(_) => Some(SvCompPathKind::EachBlock),
+                FragmentChild::AwaitBlock(_) => Some(SvCompPathKind::AwaitBlock),
+                FragmentChild::IfBlock(_) => Some(SvCompPathKind::IfBlock),
+                FragmentChild::SnippetBlock(_) => Some(SvCompPathKind::SnippetBlock),
+                FragmentChild::Component(_) => Some(SvCompPathKind::Component),
+                FragmentChild::SvelteComponent(_) => Some(SvCompPathKind::SvelteComponent),
+                FragmentChild::RegularElement(_)
+                | FragmentChild::SvelteElement(_)
+                | FragmentChild::SvelteFragment(_)
+                | FragmentChild::SlotElement(_)
+                | FragmentChild::SvelteBody(_)
+                | FragmentChild::SvelteHead(_)
+                | FragmentChild::SvelteBoundary(_)
+                | FragmentChild::SvelteDocument(_)
+                | FragmentChild::SvelteSelf(_)
+                | FragmentChild::SvelteWindow(_)
+                | FragmentChild::TitleElement(_)
+                | FragmentChild::KeyBlock(_) => Some(SvCompPathKind::OtherWithStart),
+                _ => None,
+            };
+            let start = match child {
+                FragmentChild::EachBlock(b) => b.start as usize,
+                FragmentChild::AwaitBlock(b) => b.start as usize,
+                FragmentChild::IfBlock(b) => b.start as usize,
+                FragmentChild::SnippetBlock(b) => b.start as usize,
+                FragmentChild::Component(c) => c.start as usize,
+                FragmentChild::SvelteComponent(c) => c.start as usize,
+                FragmentChild::RegularElement(e) => e.start as usize,
+                FragmentChild::SvelteElement(e) => e.start as usize,
+                FragmentChild::SvelteFragment(e) => e.start as usize,
+                FragmentChild::SlotElement(e) => e.start as usize,
+                FragmentChild::SvelteBody(e)
+                | FragmentChild::SvelteHead(e)
+                | FragmentChild::SvelteBoundary(e)
+                | FragmentChild::SvelteDocument(e)
+                | FragmentChild::SvelteSelf(e)
+                | FragmentChild::SvelteWindow(e) => e.start as usize,
+                FragmentChild::TitleElement(e) => e.start as usize,
+                FragmentChild::KeyBlock(b) => b.start as usize,
+                _ => 0,
+            };
+            if let Some(k) = kind {
+                path.push(SvCompPath { kind: k, start });
             }
-            str.update(
-                open_name_start,
-                open_name_start + name.len(),
-                &expr_text,
-            );
-            // Rewrite the close tag if present: `</svelte:component>`.
-            let close_seq = b"</svelte:component";
-            let mut k = c.end as usize;
-            // Look for close tag before c.end.
-            if k >= close_seq.len() + 1 {
-                let close_pos = k - close_seq.len() - 1;
-                // Verify.
-                if &bytes[close_pos..close_pos + close_seq.len()] == close_seq
-                    && bytes.get(close_pos + close_seq.len()).copied() == Some(b'>')
-                {
-                    str.update(
-                        close_pos + 2,
-                        close_pos + 2 + b"svelte:component".len(),
-                        &expr_text,
-                    );
+
+            if let FragmentChild::SvelteComponent(c) = child {
+                callback(c, path);
+            }
+
+            // Recurse.
+            match child {
+                FragmentChild::RegularElement(e) => visit(&e.fragment, path, callback),
+                FragmentChild::SvelteElement(e) => visit(&e.fragment, path, callback),
+                FragmentChild::Component(c) => visit(&c.fragment, path, callback),
+                FragmentChild::SvelteComponent(c) => visit(&c.fragment, path, callback),
+                FragmentChild::SvelteFragment(e) => visit(&e.fragment, path, callback),
+                FragmentChild::SlotElement(e) => visit(&e.fragment, path, callback),
+                FragmentChild::SvelteBody(e)
+                | FragmentChild::SvelteBoundary(e)
+                | FragmentChild::SvelteDocument(e)
+                | FragmentChild::SvelteHead(e)
+                | FragmentChild::SvelteSelf(e)
+                | FragmentChild::SvelteWindow(e) => visit(&e.fragment, path, callback),
+                FragmentChild::SvelteOptions(_) => {}
+                FragmentChild::TitleElement(e) => visit(&e.fragment, path, callback),
+                FragmentChild::IfBlock(b) => {
+                    visit(&b.consequent, path, callback);
+                    if let Some(alt) = &b.alternate {
+                        visit(alt, path, callback);
+                    }
                 }
+                FragmentChild::EachBlock(b) => {
+                    visit(&b.body, path, callback);
+                    if let Some(fb) = &b.fallback {
+                        visit(fb, path, callback);
+                    }
+                }
+                FragmentChild::AwaitBlock(b) => {
+                    if let Some(p) = &b.pending {
+                        visit(p, path, callback);
+                    }
+                    if let Some(t) = &b.then {
+                        visit(t, path, callback);
+                    }
+                    if let Some(cc) = &b.catch_ {
+                        visit(cc, path, callback);
+                    }
+                }
+                FragmentChild::SnippetBlock(b) => visit(&b.body, path, callback),
+                FragmentChild::KeyBlock(b) => visit(&b.fragment, path, callback),
+                _ => {}
             }
-            // Remove `this={X}` attribute. Find `this` literal text before the
-            // expression position.
-            // Look for `this` literal preceded by whitespace, between
-            // `<svelte:component` and the expression.
-            let this_search_start = c.start as usize + 1 + name.len();
-            let mut p = s as usize;
-            // Walk backwards from expression's `{` to find `=`, then `this`.
-            // Scan backward from `s` for `this`.
-            let mut found_this = None;
-            let mut scan = s as usize;
-            while scan > this_search_start {
-                scan -= 1;
-                if scan + 4 <= bytes.len() && &bytes[scan..scan + 4] == b"this" {
-                    let before_ok = scan == 0
-                        || bytes[scan - 1].is_ascii_whitespace();
-                    let after = &bytes[scan + 4..];
-                    let after_ok = after.iter().take_while(|c| c.is_ascii_whitespace() || **c == b'=' || **c == b'{').next().is_some();
-                    if before_ok && after_ok {
-                        found_this = Some(scan);
+
+            if kind.is_some() {
+                path.pop();
+            }
+        }
+    }
+
+    let bytes = source.as_bytes();
+    let mut occurrences: Vec<(u32, u32, u32, u32, String, Vec<SvCompPath>)> = Vec::new();
+    let mut path_stack: Vec<SvCompPath> = Vec::new();
+    let uses_props_global = source_uses_dollar_dollar(source, "$$props");
+    visit(&root.fragment, &mut path_stack, &mut |c, path| {
+        let (s, e) = expr_span(&c.expression);
+        let raw = &source[s as usize..e as usize];
+        // Rewrite `$$restProps` → `rest`, `$$props` → `props`, etc.
+        let expr_text = rewrite_dollar_dollar_refs_ctx(raw, uses_props_global);
+        occurrences.push((c.start, c.end, s, e, expr_text, path.to_vec()));
+    });
+
+    for (c_start, c_end, expr_s, expr_e, expr_text, path) in occurrences {
+        let is_ident_or_member = matches!(
+            // Strip Paren wrapping if any (uncommon for `this={...}`).
+            // No need to recurse; just check the top type.
+            (), _ if true
+        );
+        let _ = is_ident_or_member;
+        // Determine if this expression needs aliasing.
+        let needs_alias = !is_valid_component_name(&expr_text);
+
+        let final_name = if needs_alias {
+            // Generate a fresh alias.
+            let mut alias = generate(&mut counter, &mut used_names);
+            // Find closest container ancestor in path.
+            let mut found_container_pos: Option<usize> = None;
+            // path is the ancestor chain (NOT including this SvelteComponent
+            // itself, since visit pushed onto path before calling callback
+            // but we treat path WITHOUT the leaf SvelteComponent).
+            // Actually we DID push the SvelteComponent onto the path BEFORE
+            // calling callback. So path.last() = this SvelteComponent. We
+            // want ancestors EXCLUDING it.
+            if path.len() >= 1 {
+                let p = &path[..path.len() - 1];
+                for i in (0..p.len()).rev() {
+                    let part = &p[i];
+                    if matches!(
+                        part.kind,
+                        SvCompPathKind::EachBlock
+                            | SvCompPathKind::AwaitBlock
+                            | SvCompPathKind::IfBlock
+                            | SvCompPathKind::SnippetBlock
+                            | SvCompPathKind::Component
+                            | SvCompPathKind::SvelteComponent
+                    ) {
+                        // Position = first descendant with `start` after
+                        // container. If container is the immediate parent,
+                        // position = node.start (this SvelteComponent's start).
+                        let position = if i == p.len() - 1 {
+                            c_start as usize
+                        } else {
+                            // Take the next path part (which is by definition
+                            // an OtherWithStart or container — both have
+                            // `start`).
+                            p[i + 1].start
+                        };
+                        found_container_pos = Some(position);
                         break;
                     }
                 }
             }
-            let _ = p;
-            if let Some(this_pos) = found_this {
-                // Eat leading whitespace.
-                let mut start = this_pos;
-                while start > 0 && (bytes[start - 1] == b' ' || bytes[start - 1] == b'\t') {
-                    start -= 1;
+
+            if let Some(position) = found_container_pos {
+                // Compute indent at the insertion position.
+                let mut p_idx = position;
+                while p_idx > 0 && bytes[p_idx - 1] != b'\n' {
+                    p_idx -= 1;
                 }
-                // Find the closing `}` after the expression.
-                let mut end = e as usize;
-                while end < bytes.len() && bytes[end] != b'}' {
-                    end += 1;
+                let indent_str = &source[p_idx..position];
+                // Mirror upstream: `appendRight(position, ...)`. This writes
+                // to the RIGHT chunk's intro at `position`, landing AFTER
+                // any preceding `{#snippet ...}` snippet wrapper (applied via
+                // `prepend_left` to the LEFT chunk's outro).
+                str.append_right(
+                    position,
+                    format!("{{@const {} = {}}}\n{}", alias, expr_text, indent_str),
+                );
+            } else {
+                // No container parent — derived in script. Check map.
+                if let Some(existing) = derived_components.get(&expr_text) {
+                    alias = existing.clone();
+                } else {
+                    derived_components.insert(expr_text.clone(), alias.clone());
+                    derived_emit.push((alias.clone(), expr_text.clone()));
                 }
-                if end < bytes.len() {
-                    end += 1;
-                }
-                str.remove(start, end);
+            }
+            alias
+        } else {
+            expr_text.clone()
+        };
+
+        // Rewrite the open tag: `<svelte:component` → `<NAME`.
+        let name = b"svelte:component";
+        let open_name_start = c_start as usize + 1;
+        if open_name_start + name.len() <= bytes.len()
+            && &bytes[open_name_start..open_name_start + name.len()] == name
+        {
+            str.update(open_name_start, open_name_start + name.len(), &final_name);
+        }
+        // Rewrite close tag if present: `</svelte:component>`.
+        let close_seq = b"</svelte:component";
+        let k = c_end as usize;
+        if k >= close_seq.len() + 1 {
+            let close_pos = k - close_seq.len() - 1;
+            if close_pos < bytes.len()
+                && close_pos + close_seq.len() < bytes.len()
+                && &bytes[close_pos..close_pos + close_seq.len()] == close_seq
+                && bytes.get(close_pos + close_seq.len()).copied() == Some(b'>')
+            {
+                str.update(
+                    close_pos + 2,
+                    close_pos + 2 + b"svelte:component".len(),
+                    &final_name,
+                );
             }
         }
-    });
+        // Remove `this={EXPR}` attribute. Scan backward from expr_s for
+        // `this`, then eat leading whitespace and trailing `}`.
+        let this_search_start = c_start as usize + 1 + name.len();
+        let mut scan = expr_s as usize;
+        let mut found_this: Option<usize> = None;
+        while scan > this_search_start {
+            scan -= 1;
+            if scan + 4 <= bytes.len() && &bytes[scan..scan + 4] == b"this" {
+                let before_ok = scan == 0 || bytes[scan - 1].is_ascii_whitespace();
+                let after = &bytes[scan + 4..];
+                let after_ok = after
+                    .iter()
+                    .take_while(|c| c.is_ascii_whitespace() || **c == b'=' || **c == b'{')
+                    .next()
+                    .is_some();
+                if before_ok && after_ok {
+                    found_this = Some(scan);
+                    break;
+                }
+            }
+        }
+        if let Some(this_pos) = found_this {
+            let mut start = this_pos;
+            // Mirror upstream's `while (!str.original.charAt(this_pos -
+            // 1).trim()) this_pos--;` — eat ANY whitespace backwards (space,
+            // tab, newline, CR).
+            while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+                start -= 1;
+            }
+            let mut end = expr_e as usize;
+            while end < bytes.len() && bytes[end] != b'}' {
+                end += 1;
+            }
+            if end < bytes.len() {
+                end += 1;
+            }
+            str.remove(start, end);
+            removed_ranges.push((start, end));
+        }
+    }
+
+    (derived_emit, removed_ranges)
 }
 
-/// Match the regex `regex_valid_component_name` upstream: starts with
-/// `[A-Z]` OR `_`/`$` and contains valid identifier chars + dots.
+/// Match upstream's `regex_valid_component_name`:
+///   `/^(?:\p{Lu}[$‌‍\p{ID_Continue}.]*|\p{ID_Start}[id_continue]*(?:\.[id_continue]+)+)$/u`
+/// Two alternatives:
+///   (1) Uppercase-letter start, then ID_Continue / `.` / `$` / ZWJ.
+///   (2) ID_Start start, then ID_Continue, then ONE OR MORE dot-segments.
 fn is_valid_component_name(s: &str) -> bool {
     let s = s.trim();
     if s.is_empty() {
@@ -2196,20 +2455,100 @@ fn is_valid_component_name(s: &str) -> bool {
     }
     let bytes = s.as_bytes();
     let first = bytes[0];
-    if !(first.is_ascii_uppercase() || first == b'_' || first == b'$') {
-        // Member expressions like `Math.random` could also be valid; allow if
-        // the first segment is uppercase/letter.
-        if !first.is_ascii_alphabetic() {
-            return false;
+    // Alt 1: uppercase start.
+    if first.is_ascii_uppercase() {
+        for &c in &bytes[1..] {
+            if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.') {
+                return false;
+            }
         }
+        return true;
     }
-    // Allow letters, digits, `_`, `$`, `.`.
+    // Alt 2: ID_Start (any letter/_/$) + has at least one `.` segment.
+    if !(first.is_ascii_alphabetic() || first == b'_' || first == b'$') {
+        return false;
+    }
+    if !s.contains('.') {
+        return false;
+    }
     for &c in bytes {
         if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c == b'.') {
             return false;
         }
     }
+    // Reject leading-dot / trailing-dot / `..` runs.
+    if s.starts_with('.') || s.ends_with('.') || s.contains("..") {
+        return false;
+    }
+    // Each dot-segment must start with ID_Start (we treat ASCII alphabetic + `_`/`$`).
+    let mut segs = s.split('.');
+    let first_seg = segs.next().unwrap_or("");
+    if first_seg.is_empty() {
+        return false;
+    }
+    for seg in segs {
+        if seg.is_empty() {
+            return false;
+        }
+        let first = seg.as_bytes()[0];
+        if !(first.is_ascii_alphabetic() || first == b'_' || first == b'$') {
+            return false;
+        }
+    }
     true
+}
+
+/// For each `<svelte:component>` whose expression has NO containing
+/// block-like ancestor, emit `\n${indent}const ALIAS = $derived(EXPR);` at
+/// the end of the script body. Mirrors upstream's `state.derived_components`
+/// → `${name} = $derived(${expr})` injection.
+fn emit_svelte_component_derived(
+    source: &str,
+    str: &mut MagicString,
+    root: &Root,
+    derived: &[(String, String)],
+) {
+    if derived.is_empty() {
+        return;
+    }
+    let Some(instance) = &root.instance else {
+        return;
+    };
+    // Insertion point: just before the closing `</script>`. We use the
+    // position of `</script>` itself (scan backward from `instance.end`).
+    let bytes = source.as_bytes();
+    let script_end_pos = instance.end as usize;
+    let mut p = script_end_pos;
+    let close_tag = b"</script>";
+    let mut close_start: Option<usize> = None;
+    if p >= close_tag.len() {
+        p -= close_tag.len();
+        if &bytes[p..p + close_tag.len()] == close_tag {
+            close_start = Some(p);
+        }
+    }
+    // Strip back to position right after the last `\n` before `</script>`.
+    let insertion = if let Some(cs) = close_start {
+        let mut q = cs;
+        while q > 0 && (bytes[q - 1] == b'\t' || bytes[q - 1] == b' ') {
+            q -= 1;
+        }
+        q
+    } else {
+        instance.content.span.end as usize
+    };
+    // Use the script's indent.
+    let indent = guess_indent_from_source(source);
+    let mut buf = String::new();
+    for (i, (alias, expr)) in derived.iter().enumerate() {
+        if i == 0 {
+            buf.push_str(&format!("\n{}const {} = $derived({});", indent, alias, expr));
+        } else {
+            buf.push_str(&format!("\n{}const {} = $derived({});", indent, alias, expr));
+        }
+    }
+    buf.push('\n');
+    str.append_left(insertion, buf);
 }
 
 fn migrate_svelte_element_static_this(source: &str, str: &mut MagicString, frag: &Fragment) {
@@ -2730,6 +3069,13 @@ pub(crate) struct SlotInfo {
     pub props: Vec<SlotProp>,
     /// Whether the template uses `$$slots.X` references.
     pub uses_dollar_slots: bool,
+    /// Slot names that need a `_render`-suffixed derived alias because they
+    /// collide with a parent's `slot="X"` attribute or a `let:` ancestor.
+    /// Maps `X_render` → `X` (insertion-ordered for stable emit).
+    pub derived_conflicting_slots: Vec<(String, String)>,
+    /// Map slot element's source `start` position to the alias name to use
+    /// in the resulting `@render` expression (e.g. `label_render`).
+    pub aliased_slot_starts: std::collections::HashMap<usize, String>,
 }
 
 fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
@@ -2897,7 +3243,158 @@ fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
             eprintln!("FINAL: {} has_props={} needs_refine={}", p.name, p.has_props, p.needs_refine);
         }
     }
+    // Detect shadowed-forwarded-slot conflicts: when a `<slot name="X" />` has
+    // an ancestor (or self) with `slot="X"`, or when a default-slot has an
+    // ancestor with a `let:` directive. Each such slot gets a `_render` alias.
+    detect_conflicting_slots(&root.fragment, &mut info);
     info
+}
+
+/// Walk the fragment tree, tracking the ancestor chain. For each `<slot>`
+/// element, check if any ancestor (or self) has `slot="X"` matching the
+/// slot's `name`, OR if the slot is default and an ancestor has a `let:`
+/// directive. If so, add `X_render → X` to `derived_conflicting_slots`.
+fn detect_conflicting_slots(frag: &Fragment, info: &mut SlotInfo) {
+    fn ancestor_info(node: &FragmentChild) -> (Option<String>, bool) {
+        // Returns (slot_attr_value, has_let_directive) for the node.
+        let attrs: &Vec<ElementAttribute> = match node {
+            FragmentChild::RegularElement(e) => &e.attributes,
+            FragmentChild::SvelteElement(e) => &e.attributes,
+            FragmentChild::Component(c) => &c.attributes,
+            FragmentChild::SvelteComponent(c) => &c.attributes,
+            FragmentChild::SvelteFragment(e) => &e.attributes,
+            FragmentChild::SlotElement(e) => &e.attributes,
+            _ => return (None, false),
+        };
+        let mut slot_value: Option<String> = None;
+        let mut has_let = false;
+        for a in attrs {
+            match a {
+                ElementAttribute::Attribute(at) if at.name == "slot" => {
+                    if let Some(v) = attribute_static_string(&at.value) {
+                        slot_value = Some(v);
+                    }
+                }
+                ElementAttribute::LetDirective(_) => has_let = true,
+                _ => {}
+            }
+        }
+        (slot_value, has_let)
+    }
+
+    fn visit(
+        frag: &Fragment,
+        path_slot_attrs: &mut Vec<String>,
+        path_has_let: &mut Vec<bool>,
+        info: &mut SlotInfo,
+    ) {
+        for child in &frag.nodes {
+            let (slot_attr, has_let) = ancestor_info(child);
+            if let Some(s) = &slot_attr {
+                path_slot_attrs.push(s.clone());
+            }
+            path_has_let.push(has_let);
+            // Check if this is a <slot name="X" /> with collision.
+            if let FragmentChild::SlotElement(slot) = child {
+                let mut slot_name = String::from("default");
+                let mut self_slot_attr: Option<String> = None;
+                for a in &slot.attributes {
+                    if let ElementAttribute::Attribute(at) = a {
+                        if at.name == "name" {
+                            if let Some(v) = attribute_static_string(&at.value) {
+                                slot_name = v;
+                            }
+                        } else if at.name == "slot" {
+                            if let Some(v) = attribute_static_string(&at.value) {
+                                self_slot_attr = Some(v);
+                            }
+                        }
+                    }
+                }
+                let collides_via_slot_attr =
+                    path_slot_attrs.iter().any(|p| *p == slot_name)
+                        || self_slot_attr.as_deref() == Some(slot_name.as_str());
+                let local = if slot_name == "default" {
+                    "children".to_string()
+                } else {
+                    slot_name.clone()
+                };
+                let mut needs_alias = collides_via_slot_attr;
+                // Default-slot ancestor-let case.
+                if slot_name == "default" && path_has_let.iter().any(|b| *b) {
+                    needs_alias = true;
+                }
+                if needs_alias {
+                    let aliased = format!("{}_render", local);
+                    if !info
+                        .derived_conflicting_slots
+                        .iter()
+                        .any(|(a, _)| *a == aliased)
+                    {
+                        info.derived_conflicting_slots
+                            .push((aliased.clone(), local.clone()));
+                    }
+                    info.aliased_slot_starts
+                        .insert(slot.start as usize, aliased);
+                }
+            }
+            // Recurse into children fragments.
+            let inner: Option<&Fragment> = match child {
+                FragmentChild::RegularElement(e) => Some(&e.fragment),
+                FragmentChild::SvelteElement(e) => Some(&e.fragment),
+                FragmentChild::Component(c) => Some(&c.fragment),
+                FragmentChild::SvelteComponent(c) => Some(&c.fragment),
+                FragmentChild::SvelteFragment(e) => Some(&e.fragment),
+                FragmentChild::SvelteBody(e)
+                | FragmentChild::SvelteBoundary(e)
+                | FragmentChild::SvelteDocument(e)
+                | FragmentChild::SvelteHead(e)
+                | FragmentChild::SvelteOptions(e)
+                | FragmentChild::SvelteSelf(e)
+                | FragmentChild::SvelteWindow(e) => Some(&e.fragment),
+                FragmentChild::SlotElement(e) => Some(&e.fragment),
+                FragmentChild::TitleElement(e) => Some(&e.fragment),
+                FragmentChild::IfBlock(b) => {
+                    visit(&b.consequent, path_slot_attrs, path_has_let, info);
+                    if let Some(alt) = &b.alternate {
+                        visit(alt, path_slot_attrs, path_has_let, info);
+                    }
+                    None
+                }
+                FragmentChild::EachBlock(b) => {
+                    visit(&b.body, path_slot_attrs, path_has_let, info);
+                    if let Some(fallback) = &b.fallback {
+                        visit(fallback, path_slot_attrs, path_has_let, info);
+                    }
+                    None
+                }
+                FragmentChild::AwaitBlock(b) => {
+                    if let Some(p) = &b.pending {
+                        visit(p, path_slot_attrs, path_has_let, info);
+                    }
+                    if let Some(t) = &b.then {
+                        visit(t, path_slot_attrs, path_has_let, info);
+                    }
+                    if let Some(c) = &b.catch_ {
+                        visit(c, path_slot_attrs, path_has_let, info);
+                    }
+                    None
+                }
+                FragmentChild::SnippetBlock(b) => Some(&b.body),
+                FragmentChild::KeyBlock(b) => Some(&b.fragment),
+                _ => None,
+            };
+            if let Some(f) = inner {
+                visit(f, path_slot_attrs, path_has_let, info);
+            }
+            path_has_let.pop();
+            if slot_attr.is_some() {
+                path_slot_attrs.pop();
+            }
+        }
+    }
+
+    visit(frag, &mut Vec::new(), &mut Vec::new(), info);
 }
 
 /// Handle the "Component has let: directives" case in upstream's
@@ -2947,6 +3444,9 @@ fn apply_component_let_directive_wrap(
     }
     let mut inner_start: Option<usize> = None;
     let mut inner_end: Option<usize> = None;
+    // Nodes to move into the default-slot range (the "interleaved default
+    // text after named slot" case). Each tuple is (node_start, node_end).
+    let mut moves: Vec<(usize, usize)> = Vec::new();
     for n in &c_frag.nodes {
         let is_empty_text = matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty());
         let has_slot_attr = node_has_slot_attribute(n);
@@ -2961,8 +3461,9 @@ fn apply_component_let_directive_wrap(
                 inner_start = Some(node_start(n));
             } else if let Some(_) = inner_end {
                 // There was default content, then a named slot, now more
-                // default content — upstream moves it via str.move. Skip
-                // (the rare interleave case).
+                // default content — mirror upstream's `str.move(...)` which
+                // moves this node to `inner_end - 1`.
+                moves.push((node_start(n), node_end(n)));
             }
         }
     }
@@ -2975,6 +3476,19 @@ fn apply_component_let_directive_wrap(
         let last = &c_frag.nodes[c_frag.nodes.len() - 1];
         node_end(last)
     });
+    // Apply the "str.move" trick for interleaved default text after named
+    // slots. Mirrors upstream's `str.update(inner_end - 1, inner_end, '');
+    // str.prependLeft(inner_end - 1, original[inner_end - 1]);
+    // str.move(node.start, node.end, inner_end - 1);` sequence.
+    if !moves.is_empty() && inner_end > 0 {
+        let target_pos = inner_end - 1;
+        let target_char = bytes[target_pos] as char;
+        str.update(target_pos, inner_end, "");
+        str.prepend_left(target_pos, target_char.to_string());
+        for (ms, me) in moves.iter() {
+            str.move_range(*ms, *me, target_pos);
+        }
+    }
 
     let props_text = format!("{{ {} }}", let_pairs.join(", "));
     // Compute path indent: upstream uses `state.indent.repeat(path.length)`
@@ -2990,14 +3504,13 @@ fn apply_component_let_directive_wrap(
         format!("{{#snippet children({})}}\n{}", props_text, inner_indent),
     );
     // Indent every line in [inner_start, inner_end].
-    // The FIRST line of content: the line where inner_start lives. Its line
-    // start is BEFORE inner_start (the leading indent of the source line).
-    // Magic-string's indent prepends the indent AT inner_start itself when the
-    // last `\n` before inner_start fell in the exclusion. We replicate that by
-    // calling `append_left(inner_start, indent)` (i.e. before the content's
-    // first non-whitespace char). This is in addition to the prepend's own
-    // `inner_indent`.
-    str.append_left(inner_start, indent.clone());
+    // Special handling for the first line: only add an explicit indent when
+    // `inner_start` is mid-line (not at a `\n`). When `inner_start` is at
+    // `\n`, the next-line indent will be added by the loop below.
+    let first_is_newline = bytes.get(inner_start).copied() == Some(b'\n');
+    if !first_is_newline {
+        str.append_left(inner_start, indent.clone());
+    }
     let mut k = inner_start;
     while k < inner_end {
         if bytes[k] == b'\n' && k + 1 < inner_end {
@@ -3267,6 +3780,60 @@ fn apply_migrate_slot_usage(
             format!("{{ {} }}", let_pairs.join(", "))
         };
 
+        // Special case: snippet_name == "children" + non-svelte-fragment +
+        // has let directives → wrap the CHILDREN of the node (not the node
+        // itself) in `{#snippet children(props)}…{/snippet}`. Mirrors
+        // upstream's `migrate_slot_usage` line 1505 path.
+        if snippet_name == "children" && !is_svelte_fragment && !let_pairs.is_empty() {
+            if let Some(f) = c_frag {
+                if let Some(first) = f.nodes.first() {
+                    let inner_start = node_start(first);
+                    let last = &f.nodes[f.nodes.len() - 1];
+                    let inner_end = match last {
+                        FragmentChild::Text(t) => t.end as usize,
+                        FragmentChild::RegularElement(e) => e.end as usize,
+                        FragmentChild::Component(e) => e.end as usize,
+                        FragmentChild::SvelteComponent(e) => e.end as usize,
+                        FragmentChild::SvelteElement(e) => e.end as usize,
+                        FragmentChild::SvelteFragment(e) => e.end as usize,
+                        FragmentChild::SlotElement(e) => e.end as usize,
+                        FragmentChild::ExpressionTag(et) => et.end as usize,
+                        _ => (c_end - 1),
+                    };
+                    // Upstream uses `indent.repeat(path.length)` for the body
+                    // indent — our `depth` accounts for half of path.length
+                    // (Svelte's walker path counts both elements and their
+                    // Fragments). Use `depth * 2` to mirror.
+                    let body_indent = indent.repeat(depth * 2);
+                    let close_indent = indent.repeat(depth * 2 - 1);
+                    let outer_indent = indent.repeat(depth * 2 - 2);
+                    str.append_left(
+                        inner_start,
+                        format!(
+                            "{{#snippet {}({})}}\n{}",
+                            snippet_name, props_text, body_indent
+                        ),
+                    );
+                    // Indent every interior `\n`-led line by one more level.
+                    let body_bytes = source.as_bytes();
+                    let mut k = inner_start;
+                    while k < inner_end {
+                        if body_bytes[k] == b'\n' && k + 1 < inner_end {
+                            str.append_left(k + 1, indent.to_string());
+                        }
+                        k += 1;
+                    }
+                    // Insert `{/snippet}` BEFORE inner_end. Use close_indent
+                    // for `{/snippet}` and outer_indent before `</span>`.
+                    str.prepend_left(
+                        inner_end,
+                        format!("{}{{/snippet}}\n{}", close_indent, outer_indent),
+                    );
+                }
+            }
+            continue;
+        }
+
         if is_svelte_fragment {
             // Unwrap: remove the wrapper tags, keep content.
             if let Some(f) = c_frag {
@@ -3494,11 +4061,16 @@ fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, s
         }
         let _ = has_inner_slot_attr;
 
-        let local = if slot_name == "default" {
+        let raw_local = if slot_name == "default" {
             "children".to_string()
         } else {
             slot_name.clone()
         };
+        let local = slots
+            .aliased_slot_starts
+            .get(&(slot.start as usize))
+            .cloned()
+            .unwrap_or(raw_local);
         // Build the @render text.
         let render_args = if prop_pairs.is_empty() {
             String::new()
@@ -3682,7 +4254,15 @@ fn emit_props_script_no_instance(
     } else {
         format!("{}{}", indent, block)
     };
-    let full = format!("{}\n{}\n</script>\n\n", head, inner);
+    // When we have shadowed-slot `_render` derived bindings, upstream's text
+    // accumulates an extra blank line right before `</script>` (a stylistic
+    // artifact of the rewrites). Mirror it.
+    let trail = if slots.derived_conflicting_slots.is_empty() {
+        "".to_string()
+    } else {
+        "\n".to_string()
+    };
+    let full = format!("{}\n{}\n{}</script>\n\n", head, inner, trail);
     str.prepend_left(0, full);
     let _ = source;
 }
@@ -3838,7 +4418,7 @@ fn build_props_block(
         decl = format!("{} = $props();", decl);
     }
 
-    if let Some(t) = type_block {
+    let mut block_text = if let Some(t) = type_block {
         if uses_ts {
             format!("{}\n\n{}{}", t, indent, decl)
         } else {
@@ -3865,7 +4445,15 @@ fn build_props_block(
         format!("{}\n{}{}", ann, indent, decl)
     } else {
         decl
+    };
+    // Append `const X_render = $derived(X);` for shadowed slot conflicts.
+    for (aliased, original) in &slots.derived_conflicting_slots {
+        block_text.push_str(&format!(
+            "\n{}const {} = $derived({});",
+            indent, aliased, original
+        ));
     }
+    block_text
 }
 
 #[derive(Debug, Clone)]
@@ -3938,6 +4526,7 @@ fn migrate_simple_props(
     slots: &SlotInfo,
     opt_use_ts: bool,
     filename: Option<&str>,
+    skip_ranges: &[(usize, usize)],
 ) {
     // Pre-check for $$props / $$restProps and svelte:self even when there's
     // no <script> tag. If either is present, we must synthesize a script
@@ -4361,6 +4950,9 @@ fn migrate_simple_props(
         // Replace `$$props` / `$$restProps` identifier uses in the rest of
         // the script + template.
         let bytes_local = source.as_bytes();
+        let in_skip = |pos: usize| -> bool {
+            skip_ranges.iter().any(|(s, e)| pos >= *s && pos < *e)
+        };
         if uses_props {
             let needle = b"$$props";
             let n = needle.len();
@@ -4371,7 +4963,9 @@ fn migrate_simple_props(
                 let before_ok = i == 0
                     || !(bytes_local[i - 1].is_ascii_alphanumeric() || bytes_local[i - 1] == b'_');
                 if &bytes_local[i..i + n] == needle && before_ok && after_ok {
-                    str.update(i, i + n, "props");
+                    if !in_skip(i) {
+                        str.update(i, i + n, "props");
+                    }
                     i += n;
                 } else {
                     i += 1;
@@ -4384,7 +4978,9 @@ fn migrate_simple_props(
             let mut i = 0;
             while i + n <= bytes_local.len() {
                 if &bytes_local[i..i + n] == needle {
-                    str.update(i, i + n, "rest");
+                    if !in_skip(i) {
+                        str.update(i, i + n, "rest");
+                    }
                     i += n;
                 } else {
                     i += 1;
@@ -4959,7 +5555,7 @@ fn migrate_simple_props(
     };
 
     // Build the final block that replaces the FIRST export node.
-    let final_block = if let Some(td) = &typedef_block {
+    let mut final_block = if let Some(td) = &typedef_block {
         if uses_ts {
             // `interface Props {…}\n\n\tlet { … }: Props = $props();`
             let decl_with_ann = props_decl.replace(" = $props();", ": Props = $props();");
@@ -4992,7 +5588,21 @@ fn migrate_simple_props(
     } else {
         props_decl.clone()
     };
+    // Emit `const X_render = $derived(X);` lines for each entry in
+    // `derived_conflicting_slots`. These resolve a slot-name collision with a
+    // parent's `slot="X"` attribute or a `let:` ancestor by aliasing the slot
+    // through a derived binding.
+    for (aliased, original) in &slots.derived_conflicting_slots {
+        final_block.push_str(&format!(
+            "\n{}const {} = $derived({});",
+            indent, aliased, original
+        ));
+    }
 
+    // Helper: is `pos` inside any range in skip_ranges?
+    let in_skip = |pos: usize| -> bool {
+        skip_ranges.iter().any(|(s, e)| pos >= *s && pos < *e)
+    };
     // Replace `$$restProps` references with `rest` in template attributes.
     if uses_rest {
         let needle = b"$$restProps";
@@ -5000,7 +5610,9 @@ fn migrate_simple_props(
         let mut i = 0;
         while i + n <= bytes.len() {
             if &bytes[i..i + n] == needle {
-                str.update(i, i + n, "rest");
+                if !in_skip(i) {
+                    str.update(i, i + n, "rest");
+                }
                 i += n;
             } else {
                 i += 1;
@@ -5019,7 +5631,9 @@ fn migrate_simple_props(
             let before_ok = i == 0
                 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
             if &bytes[i..i + n] == needle && before_ok && after_ok {
-                str.update(i, i + n, "props");
+                if !in_skip(i) {
+                    str.update(i, i + n, "props");
+                }
                 i += n;
             } else {
                 i += 1;
@@ -6404,6 +7018,7 @@ fn migrate_simple_derivations(
         // Also detect a preceding `let X = INIT;` (WITH init) for a target —
         // in that case, upstream treats X as state, not derived, so we bail.
         let mut preceding_let_id_end: Option<usize> = None;
+        let mut preceding_let_decl_start: Option<usize> = None;
         let mut preceding_let_with_init = false;
         for sibling in body {
             let Statement::Variable(v) = sibling else {
@@ -6423,6 +7038,7 @@ fn migrate_simple_derivations(
                     preceding_let_with_init = true;
                 } else if v.declarations.len() == 1 {
                     preceding_let_id_end = Some(id.span.end as usize);
+                    preceding_let_decl_start = Some(v.span.start as usize);
                 }
             }
         }
@@ -6431,13 +7047,68 @@ fn migrate_simple_derivations(
             continue;
         }
 
+        // Extract leading/trailing block-body comments (for `$: { /* lead */
+        // X = expr; /* trail */ }` → preserve around the resulting
+        // `let X = $derived(expr)`).
+        let (block_leading_comments, block_trailing_comments) =
+            if is_block_body {
+                if let Statement::Block(b) = &l.body {
+                    let block_open = b.span.start as usize; // `{`
+                    let block_close = b.span.end as usize;  // one-past `}`
+                    // Find the inner-statement span.
+                    let inner = &b.body[0];
+                    let inner_start = match inner {
+                        Statement::Expression(es) => es.span.start as usize,
+                        _ => b.span.start as usize + 1,
+                    };
+                    let inner_end = match inner {
+                        Statement::Expression(es) => es.span.end as usize,
+                        _ => b.span.start as usize + 1,
+                    };
+                    let lead_text = source[block_open + 1..inner_start].to_string();
+                    let trail_text = source[inner_end..block_close.saturating_sub(1)].to_string();
+                    let lead = extract_comments_from_chunk(&lead_text);
+                    let trail = extract_comments_from_chunk(&trail_text);
+                    (lead, trail)
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+        // Compute the indent used when emitting comments — matches the indent
+        // of the destination line (the `$:` line for inline, or the `let X;`
+        // line for the preceding-decl case).
+        let indent_for_comments = {
+            let anchor = preceding_let_decl_start.unwrap_or(l_start);
+            let mut p = anchor;
+            while p > 0 && bytes[p - 1] != b'\n' {
+                p -= 1;
+            }
+            source[p..anchor].to_string()
+        };
+
         let rune = if should_be_state { "$state" } else { "$derived" };
         if let Some(id_end) = preceding_let_id_end {
+            // Prepend leading comments before the `let X;` declaration.
+            if let Some(decl_start) = preceding_let_decl_start {
+                for c in &block_leading_comments {
+                    str.prepend_left(
+                        decl_start,
+                        format!("{}\n{}", c, indent_for_comments),
+                    );
+                }
+            }
             // Append ` = $derived(RHS)` (or `$state(RHS)`) after the `let X`
             // identifier and remove the labeled statement entirely. This
             // leaves the leading `\t` of the original `$:` line behind, which
             // matches upstream output (the blank line with trailing tab).
             str.append_left(id_end, format!(" = {}({})", rune, rhs_text));
+            // Append trailing comments after the inserted `$derived(...)`.
+            for c in &block_trailing_comments {
+                str.append_left(id_end, format!("\n{}{}", indent_for_comments, c));
+            }
             str.remove(l_start, l_end);
         } else if should_be_state {
             // No preceding let, state path — upstream prepends
@@ -6476,6 +7147,41 @@ fn migrate_simple_derivations(
     }
     let _ = str;
     (consumed, consumed_names)
+}
+
+/// Extract comment fragments from a chunk of source between `{` and the inner
+/// statement (leading) or between the inner statement and `}` (trailing).
+/// Returns each comment formatted as `// ${value}` for line comments or
+/// `/*${value}*/` for block comments (matching upstream's formatting).
+fn extract_comments_from_chunk(chunk: &str) -> Vec<String> {
+    let bytes = chunk.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            // Line comment: read until end-of-line.
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            let value = &chunk[i + 2..j];
+            out.push(format!("// {}", value));
+            i = j;
+        } else if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            // Block comment: read until `*/`.
+            let mut j = i + 2;
+            while j + 1 < bytes.len() && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            let value = &chunk[i + 2..j];
+            out.push(format!("/*{}*/", value));
+            i = (j + 2).min(bytes.len());
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
