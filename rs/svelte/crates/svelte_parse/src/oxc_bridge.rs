@@ -4,6 +4,9 @@
 //! arena-allocated OXC AST into owned `svelte_js_ast` nodes via
 //! [`crate::oxc_to_typed`]. All node spans are shifted into the original
 //! `.svelte` source's coordinate space.
+//!
+//! Callers pass a reused [`Allocator`] (typically `Parser::oxc_alloc`).
+//! The allocator is reset after each parse once the typed tree is built.
 
 use oxc_allocator::Allocator;
 use oxc_parser::{ParseOptions, Parser as OxcParser};
@@ -105,20 +108,16 @@ fn collect_comments(
                 &slice[(span.start as usize)..(span.end as usize)],
                 line,
             );
-            // OXC's Comment.span covers the comment's *body* (between the
-            // `//` or `/*` markers and the terminator). Adjust to include
-            // the markers when emitting a `RawComment` — acorn's onComment
-            // shape carries the start of `//` or `/*`.
             let kind_offset = if matches!(c.kind, oxc_ast::CommentKind::Line) {
-                2 // `//`
+                2
             } else {
-                2 // `/*` ... `*/`
+                2
             };
             let start = span.start.saturating_sub(kind_offset) + shift_offset;
             let end = if matches!(c.kind, oxc_ast::CommentKind::Line) {
                 span.end + shift_offset
             } else {
-                span.end + 2 + shift_offset // include `*/`
+                span.end + 2 + shift_offset
             };
             RawComment {
                 line,
@@ -132,6 +131,7 @@ fn collect_comments(
 }
 
 pub fn parse_expression(
+    alloc: &mut Allocator,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
@@ -139,19 +139,21 @@ pub fn parse_expression(
     ts: bool,
 ) -> Result<Expression, CompileDiagnostic> {
     let slice = &full_source[start..end];
-    let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts);
-    let parser = OxcParser::new(&allocator, slice, source_type).with_options(opts());
-    match parser.parse_expression() {
+    let parser = OxcParser::new(alloc, slice, source_type).with_options(opts());
+    let result = match parser.parse_expression() {
         Ok(expr) => Ok(walker::expression(&expr, Shift(start as u32))),
         Err(diags) => {
             let msg = diags.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
             Err(js_diag(start, end, msg))
         }
-    }
+    };
+    alloc.reset();
+    result
 }
 
 pub fn parse_program(
+    alloc: &mut Allocator,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
@@ -159,11 +161,11 @@ pub fn parse_program(
     ts: bool,
 ) -> Result<(Program, Vec<RawComment>), CompileDiagnostic> {
     let slice = &full_source[start..end];
-    let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts).with_module(true);
-    let parser = OxcParser::new(&allocator, slice, source_type).with_options(opts());
+    let parser = OxcParser::new(alloc, slice, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
+        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
         return Err(js_diag(start, end, msg));
     }
@@ -171,20 +173,23 @@ pub fn parse_program(
     let prog = walker::program(&ret.program, Shift(start as u32));
     walker::clear_slice();
     let comments = collect_comments(&ret.program.comments, slice, start as u32, true);
+    alloc.reset();
     Ok((prog, comments))
 }
 
 pub fn parse_expression_at(
+    alloc: &mut Allocator,
     full_source: &str,
     line_map: &LineMap,
     start: usize,
     ts: bool,
 ) -> Result<(Expression, usize), CompileDiagnostic> {
-    let (e, end, _) = parse_expression_at_with_comments(full_source, line_map, start, ts)?;
+    let (e, end, _) = parse_expression_at_with_comments(alloc, full_source, line_map, start, ts)?;
     Ok((e, end))
 }
 
 pub fn parse_expression_at_with_comments(
+    alloc: &mut Allocator,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
@@ -194,13 +199,10 @@ pub fn parse_expression_at_with_comments(
     if let Some((expression, end)) = try_parse_simple_identifier(full_source, start) {
         return Ok((expression, end, Vec::new()));
     }
-    let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts);
-    // Parse the WHOLE tail as a program — OXC reports the end span of the
-    // first expression, which we use to advance the cursor.
-    let parser = OxcParser::new(&allocator, tail, source_type).with_options(opts());
+    let parser = OxcParser::new(alloc, tail, source_type).with_options(opts());
     let res = parser.parse_expression();
-    match res {
+    let result = match res {
         Ok(expr) => {
             let span_end = oxc_span::GetSpan::span(&expr).end as usize + start;
             let expression = walker::expression(&expr, Shift(start as u32));
@@ -210,14 +212,13 @@ pub fn parse_expression_at_with_comments(
             let msg = diags.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
             Err(js_diag(start, start + tail.len(), msg))
         }
-    }
+    };
+    alloc.reset();
+    result
 }
 
-/// Parse a `NAME = EXPR` slice (the body of `{@const NAME = EXPR}`) as a
-/// VariableDeclaration. Wraps the text with `const ` then runs OXC, extracts
-/// the single VariableDeclaration, and shifts spans back to the original
-/// source coordinates.
 pub fn parse_const_decl_at(
+    alloc: &mut Allocator,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
@@ -226,18 +227,18 @@ pub fn parse_const_decl_at(
 ) -> Result<svelte_js_ast::VariableDeclaration, CompileDiagnostic> {
     let body = &full_source[start..end];
     let synthetic = format!("const {body};");
-    let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts).with_module(true);
-    let parser = OxcParser::new(&allocator, &synthetic, source_type).with_options(opts());
+    let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
+        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
         return Err(js_diag(start, end, msg));
     }
-    let prefix_len = 6u32; // "const "
+    let prefix_len = 6u32;
     let shift = Shift((start as i64 - prefix_len as i64).max(0) as u32);
     let prog = walker::program(&ret.program, shift);
-    // Expect a single Variable statement.
+    alloc.reset();
     for stmt in prog.body {
         if let svelte_js_ast::Statement::Variable(v) = stmt {
             return Ok(*v);
@@ -247,57 +248,58 @@ pub fn parse_const_decl_at(
 }
 
 pub fn parse_pattern_at(
+    alloc: &mut Allocator,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
     end: usize,
     ts: bool,
 ) -> Result<(Pattern, usize), CompileDiagnostic> {
-    // Re-parse using the synthetic-source trick: wrap as `let <pattern> = 0;`
-    // and pluck the declarator's id back out.
     let pattern_text = &full_source[start..end];
     let synthetic = format!("let {pattern_text} = 0;");
-    let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts).with_module(true);
-    let parser = OxcParser::new(&allocator, &synthetic, source_type).with_options(opts());
+    let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
+        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
         return Err(js_diag(start, end, msg));
     }
-    let prefix_len = 4u32; // "let "
-    // Position of the pattern within the synthetic source is at `prefix_len`.
-    // After parsing, the BindingPattern.span.start == prefix_len. To shift
-    // back to the original .svelte coordinates: `start - prefix_len`.
+    let prefix_len = 4u32;
     let shift_value = start as i64 - prefix_len as i64;
     let shift = if shift_value < 0 {
         Shift(0)
     } else {
         Shift(shift_value as u32)
     };
-    if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
+    let result = if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
         if let Some(d) = decl.declarations.first() {
-            return Ok((walker::binding_pattern(&d.id, shift), end));
+            Ok((walker::binding_pattern(&d.id, shift), end))
+        } else {
+            Err(js_diag(start, end, "expected pattern".into()))
         }
-    }
-    Err(js_diag(start, end, "expected pattern".into()))
+    } else {
+        Err(js_diag(start, end, "expected pattern".into()))
+    };
+    alloc.reset();
+    result
 }
 
 pub fn parse_arrow_params_at(
+    alloc: &mut Allocator,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
     end: usize,
     ts: bool,
 ) -> Result<(Vec<Pattern>, usize), CompileDiagnostic> {
-    // Wrap as `let _f = (PARAMS) => {};` and read the arrow's params back.
     let params_text = &full_source[start..end];
     let synthetic = format!("let _f = {params_text} => {{}};");
-    let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts).with_module(true);
-    let parser = OxcParser::new(&allocator, &synthetic, source_type).with_options(opts());
+    let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
+        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
         return Err(js_diag(start, end, msg));
     }
@@ -308,8 +310,7 @@ pub fn parse_arrow_params_at(
     } else {
         Shift(shift_value as u32)
     };
-    // Walk to the ArrowFunctionExpression.
-    if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
+    let result = if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
         if let Some(d) = decl.declarations.first() {
             if let Some(oxc_ast::ast::Expression::ArrowFunctionExpression(arrow)) = &d.init {
                 let mut out: Vec<Pattern> = Vec::with_capacity(
@@ -331,9 +332,16 @@ pub fn parse_arrow_params_at(
                         ),
                     })));
                 }
-                return Ok((out, end));
+                Ok((out, end))
+            } else {
+                Ok((Vec::new(), end))
             }
+        } else {
+            Ok((Vec::new(), end))
         }
-    }
-    Ok((Vec::new(), end))
+    } else {
+        Ok((Vec::new(), end))
+    };
+    alloc.reset();
+    result
 }

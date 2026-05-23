@@ -57,9 +57,15 @@ fn run_once(source: &str) -> (f64, f64, f64, f64) {
 
     let t = Instant::now();
     let typed = svelte_transform_server::try_typed_server(&root, "Index")
-        .or_else(|| svelte_transform_server::try_typed_server_component(root.clone(), "Index"))
+        .or_else(|| {
+            let root = svelte_parse::parse(source, false).expect("parse");
+            svelte_transform_server::try_typed_server_component(root, "Index")
+        })
         .or_else(|| svelte_transform_client::try_typed_client(&root, "Index"))
-        .or_else(|| svelte_transform_client::try_typed_client_component(&root, "Index"))
+        .or_else(|| {
+            let root = svelte_parse::parse(source, false).expect("parse");
+            svelte_transform_client::try_typed_client_component(&root, "Index")
+        })
         .expect("no typed transform handles this fixture yet");
     let tr = t.elapsed().as_secs_f64() * 1000.0;
     let convert_ms = 0.0;

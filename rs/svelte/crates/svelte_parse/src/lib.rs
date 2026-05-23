@@ -123,7 +123,13 @@ pub fn parse(source: &str, loose: bool) -> Result<Root, CompileDiagnostic> {
     // Hoist <script> and <style> children to Root.instance / module / css.
     // Mirrors the post-parse step at the bottom of upstream's parse() in
     // `phases/1-parse/index.js:153-168`.
-    hoist::hoist_scripts_and_styles(&mut root, source, &parser.line_map, parser.ts)?;
+    hoist::hoist_scripts_and_styles(
+        &mut parser.oxc_alloc,
+        &mut root,
+        source,
+        &parser.line_map,
+        parser.ts,
+    )?;
 
     // Flush parser-collected comments (from `{expression}` mustaches and
     // element-attribute expressions) into `Root.comments`. Script-internal

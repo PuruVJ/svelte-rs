@@ -58,11 +58,12 @@ where
 // (called from the parse bridge), read by helpers that need to capture
 // raw source text (e.g. TS type annotations).
 thread_local! {
-    static SLICE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    static SLICE: std::cell::RefCell<Option<std::sync::Arc<str>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 pub fn set_slice(s: &str) {
-    SLICE.with(|c| *c.borrow_mut() = Some(s.to_string()));
+    SLICE.with(|c| *c.borrow_mut() = Some(std::sync::Arc::from(s)));
 }
 
 pub fn clear_slice() {
