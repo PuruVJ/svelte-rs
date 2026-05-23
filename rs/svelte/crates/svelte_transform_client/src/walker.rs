@@ -82,6 +82,23 @@ pub fn try_typed_client_walker_with_filename<'a>(
 
 thread_local! {
     static CURRENT_FILENAME: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    static CURRENT_CSS_HASH: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+}
+
+/// Set scoped CSS hash from `cssHash` compile option (called by `svelte_compiler`).
+pub fn set_scoped_css_hash(hash: Option<String>) {
+    CURRENT_CSS_HASH.with(|c| *c.borrow_mut() = hash);
+}
+
+fn current_scoped_css_hash() -> Option<String> {
+    CURRENT_CSS_HASH.with(|c| c.borrow().clone())
+}
+
+fn head_hash_key() -> String {
+    current_scoped_css_hash().unwrap_or_else(|| {
+        let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
+        svelte_transform_shared::str_hash::svelte_str_hash(&filename)
+    })
 }
 
 fn set_walker_filename(f: Option<&str>) {
@@ -211,9 +228,7 @@ fn emit_svelte_head_program(
         String::new()
     };
 
-    // Compute hash from filename.
-    let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
-    let hash_val = svelte_filename_hash(&filename);
+    let hash_val = head_hash_key();
 
     // Head body emission: emit `var fragment = root_1(); $.next(N); $.append($$anchor, fragment);`
     let mut head_body: Vec<Statement> = Vec::new();
@@ -437,9 +452,7 @@ fn emit_head_if_block_program(
     }
     let cons_flag = if cons_non_ws.len() > 1 { 1.0 } else { 0.0 };
 
-    // Compute hash from filename.
-    let filename = current_walker_filename().unwrap_or_else(|| "(unknown)".to_string());
-    let hash_val = svelte_filename_hash(&filename);
+    let hash_val = head_hash_key();
 
     // Build consequent arrow body.
     let mut cons_body: Vec<Statement> = Vec::new();
@@ -3929,28 +3942,7 @@ fn emit_single_static_custom_element_program(
     Some(finish_program(prog))
 }
 
-/// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2-variant
-/// (XOR rather than add) base-36 encoded as u32. Mirrors
-/// `packages/svelte/src/utils.js`.
-fn svelte_filename_hash(s: &str) -> String {
-    let s: String = s.chars().filter(|c| *c != '\r').collect();
-    let mut h: i64 = 5381;
-    for c in s.chars().rev() {
-        h = ((h << 5) - h) ^ (c as i64);
-        h &= 0xFFFFFFFF;
-    }
-    let mut n = h as u32;
-    if n == 0 {
-        return "0".into();
-    }
-    let chars: Vec<char> = "0123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
-    let mut out = String::new();
-    while n > 0 {
-        out.insert(0, chars[(n % 36) as usize]);
-        n /= 36;
-    }
-    out
-}
+use svelte_transform_shared::str_hash::svelte_str_hash as svelte_filename_hash;
 
 pub fn try_typed_client_walker_with<'a>(
     mut root: Root,

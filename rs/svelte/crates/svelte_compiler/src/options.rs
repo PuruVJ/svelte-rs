@@ -98,6 +98,10 @@ pub struct CompileOptions {
     pub disclose_version: bool,
     #[serde(default, rename = "modernAst")]
     pub modern_ast: bool,
+    /// Pre-resolved scoped CSS hash. The JS bridge calls `cssHash({ hash, css,
+    /// name, filename })` and passes the resulting string here as `cssHash`.
+    #[serde(default, rename = "cssHash")]
+    pub css_hash: Option<String>,
 }
 
 fn default_namespace() -> Namespace {
@@ -129,6 +133,7 @@ impl Default for CompileOptions {
             runes: None,
             disclose_version: default_disclose_version(),
             modern_ast: false,
+            css_hash: None,
         }
     }
 }

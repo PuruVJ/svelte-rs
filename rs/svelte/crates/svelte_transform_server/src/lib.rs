@@ -71,11 +71,16 @@ pub fn try_typed_server_component_with_opts<'a>(
     )
 }
 
-/// Expose the filename-hash function for `svelte_compiler` to compute
-/// the `svelte-{hash}` prefix when assembling the `$$css` const outside
-/// the transform.
+/// Expose the filename-hash function for callers that need the raw hash
+/// fragment (e.g. legacy paths). Prefer [`set_scoped_css_hash`] + thread-local
+/// scoped hash for compile output.
 pub fn svelte_filename_hash_pub(s: &str) -> String {
-    svelte_filename_hash(s)
+    svelte_transform_shared::str_hash::svelte_str_hash(s)
+}
+
+/// Set the scoped CSS class hash for the current compile (from `cssHash` option).
+pub fn set_scoped_css_hash(hash: Option<String>) {
+    CSS_HASH.with(|c| *c.borrow_mut() = hash);
 }
 
 /// Second-tier typed entry point. Currently handles:
@@ -111,14 +116,15 @@ pub fn try_typed_server_component_full<'a>(
             }
         }
     }
-    // When the source has a `<style>` block, append `svelte-{hash}` to every
-    // class attribute and (if css injection is enabled) also emit
-    // `const $$css = { hash, code }` + `$$renderer.global.css.add($$css);`.
-    // The hash matches upstream's default `cssHash` (hash of filename, or hash
-    // of css source if filename is unknown).
-    let css_hash: Option<String> = root.css.as_ref().map(|_css| {
-        let basis = filename.unwrap_or("(unknown)");
-        format!("svelte-{}", svelte_filename_hash(basis))
+    // When the source has a `<style>` block, append the scoped hash to every
+    // class attribute and (if css injection is enabled) emit `const $$css`.
+    let css_hash: Option<String> = root.css.as_ref().map(|_| {
+        CSS_HASH.with(|c| {
+            c.borrow().clone().unwrap_or_else(|| {
+                let basis = filename.unwrap_or("(unknown)");
+                svelte_transform_shared::str_hash::default_css_class_hash(basis, "")
+            })
+        })
     });
     // Set the thread-local so element-attribute emission can read the hash.
     CSS_HASH.with(|c| {
@@ -2303,28 +2309,8 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
-/// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2 variant
-/// (XOR rather than add) base-36 encoded as u32. Mirrors
-/// `packages/svelte/src/utils.js`.
-fn svelte_filename_hash(s: &str) -> String {
-    let s: String = s.chars().filter(|c| *c != '\r').collect();
-    let mut h: i64 = 5381;
-    for c in s.chars().rev() {
-        h = ((h << 5) - h) ^ (c as i64);
-        h &= 0xFFFFFFFF;
-    }
-    let mut n = h as u32;
-    if n == 0 {
-        return "0".into();
-    }
-    let chars: Vec<char> = "0123456789abcdefghijklmnopqrstuvwxyz".chars().collect();
-    let mut out = String::new();
-    while n > 0 {
-        out.insert(0, chars[(n % 36) as usize]);
-        n /= 36;
-    }
-    out
-}
+/// Upstream's `hash(filename)` for `$.head(HASH, ...)`. Re-exported from shared.
+use svelte_transform_shared::str_hash::svelte_str_hash as svelte_filename_hash;
 
 /// Lower `<svelte:head>...` into `$.head(HASH, $$renderer, ($$renderer) => { BODY })`.
 /// `<title>` children inside the head become `$$renderer.title(($$renderer) => { ... })`.
@@ -2344,7 +2330,7 @@ fn lower_svelte_head_server_inner(
     let filename: String = HEAD_FILENAME.with(|c| {
         c.borrow().clone().unwrap_or_else(|| "(unknown)".to_string())
     });
-    let hash = svelte_filename_hash(&filename);
+    let hash = svelte_transform_shared::str_hash::svelte_str_hash(&filename);
 
     // Lower the head fragment body. We mirror lower_fragment_with_marker
     // logic, but with one extra rule: `<title>` children become a

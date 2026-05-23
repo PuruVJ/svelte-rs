@@ -6,6 +6,7 @@
 
 pub mod builders_typed;
 pub mod compile_bump;
+pub mod str_hash;
 pub mod template_meta;
 pub mod template_slab;
 

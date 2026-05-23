@@ -8,8 +8,10 @@
 #![forbid(unsafe_code)]
 
 
+pub mod css_hash;
 pub mod options;
 
+pub use css_hash::resolve_css_hash;
 pub use options::{
     derive_component_name, derive_component_name_from_filename, sanitize_export_name,
     CompileOptions, CssMode, ExperimentalOptions, FragmentsStrategy, Generate,
@@ -133,6 +135,9 @@ pub fn compile_with_name(
     let compile_bump = svelte_transform_shared::compile_bump::CompileBump::new();
     let mut root = svelte_parse::parse_in_arena(&compile_bump.template, source, false)?;
     svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
+    let css_hash = css_hash::resolve_css_hash(&options, source, &root);
+    svelte_transform_server::set_scoped_css_hash(css_hash.clone());
+    svelte_transform_client::set_scoped_css_hash(css_hash);
     if matches!(
         options.module.generate,
         Some(Generate::Client) | None
@@ -170,11 +175,14 @@ pub fn compile_with_name(
                         position: None,
                     }),
                 };
-                let basis = options.module.filename.as_deref().unwrap_or("(unknown)");
-                let hash = format!(
-                    "svelte-{}",
-                    svelte_transform_server::svelte_filename_hash_pub(basis)
-                );
+                let hash = css_hash::resolve_css_hash(&options, source, &root).unwrap_or_else(|| {
+                    format!(
+                        "svelte-{}",
+                        svelte_transform_shared::str_hash::svelte_str_hash(
+                            options.module.filename.as_deref().unwrap_or("(unknown)")
+                        )
+                    )
+                });
                 analysis.css_hash = hash.clone();
                 let rendered = analysis.root.css.as_ref().map(|sheet| {
                     let raw = svelte_analyze::css_render::render_stylesheet_with_opts_minify(

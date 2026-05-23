@@ -33,6 +33,7 @@ pub use walker::try_typed_client_walker;
 pub use walker::try_typed_client_walker_with;
 pub use walker::try_typed_client_walker_with_filename;
 pub use walker::fold_in_fragment as walker_fold_in_fragment;
+pub use walker::set_scoped_css_hash;
 
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 use svelte_ast::fragment::FragmentChild;

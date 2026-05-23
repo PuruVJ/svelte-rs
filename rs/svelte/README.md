@@ -49,9 +49,9 @@ const result = compileSync(source, {
 ```
 
 WASM is built with `wasm-pack build crates/svelte_wasm --target nodejs --release`.
-The facade normalizes function-valued options (`customElement`, `css`) on the JS
-side before calling into Rust. `parse()` still returns `null` until AST
-serialization lands.
+The facade normalizes function-valued options (`customElement`, `css`, **`cssHash`**) on the JS
+side before calling into Rust — `cssHash` receives `{ hash, css, name, filename }` identical
+to upstream analyze. The resolved string is passed as `cssHash` in serialized options.
 
 ## Status
 

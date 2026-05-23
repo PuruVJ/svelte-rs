@@ -6,8 +6,16 @@ import type {
 } from 'svelte/compiler';
 
 export function normalizeCompileOptions(
+	source: string,
 	options?: CompileOptions | ModuleCompileOptions
 ): CompileOptions | ModuleCompileOptions;
+
+export {
+	resolveCssHashOption,
+	svelteHash,
+	defaultCssHash,
+	extractCssStyles,
+} from './css-hash.js';
 
 export function compile(source: string, options?: CompileOptions): Promise<CompileResult>;
 

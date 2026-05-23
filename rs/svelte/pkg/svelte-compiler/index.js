@@ -1,17 +1,19 @@
 /**
  * JS-shaped facade over `svelte_wasm` — mirrors `packages/svelte/src/compiler/index.js`.
  *
- * Only JSON-serializable options are forwarded to WASM (no `warningFilter` callbacks).
- * Function-valued options (`customElement`, `css`, `cssHash`) are resolved on the JS side
- * when possible before calling into Rust.
+ * Function-valued options (`customElement`, `css`, `cssHash`) are resolved on the
+ * JS side before calling WASM. `cssHash` receives the same `{ hash, css, name,
+ * filename }` object as upstream analyze.
  */
 
 import * as wasm from '../../crates/svelte_wasm/pkg/svelte_wasm.js';
+import { resolveCssHashOption } from './css-hash.js';
 
 /**
- * @param {import('svelte/compiler').CompileOptions | import('svelte/compiler').ModuleCompileOptions} options
+ * @param {string} source
+ * @param {import('svelte/compiler').CompileOptions | import('svelte/compiler').ModuleCompileOptions} [options]
  */
-export function normalizeCompileOptions(options = {}) {
+export function normalizeCompileOptions(source, options = {}) {
 	const filename = options.filename ?? '(unknown)';
 	const out = { ...options };
 	delete out.warningFilter;
@@ -21,7 +23,10 @@ export function normalizeCompileOptions(options = {}) {
 	if (typeof options.css === 'function') {
 		out.css = options.css({ filename });
 	}
-	if (typeof options.cssHash === 'function') {
+	const resolvedCssHash = resolveCssHashOption(source, options);
+	if (resolvedCssHash !== undefined) {
+		out.cssHash = resolvedCssHash;
+	} else {
 		delete out.cssHash;
 	}
 	return out;
@@ -34,7 +39,7 @@ export function normalizeCompileOptions(options = {}) {
  */
 export function compileSync(source, options = {}) {
 	return /** @type {import('svelte/compiler').CompileResult} */ (
-		wasm.compile(source, normalizeCompileOptions(options))
+		wasm.compile(source, normalizeCompileOptions(source, options))
 	);
 }
 
@@ -59,6 +64,8 @@ export async function parse(source, options = {}) {
 export async function initWasm() {}
 
 export { initWasm as init };
+
+export { resolveCssHashOption, svelteHash, defaultCssHash, extractCssStyles } from './css-hash.js';
 
 /**
  * @param {string} source
