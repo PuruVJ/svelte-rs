@@ -3480,15 +3480,31 @@ fn apply_component_let_directive_wrap(
     // slots. Mirrors upstream's `str.update(inner_end - 1, inner_end, '');
     // str.prependLeft(inner_end - 1, original[inner_end - 1]);
     // str.move(node.start, node.end, inner_end - 1);` sequence.
-    if !moves.is_empty() && inner_end > 0 {
+    //
+    // Upstream's MagicString.indent() with `{ exclude: [...] }` walks chunks
+    // in their CURRENT order and inserts the indent prefix after every `\n`
+    // it sees inside non-excluded ranges. The `prependLeft(target_pos, char)`
+    // creates a phantom chunk that — because the moved content typically ends
+    // with `\n    ` — leaves an indent-eligible `\n` right before our prepend.
+    // Our textual indent loop iterates ORIGINAL bytes only and misses that
+    // moved-content newline, so the blank middle line ends up 1 space short.
+    // Compensate by emitting an extra indent unit when prepending.
+    let interleave_pad = if !moves.is_empty() && inner_end > 0 {
         let target_pos = inner_end - 1;
         let target_char = bytes[target_pos] as char;
         str.update(target_pos, inner_end, "");
-        str.prepend_left(target_pos, target_char.to_string());
+        // Re-insert the original char + 1 extra space — mirrors the side
+        // effect of upstream's MagicString indent processing the prepended
+        // chunk's `\n` (which our textual byte loop doesn't see).
+        str.prepend_left(target_pos, format!(" {}", target_char));
         for (ms, me) in moves.iter() {
             str.move_range(*ms, *me, target_pos);
         }
-    }
+        true
+    } else {
+        false
+    };
+    let _ = interleave_pad;
 
     let props_text = format!("{{ {} }}", let_pairs.join(", "));
     // Compute path indent: upstream uses `state.indent.repeat(path.length)`
