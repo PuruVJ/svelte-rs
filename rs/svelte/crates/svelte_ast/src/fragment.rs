@@ -9,9 +9,17 @@ use crate::elements::{
 use crate::position::Offset;
 use crate::tags::{AttachTag, ConstTag, DebugTag, ExpressionTag, HtmlTag, RenderTag};
 
+/// Compile-time metadata on template fragments (set by `svelte_transform_shared::mark_template_metadata`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FragmentMetadata {
+    /// True when the fragment or any descendant can affect runtime output beyond static HTML.
+    pub dynamic: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Fragment {
     pub nodes: Vec<FragmentChild>,
+    pub metadata: FragmentMetadata,
 }
 
 impl Fragment {

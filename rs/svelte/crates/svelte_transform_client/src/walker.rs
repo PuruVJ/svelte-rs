@@ -3938,6 +3938,34 @@ pub fn try_typed_client_walker_with(
     let template_assigned = scan_fragment_assignments(&root.fragment);
     let script = analyze_script(root.instance.as_ref(), &template_assigned)?;
 
+    svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
+    fold_fragment_with_consts(&mut root.fragment, &script.constants);
+
+    // Sparse-islands fast path (skip-static-subtree class): one `$.from_html` + sparse nav.
+    if root.module.is_none() {
+        if let Some(mut p) = crate::sparse_pipeline::try_sparse_islands_program(
+            &root.fragment,
+            component_name,
+            &script,
+        ) {
+            if !module_stmts.is_empty() {
+                let mut insert_at = 0;
+                for (i, stmt) in p.body.iter().enumerate() {
+                    if matches!(stmt, Statement::Import(_)) {
+                        insert_at = i + 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut new_body: Vec<Statement> = p.body[..insert_at].to_vec();
+                new_body.extend(module_stmts.iter().cloned());
+                new_body.extend(p.body[insert_at..].iter().cloned());
+                p.body = new_body;
+            }
+            return Some(p);
+        }
+    }
+
     // PRE-DETECT: top-level `<svelte:head>` + simple remainder shape.
     {
         let mut head_node: Option<&svelte_ast::elements::SvelteHead> = None;
@@ -4221,10 +4249,7 @@ pub fn try_typed_client_walker_with(
         }
     }
 
-    // Apply script-context fold to the fragment after pre-detect fast paths
-    // (they inspect the unfolded template). Inline plain `let X = LIT`
-    // bindings, fold nullish-coalesce, fold literal arithmetic, etc.
-    fold_fragment_with_consts(&mut root.fragment, &script.constants);
+    // Fragment already folded + metadata marked at entry (sparse fast path above).
     let mut fragment = root.fragment;
 
     // Extract top-level snippets — emit as `const NAME = ($$anchor, ...) => { ... };`
@@ -8321,7 +8346,7 @@ fn emit_single_element_wrapping_ifs_program(
 ///     $.append($$anchor, fragment);
 ///     ...
 ///   }
-fn emit_top_level_multi_if_program(
+pub(crate) fn emit_top_level_multi_if_program(
     nodes: &[FragmentChild],
     component_name: &str,
     script: &ScriptInfo,
@@ -13582,6 +13607,12 @@ fn is_only_blocker_derived(
 /// or nested reactive content). Used by emitters that pass the element
 /// verbatim into the template HTML.
 fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
+    if el.metadata.is_static_element {
+        return true;
+    }
+    if el.metadata.dynamic {
+        return false;
+    }
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     for a in &el.attributes {
         match a {
@@ -19178,7 +19209,7 @@ fn trim_boundary_ws(nodes: &[FragmentChild]) -> &[FragmentChild] {
 // Script analysis
 // ---------------------------------------------------------------------------
 
-struct ScriptInfo {
+pub(crate) struct ScriptInfo {
     /// Hoisted imports go above the `var root = ...` declaration.
     imports: Vec<Statement>,
     /// Rewritten body statements emitted at the start of the function.
@@ -19188,7 +19219,7 @@ struct ScriptInfo {
     /// Bindings that became `$.state(...)` — references to them in reactive
     /// contexts (template_effect deps, function bodies) need `$.get(X)` /
     /// `$.set(X, V)` wrapping.
-    state_bindings: HashSet<String>,
+    pub(crate) state_bindings: HashSet<String>,
     /// Plain `let X = LITERAL` bindings that are never assigned. Template
     /// references can be substituted with the literal value at compile time.
     constants: HashMap<String, Expression>,
@@ -19197,7 +19228,7 @@ struct ScriptInfo {
     uses_props: bool,
     /// Whether the script contains a class with rune fields. Triggers
     /// `$.push($$props, true); ...; $.pop();` wrap around the function body.
-    has_class_with_runes: bool,
+    pub(crate) has_class_with_runes: bool,
     /// Names bound to `let X = $props()` (identifier destructure). Static-key
     /// reads of these (e.g. `X.foo`) get rewritten to `$$props.foo`.
     rest_props_bindings: HashSet<String>,
@@ -19205,14 +19236,14 @@ struct ScriptInfo {
     /// - the rewritten setup statements (hoisted `var`s + `$.run([...])`)
     /// - the set of bindings touched by those groups
     /// - the index of the last group (used in template_effect blockers)
-    async_info: Option<AsyncInfo>,
+    pub(crate) async_info: Option<AsyncInfo>,
     /// Names of `let X = $state({...})` / `$state([...])` bindings —
     /// lowered to `$.proxy(...)`. Reads stay as direct member access (no
     /// `$.get` wrap); writes stay as direct property assignment.
     proxy_bindings: HashSet<String>,
     /// Names of `const X = $derived(...)` bindings — lowered to
     /// `$.derived(() => ...)`. Reads of these get `$.get(X)` wrapping.
-    derived_bindings: HashSet<String>,
+    pub(crate) derived_bindings: HashSet<String>,
     /// Names destructured from `let { a, b, c } = $props()`. Template
     /// reads of these names get rewritten to `$$props.NAME` and the
     /// declaration itself is dropped from the script body.
@@ -19230,7 +19261,7 @@ struct ScriptInfo {
 }
 
 #[derive(Clone)]
-struct AsyncInfo {
+pub(crate) struct AsyncInfo {
     setup_stmts: Vec<Statement>,
     async_bindings: HashSet<String>,
     last_group_idx: usize,
@@ -19242,7 +19273,7 @@ struct AsyncInfo {
     blocker_bindings: HashMap<String, usize>,
 }
 
-fn analyze_script(
+pub(crate) fn analyze_script(
     instance: opt_ref::Ref<svelte_ast::root::Script>,
     template_assigned: &HashSet<String>,
 ) -> Option<ScriptInfo> {

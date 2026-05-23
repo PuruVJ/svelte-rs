@@ -1902,7 +1902,10 @@ fn lower_fragment_with_const_await_with(
     // Lower the rest of the fragment with the const names treated as
     // async-tainted. `<promises_var>` is the local var name.
     let async_set: std::collections::HashSet<String> = const_names.into_iter().collect();
-    let stub_fragment = svelte_ast::fragment::Fragment { nodes: rest_nodes };
+    let stub_fragment = svelte_ast::fragment::Fragment {
+        nodes: rest_nodes,
+        metadata: Default::default(),
+    };
     let empty_blockers: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     // When called inside an if-block branch, the caller already pushed
@@ -5474,6 +5477,12 @@ fn is_trivial_static_element(el: &svelte_ast::elements::RegularElement) -> bool 
 /// building per-element AST nodes — no dynamic attrs, blocks, components,
 /// or special-case elements (`<option>`, `<select>`, `<textarea>`).
 fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
+    if el.metadata.is_static_element {
+        return true;
+    }
+    if el.metadata.dynamic {
+        return false;
+    }
     if matches!(el.name.as_str(), "option" | "select" | "textarea") {
         return false;
     }

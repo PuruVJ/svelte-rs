@@ -8,8 +8,17 @@
 
 #![forbid(unsafe_code)]
 
+mod direct_codegen;
+#[cfg(test)]
+mod direct_codegen_tests;
+mod sparse_pipeline;
 mod typed_fast;
 mod walker;
+
+pub use direct_codegen::{
+    try_emit_client_program_direct, try_emit_fully_static_client_js,
+};
+pub use sparse_pipeline::try_sparse_islands_program;
 
 pub use typed_fast::try_typed_client;
 pub use walker::try_typed_client_walker;

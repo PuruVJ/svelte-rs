@@ -500,6 +500,7 @@ fn build_element(
             name_loc,
             attributes,
             fragment,
+            metadata: Default::default(),
         })),
         _ => FragmentChild::RegularElement(RegularElement {
             start,
@@ -508,6 +509,7 @@ fn build_element(
             name_loc,
             attributes,
             fragment,
+            metadata: Default::default(),
         }),
     }
 }
@@ -1596,6 +1598,7 @@ fn read_textarea_fragment(
     flush_text(&mut nodes, text_start, parser.index, parser.template);
     Ok(Fragment {
         nodes,
+        metadata: Default::default(),
     })
 }
 
@@ -1669,6 +1672,7 @@ fn read_raw_until_close_tag(
             raw: raw.clone(),
             data: raw,
         })],
+        metadata: Default::default(),
     })
 }
 
@@ -1813,6 +1817,7 @@ fn parse_fragment_until_close_tag(
     Ok((
         Fragment {
             nodes,
+            metadata: Default::default(),
         },
         implicit_close,
     ))

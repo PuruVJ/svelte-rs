@@ -766,6 +766,7 @@ fn read_if_block(
             let nested = read_if_block(parser, else_brace_pos, true)?;
             Some(Fragment {
                 nodes: vec![nested],
+                metadata: Default::default(),
             })
         } else {
             // `{:else}` — eat `}` then parse the else body up to `{/if}`.
@@ -865,6 +866,7 @@ fn parse_fragment_until_block_boundary(
     }
     Ok(Fragment {
         nodes,
+        metadata: Default::default(),
     })
 }
 

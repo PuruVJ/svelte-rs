@@ -5,3 +5,6 @@
 #![forbid(unsafe_code)]
 
 pub mod builders_typed;
+pub mod compile_bump;
+pub mod template_meta;
+pub mod template_slab;
