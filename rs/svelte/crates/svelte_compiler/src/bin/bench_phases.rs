@@ -7,7 +7,7 @@ use std::time::Instant;
 
 fn main() {
     let fixture = std::env::args().nth(1).expect("usage: bench_phases FIXTURE server|client [iter]");
-    let mode = std::env::args().nth(2).expect("usage: bench_phases FIXTURE server|client [iter]");
+    let mode = std::env::args().nth(2).expect("usage: bench_phases FIXTURE server|client|e2e [iter]");
     let iter: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(5000);
 
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -15,6 +15,11 @@ fn main() {
         .join(&fixture)
         .join("index.svelte");
     let source = std::fs::read_to_string(&path).unwrap();
+
+    if mode == "e2e" {
+        bench_e2e_compile(&fixture, &source, iter);
+        return;
+    }
 
     let mut opts = svelte_compiler::CompileOptions::default();
     opts.module.generate = Some(match mode.as_str() {
@@ -89,4 +94,17 @@ fn main() {
     }
     let sum = (parse_ms + analyze_ms + transform_ms + codegen_ms) / n;
     println!("  sum        {sum:.4} ms/iter");
+}
+
+fn bench_e2e_compile(fixture: &str, source: &str, iter: usize) {
+    let mut opts = svelte_compiler::CompileOptions::default();
+    opts.module.generate = Some(svelte_compiler::Generate::Client);
+    let mut total_ms = 0.0;
+    for _ in 0..iter {
+        let t = Instant::now();
+        let _ = svelte_compiler::compile(source, "Index", opts.clone()).unwrap();
+        total_ms += t.elapsed().as_secs_f64() * 1000.0;
+    }
+    println!("fixture={fixture} mode=e2e iter={iter}");
+    println!("  compile    {:.4} ms/iter", total_ms / iter as f64);
 }

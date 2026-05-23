@@ -17,6 +17,22 @@
 
 Client and server transforms read these flags before re-walking subtrees.
 
+## Static HTML cache
+
+After `mark_template_metadata`, client `compile()` runs `precompute_static_html_cache`
+so each static element’s outer HTML is serialized once into
+`element.metadata.cached_static_html`. Sparse emit reuses it instead of re-walking subtrees.
+
+## Sparse early compile
+
+`try_emit_sparse_islands_client_js` runs in `compile()` before the walker:
+
+1. Fast `analyze_script_props_only` for `$props()`-only scripts
+2. `try_sparse_islands_program` + `try_emit_client_program_direct`
+3. Returns JS without `print_typed` or walker PRE-DETECT
+
+Measure real pipeline: `bench_phases FIXTURE e2e 5000`.
+
 ## Direct codegen (skip `print_typed`)
 
 `compile()` tries, in order:

@@ -10017,7 +10017,7 @@ pub(crate) fn emit_top_level_multi_if_program(
                 html.push_str("<!>")
             }
             Slot::StaticEl(el) => {
-                serialize_element_to_html(el, &mut html, &mut needs_import_node)?;
+                crate::static_html_cache::push_element_html(el, &mut html, &mut needs_import_node)?;
             }
             Slot::ElementWithHtml(el, _) => {
                 // Emit `<TAG STATIC_ATTRS></TAG>` (no body content).
@@ -17065,7 +17065,31 @@ fn serialize_fragment_to_html(
     Some(())
 }
 
+/// Serialize element HTML, using `metadata.cached_static_html` when present.
+pub(crate) fn serialize_element_to_html_cached(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    if let Some(cached) = &el.metadata.cached_static_html {
+        if el.name.contains('-') || el.name == "video" {
+            *needs_import_node = true;
+        }
+        out.push_str(cached);
+        return Some(());
+    }
+    serialize_element_to_html_inner(el, out, needs_import_node)
+}
+
 fn serialize_element_to_html(
+    el: &svelte_ast::elements::RegularElement,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    serialize_element_to_html_cached(el, out, needs_import_node)
+}
+
+pub(crate) fn serialize_element_to_html_inner(
     el: &svelte_ast::elements::RegularElement,
     out: &mut String,
     needs_import_node: &mut bool,
@@ -19222,7 +19246,7 @@ pub(crate) struct ScriptInfo {
     pub(crate) state_bindings: HashSet<String>,
     /// Plain `let X = LITERAL` bindings that are never assigned. Template
     /// references can be substituted with the literal value at compile time.
-    constants: HashMap<String, Expression>,
+    pub(crate) constants: HashMap<String, Expression>,
     /// Whether `$props()` was destructured — the component function needs
     /// `$$props` as its second parameter.
     uses_props: bool,
@@ -19258,6 +19282,28 @@ pub(crate) struct ScriptInfo {
     /// anywhere. Init wrapped in `$.mutable_source(...)`. Reads + writes
     /// flow through the same state_bindings rewriting as `$state` runes.
     legacy_mutable_bindings: HashSet<String>,
+}
+
+impl ScriptInfo {
+    /// Fast path for `let { … } = $props();` only scripts.
+    pub(crate) fn props_only(props_destructured: HashSet<String>) -> Self {
+        ScriptInfo {
+            imports: Vec::new(),
+            body: Vec::new(),
+            emit_legacy_flag: false,
+            state_bindings: HashSet::new(),
+            constants: HashMap::new(),
+            uses_props: true,
+            has_class_with_runes: false,
+            rest_props_bindings: HashSet::new(),
+            async_info: None,
+            proxy_bindings: HashSet::new(),
+            derived_bindings: HashSet::new(),
+            props_destructured,
+            legacy_export_props: Vec::new(),
+            legacy_mutable_bindings: HashSet::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -21449,7 +21495,7 @@ fn scan_stmt_for_assignments(s: &Statement, out: &mut HashSet<String>) {
     }
 }
 
-fn scan_fragment_assignments(f: &Fragment) -> HashSet<String> {
+pub(crate) fn scan_fragment_assignments(f: &Fragment) -> HashSet<String> {
     let mut out = HashSet::new();
     scan_nodes_for_assignments(&f.nodes, &mut out);
     out
@@ -22923,7 +22969,7 @@ pub fn fold_in_fragment(f: &mut Fragment) {
 /// Math.X, and nullish-coalesce rules. The fragment shape is preserved —
 /// expressions that fold to literals remain inside their ExpressionTag so
 /// `classify` can still distinguish "static body" from "had-expressions".
-fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expression>) {
+pub(crate) fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expression>) {
     for child in &mut f.nodes {
         fold_node_with_consts(child, consts);
     }
