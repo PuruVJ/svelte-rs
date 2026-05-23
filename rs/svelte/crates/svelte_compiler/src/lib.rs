@@ -54,6 +54,7 @@ pub fn compile(
     // print. If no typed transform can handle the input shape, we surface
     // an unsupported error (rather than fall back to a Value-based path —
     // none exists). Coverage is being grown fixture-by-fixture.
+    let comments = std::mem::take(&mut root.comments);
     let typed = match options.module.generate {
         Some(Generate::Server) => {
             let exp_async = options.module.experimental.async_;
@@ -106,7 +107,7 @@ pub fn compile(
                 p
             } else if let Some(p) =
                 svelte_transform_server::try_typed_server_component_full(
-                    &mut root, component_name, exp_async, filename, preserve_comments,
+                    root, component_name, exp_async, filename, preserve_comments,
                     css_inject_args,
                 )
             {
@@ -135,16 +136,16 @@ pub fn compile(
             if let Some(p) = fast {
                 p
             } else if let Some(p) =
+                svelte_transform_client::try_typed_client_component(&root, component_name)
+            {
+                p
+            } else if let Some(p) =
                 svelte_transform_client::try_typed_client_walker_with_filename(
-                    &root,
+                    root,
                     component_name,
                     use_tree,
                     options.module.filename.as_deref(),
                 )
-            {
-                p
-            } else if let Some(p) =
-                svelte_transform_client::try_typed_client_component(&root, component_name)
             {
                 p
             } else {
@@ -159,8 +160,7 @@ pub fn compile(
     };
 
     let mut typed_opts = svelte_codegen_js::TypedPrintOptions::default();
-    typed_opts.comments = root
-        .comments
+    typed_opts.comments = comments
         .iter()
         .map(|c| svelte_codegen_js::TypedComment {
             kind: match c.kind {

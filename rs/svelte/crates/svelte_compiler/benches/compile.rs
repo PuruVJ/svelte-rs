@@ -89,10 +89,14 @@ fn bench_transform_server(c: &mut Criterion) {
         let root = svelte_parse::parse(&source, false).unwrap();
         group.bench_with_input(BenchmarkId::new("transform", label), &source, |b, source| {
             b.iter(|| {
-                let mut root = svelte_parse::parse(source, false).unwrap();
-                let r = black_box(&mut root);
-                svelte_transform_server::try_typed_server(r, "Index")
-                    .or_else(|| svelte_transform_server::try_typed_server_component(r, "Index"))
+                let root = svelte_parse::parse(source, false).unwrap();
+                black_box(
+                    svelte_transform_server::try_typed_server(&root, "Index")
+                        .or_else(|| {
+                            let root = svelte_parse::parse(source, false).unwrap();
+                            svelte_transform_server::try_typed_server_component(root, "Index")
+                        })
+                )
             });
         });
     }
@@ -110,11 +114,24 @@ fn bench_codegen(c: &mut Criterion) {
     let mut group = c.benchmark_group("codegen");
     for (label, name) in &fixtures {
         let source = load_fixture(name);
-        let mut root = svelte_parse::parse(&source, false).unwrap();
+        let root = svelte_parse::parse(&source, false).unwrap();
         let typed = svelte_transform_server::try_typed_server(&root, "Index")
-            .or_else(|| svelte_transform_server::try_typed_server_component(&mut root, "Index"))
-            .or_else(|| svelte_transform_client::try_typed_client(&root, "Index"))
-            .or_else(|| svelte_transform_client::try_typed_client_component(&root, "Index"));
+            .or_else(|| {
+                let root = svelte_parse::parse(&source, false).unwrap();
+                svelte_transform_server::try_typed_server_component(root, "Index")
+            })
+            .or_else(|| {
+                let root = svelte_parse::parse(&source, false).unwrap();
+                svelte_transform_client::try_typed_client(&root, "Index")
+            })
+            .or_else(|| {
+                let root = svelte_parse::parse(&source, false).unwrap();
+                svelte_transform_client::try_typed_client_component(&root, "Index")
+            })
+            .or_else(|| {
+                let root = svelte_parse::parse(&source, false).unwrap();
+                svelte_transform_client::try_typed_client_walker(root, "Index")
+            });
         if let Some(ref program) = typed {
             group.bench_with_input(BenchmarkId::new("codegen", label), program, |b, prog| {
                 b.iter(|| {

@@ -293,7 +293,7 @@ fn variable_declaration(
     });
     VariableDeclaration {
         kind,
-        declarations,
+        declarations: declarations,
         span: span_of(v.span, shift),
     }
 }
@@ -644,14 +644,14 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
-            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)),
+            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)).into(),
             optional: c.optional,
             span: span_of(c.span, shift),
         })),
         E::ChainExpression(c) => match &c.expression {
             oxc::ChainElement::CallExpression(c2) => Expression::Call(Box::new(CallExpression {
                 callee: expression(&c2.callee, shift),
-                arguments: map_collect(c2.arguments.iter(), |a| argument(a, shift)),
+                arguments: map_collect(c2.arguments.iter(), |a| argument(a, shift)).into(),
                 optional: c2.optional,
                 span: span_of(c2.span, shift),
             })),
@@ -723,7 +723,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::NewExpression(n) => Expression::New(Box::new(NewExpression {
             callee: expression(&n.callee, shift),
-            arguments: map_collect(n.arguments.iter(), |a| argument(a, shift)),
+            arguments: map_collect(n.arguments.iter(), |a| argument(a, shift)).into(),
             span: span_of(n.span, shift),
         })),
         E::ObjectExpression(o) => Expression::Object(Box::new(ObjectExpression {
@@ -874,7 +874,7 @@ fn expression_from_for_init(init: &oxc::ForStatementInit<'_>, shift: Shift) -> E
         F::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         F::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
-            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)),
+            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)).into(),
             optional: c.optional,
             span: span_of(c.span, shift),
         })),
@@ -1258,7 +1258,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
         A::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         A::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
-            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)),
+            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)).into(),
             optional: c.optional,
             span: span_of(c.span, shift),
         })),

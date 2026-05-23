@@ -24,13 +24,13 @@ use svelte_transform_shared::builders_typed as t;
 use std::borrow::Cow;
 
 /// Backwards-compatible entry — defaults `experimental_async = false`.
-pub fn try_typed_server_component(root: &mut Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_server_component(root: Root, component_name: &str) -> Option<Program> {
     try_typed_server_component_with_filename(root, component_name, false, None)
 }
 
 /// Compatibility shim — defaults filename to None, preserve_comments to false.
 pub fn try_typed_server_component_with(
-    root: &mut Root,
+    root: Root,
     component_name: &str,
     experimental_async: bool,
 ) -> Option<Program> {
@@ -41,7 +41,7 @@ pub fn try_typed_server_component_with(
 
 /// Compatibility shim — preserve_comments defaults to false.
 pub fn try_typed_server_component_with_filename(
-    root: &mut Root,
+    root: Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -53,7 +53,7 @@ pub fn try_typed_server_component_with_filename(
 
 /// Compatibility shim — css_inject defaults to None.
 pub fn try_typed_server_component_with_opts(
-    root: &mut Root,
+    root: Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -76,7 +76,7 @@ pub fn svelte_filename_hash_pub(s: &str) -> String {
 /// - "single <Component bind:this={x}/>"
 /// - "<svelte:element this={tag}>"
 pub fn try_typed_server_component_full(
-    root: &mut Root,
+    mut root: Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -1457,8 +1457,7 @@ fn lower_fragment_server_async_with(
     for n in nodes.iter() {
         if after_dropped_comment {
             if let FragmentChild::Text(t) = n {
-                let escaped = escape_text(&collapse_ws(&t.data));
-                buf.push_str_after_comment(&escaped);
+                buf.push_escaped_text_after_comment(&collapse_ws(&t.data));
                 after_dropped_comment = false;
                 continue;
             }
@@ -2565,8 +2564,7 @@ fn lower_head_fragment(
         }
         if after_dropped_comment {
             if let FragmentChild::Text(t) = n {
-                let escaped = escape_text(&collapse_ws(&t.data));
-                buf.push_str_after_comment(&escaped);
+                buf.push_escaped_text_after_comment(&collapse_ws(&t.data));
                 after_dropped_comment = false;
                 continue;
             }
@@ -2583,8 +2581,7 @@ fn lower_head_fragment(
                     trim_leading_ws = false;
                     continue;
                 }
-                let escaped = escape_text(&collapse_ws(trimmed));
-                buf.push_str(&escaped);
+                buf.push_escaped_text(&collapse_ws(trimmed));
                 trim_leading_ws = false;
                 continue;
             }
@@ -2739,8 +2736,7 @@ fn lower_fragment_with_marker(
         // whitespace against the previous trailing whitespace.
         if after_dropped_comment {
             if let FragmentChild::Text(t) = n {
-                let escaped = escape_text(&collapse_ws(&t.data));
-                buf.push_str_after_comment(&escaped);
+                buf.push_escaped_text_after_comment(&collapse_ws(&t.data));
                 after_dropped_comment = false;
                 continue;
             }
@@ -2761,8 +2757,7 @@ fn lower_fragment_with_marker(
                     trim_leading_ws = false;
                     continue;
                 }
-                let escaped = escape_text(&collapse_ws(trimmed));
-                buf.push_str(&escaped);
+                buf.push_escaped_text(&collapse_ws(trimmed));
                 trim_leading_ws = false;
                 continue;
             }
@@ -3054,12 +3049,7 @@ fn lower_content_editable_bind_inline(
     let body_source: Expression = if bind_name == "innerHTML" {
         bind_expr
     } else {
-        Expression::Call(Box::new(CallExpression {
-            callee: t::member_id(t::id_dollar(), "escape"),
-            arguments: vec![Argument::Expression(bind_expr)],
-            optional: false,
-            span: Span::ZERO,
-        }))
+        html_escape_expression(bind_expr)
     };
 
     if bind_name == "innerHTML" {
@@ -3112,7 +3102,7 @@ fn lower_content_editable_bind_inline(
 
     // Close tag goes back into buf so the next iteration's content fuses
     // with it (`</div> <div ...>` shows up as one push instead of three).
-    buf.push_str(&format!("</{}>", el.name));
+    push_close_tag(buf, &el.name);
     Some(())
 }
 
@@ -3189,12 +3179,7 @@ fn lower_textarea_server_inline(
         t::template_raw(quasis, exprs)
     };
 
-    let escape_call = Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id_dollar(), "escape"),
-        arguments: vec![Argument::Expression(body_source)],
-        optional: false,
-        span: Span::ZERO,
-    }));
+    let escape_call = html_escape_expression(body_source);
 
     let idx = BODY_VAR_COUNTER.with(|c| {
         let i = c.get();
@@ -3305,12 +3290,7 @@ fn lower_textarea_server(
         t::template_raw(quasis, exprs)
     };
 
-    let escape_call = Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id_dollar(), "escape"),
-        arguments: vec![Argument::Expression(body_source)],
-        optional: false,
-        span: Span::ZERO,
-    }));
+    let escape_call = html_escape_expression(body_source);
 
     let idx = BODY_VAR_COUNTER.with(|c| {
         let i = c.get();
@@ -3822,7 +3802,7 @@ fn lower_render_tag_for_select(rt: &svelte_ast::tags::RenderTag) -> Option<State
     arguments.extend(args);
     Some(t::stmt(Expression::Call(Box::new(CallExpression {
         callee,
-        arguments,
+        arguments: arguments,
         optional: false,
         span: Span::ZERO,
     }))))
@@ -5017,7 +4997,7 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
     }
     let option_call = t::stmt(Expression::Call(Box::new(CallExpression {
         callee: t::member_id(t::id_renderer(), "option"),
-        arguments,
+        arguments: arguments,
         optional: false,
         span: Span::ZERO,
     })));
@@ -5505,12 +5485,12 @@ fn serialize_static_fragment_to_template(
                 if data.is_empty() {
                     continue;
                 }
-                buf.push_str(&escape_text(&collapse_ws(data)));
+                buf.push_escaped_text(&collapse_ws(data));
             }
             FragmentChild::Comment(c) => {
                 if PRESERVE_COMMENTS.with(|p| p.get()) {
                     buf.push_str("<!--");
-                    buf.push_str(&escape_text(&c.data));
+                    buf.push_escaped_text(&c.data);
                     buf.push_str("-->");
                 }
             }
@@ -5519,7 +5499,7 @@ fn serialize_static_fragment_to_template(
             }
             FragmentChild::ExpressionTag(tag) => {
                 if let Some(s) = literal_expr_to_string(&tag.expression) {
-                    buf.push_str(&escape_text(&s));
+                    buf.push_escaped_text(&s);
                 }
             }
             _ => return None,
@@ -5554,7 +5534,7 @@ fn serialize_static_element_to_template(
 fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<()> {
     match n {
         FragmentChild::Text(t) => {
-            buf.push_str(&escape_text(&collapse_ws(&t.data)));
+            buf.push_escaped_text(&collapse_ws(&t.data));
             Some(())
         }
         FragmentChild::ExpressionTag(tag) => {
@@ -5566,14 +5546,9 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             }
             // Constant-fold literal expressions (no `$.escape` wrap, just inline).
             if let Some(s) = literal_expr_to_string(&tag.expression) {
-                buf.push_str(&escape_text(&s));
+                buf.push_escaped_text(&s);
             } else {
-                buf.push_expr(Expression::Call(Box::new(CallExpression {
-                    callee: t::member_id(t::id_dollar(), "escape"),
-                    arguments: vec![Argument::Expression(tag.expression.clone())],
-                    optional: false,
-                    span: Span::ZERO,
-                })));
+                buf.push_expr(html_escape_expression(tag.expression.clone()));
             }
             Some(())
         }
@@ -5761,7 +5736,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             // `preserveComments: true`, emit them verbatim.
             if PRESERVE_COMMENTS.with(|p| p.get()) {
                 buf.push_str("<!--");
-                buf.push_str(&escape_text(&c.data));
+                buf.push_escaped_text(&c.data);
                 buf.push_str("-->");
             }
             Some(())
@@ -6161,7 +6136,7 @@ fn append_value_attribute(
                 buf.push_str(" ");
                 buf.push_str(name);
                 buf.push_str("=\"");
-                buf.push_str(&escape_attribute_text(&s));
+                buf.push_escaped_attribute_text(&s);
                 buf.push_str("\"");
                 return Some(());
             }
@@ -6184,7 +6159,7 @@ fn append_value_attribute(
                 buf.push_str("=\"");
                 for p in parts {
                     if let AttributeValuePart::Text(t) = p {
-                        buf.push_str(&escape_attribute_text(&t.data));
+                        buf.push_escaped_attribute_text(&t.data);
                     }
                 }
                 buf.push_str("\"");
@@ -6287,9 +6262,10 @@ fn append_class_attribute_with_hash(
                         combined.push_str(&t.data);
                     }
                 }
-                let combined = format!("{} {}", combined.trim(), hash);
                 buf.push_str(" class=\"");
-                buf.push_str(&escape_attribute_text(combined.trim()));
+                buf.push_escaped_attribute_text(combined.trim());
+                buf.push_str(" ");
+                buf.push_str(hash);
                 buf.push_str("\"");
                 Some(())
             } else {
@@ -6340,7 +6316,7 @@ fn append_class_attribute_with_hash(
 fn string_lit(s: &str) -> Expression {
     Expression::Literal(Box::new(Literal::String(StringLiteral {
         value: Cow::Owned(s.to_string()),
-        raw: Some(format!("'{s}'")),
+        raw: Some(js_string_raw(s)),
         span: Span::ZERO,
     })))
 }
@@ -6355,8 +6331,7 @@ fn is_event_handler_name(name: &str) -> bool {
     third.is_ascii_lowercase()
 }
 
-fn escape_attribute_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn escape_attribute_text_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '"' => out.push_str("&quot;"),
@@ -6366,6 +6341,11 @@ fn escape_attribute_text(s: &str) -> String {
             _ => out.push(c),
         }
     }
+}
+
+fn escape_attribute_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    escape_attribute_text_into(&mut out, s);
     out
 }
 
@@ -6395,8 +6375,7 @@ fn format_number(n: f64) -> String {
     }
 }
 
-fn escape_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+fn escape_text_into(out: &mut String, s: &str) {
     for c in s.chars() {
         match c {
             '`' => out.push_str("\\`"),
@@ -6404,6 +6383,40 @@ fn escape_text(s: &str) -> String {
             _ => out.push(c),
         }
     }
+}
+
+fn js_string_raw(s: &str) -> String {
+    let mut raw = String::with_capacity(s.len() + 2);
+    raw.push('\'');
+    raw.push_str(s);
+    raw.push('\'');
+    raw
+}
+
+/// When an expression is a compile-time string literal, inline the escaped
+/// value instead of emitting `$.escape(EXPR)`.
+fn html_escape_expression(expr: Expression) -> Expression {
+    if let Some(s) = literal_expr_to_string(&expr) {
+        string_lit(&escape_text(&s))
+    } else {
+        Expression::Call(Box::new(CallExpression {
+            callee: t::member_id(t::id_dollar(), "escape"),
+            arguments: vec![Argument::Expression(expr)],
+            optional: false,
+            span: Span::ZERO,
+        }))
+    }
+}
+
+fn push_close_tag(buf: &mut TemplateBuf, name: &str) {
+    buf.push_str("</");
+    buf.push_str(name);
+    buf.push_str(">");
+}
+
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    escape_text_into(&mut out, s);
     out
 }
 
@@ -6434,11 +6447,28 @@ struct TemplateBuf {
 
 impl TemplateBuf {
     fn new() -> Self {
-        Self { parts: vec![String::new()], exprs: Vec::new() }
+        Self::with_capacity(0)
+    }
+
+    fn with_capacity(expr_count: usize) -> Self {
+        let mut parts = Vec::with_capacity(expr_count + 1);
+        parts.push(String::new());
+        Self {
+            parts,
+            exprs: Vec::with_capacity(expr_count),
+        }
     }
 
     fn push_str(&mut self, s: &str) {
         self.parts.last_mut().unwrap().push_str(s);
+    }
+
+    fn push_escaped_text(&mut self, s: &str) {
+        escape_text_into(self.parts.last_mut().unwrap(), s);
+    }
+
+    fn push_escaped_attribute_text(&mut self, s: &str) {
+        escape_attribute_text_into(self.parts.last_mut().unwrap(), s);
     }
 
     /// Append `s` but dedupe a leading whitespace char when the buf already
@@ -6451,6 +6481,16 @@ impl TemplateBuf {
             last.push_str(trimmed);
         } else {
             last.push_str(s);
+        }
+    }
+
+    fn push_escaped_text_after_comment(&mut self, s: &str) {
+        let last = self.parts.last_mut().unwrap();
+        if last.ends_with(' ') {
+            let trimmed = s.trim_start_matches(|c: char| c.is_whitespace());
+            escape_text_into(last, trimmed);
+        } else {
+            escape_text_into(last, s);
         }
     }
 

@@ -119,13 +119,14 @@ pub fn template_raw(parts: Vec<String>, exprs: Vec<Expression>) -> Expression {
     // - Backslash → `\\`
     // - Backtick → `` \` ``
     // - `${` interpolation prefix → `\${` (so it stays literal)
-    let mut quasis = Vec::with_capacity(parts.len());
-    for (i, p) in parts.iter().enumerate() {
-        let raw = escape_template_quasi(p);
+    let len = parts.len();
+    let mut quasis = Vec::with_capacity(len);
+    for (i, cooked) in parts.into_iter().enumerate() {
+        let raw = escape_template_quasi(&cooked);
         quasis.push(TemplateElement {
-            cooked: p.clone(),
+            cooked,
             raw,
-            tail: i == parts.len() - 1,
+            tail: i == len - 1,
             span: Span::ZERO,
         });
     }
@@ -172,7 +173,7 @@ pub fn array(elements: Vec<Expression>) -> Expression {
 
 pub fn object(properties: Vec<ObjectMember>) -> Expression {
     Expression::Object(Box::new(ObjectExpression {
-        properties,
+        properties: properties,
         span: Span::ZERO,
     }))
 }

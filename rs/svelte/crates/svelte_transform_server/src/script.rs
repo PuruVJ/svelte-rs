@@ -1634,7 +1634,7 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
                 }
                 new_decls.push(d);
             }
-            v.declarations = new_decls;
+            v.declarations = new_decls.into();
             for d in &mut v.declarations {
                 if let Some(init) = &mut d.init {
                     rewrite_expression(init, ctx);

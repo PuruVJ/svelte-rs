@@ -27,12 +27,12 @@ use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
-pub fn try_typed_client_walker(root: &Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_client_walker(root: Root, component_name: &str) -> Option<Program> {
     try_typed_client_walker_with(root, component_name, false)
 }
 
 pub fn try_typed_client_walker_with_filename(
-    root: &Root,
+    root: Root,
     component_name: &str,
     use_tree: bool,
     filename: Option<&str>,
@@ -3916,7 +3916,7 @@ fn svelte_filename_hash(s: &str) -> String {
 }
 
 pub fn try_typed_client_walker_with(
-    root: &Root,
+    mut root: Root,
     component_name: &str,
     use_tree: bool,
 ) -> Option<Program> {
@@ -3927,8 +3927,8 @@ pub fn try_typed_client_walker_with(
     // customElements.define) to inject after imports.
     let module_stmts: Vec<Statement> = root
         .module
-        .as_ref()
-        .map(|m| m.content.body.clone())
+        .as_mut()
+        .map(|m| std::mem::take(&mut m.content.body))
         .unwrap_or_default();
 
     // Script analysis: collect statements to emit, plus any erased rune
@@ -3937,13 +3937,6 @@ pub fn try_typed_client_walker_with(
     // script has no direct mutation.
     let template_assigned = scan_fragment_assignments(&root.fragment);
     let script = analyze_script(root.instance.as_ref(), &template_assigned)?;
-
-    // Apply script-context fold to the fragment: inline plain `let X = LIT`
-    // bindings, fold nullish-coalesce, fold literal arithmetic
-    // (`40 + 2` → `42`), and any nested Math.X calls. Always run — even
-    // without script constants, expressions like `{40 + 2}` may fold.
-    let mut fragment = root.fragment.clone();
-    fold_fragment_with_consts(&mut fragment, &script.constants);
 
     // PRE-DETECT: top-level `<svelte:head>` + simple remainder shape.
     {
@@ -4228,6 +4221,12 @@ pub fn try_typed_client_walker_with(
         }
     }
 
+    // Apply script-context fold to the fragment after pre-detect fast paths
+    // (they inspect the unfolded template). Inline plain `let X = LIT`
+    // bindings, fold nullish-coalesce, fold literal arithmetic, etc.
+    fold_fragment_with_consts(&mut root.fragment, &script.constants);
+    let mut fragment = root.fragment;
+
     // Extract top-level snippets — emit as `const NAME = ($$anchor, ...) => { ... };`
     // before the export. SnippetBlocks are removed from the fragment.
     // Pre-allocate `var_counts` so the snippet's `text` consumes the bare
@@ -4266,15 +4265,8 @@ pub fn try_typed_client_walker_with(
         p.body = new_body;
         Some(p)
     };
-    let root_owned = svelte_ast::root::Root {
-        fragment,
-        ..root.clone()
-    };
-    let root = &root_owned;
-
     // Collect top-level non-ws nodes.
-    let nodes: Vec<&FragmentChild> = root
-        .fragment
+    let nodes: Vec<&FragmentChild> = fragment
         .nodes
         .iter()
         .filter(|n| match n {
@@ -4362,9 +4354,9 @@ pub fn try_typed_client_walker_with(
             // preserveWhitespace on `<svelte:options>` routes to a dedicated
             // emitter that keeps source whitespace + uses fragment/sibling
             // navigation instead of the `$.comment()` shortcut.
-            if detect_preserve_whitespace(&root.fragment) {
+            if detect_preserve_whitespace(&fragment) {
                 if let Some(p) = emit_single_each_preserve_whitespace_program(
-                    &root.fragment, eb, component_name, &script,
+                    &fragment, eb, component_name, &script,
                 ) {
                     return Some(p);
                 }
@@ -4486,7 +4478,7 @@ pub fn try_typed_client_walker_with(
             ))
         {
             if let Some(p) = emit_top_level_multi_if_program(
-                &root.fragment.nodes,
+                &fragment.nodes,
                 component_name,
                 &script,
             ) {
@@ -4514,10 +4506,10 @@ pub fn try_typed_client_walker_with(
             .iter()
             .any(|n| matches!(n, FragmentChild::RegularElement(_)))
         && script.async_info.is_none()
-        && fragment_has_deep_reactive(&root.fragment)
+        && fragment_has_deep_reactive(&fragment)
     {
         if let Some(p) = emit_deep_static_walker_program(
-            &root.fragment,
+            &fragment,
             component_name,
             &script,
         ) {
