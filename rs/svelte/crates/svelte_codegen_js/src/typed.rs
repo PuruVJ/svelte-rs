@@ -162,6 +162,10 @@ const CODE_INIT_CAPACITY: usize = 4096;
 const MAPPINGS_INIT_CAPACITY: usize = 64;
 const INDENT_LEVELS: usize = 128;
 
+thread_local! {
+    static TAB_INDENT_TABLE: (Rc<str>, Rc<Vec<String>>, Rc<Vec<u32>>) = build_indent_table("\t");
+}
+
 fn build_indent_table(indent_unit: &str) -> (Rc<str>, Rc<Vec<String>>, Rc<Vec<u32>>) {
     let unit_cols = indent_unit.chars().count() as u32;
     let mut levels = Vec::with_capacity(INDENT_LEVELS + 1);
@@ -212,8 +216,12 @@ impl<'a> Emitter<'a> {
         comments: &'a [TypedComment],
         comment_index: &'a std::cell::Cell<usize>,
     ) -> Self {
-        let indent_unit_str = opts.indent.clone().unwrap_or_else(|| "\t".to_string());
-        let (indent_unit, indent_levels, indent_cols) = build_indent_table(&indent_unit_str);
+        let indent_unit_str = opts.indent.as_deref().unwrap_or("\t");
+        let (indent_unit, indent_levels, indent_cols) = if indent_unit_str == "\t" {
+            TAB_INDENT_TABLE.with(|t| t.clone())
+        } else {
+            build_indent_table(indent_unit_str)
+        };
         Self {
             code: String::with_capacity(CODE_INIT_CAPACITY),
             col: 0,
