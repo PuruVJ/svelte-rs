@@ -14,6 +14,15 @@ path = "src/bin/svelte_rs.rs"
 name = "bench_in_proc"
 path = "src/bin/bench_in_proc.rs"
 
+[[bin]]
+name = "bench_profile"
+path = "src/bin/bench_profile.rs"
+required-features = ["profile"]
+
+[[bin]]
+name = "bench_phases"
+path = "src/bin/bench_phases.rs"
+
 [[bench]]
 name = "compile"
 harness = false
@@ -32,6 +41,10 @@ svelte_migrate = { workspace = true }
 svelte_print = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+pprof = { version = "0.14", optional = true, features = ["flamegraph"] }
+
+[features]
+profile = ["dep:pprof"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

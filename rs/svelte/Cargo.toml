@@ -86,6 +86,14 @@ codegen-units = 1
 opt-level = 3
 strip = "symbols"
 
+# Profiling: keep symbols + debuginfo for flamegraphs (`bench_profile`).
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 2
+lto = "thin"
+codegen-units = 16
+
 [profile.release-wasm]
 inherits = "release"
 opt-level = "z"
