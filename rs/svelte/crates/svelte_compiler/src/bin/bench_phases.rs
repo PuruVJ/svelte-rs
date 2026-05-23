@@ -44,30 +44,28 @@ fn main() {
         analyze_ms += t.elapsed().as_secs_f64() * 1000.0;
 
         let t = Instant::now();
+        let bump = svelte_transform_shared::compile_bump::CompileBump::new();
         let typed = match opts.module.generate {
             Some(svelte_compiler::Generate::Server) => {
                 if root.instance.is_some() || root.module.is_some() || root.css.is_some() {
-                    let bump = svelte_transform_shared::compile_bump::CompileBump::new();
                     let arena_root =
                         svelte_parse::parse_in_arena(&bump.template, &source, false).unwrap();
-                    svelte_transform_server::try_typed_server_component(arena_root, "Index")
+                    svelte_transform_server::try_typed_server_component(arena_root, "Index", bump.bump())
                 } else {
-                    svelte_transform_server::try_typed_server(root, "Index").or_else(|| {
-                        let bump = svelte_transform_shared::compile_bump::CompileBump::new();
+                    svelte_transform_server::try_typed_server(root, "Index", bump.bump()).or_else(|| {
                         let arena_root =
                             svelte_parse::parse_in_arena(&bump.template, &source, false).ok()?;
-                        svelte_transform_server::try_typed_server_component(arena_root, "Index")
+                        svelte_transform_server::try_typed_server_component(arena_root, "Index", bump.bump())
                     })
                 }
             }
             Some(svelte_compiler::Generate::Client) | None => {
-                let bump = svelte_transform_shared::compile_bump::CompileBump::new();
                 let mut arena_root =
                     svelte_parse::parse_in_arena(&bump.template, &source, false).unwrap();
                 svelte_transform_client::walker_fold_in_fragment(&mut arena_root.fragment);
-                svelte_transform_client::try_typed_client(&arena_root, "Index")
+                svelte_transform_client::try_typed_client(&arena_root, "Index", bump.bump())
                     .or_else(|| {
-                        svelte_transform_client::try_typed_client_component(&arena_root, "Index")
+                        svelte_transform_client::try_typed_client_component(&arena_root, "Index", bump.bump())
                     })
                     .or_else(|| {
                         svelte_transform_client::try_typed_client_walker_with_filename(
@@ -75,6 +73,7 @@ fn main() {
                             "Index",
                             false,
                             None,
+                            bump.bump(),
                         )
                     })
             }
@@ -92,6 +91,7 @@ fn main() {
             svelte_codegen_js::estimate_code_init_capacity(source.len());
         let _ = svelte_codegen_js::print_typed(&typed, &typed_opts);
         codegen_ms += t.elapsed().as_secs_f64() * 1000.0;
+        let _ = bump;
     }
 
     let n = iter as f64;

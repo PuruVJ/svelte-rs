@@ -58,7 +58,7 @@ pub struct Script<'a> {
     pub start: Offset,
     pub end: Offset,
     pub context: ScriptContext,
-    pub content: Program,
+    pub content: Program<'a>,
     pub attributes: BumpVec<'a, Attribute<'a>>,
 }
 

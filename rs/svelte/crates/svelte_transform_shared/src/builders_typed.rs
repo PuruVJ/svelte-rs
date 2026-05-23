@@ -519,10 +519,16 @@ pub fn if_stmt(test: Expression, consequent: Statement, alternate: Option<Statem
     }))
 }
 
-pub fn program(body: Vec<Statement>) -> Program {
+pub fn program_in<'a>(bump: &'a bumpalo::Bump, body: impl IntoIterator<Item = Statement>) -> Program<'a> {
+    let mut out = bumpalo::collections::Vec::new_in(bump);
+    out.extend(body);
     Program {
         source_type: SourceType::Module,
-        body,
+        body: out,
         span: Span::ZERO,
     }
+}
+
+pub fn program<'a>(bump: &'a bumpalo::Bump, body: Vec<Statement>) -> Program<'a> {
+    program_in(bump, body)
 }

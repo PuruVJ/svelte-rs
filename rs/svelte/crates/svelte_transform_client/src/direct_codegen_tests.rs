@@ -18,7 +18,7 @@ mod tests {
         assert!(direct.contains("$.from_html(`<h1>hello world</h1>`)"));
         assert!(direct.contains("export default function Hello_world"));
         assert!(!direct.contains("print_typed"));
-        assert!(try_typed_client(&root, "Hello_world").is_some());
+        assert!(try_typed_client(&root, "Hello_world", bump.bump()).is_some());
     }
 
     #[test]
@@ -26,7 +26,8 @@ mod tests {
         let src = "<h1>x</h1>";
         let ast = parse(src, false).unwrap();
         let root = ast.root();
-        let program = try_typed_client(&root, "X").unwrap();
+        let bump = CompileBump::new();
+        let program = try_typed_client(&root, "X", bump.bump()).unwrap();
         let js = try_emit_client_program_direct(&program).unwrap();
         assert!(js.contains("var root = $.from_html"));
         assert!(js.contains("$.append($$anchor"));

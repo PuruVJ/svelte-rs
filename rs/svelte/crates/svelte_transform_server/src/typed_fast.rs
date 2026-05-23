@@ -21,15 +21,16 @@ use std::borrow::Cow;
 /// Try to lower `root` end-to-end via the typed path. Returns `None` for
 /// shapes that need the legacy/Value path (any script, dynamic content,
 /// CSS scoping hooks, etc).
-pub fn try_typed_server(root: &Root<'_>, component_name: &str) -> Option<Program> {
-    try_typed_server_with(root, component_name, false)
+pub fn try_typed_server<'a>(root: &Root<'_>, component_name: &str, bump: &'a bumpalo::Bump) -> Option<Program<'a>> {
+    try_typed_server_with(root, component_name, false, bump)
 }
 
-pub fn try_typed_server_with(
+pub fn try_typed_server_with<'a>(
     root: &Root<'_>,
     component_name: &str,
     experimental_async: bool,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     if root.instance.is_some() || root.module.is_some() {
         return None;
     }
@@ -73,7 +74,7 @@ pub fn try_typed_server_with(
     }
     prog.push(import);
     prog.push(export);
-    Some(t::program(prog))
+    Some(t::program(bump, prog))
 }
 
 /// Walk a fragment and return its content as one HTML string if and only

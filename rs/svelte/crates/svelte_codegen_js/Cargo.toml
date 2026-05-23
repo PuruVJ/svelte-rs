@@ -10,6 +10,7 @@ description = "Port of `esrap`: estree (acorn-shaped JSON) → formatted JavaScr
 sourcemap = { workspace = true }
 serde_json = { workspace = true }
 svelte_js_ast = { workspace = true }
+bumpalo = { version = "3", features = ["collections", "boxed"] }
 
 [dev-dependencies]
 svelte_parse = { workspace = true }

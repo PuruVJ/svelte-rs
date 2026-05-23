@@ -29,7 +29,7 @@ use svelte_ast::fragment::{Fragment, FragmentChild};
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
-pub fn try_typed_client(root: &Root<'_>, component_name: &str) -> Option<Program> {
+pub fn try_typed_client<'a>(root: &Root<'_>, component_name: &str, bump: &'a bumpalo::Bump) -> Option<Program<'a>> {
     if root.instance.is_some() || root.module.is_some() {
         return None;
     }
@@ -77,7 +77,7 @@ pub fn try_typed_client(root: &Root<'_>, component_name: &str) -> Option<Program
         func_body,
     );
 
-    Some(t::program(vec![
+    Some(t::program(bump, vec![
         import_disclose,
         import_flags,
         import_internal,

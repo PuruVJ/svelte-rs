@@ -10,10 +10,9 @@
 //! Design choices:
 //! - **Typed enums, not `serde_json::Value`.** Discriminant is one byte plus
 //!   a pointer to the payload — no string-keyed hash lookups in hot loops.
-//! - **`Box<T>` per child node.** Not as fast as a single-arena layout, but
-//!   no lifetime annotations bleeding through the entire codebase. We can
-//!   migrate to bumpalo later behind the same enum API if the profile says
-//!   we need to.
+//! - **Arena-backed `Program.body`.** Top-level statement lists allocate into
+//!   the compile bump; nested `Statement` / `Expression` nodes remain heap
+//!   `Box`/`Vec` with `Clone` for transform hot paths.
 //! - **Spans are optional `(u32, u32)`.** Only set on nodes whose positions
 //!   matter for sourcemaps; transform-synthesized nodes leave it `None`.
 //! - **No `Serialize` impls.** Public AST exposure (if/when added) goes
@@ -24,18 +23,20 @@
 
 use std::borrow::Cow;
 
+mod arena;
 mod span;
 
+pub use arena::JsArena;
 pub use span::Span;
 
 // -------------------------------------------------------------------------
 // Top-level
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Program {
+#[derive(Debug, Clone, PartialEq)]
+pub struct Program<'a> {
     pub source_type: SourceType,
-    pub body: Vec<Statement>,
+    pub body: bumpalo::collections::Vec<'a, Statement>,
     pub span: Span,
 }
 

@@ -25,7 +25,19 @@ impl AstBundle {
         self.borrow_dependent()
     }
 
+    pub fn with_root_mut<R>(&mut self, f: impl FnOnce(&mut Root<'_>) -> R) -> R {
+        self.with_dependent_mut(|_owner, root| f(root))
+    }
+
     pub fn arena(&self) -> &TemplateArena {
         self.borrow_owner()
     }
+
+    /// Consume and return the owned arena (drops the AST).
+    pub fn into_arena(self) -> TemplateArena {
+        self.into_owner()
+    }
 }
+
+/// Back-compat alias for code expecting a “parsed component” type name.
+pub type ParsedComponent = AstBundle;

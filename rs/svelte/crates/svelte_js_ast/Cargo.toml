@@ -4,9 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Typed JS AST consumed by svelte_codegen_js and produced by svelte_transform_*. Defined in Rust idioms (typed enums, Box-per-child) rather than the acorn-shaped serde_json::Value the port originally used — that change unlocks the ~3x performance gap profiled against V8."
+description = "Typed JS AST consumed by svelte_codegen_js and produced by svelte_transform_*. Defined in Rust idioms (typed enums, arena-backed nodes) rather than the acorn-shaped serde_json::Value the port originally used — that change unlocks the ~3x performance gap profiled against V8."
 
 [dependencies]
-# No serde — this is the INTERNAL IR. If a public ESTree-JSON serializer
-# is needed for tooling, it'll live in its own module/crate and walk this
-# AST.
+bumpalo = { version = "3", features = ["collections", "boxed"] }

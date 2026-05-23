@@ -20,7 +20,7 @@ use svelte_ast::{
 };
 use svelte_diagnostics::CompileDiagnostic;
 
-pub use bundle::AstBundle;
+pub use bundle::{AstBundle, ParsedComponent};
 pub use parser::Parser;
 
 /// Parse a `.svelte` source string into an arena-backed AST bundle.
@@ -248,5 +248,24 @@ mod tests {
     fn strips_bom() {
         let bundle = parse("\u{feff}hi", false).unwrap();
         assert_eq!(bundle.root().end, 2);
+    }
+}
+
+#[cfg(test)]
+mod fixture_parse_tests {
+    use super::*;
+
+    #[test]
+    fn purity_parses() {
+        let s = include_str!("/workspace/packages/svelte/tests/snapshot/samples/purity/index.svelte");
+        parse(s, false).expect("purity parse");
+    }
+
+    #[test]
+    fn nullish_coalescence_parses() {
+        let s = include_str!(
+            "/workspace/packages/svelte/tests/snapshot/samples/nullish-coallescence-omittance/index.svelte"
+        );
+        parse(s, false).expect("nullish parse");
     }
 }

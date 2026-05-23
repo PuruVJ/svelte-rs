@@ -6,8 +6,6 @@
 //! `None` from the entry points; `svelte_compiler::compile` surfaces that as
 //! a `typed_client_unsupported` diagnostic.
 
-#![forbid(unsafe_code)]
-
 mod deep_static_js;
 mod direct_codegen;
 #[cfg(test)]
@@ -63,7 +61,11 @@ pub enum FragmentsMode {
 /// Second-tier typed entry point. Currently handles:
 /// - "instance script with imports only + empty template"
 /// - "no script + single <Component bind:this={x}>" (bind-this client)
-pub fn try_typed_client_component(root: &Root<'_>, component_name: &str) -> Option<Program> {
+pub fn try_typed_client_component<'a>(
+    root: &Root<'_>,
+    component_name: &str,
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     if root.css.is_some() || root.module.is_some() {
         return None;
     }
@@ -109,7 +111,7 @@ pub fn try_typed_client_component(root: &Root<'_>, component_name: &str) -> Opti
         vec![t::pat_id("$$anchor")],
         func_body,
     ));
-    Some(t::program(top))
+    Some(t::program(bump, top))
 }
 
 /// `<Foo bind:this={x} a={y} {...rest} />` →

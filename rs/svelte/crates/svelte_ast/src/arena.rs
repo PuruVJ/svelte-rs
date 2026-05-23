@@ -1,8 +1,8 @@
 //! Bump arena helpers for template AST nodes.
 //!
 //! Template trees are allocated into a single [`Bump`] per compile/parse so the
-//! whole AST drops in one free. JS subtrees (`Expression`, `Program`) remain
-//! heap-owned until a later migration.
+//! whole AST drops in one free. Script `Program.body` shares the same bump;
+//! nested `Statement` / `Expression` nodes remain heap-owned with `Clone`.
 
 use bumpalo::Bump;
 

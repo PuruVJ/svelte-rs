@@ -24,43 +24,50 @@ use svelte_transform_shared::builders_typed as t;
 use std::borrow::Cow;
 
 /// Backwards-compatible entry — defaults `experimental_async = false`.
-pub fn try_typed_server_component(root: Root<'_>, component_name: &str) -> Option<Program> {
-    try_typed_server_component_with_filename(root, component_name, false, None)
+pub fn try_typed_server_component<'a>(
+    root: Root<'_>,
+    component_name: &str,
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
+    try_typed_server_component_with_filename(root, component_name, false, None, bump)
 }
 
 /// Compatibility shim — defaults filename to None, preserve_comments to false.
-pub fn try_typed_server_component_with(
+pub fn try_typed_server_component_with<'a>(
     root: Root,
     component_name: &str,
     experimental_async: bool,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     try_typed_server_component_with_opts(
-        root, component_name, experimental_async, None, false,
+        root, component_name, experimental_async, None, false, bump,
     )
 }
 
 /// Compatibility shim — preserve_comments defaults to false.
-pub fn try_typed_server_component_with_filename(
+pub fn try_typed_server_component_with_filename<'a>(
     root: Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     try_typed_server_component_with_opts(
-        root, component_name, experimental_async, filename, false,
+        root, component_name, experimental_async, filename, false, bump,
     )
 }
 
 /// Compatibility shim — css_inject defaults to None.
-pub fn try_typed_server_component_with_opts(
+pub fn try_typed_server_component_with_opts<'a>(
     root: Root,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
     preserve_comments: bool,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     try_typed_server_component_full(
-        root, component_name, experimental_async, filename, preserve_comments, None,
+        root, component_name, experimental_async, filename, preserve_comments, None, bump,
     )
 }
 
@@ -75,14 +82,15 @@ pub fn svelte_filename_hash_pub(s: &str) -> String {
 /// - "instance script (imports + optionally rune-erasable statements) + simple template"
 /// - "single <Component bind:this={x}/>"
 /// - "<svelte:element this={tag}>"
-pub fn try_typed_server_component_full(
+pub fn try_typed_server_component_full<'a>(
     mut root: Root<'_>,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
     preserve_comments: bool,
     css_inject: Option<(String, String)>,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     PRESERVE_COMMENTS.with(|c| c.set(preserve_comments));
     BODY_VAR_COUNTER.with(|c| c.set(0));
     SIBLING_PROMISES_COUNTER.with(|c| c.set(0));
@@ -95,7 +103,7 @@ pub fn try_typed_server_component_full(
     let mut module_bindings: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     if let Some(m) = root.module.as_mut() {
-        for s in std::mem::take(&mut m.content.body) {
+        for s in m.content.body.iter().cloned() {
             script::collect_bindings_from_stmt(&s, &mut module_bindings);
             match s {
                 Statement::Import(i) => module_imports.push(Statement::Import(i)),
@@ -179,7 +187,7 @@ pub fn try_typed_server_component_full(
     let mut store_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut script_top_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(s) = root.instance.as_mut() {
-        let mut content = std::mem::take(&mut s.content);
+        let mut content = s.content.clone();
         let info = script::rewrite_program_for_server(&mut content);
         uses_props = info.uses_props;
         needs_component_wrap |= info.needs_component_wrap();
@@ -200,7 +208,7 @@ pub fn try_typed_server_component_full(
             &mut store_refs,
         );
         consts = script::collect_script_constants(&content, &info.rune_bindings);
-        let (imports, rest) = partition_imports(std::mem::take(&mut content.body))?;
+        let (imports, rest) = partition_imports(content.body.iter().cloned().collect())?;
         script_imports = imports;
         if script::script_has_async_transform(&rest) {
             async_info = script::transform_async_script_server(rest);
@@ -490,7 +498,7 @@ pub fn try_typed_server_component_full(
         top.push(t::const_decl("$$css", obj));
     }
     top.push(t::export_default_function(component_name, params, func_body));
-    Some(t::program(top))
+    Some(t::program(bump, top))
 }
 
 /// Extract top-level `{#snippet NAME(...)}` blocks from the fragment, lower

@@ -27,18 +27,55 @@ use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
-pub fn try_typed_client_walker(root: Root<'_>, component_name: &str) -> Option<Program> {
-    try_typed_client_walker_with(root, component_name, false)
+thread_local! {
+    static WALKER_PROG_BUMP: std::cell::RefCell<Option<*const bumpalo::Bump>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-pub fn try_typed_client_walker_with_filename(
+pub fn set_walker_program_bump(bump: &bumpalo::Bump) {
+    WALKER_PROG_BUMP.with(|c| *c.borrow_mut() = Some(bump as *const bumpalo::Bump));
+}
+
+pub fn clear_walker_program_bump() {
+    WALKER_PROG_BUMP.with(|c| *c.borrow_mut() = None);
+}
+
+fn walker_program_bump() -> &'static bumpalo::Bump {
+    WALKER_PROG_BUMP.with(|c| unsafe {
+        &*c.borrow()
+            .expect("walker program bump not set — call set_walker_program_bump first")
+    })
+}
+
+fn finish_program(body: Vec<Statement>) -> Program<'static> {
+    t::program(walker_program_bump(), body)
+}
+
+fn erase_program_lifetime<'a>(p: Program<'static>) -> Program<'a> {
+    // SAFETY: nodes in `p` were allocated in the bump set by
+    // `set_walker_program_bump`; the caller keeps that bump alive.
+    unsafe { std::mem::transmute(p) }
+}
+
+pub fn try_typed_client_walker<'a>(
+    root: Root<'_>,
+    component_name: &str,
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
+    try_typed_client_walker_with(root, component_name, false, bump)
+}
+
+pub fn try_typed_client_walker_with_filename<'a>(
     root: Root,
     component_name: &str,
     use_tree: bool,
     filename: Option<&str>,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
     set_walker_filename(filename);
-    let r = try_typed_client_walker_with(root, component_name, use_tree);
+    set_walker_program_bump(bump);
+    let r = try_typed_client_walker_with(root, component_name, use_tree, bump);
+    clear_walker_program_bump();
     set_walker_filename(None);
     r
 }
@@ -64,7 +101,7 @@ fn emit_svelte_head_program(
     others: &[&FragmentChild<'_>],
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -316,7 +353,7 @@ fn emit_svelte_head_program(
         ));
     }
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the `head-html-and-component` shape:
@@ -327,7 +364,7 @@ fn emit_head_if_block_program(
     body_component: &svelte_ast::elements::Component<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Head body must be a single IfBlock (no else) with a literal test
     // and consequent containing [@html, <meta>, <Component>].
     let head_non_ws: Vec<&FragmentChild> = head
@@ -606,7 +643,7 @@ fn emit_head_if_block_program(
         t::call(t::member_id(t::id_dollar(), "from_html"), cons_args),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the `text-empty-2` shape — a single outer element
@@ -617,7 +654,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     outer: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if !outer.attributes.is_empty() {
         return None;
     }
@@ -778,7 +815,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the `option-rich-content-static` shape — a single
@@ -791,7 +828,7 @@ fn emit_select_with_rich_options_static(
     select_el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if !select_el.attributes.is_empty() {
         return None;
     }
@@ -1055,7 +1092,7 @@ fn emit_select_with_rich_options_static(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the `boundary-pending-attribute` shape — top-level
@@ -1081,7 +1118,7 @@ fn emit_rich_select_program(
     root_fragment: &svelte_ast::fragment::Fragment<'_>,
     _component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Shape detection: 4 top-level snippets with names
     //   opt / option_snippet / option_snippet2 / conditional_option
     // followed by/interleaved with 24 <select> elements.
@@ -1115,7 +1152,7 @@ fn emit_rich_select_program(
     let raw = RICH_SELECT_RAW_OUTPUT;
     let mut prog: Vec<Statement> = Vec::new();
     prog.push(Statement::Raw(Box::new(raw.to_string())));
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Detect the dynamic-attributes-casing snapshot shape:
@@ -1128,7 +1165,7 @@ fn emit_dynamic_attributes_casing_program(
     root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     _script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let _ = component_name;
     // Collect top-level RegularElements in order.
     let mut els: Vec<&svelte_ast::elements::RegularElement> = Vec::new();
@@ -1182,7 +1219,7 @@ fn emit_dynamic_attributes_casing_program(
     let raw = DYNAMIC_ATTRIBUTES_CASING_RAW_OUTPUT;
     let mut prog: Vec<Statement> = Vec::new();
     prog.push(Statement::Raw(Box::new(raw.to_string())));
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn attr_single_expr(a: &svelte_ast::attributes::ElementAttribute<'_>) -> Option<Expression> {
@@ -1718,7 +1755,7 @@ fn emit_boundary_pending_attribute_program(
     boundary: &svelte_ast::elements::SvelteBoundary,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     use svelte_ast::attributes::{AttributeValue, ElementAttribute};
     // Snippet must be named `pending` (or any single identifier — we
     // wire by name).
@@ -2057,7 +2094,7 @@ fn emit_boundary_pending_attribute_program(
     prog.extend(script.imports.iter().cloned());
     prog.push(snippet_const);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for `<select>` containing `<optgroup>` children with
@@ -2068,7 +2105,7 @@ fn emit_select_with_optgroup_rich(
     root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     let core: Vec<&FragmentChild> = root_fragment
         .nodes
@@ -3140,7 +3177,7 @@ fn emit_select_with_optgroup_rich(
             vec![arr],
         )));
     }
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn select_optgroup_var(idx: usize) -> String {
@@ -3160,7 +3197,7 @@ fn emit_select_with_rich_reactive_and_trailing(
     root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     // Collect top-level non-WS, non-comment children.
     let core: Vec<&FragmentChild> = root_fragment
@@ -3747,7 +3784,7 @@ fn emit_select_with_rich_reactive_and_trailing(
             vec![arr],
         )));
     }
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn select_option_var(idx: usize) -> String {
@@ -3802,7 +3839,7 @@ fn emit_single_static_custom_element_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     module_stmts: &[Statement],
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Collect static (name, value) pairs from the element attributes.
     let mut props: Vec<(String, String)> = Vec::new();
     for a in &el.attributes {
@@ -3889,7 +3926,7 @@ fn emit_single_static_custom_element_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Upstream's `hash(filename)` for `$.head(HASH, ...)`. DJB2-variant
@@ -3915,11 +3952,24 @@ fn svelte_filename_hash(s: &str) -> String {
     out
 }
 
-pub fn try_typed_client_walker_with(
+pub fn try_typed_client_walker_with<'a>(
     mut root: Root,
     component_name: &str,
     use_tree: bool,
-) -> Option<Program> {
+    bump: &'a bumpalo::Bump,
+) -> Option<Program<'a>> {
+    set_walker_program_bump(bump);
+    let result = try_typed_client_walker_with_inner(root, component_name, use_tree)
+        .map(erase_program_lifetime);
+    clear_walker_program_bump();
+    result
+}
+
+fn try_typed_client_walker_with_inner(
+    mut root: Root,
+    component_name: &str,
+    use_tree: bool,
+) -> Option<Program<'static>> {
     if root.css.is_some() {
         return None;
     }
@@ -3927,8 +3977,8 @@ pub fn try_typed_client_walker_with(
     // customElements.define) to inject after imports.
     let module_stmts: Vec<Statement> = root
         .module
-        .as_mut()
-        .map(|m| std::mem::take(&mut m.content.body))
+        .as_ref()
+        .map(|m| m.content.body.iter().cloned().collect())
         .unwrap_or_default();
 
     // Script analysis: collect statements to emit, plus any erased rune
@@ -3957,12 +4007,13 @@ pub fn try_typed_client_walker_with(
                         break;
                     }
                 }
-                let mut new_body: Vec<Statement> = p.body[..insert_at].to_vec();
+                let mut new_body: Vec<Statement> = p.body[..insert_at].iter().cloned().collect();
                 new_body.extend(module_stmts.iter().cloned());
                 new_body.extend(p.body[insert_at..].iter().cloned());
-                p.body = new_body;
+                p.body.clear();
+                p.body.extend(new_body);
             }
-            return Some(p);
+            return Some(erase_program_lifetime(p));
         }
     }
 
@@ -4264,7 +4315,7 @@ pub fn try_typed_client_walker_with(
     )?;
     // Helper closure: inject snippet declarations + extra root templates
     // after the import block of any typed-fast program.
-    let inject_snippets = |opt: Option<Program>| -> Option<Program> {
+    let inject_snippets = |opt: Option<Program<'static>>| -> Option<Program<'static>> {
         let mut p = opt?;
         if snippet_decls.is_empty()
             && snippet_extra_roots.is_empty()
@@ -4280,14 +4331,14 @@ pub fn try_typed_client_walker_with(
                 break;
             }
         }
-        let mut new_body: Vec<Statement> =
-            p.body[..insert_at].to_vec();
+        let mut new_body: Vec<Statement> = p.body[..insert_at].iter().cloned().collect();
         // Module-level script (e.g. customElements.define) → after imports.
         new_body.extend(module_stmts.iter().cloned());
         new_body.extend(snippet_decls.iter().cloned());
         new_body.extend(snippet_extra_roots.iter().cloned());
         new_body.extend(p.body[insert_at..].iter().cloned());
-        p.body = new_body;
+        p.body.clear();
+        p.body.extend(new_body);
         Some(p)
     };
     // Collect top-level non-ws nodes.
@@ -4994,7 +5045,7 @@ pub fn try_typed_client_walker_with(
             vec![arr],
         )));
     }
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn emit_directives(
@@ -5081,7 +5132,7 @@ fn emit_tree_program(
     classified: &[NodeKind],
     component_name: &str,
     is_multi_root: bool,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Tree mode currently only supports fully-static templates (every node
     // serializes to a tree literal). Build the nested array.
     let mut tree_elements: Vec<Expression> = Vec::new();
@@ -5134,7 +5185,7 @@ fn emit_tree_program(
         body,
     );
 
-    Some(t::program(vec![
+    Some(finish_program(vec![
         t::import_side_effect("svelte/internal/disclose-version"),
         t::import_side_effect("svelte/internal/flags/legacy"),
         t::import_namespace("$", "svelte/internal/client"),
@@ -5256,7 +5307,7 @@ fn collapse_ws(s: &str) -> String {
 // Class-only (empty template + class with runes) emission
 // ---------------------------------------------------------------------------
 
-fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<Program> {
+fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<Program<'static>> {
     let mut body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     // `$.push($$props, true);`
     body.push(t::stmt(t::call(
@@ -5286,7 +5337,7 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -5297,7 +5348,7 @@ fn emit_single_component_program(
     c: &Component<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let mut props: Vec<ObjectMember> = Vec::new();
     for attr in &c.attributes {
         match attr {
@@ -5575,7 +5626,7 @@ fn emit_single_component_program(
             prog.extend(script.imports.iter().cloned());
             prog.extend(module_extras);
             prog.push(export);
-            return Some(t::program(prog));
+            return Some(finish_program(prog));
         }
         // Slot child case 1: body is exactly one Component (no props, no
         // body), surrounded by whitespace text and comments only. Emit
@@ -5674,7 +5725,7 @@ fn emit_single_component_program(
                     prog.push(t::import_namespace("$", "svelte/internal/client"));
                     prog.extend(script.imports.iter().cloned());
                     prog.push(export);
-                    return Some(t::program(prog));
+                    return Some(finish_program(prog));
                 }
             }
         }
@@ -5826,7 +5877,7 @@ fn emit_single_component_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Single top-level async-tainted ExpressionTag — emits a no-root
@@ -5836,7 +5887,7 @@ fn emit_single_async_expr_program(
     component_name: &str,
     script: &ScriptInfo,
     ai: &AsyncInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let mut body: Vec<Statement> = Vec::with_capacity(script.body.len() + 16);
     body.extend(script.body.iter().cloned());
     body.push(t::stmt(t::call(
@@ -5893,7 +5944,7 @@ fn emit_single_async_expr_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -6679,7 +6730,7 @@ fn emit_single_vanilla_if_program(
     ib: &svelte_ast::blocks::IfBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Bail if script touches things we can't yet preserve safely.
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
@@ -6849,7 +6900,7 @@ fn emit_single_vanilla_if_program(
     // branches captured.
     prog.extend(root_decls);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit the upstream client shape for a runes-mode top-level single
@@ -6887,7 +6938,7 @@ fn emit_top_level_html_tag_program(
     expr: &Expression,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -7002,7 +7053,7 @@ fn emit_top_level_html_tag_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the shape:
@@ -7025,7 +7076,7 @@ fn emit_top_level_render_tag_program(
     rt_expr: &Expression,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -7091,7 +7142,7 @@ fn emit_top_level_render_tag_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the shape:
@@ -7115,7 +7166,7 @@ fn emit_single_element_wrapping_html_tag_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -7313,7 +7364,7 @@ fn emit_single_element_wrapping_html_tag_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit the upstream shape for a top-level fragment that is exactly one
@@ -7332,7 +7383,7 @@ fn emit_top_level_single_text_program(
     text: &str,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -7374,7 +7425,7 @@ fn emit_top_level_single_text_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit the upstream shape for a top-level fragment that is exactly one
@@ -7394,7 +7445,7 @@ fn emit_top_level_single_expression_program(
     expr: &Expression,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -7493,7 +7544,7 @@ fn emit_top_level_single_expression_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit the upstream shape for a single wrapper element containing
@@ -7519,7 +7570,7 @@ fn emit_single_element_with_component_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -7655,7 +7706,7 @@ fn emit_single_element_with_component_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the shape:
@@ -7673,7 +7724,7 @@ fn emit_single_element_with_inner_snippet_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.proxy_bindings.is_empty()
         || !script.derived_bindings.is_empty()
@@ -7868,7 +7919,7 @@ fn emit_single_element_with_inner_snippet_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Collapse runs of consecutive ASCII spaces in the template HTML, but
@@ -7936,7 +7987,7 @@ fn emit_single_element_wrapping_ifs_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -8311,7 +8362,7 @@ fn emit_single_element_wrapping_ifs_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a non-async program for a top-level fragment that is exactly
@@ -8338,6 +8389,9 @@ fn emit_single_element_wrapping_ifs_program(
 ///   }
 pub(crate) struct TopLevelMultiIfEmit {
     pub(crate) func_body: Vec<Statement>,
+    /// Pre-rendered export function body (tab-indented lines). Emitted without
+    /// re-walking `Statement` nodes in the direct module printer.
+    pub(crate) func_body_js: String,
     pub(crate) root_decls: Vec<Statement>,
     pub(crate) html: String,
     pub(crate) needs_import_node: bool,
@@ -8347,7 +8401,7 @@ pub(crate) fn emit_top_level_multi_if_program(
     nodes: &[FragmentChild<'_>],
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let parts = emit_top_level_multi_if_parts(nodes, component_name, script)?;
     Some(program_from_top_level_multi_if(&parts, component_name, script))
 }
@@ -10335,8 +10389,11 @@ pub(crate) fn emit_top_level_multi_if_parts(
     // — this matches upstream's text node merging.
     let html = collapse_template_inter_element_ws(&html);
 
+    let func_body_js = crate::direct_codegen::render_function_stmts_to_string(&func_body, 1)?;
+
     Some(TopLevelMultiIfEmit {
         func_body,
+        func_body_js,
         root_decls,
         html,
         needs_import_node,
@@ -10347,7 +10404,7 @@ fn program_from_top_level_multi_if(
     parts: &TopLevelMultiIfEmit,
     component_name: &str,
     script: &ScriptInfo,
-) -> Program {
+) -> Program<'static> {
     let mut params = vec![t::pat_id_anchor()];
     if script.uses_props_param() {
         params.push(t::pat_id("$$props"));
@@ -10374,7 +10431,7 @@ fn program_from_top_level_multi_if(
         ),
     ));
     prog.push(export);
-    t::program(prog)
+    finish_program(prog)
 }
 
 /// Emit a runes/legacy-mode program for the shape:
@@ -10387,7 +10444,7 @@ fn emit_single_element_wrapping_each_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -10851,7 +10908,7 @@ fn emit_single_element_wrapping_each_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// True iff the expression directly references any name in `names`
@@ -11336,7 +11393,7 @@ fn emit_single_element_with_spread_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -11483,7 +11540,7 @@ fn emit_single_element_with_spread_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the shape:
@@ -11496,7 +11553,7 @@ fn emit_single_element_with_bind_this_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -11712,7 +11769,7 @@ fn emit_single_element_with_bind_this_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a program for the shape:
@@ -11728,7 +11785,7 @@ fn emit_single_element_with_folded_prefix_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -11928,14 +11985,14 @@ fn emit_single_element_with_folded_prefix_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn emit_single_dynamic_element_program(
     el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.has_class_with_runes
         || !script.state_bindings.is_empty()
         || !script.proxy_bindings.is_empty()
@@ -12293,7 +12350,7 @@ fn emit_single_dynamic_element_program(
         ),
     ));
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// `{#if await EXPR}then{:else}else{/if}` →
@@ -12307,7 +12364,7 @@ fn emit_single_async_if_program(
     ib: &svelte_ast::blocks::IfBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let test_inner = strip_outer_await(&ib.test);
     let consequent_body = emit_async_branch_body(&ib.consequent, "text")?;
     let alternate_body = if let Some(alt) = &ib.alternate {
@@ -12446,7 +12503,7 @@ fn emit_single_async_if_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// True iff the fragment contains a `{@const X = ...}` whose initializer has
@@ -12486,7 +12543,7 @@ fn emit_async_const_chain_program(
     if_blocks: &[&svelte_ast::blocks::IfBlock<'_>],
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let ai = script.async_info.as_ref()?;
 
     // Determine if any const init uses an IIFE pattern → triggers
@@ -12651,7 +12708,7 @@ fn emit_async_const_chain_program(
     prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Returns true iff `e` is an IIFE call — `(arrow)()` form. Used to decide
@@ -12923,7 +12980,7 @@ fn emit_const_async_if_program(
     ib: &svelte_ast::blocks::IfBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Extract const tags + the single child element.
     let mut consts: Vec<&svelte_ast::tags::ConstTag> = Vec::new();
     let mut element_node: Option<&svelte_ast::elements::RegularElement> = None;
@@ -13216,7 +13273,7 @@ fn emit_const_async_if_program(
     prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Helper: build an ArrayExpression from a Vec of Expressions.
@@ -13287,7 +13344,7 @@ fn emit_async_if_chain_program(
     if_blocks: &[&svelte_ast::blocks::IfBlock<'_>],
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let ai = script.async_info.as_ref()?;
 
     // Module-level template: N `<!>` placeholders separated by single spaces.
@@ -13373,7 +13430,7 @@ fn emit_async_if_chain_program(
     prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 /// Emit a single if-block at the given node anchor. Returns either a
@@ -13782,7 +13839,7 @@ fn emit_select_rich_content_program(
     root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let mut ctx = SelectCtx::default();
 
     // Phase 1: extract top-level snippets in source order.
@@ -13901,7 +13958,7 @@ fn emit_select_rich_content_program(
     prog.extend(ctx.module_decls.clone());
     prog.push(root_decl);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 #[derive(Default)]
@@ -16061,7 +16118,7 @@ fn emit_deep_static_walker_program(
     root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Collect top-level element nodes (interleaved with text/comment).
     let mut html = String::with_capacity(128);
     let mut needs_import_node = false;
@@ -16510,7 +16567,7 @@ fn emit_deep_static_walker_program(
     prog.extend(script.imports.iter().cloned());
     prog.push(root_decl);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 #[derive(Default)]
@@ -18245,7 +18302,7 @@ fn emit_single_async_each_program(
     eb: &svelte_ast::blocks::EachBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Body: only support text-only bodies (single ExpressionTag) for now.
     let body_non_ws: Vec<&FragmentChild> = eb
         .body
@@ -18507,7 +18564,7 @@ fn emit_single_async_each_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -18518,7 +18575,7 @@ fn emit_single_svelte_element_program(
     se: &svelte_ast::elements::SvelteElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if !se.attributes.is_empty() {
         return None;
     }
@@ -18642,7 +18699,7 @@ fn emit_single_svelte_element_program(
     prog.push(t::import_namespace("$", "svelte/internal/client"));
     prog.extend(script.imports.iter().cloned());
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 // ---------------------------------------------------------------------------
@@ -18701,7 +18758,7 @@ fn emit_single_each_preserve_whitespace_program(
     eb: &svelte_ast::blocks::EachBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Body must be a single wrapper element (e.g. `<div>{l}</div>`) for
     // this narrow emitter. Other shapes bail.
     let body_non_ws: Vec<&FragmentChild> = eb
@@ -18908,14 +18965,14 @@ fn emit_single_each_preserve_whitespace_program(
     prog.extend(script.imports.iter().cloned());
     prog.extend(hoisted);
     prog.push(export);
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn emit_single_each_program(
     eb: &svelte_ast::blocks::EachBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     // Body classification: either a single wrapper element (e.g. `<p>{i}</p>`)
     // or a text-only body (e.g. `{thing}, `). Anything else bails.
     let body_nodes: Vec<&FragmentChild> = eb
@@ -19349,7 +19406,7 @@ fn emit_single_each_program(
             vec![arr],
         )));
     }
-    Some(t::program(prog))
+    Some(finish_program(prog))
 }
 
 fn trim_boundary_ws<'a>(nodes: &'a [FragmentChild<'a>]) -> &'a [FragmentChild<'a>] {

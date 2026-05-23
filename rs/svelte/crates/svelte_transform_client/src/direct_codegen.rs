@@ -38,6 +38,21 @@ pub fn try_emit_fully_static_client_js(
     Some(out.into_owned())
 }
 
+/// Render function-body statements to JS source (one print pass).
+pub(crate) fn render_function_stmts_to_string(
+    stmts: &[Statement],
+    depth: usize,
+) -> Option<String> {
+    let mut out = String::with_capacity(stmts.len().saturating_mul(96) + 64);
+    for stmt in stmts {
+        if !function_stmt_direct_printable(stmt) {
+            return None;
+        }
+        emit_function_stmt_direct(stmt, &mut out, depth)?;
+    }
+    Some(out)
+}
+
 /// Emit sparse top-level multi-if client JS without building a full `Program` AST.
 pub(crate) fn emit_top_level_multi_if_module_js(
     parts: &TopLevelMultiIfEmit,
@@ -45,11 +60,6 @@ pub(crate) fn emit_top_level_multi_if_module_js(
     script: &ScriptInfo,
     bump: &CompileBump,
 ) -> Option<String> {
-    for s in &parts.func_body {
-        if !function_stmt_direct_printable(s) {
-            return None;
-        }
-    }
     for s in &parts.root_decls {
         if !root_decl_direct_printable(s) {
             return None;
@@ -57,7 +67,7 @@ pub(crate) fn emit_top_level_multi_if_module_js(
     }
 
     let mut out = String::with_capacity(
-        parts.html.len() + parts.func_body.len() * 96 + 512,
+        parts.html.len() + parts.func_body_js.len() + 512,
     );
     for imp in &script.imports {
         if let Statement::Import(i) = imp {
@@ -88,9 +98,7 @@ pub(crate) fn emit_top_level_multi_if_module_js(
     }
     out.push_str(&params.join(", "));
     out.push_str(") {\n");
-    for stmt in &parts.func_body {
-        emit_function_stmt_direct(stmt, &mut out, 1)?;
-    }
+    out.push_str(&parts.func_body_js);
     out.push_str("}\n");
     let _ = bump;
     Some(out)
@@ -135,7 +143,7 @@ fn emit_root_decl_direct(s: &Statement, out: &mut String) -> Option<()> {
 }
 
 /// Try emitting client JS directly from a typed `Program` (sparse / static slab shapes).
-pub fn try_emit_client_program_direct(program: &Program) -> Option<String> {
+pub fn try_emit_client_program_direct(program: &Program<'_>) -> Option<String> {
     if !program_direct_printable(program) {
         return None;
     }
@@ -200,11 +208,11 @@ fn write_usize(out: &mut impl StringSink, n: usize) {
 
 // --- Program direct printer -------------------------------------------------
 
-fn estimate_program_js_len(program: &Program) -> usize {
+fn estimate_program_js_len(program: &Program<'_>) -> usize {
     program.body.len().saturating_mul(80) + 256
 }
 
-fn program_direct_printable(program: &Program) -> bool {
+fn program_direct_printable(program: &Program<'_>) -> bool {
     let mut saw_export = false;
     for stmt in &program.body {
         match stmt {
@@ -294,7 +302,7 @@ fn expr_direct_printable(e: &Expression) -> bool {
     }
 }
 
-fn emit_program_direct(program: &Program, out: &mut String) -> Option<()> {
+fn emit_program_direct(program: &Program<'_>, out: &mut String) -> Option<()> {
     let mut export: Option<&ExportDefaultDeclaration> = None;
     let mut import_count = 0usize;
     let mut var_count = 0usize;

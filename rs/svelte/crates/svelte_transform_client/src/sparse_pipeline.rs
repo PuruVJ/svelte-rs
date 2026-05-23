@@ -13,7 +13,7 @@ pub fn try_sparse_islands_program(
     fragment: &Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     if script.async_info.is_some()
         || script.has_class_with_runes
         || !script.state_bindings.is_empty()
@@ -75,7 +75,7 @@ pub fn try_sparse_islands_root(
     root: &svelte_ast::root::Root<'_>,
     component_name: &str,
     template_assigned: &std::collections::HashSet<String>,
-) -> Option<Program> {
+) -> Option<Program<'static>> {
     let script = analyze_script(root.instance.as_ref(), template_assigned)?;
     try_sparse_islands_program(&root.fragment, component_name, &script)
 }

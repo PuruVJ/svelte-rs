@@ -1669,6 +1669,7 @@ dependencies = [
 name = "svelte_codegen_js"
 version = "0.0.0"
 dependencies = [
+ "bumpalo",
  "serde_json",
  "sourcemap",
  "svelte_analyze",
@@ -1735,6 +1736,9 @@ dependencies = [
 [[package]]
 name = "svelte_js_ast"
 version = "0.0.0"
+dependencies = [
+ "bumpalo",
+]
 
 [[package]]
 name = "svelte_magic_string"

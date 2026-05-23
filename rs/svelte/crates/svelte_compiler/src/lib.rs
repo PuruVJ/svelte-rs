@@ -14,10 +14,11 @@ pub use options::{
     CompileOptions, CssMode, ExperimentalOptions, FragmentsStrategy, Generate,
     ModuleCompileOptions, ParseOptions,
 };
-pub use svelte_ast::Root;
+pub use svelte_ast::{Root, TemplateArena};
 pub use svelte_diagnostics::CompileDiagnostic;
 pub use svelte_migrate::{migrate, MigrateOptions, MigrateResult};
-pub use svelte_parse::AstBundle;
+pub use svelte_parse::{parse_in_arena, AstBundle, ParsedComponent};
+pub use svelte_transform_shared::compile_bump::CompileBump;
 pub use svelte_print::{print as print_root, PrintOptions, PrintResult};
 
 /// `parse(source, options)` — delegates to `svelte_parse::parse`.
@@ -29,6 +30,15 @@ pub use svelte_print::{print as print_root, PrintOptions, PrintResult};
 /// matching upstream's `InternalCompileError` shape.
 pub fn parse(source: &str, options: ParseOptions) -> Result<AstBundle, CompileDiagnostic> {
     svelte_parse::parse(source, options.loose)
+}
+
+/// Parse into an existing [`CompileBump`] template arena (same bump as [`compile`]).
+pub fn parse_with_bump<'a>(
+    bump: &'a CompileBump,
+    source: &str,
+    options: ParseOptions,
+) -> Result<Root<'a>, CompileDiagnostic> {
+    parse_in_arena(&bump.template, source, options.loose)
 }
 
 /// Output of `compile()` — mirrors upstream's `{ js, css, warnings, ast, stats }`.
@@ -57,7 +67,7 @@ pub fn compile(
         options.module.generate,
         Some(Generate::Client) | None
     ) {
-        svelte_transform_client::precompute_static_html_cache(&mut root);
+        svelte_transform_client::precompute_static_html_cache(&mut root, compile_bump.bump());
     }
     // The pipeline is typed end-to-end: parse -> typed transform -> typed
     // print. If no typed transform can handle the input shape, we surface
@@ -111,13 +121,13 @@ pub fn compile(
             };
 
             if let Some(p) = svelte_transform_server::try_typed_server_with(
-                &root, component_name, exp_async,
+                &root, component_name, exp_async, compile_bump.bump(),
             ) {
                 p
             } else if let Some(p) =
                 svelte_transform_server::try_typed_server_component_full(
                     root, component_name, exp_async, filename, preserve_comments,
-                    css_inject_args,
+                    css_inject_args, compile_bump.bump(),
                 )
             {
                 p
@@ -164,12 +174,14 @@ pub fn compile(
             let fast = if use_tree {
                 None
             } else {
-                svelte_transform_client::try_typed_client(&root, component_name)
+                svelte_transform_client::try_typed_client(&root, component_name, compile_bump.bump())
             };
             if let Some(p) = fast {
                 p
             } else if let Some(p) =
-                svelte_transform_client::try_typed_client_component(&root, component_name)
+                svelte_transform_client::try_typed_client_component(
+                    &root, component_name, compile_bump.bump(),
+                )
             {
                 p
             } else if let Some(p) =
@@ -178,6 +190,7 @@ pub fn compile(
                     component_name,
                     use_tree,
                     options.module.filename.as_deref(),
+                    compile_bump.bump(),
                 )
             {
                 p

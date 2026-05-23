@@ -53,6 +53,16 @@ Template nodes (`Fragment`, elements, blocks, attributes) allocate into a single
 
 Scratch strings for direct codegen use the same bump via **`CompileBump`** (`compile_bump.template.bump`).
 
+## Arena-backed JS (`Program` bodies)
+
+`Program<'a>.body` is a `bumpalo::Vec<'a, Statement>` allocated in the compile bump (script hoist + transform `program_in`). Nested `Expression` nodes remain heap-allocated for now (preserves `.clone()` in transforms).
+
+## Public parse API
+
+- `parse()` → [`AstBundle`](crates/svelte_parse/src/bundle.rs) (arena + `Root`)
+- `parse_in_arena` / `compile::parse_with_bump` — reuse one bump for parse + compile
+- `ParsedComponent` type alias
+
 ## Entry order (client walker)
 
 1. `analyze_script`

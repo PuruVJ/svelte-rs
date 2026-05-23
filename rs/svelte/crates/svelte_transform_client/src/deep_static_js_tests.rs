@@ -14,7 +14,7 @@ mod tests {
         let bump = CompileBump::new();
         let mut root = parse_in_arena(&bump.template, &source, false).unwrap();
         svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
-        crate::static_html_cache::precompute_static_html_cache(&mut root);
+        crate::static_html_cache::precompute_static_html_cache(&mut root, bump.bump());
 
         let assigned = scan_fragment_assignments(&root.fragment);
         let script = analyze_script_props_only(root.instance.as_ref(), &assigned).unwrap();

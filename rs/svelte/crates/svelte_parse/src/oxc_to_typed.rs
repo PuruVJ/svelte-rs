@@ -89,8 +89,8 @@ fn slice_text(span: oxc_span::Span) -> Option<String> {
 // Program
 // -------------------------------------------------------------------------
 
-pub fn program(p: &oxc::Program<'_>, shift: Shift) -> Program {
-    let mut body = Vec::with_capacity(p.body.len());
+pub fn program<'a>(p: &oxc::Program<'_>, shift: Shift, bump: &'a bumpalo::Bump) -> Program<'a> {
+    let mut body = bumpalo::collections::Vec::new_in(bump);
     body.extend(p.body.iter().map(|s| statement(s, shift)));
     Program {
         source_type: SourceType::Module,

@@ -26,10 +26,10 @@ pub struct Component<'a> {
 
 /// Compile-time metadata on elements (set by `mark_template_metadata`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ElementMetadata {
+pub struct ElementMetadata<'a> {
     pub dynamic: bool,
     pub is_static_element: bool,
-    pub cached_static_html: Option<String>,
+    pub cached_static_html: Option<bumpalo::collections::String<'a>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,7 +40,7 @@ pub struct RegularElement<'a> {
     pub name_loc: SourceLocation,
     pub attributes: BumpVec<'a, ElementAttribute<'a>>,
     pub fragment: Fragment<'a>,
-    pub metadata: ElementMetadata,
+    pub metadata: ElementMetadata<'a>,
 }
 
 #[derive(Debug, PartialEq)]

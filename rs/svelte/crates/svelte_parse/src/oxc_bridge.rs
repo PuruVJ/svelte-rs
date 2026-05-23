@@ -56,6 +56,12 @@ fn try_parse_simple_identifier(source: &str, start: usize) -> Option<(Expression
     if is_js_keyword(name) {
         return None;
     }
+    // Only use the fast path when the mustache is a bare identifier (`{foo}`),
+    // not the start of a member/call chain (`{Math.max(...)}`).
+    let after = tail[end..].trim_start();
+    if !after.is_empty() && !after.starts_with('}') {
+        return None;
+    }
     Some((
         Expression::Identifier(svelte_js_ast::Identifier {
             name: Cow::Owned(name.into()),
@@ -152,14 +158,15 @@ pub fn parse_expression(
     result
 }
 
-pub fn parse_program(
+pub fn parse_program<'a>(
     alloc: &mut Allocator,
+    bump: &'a bumpalo::Bump,
     full_source: &str,
     _line_map: &LineMap,
     start: usize,
     end: usize,
     ts: bool,
-) -> Result<(Program, Vec<RawComment>), CompileDiagnostic> {
+) -> Result<(Program<'a>, Vec<RawComment>), CompileDiagnostic> {
     let slice = &full_source[start..end];
     let source_type = SourceType::default().with_typescript(ts).with_module(true);
     let parser = OxcParser::new(alloc, slice, source_type).with_options(opts());
@@ -170,7 +177,7 @@ pub fn parse_program(
         return Err(js_diag(start, end, msg));
     }
     walker::set_slice(slice);
-    let prog = walker::program(&ret.program, Shift(start as u32));
+    let prog = walker::program(&ret.program, Shift(start as u32), bump);
     walker::clear_slice();
     let comments = collect_comments(&ret.program.comments, slice, start as u32, true);
     alloc.reset();
@@ -237,9 +244,10 @@ pub fn parse_const_decl_at(
     }
     let prefix_len = 6u32;
     let shift = Shift((start as i64 - prefix_len as i64).max(0) as u32);
-    let prog = walker::program(&ret.program, shift);
+    let js_bump = bumpalo::Bump::new();
+    let prog = walker::program(&ret.program, shift, &js_bump);
     alloc.reset();
-    for stmt in prog.body {
+    for stmt in prog.body.into_iter() {
         if let svelte_js_ast::Statement::Variable(v) = stmt {
             return Ok(*v);
         }

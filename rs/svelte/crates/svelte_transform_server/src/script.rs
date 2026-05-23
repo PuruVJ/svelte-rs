@@ -67,7 +67,7 @@ pub struct AsyncInfo {
 
 /// Returns true if the program contains top-level `await` (an Await
 /// expression not inside an async function / async arrow).
-pub fn has_top_level_await(p: &Program) -> bool {
+pub fn has_top_level_await(p: &Program<'_>) -> bool {
     p.body.iter().any(stmt_has_top_level_await)
 }
 
@@ -462,7 +462,7 @@ fn void_zero() -> Expression {
 /// Detect any `$.derived(ARROW)` where ARROW's body contains await — the
 /// post rune-erase form of `let X = $derived(await E)`. Used to trigger the
 /// async transform even when the script has no other top-level await.
-fn has_async_derived_init(p: &Program) -> bool {
+fn has_async_derived_init(p: &Program<'_>) -> bool {
     p.body.iter().any(|s| {
         if let Statement::Variable(v) = s {
             v.declarations.iter().any(|d| {
@@ -724,7 +724,7 @@ impl RewriteInfo {
 }
 
 /// Rewrite a Program in-place to erase server-irrelevant rune calls.
-pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
+pub fn rewrite_program_for_server(p: &mut Program<'_>) -> RewriteInfo {
     let mut rune_bindings: HashSet<String> = HashSet::new();
     let mut derived_bindings: HashSet<String> = HashSet::new();
     let mut state_bindings: HashSet<String> = HashSet::new();
@@ -750,7 +750,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
     // with bindings in the right order.
     let mut legacy_export_props: Vec<String> = Vec::new();
     let mut new_body: Vec<Statement> = Vec::with_capacity(p.body.len());
-    for stmt in std::mem::take(&mut p.body) {
+    for stmt in p.body.iter().cloned() {
         match stmt {
             Statement::ExportNamed(e) if e.declaration.is_some() => {
                 // Only handle `export let NAME[=DEFAULT]` shape. Anything
@@ -852,7 +852,8 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
             other => new_body.push(other),
         }
     }
-    p.body = new_body;
+    p.body.clear();
+    p.body.extend(new_body);
 
     if single_id_props.is_some() || has_class_with_runes {
         ctx.uses_props = true;
@@ -1187,7 +1188,7 @@ fn collect_pattern_names(p: &Pattern, out: &mut HashSet<String>) {
 ///
 /// Conservative: requires `let X = LITERAL` (no destructuring, no reassign).
 pub fn collect_script_constants(
-    p: &Program,
+    p: &Program<'_>,
     skip: &HashSet<String>,
 ) -> HashMap<String, Expression> {
     // First pass: collect candidates. In runes mode (any rune declaration
@@ -2419,7 +2420,7 @@ fn rewrite_store_refs_inner(
 /// Collect names of top-level `let/const/var` bindings (only direct Identifier
 /// patterns; destructure patterns are skipped — store-detection only needs
 /// the names users would reference via the `$X` form).
-pub fn collect_top_level_bindings(p: &Program) -> HashSet<String> {
+pub fn collect_top_level_bindings(p: &Program<'_>) -> HashSet<String> {
     let mut out = HashSet::new();
     for s in &p.body {
         collect_bindings_from_stmt(s, &mut out);

@@ -126,7 +126,7 @@ impl LineMap {
 }
 
 /// Top-level entry point.
-pub fn print_typed(program: &Program, opts: &TypedPrintOptions) -> TypedPrintResult {
+pub fn print_typed(program: &Program<'_>, opts: &TypedPrintOptions) -> TypedPrintResult {
     let comment_index = std::cell::Cell::new(0usize);
     let mut emitter = Emitter::new(opts, &opts.comments, &comment_index);
     emitter.emit_program(program);
@@ -163,9 +163,12 @@ pub fn print_statements_str(body: &[Statement]) -> String {
 /// to preserve. Comments inside empty block-statement bodies survive
 /// the round-trip (e.g. `() => { /* … */ }` → `() => { /* … */ }`).
 pub fn print_statements_str_with_comments(body: &[Statement], comments: &[TypedComment]) -> String {
+    let bump = bumpalo::Bump::new();
+    let mut body_vec = bumpalo::collections::Vec::new_in(&bump);
+    body_vec.extend(body.iter().cloned());
     let prog = Program {
         source_type: svelte_js_ast::SourceType::Module,
-        body: body.to_vec(),
+        body: body_vec,
         span: svelte_js_ast::Span::ZERO,
     };
     let opts = TypedPrintOptions::default();
@@ -348,7 +351,7 @@ impl<'a> Emitter<'a> {
 
     // -- top-level ---------------------------------------------------------
 
-    fn emit_program(&mut self, p: &Program) {
+    fn emit_program(&mut self, p: &Program<'_>) {
         self.emit_body_seq(&p.body, false);
     }
 
@@ -2055,16 +2058,26 @@ mod tests {
         })
     }
 
-    #[test]
-    fn smoke_identifier() {
-        let prog = Program {
+    fn test_program(body: Vec<Statement>) -> (bumpalo::Bump, Program<'_>) {
+        let bump = bumpalo::Bump::new();
+        let program = Program {
             source_type: SourceType::Module,
-            body: vec![Statement::Expression(Box::new(ExpressionStatement {
-                expression: id("foo"),
-                span: Span::ZERO,
-            }))],
+            body: {
+                let mut v = bumpalo::collections::Vec::new_in(&bump);
+                v.extend(body);
+                v
+            },
             span: Span::ZERO,
         };
+        (bump, program)
+    }
+
+    #[test]
+    fn smoke_identifier() {
+        let (_bump, prog) = test_program(vec![Statement::Expression(Box::new(ExpressionStatement {
+                expression: id("foo"),
+                span: Span::ZERO,
+            }))]);
         let r = print_typed(&prog, &TypedPrintOptions::default());
         assert_eq!(r.code, "foo;");
     }
@@ -2077,23 +2090,17 @@ mod tests {
             optional: false,
             span: Span::ZERO,
         }));
-        let prog = Program {
-            source_type: SourceType::Module,
-            body: vec![Statement::Expression(Box::new(ExpressionStatement {
+        let (_bump, prog) = test_program(vec![Statement::Expression(Box::new(ExpressionStatement {
                 expression: call,
                 span: Span::ZERO,
-            }))],
-            span: Span::ZERO,
-        };
+            }))]);
         let r = print_typed(&prog, &TypedPrintOptions::default());
         assert_eq!(r.code, "foo(bar);");
     }
 
     #[test]
     fn smoke_var_decl() {
-        let prog = Program {
-            source_type: SourceType::Module,
-            body: vec![Statement::Variable(Box::new(VariableDeclaration {
+        let (_bump, prog) = test_program(vec![Statement::Variable(Box::new(VariableDeclaration {
                 kind: VariableKind::Var,
                 declarations: vec![VariableDeclarator {
                     id: Pattern::Identifier(Identifier {
@@ -2111,18 +2118,14 @@ mod tests {
                     span: Span::ZERO,
                 }],
                 span: Span::ZERO,
-            }))],
-            span: Span::ZERO,
-        };
+            }))]);
         let r = print_typed(&prog, &TypedPrintOptions::default());
         assert_eq!(r.code, "var x = 42;");
     }
 
     #[test]
     fn smoke_import_namespace() {
-        let prog = Program {
-            source_type: SourceType::Module,
-            body: vec![Statement::Import(Box::new(ImportDeclaration {
+        let (_bump, prog) = test_program(vec![Statement::Import(Box::new(ImportDeclaration {
                 specifiers: vec![ImportSpecifierKind::Namespace(ImportNamespaceSpecifier {
                     local: Identifier {
                         name: Cow::Borrowed("$"),
@@ -2137,9 +2140,7 @@ mod tests {
                 },
                 type_only: false,
                 span: Span::ZERO,
-            }))],
-            span: Span::ZERO,
-        };
+            }))]);
         let r = print_typed(&prog, &TypedPrintOptions::default());
         assert_eq!(r.code, "import * as $ from 'svelte/internal/client';");
     }

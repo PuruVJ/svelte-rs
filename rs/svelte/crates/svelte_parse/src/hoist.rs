@@ -115,7 +115,7 @@ fn build_script_with_comments<'a>(
             .map(|s| s == "ts" || s == "typescript")
             .unwrap_or(false);
     let (content, comments) =
-        oxc_bridge::parse_program(alloc, source, line_map, body_start, body_end, ts)?;
+        oxc_bridge::parse_program(alloc, bump, source, line_map, body_start, body_end, ts)?;
     let context = if is_module_script(&el.attributes) {
         ScriptContext::Module
     } else {
