@@ -111,7 +111,7 @@ fn sweep_validator_fixtures() {
 
         let result = std::panic::catch_unwind(|| {
             let root = parse(&source, false)?;
-            let analysis = analyze_component(root, None);
+            let analysis = analyze_component(&root, None);
             Ok::<_, svelte_diagnostics::CompileDiagnostic>(analysis)
         });
 

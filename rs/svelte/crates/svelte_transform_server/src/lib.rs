@@ -305,14 +305,14 @@ pub fn try_typed_server_component_full(
         let sanitize_decl = t::const_decl(
             "$$sanitized_props",
             t::call(
-                t::member_id(t::id("$"), "sanitize_props"),
+                t::member_id(t::id_dollar(), "sanitize_props"),
                 vec![t::id("$$props")],
             ),
         );
         let restprops_decl = t::const_decl(
             "$$restProps",
             t::call(
-                t::member_id(t::id("$"), "rest_props"),
+                t::member_id(t::id_dollar(), "rest_props"),
                 vec![t::id("$$sanitized_props"), name_array],
             ),
         );
@@ -346,7 +346,7 @@ pub fn try_typed_server_component_full(
             span: Span::ZERO,
         }));
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "bind_props"),
+            t::member_id(t::id_dollar(), "bind_props"),
             vec![t::id("$$props"), obj],
         )));
         uses_props = true;
@@ -360,7 +360,7 @@ pub fn try_typed_server_component_full(
         let add_call = t::stmt(t::call(
             t::member_id(
                 t::member_id(
-                    t::member_id(t::id("$$renderer"), "global"),
+                    t::member_id(t::id_renderer(), "global"),
                     "css",
                 ),
                 "add",
@@ -397,7 +397,7 @@ pub fn try_typed_server_component_full(
         prefix.push(Statement::If(Box::new(IfStatement {
             test: t::id("$$store_subs"),
             consequent: t::stmt(t::call(
-                t::member_id(t::id("$"), "unsubscribe_stores"),
+                t::member_id(t::id_dollar(), "unsubscribe_stores"),
                 vec![t::id("$$store_subs")],
             )),
             alternate: None,
@@ -410,7 +410,7 @@ pub fn try_typed_server_component_full(
     // `$$renderer.component(($$renderer) => { ... });`.
     if needs_component_wrap {
         let inner = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: func_body,
@@ -420,7 +420,7 @@ pub fn try_typed_server_component_full(
             span: Span::ZERO,
         }));
         func_body = vec![t::stmt(Expression::Call(Box::new(CallExpression {
-            callee: t::member_id(t::id("$$renderer"), "component"),
+            callee: t::member_id(t::id_renderer(), "component"),
             arguments: vec![Argument::Expression(inner)],
             optional: false,
             span: Span::ZERO,
@@ -431,7 +431,7 @@ pub fn try_typed_server_component_full(
     // body needs the `$$renderer.component(...)` wrap, upstream always passes
     // `$$props` through to the outer function (so the wrap can forward props
     // into the inner closure even when the script doesn't read them directly).
-    let mut params = vec![t::pat_id("$$renderer")];
+    let mut params = vec![t::pat_id_renderer()];
     if uses_props || needs_component_wrap {
         params.push(t::pat_id("$$props"));
     }
@@ -541,7 +541,7 @@ fn extract_and_lower_snippets(
             } else {
                 lower_fragment_with_marker(&sb.body, needs_marker)?
             };
-            let mut params = vec![t::pat_id("$$renderer")];
+            let mut params = vec![t::pat_id_renderer()];
             for p in &sb.parameters {
                 params.push(p.clone());
             }
@@ -605,7 +605,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
     // `function $$render_inner($$renderer) { ...inner... }`
     out.push(t::function_decl(
         "$$render_inner",
-        vec![t::pat_id("$$renderer")],
+        vec![t::pat_id_renderer()],
         inner,
     ));
     // `do { $$settled = true; $$inner_renderer = $$renderer.copy();
@@ -623,7 +623,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
     do_body.push(t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
         left: AssignmentTarget::Expression(t::id("$$inner_renderer")),
         operator: AssignmentOperator::Assign,
-        right: t::call(t::member_id(t::id("$$renderer"), "copy"), Vec::new()),
+        right: t::call(t::member_id(t::id_renderer(), "copy"), Vec::new()),
         span: Span::ZERO,
     }))));
     do_body.push(t::stmt(t::call(
@@ -646,7 +646,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
     })));
     // `$$renderer.subsume($$inner_renderer);`
     out.push(t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "subsume"),
+        t::member_id(t::id_renderer(), "subsume"),
         vec![t::id("$$inner_renderer")],
     )));
     out
@@ -1261,7 +1261,7 @@ fn wrap_async_block(
         span: Span::ZERO,
     }));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: inner,
@@ -1271,7 +1271,7 @@ fn wrap_async_block(
         span: Span::ZERO,
     }));
     t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "async_block"),
+        t::member_id(t::id_renderer(), "async_block"),
         vec![blockers, arrow],
     ))
 }
@@ -1279,7 +1279,7 @@ fn wrap_async_block(
 /// Wraps the given inner statements in `$$renderer.child_block(async ($$renderer) => { ... });`.
 fn wrap_child_block(inner: Vec<Statement>) -> Statement {
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: inner,
@@ -1289,7 +1289,7 @@ fn wrap_child_block(inner: Vec<Statement>) -> Statement {
         span: Span::ZERO,
     }));
     t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "child_block"),
+        t::member_id(t::id_renderer(), "child_block"),
         vec![arrow],
     ))
 }
@@ -1532,7 +1532,7 @@ fn lower_fragment_server_async_with(
                     } else {
                         let rewritten = wrap_async_test(&et.expression);
                         let escape_call = t::call(
-                            t::member_id(t::id("$"), "escape"),
+                            t::member_id(t::id_dollar(), "escape"),
                             vec![rewritten],
                         );
                         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -1543,7 +1543,7 @@ fn lower_fragment_server_async_with(
                             span: Span::ZERO,
                         }));
                         out.push(t::stmt(t::call(
-                            t::member_id(t::id("$$renderer"), "push"),
+                            t::member_id(t::id_renderer(), "push"),
                             vec![arrow],
                         )));
                     }
@@ -1847,7 +1847,7 @@ fn lower_fragment_with_const_await_with(
     out.push(t::var(
         promises_var,
         t::call(
-            t::member_id(t::id("$$renderer"), "run"),
+            t::member_id(t::id_renderer(), "run"),
             vec![Expression::Array(Box::new(ArrayExpression {
                 elements: groups.iter().cloned().map(ArrayElement::Expression).collect(),
                 span: Span::ZERO,
@@ -2096,7 +2096,7 @@ fn emit_async_wrap_with_await(
         span: Span::ZERO,
     }));
     let rewritten = wrap_async_test(expr);
-    let escape_call = t::call(t::member_id(t::id("$"), "escape"), vec![rewritten]);
+    let escape_call = t::call(t::member_id(t::id_dollar(), "escape"), vec![rewritten]);
     let push_thunk = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
         param_type_annotations: Vec::new(),
@@ -2105,18 +2105,18 @@ fn emit_async_wrap_with_await(
         span: Span::ZERO,
     }));
     let inner_push = t::call(
-        t::member_id(t::id("$$renderer"), "push"),
+        t::member_id(t::id_renderer(), "push"),
         vec![push_thunk],
     );
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(inner_push),
         r#async: false,
         span: Span::ZERO,
     }));
     t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "async"),
+        t::member_id(t::id_renderer(), "async"),
         vec![blockers, arrow],
     ))
 }
@@ -2133,7 +2133,7 @@ fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str)
         elements: vec![ArrayElement::Expression(promises_slot)],
         span: Span::ZERO,
     }));
-    let escape_call = t::call(t::member_id(t::id("$"), "escape"), vec![expr.clone()]);
+    let escape_call = t::call(t::member_id(t::id_dollar(), "escape"), vec![expr.clone()]);
     let push_thunk = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
         param_type_annotations: Vec::new(),
@@ -2142,18 +2142,18 @@ fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str)
         span: Span::ZERO,
     }));
     let inner_push = t::call(
-        t::member_id(t::id("$$renderer"), "push"),
+        t::member_id(t::id_renderer(), "push"),
         vec![push_thunk],
     );
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(inner_push),
         r#async: false,
         span: Span::ZERO,
     }));
     t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "async"),
+        t::member_id(t::id_renderer(), "async"),
         vec![blockers, arrow],
     ))
 }
@@ -2294,7 +2294,7 @@ fn lower_svelte_head_server_inner(
     let body = lower_head_fragment(&sh.fragment)?;
 
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
@@ -2304,14 +2304,14 @@ fn lower_svelte_head_server_inner(
         span: Span::ZERO,
     }));
     Some(t::stmt(t::call(
-        t::member_id(t::id("$"), "head"),
+        t::member_id(t::id_dollar(), "head"),
         vec![
             Expression::Literal(Box::new(Literal::String(StringLiteral {
                 value: hash.clone(),
                 raw: Some(format!("'{hash}'")),
                 span: Span::ZERO,
             }))),
-            t::id("$$renderer"),
+            t::id_renderer(),
             arrow,
         ],
     )))
@@ -2363,7 +2363,7 @@ fn lower_svelte_boundary_server(
             let name = snip.expression.name.clone();
             let needs_marker = body_needs_marker(&snip.body);
             let body_stmts = lower_fragment_with_marker(&snip.body, needs_marker)?;
-            let mut params = vec![t::pat_id("$$renderer")];
+            let mut params = vec![t::pat_id_renderer()];
             for p in &snip.parameters {
                 params.push(p.clone());
             }
@@ -2429,7 +2429,7 @@ fn lower_svelte_boundary_server(
         // Snippet path: \`push(\`<!--[!-->\`); pending($$renderer); push(\`<!--]-->\`);\`
         let pending_branch = vec![
             push_template("<!--[!-->"),
-            t::stmt(t::call(pending_expr.clone(), vec![t::id("$$renderer")])),
+            t::stmt(t::call(pending_expr.clone(), vec![t::id_renderer()])),
             push_template("<!--]-->"),
         ];
         let body_branch = vec![
@@ -2523,7 +2523,7 @@ fn lower_svelte_boundary_server(
     })));
     arrow_body.push(push_template("<!--]-->"));
     let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
@@ -2534,7 +2534,7 @@ fn lower_svelte_boundary_server(
     }));
 
     out.push(t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "boundary"),
+        t::member_id(t::id_renderer(), "boundary"),
         vec![snippets_obj, body_arrow],
     )));
     Some(out)
@@ -2604,7 +2604,7 @@ fn lower_head_fragment(
             inner_buf.push_str("</title>");
             let inner_body = inner_buf.flush().into_iter().collect::<Vec<_>>();
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                params: vec![t::pat_id("$$renderer")],
+                params: vec![t::pat_id_renderer()],
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: inner_body,
@@ -2614,7 +2614,7 @@ fn lower_head_fragment(
                 span: Span::ZERO,
             }));
             out.push(t::stmt(t::call(
-                t::member_id(t::id("$$renderer"), "title"),
+                t::member_id(t::id_renderer(), "title"),
                 vec![arrow],
             )));
             last_was_component = false;
@@ -2948,15 +2948,15 @@ fn lower_fragment_with_marker(
                     // with the `await EXPR` rewritten to `(await $.save(EXPR))()`.
                     let inner = wrap_async_test(&tag.expression);
                     let html_call = t::call(
-                        t::member_id(t::id("$"), "html"),
+                        t::member_id(t::id_dollar(), "html"),
                         vec![inner],
                     );
                     let push_call = t::stmt(t::call(
-                        t::member_id(t::id("$$renderer"), "push"),
+                        t::member_id(t::id_renderer(), "push"),
                         vec![html_call],
                     ));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                        params: vec![t::pat_id("$$renderer")],
+                        params: vec![t::pat_id_renderer()],
                         param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: vec![push_call],
@@ -2966,7 +2966,7 @@ fn lower_fragment_with_marker(
                         span: Span::ZERO,
                     }));
                     out.push(t::stmt(t::call(
-                        t::member_id(t::id("$$renderer"), "child_block"),
+                        t::member_id(t::id_renderer(), "child_block"),
                         vec![arrow],
                     )));
                     last_was_component = false;
@@ -2982,7 +2982,7 @@ fn lower_fragment_with_marker(
                         wrap_async_test(&tag.expression)
                     };
                     let escape_call = t::call(
-                        t::member_id(t::id("$"), "escape"),
+                        t::member_id(t::id_dollar(), "escape"),
                         vec![inner],
                     );
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -2993,7 +2993,7 @@ fn lower_fragment_with_marker(
                         span: Span::ZERO,
                     }));
                     out.push(t::stmt(t::call(
-                        t::member_id(t::id("$$renderer"), "push"),
+                        t::member_id(t::id_renderer(), "push"),
                         vec![arrow],
                     )));
                     last_was_component = false;
@@ -3053,7 +3053,7 @@ fn lower_content_editable_bind_inline(
         bind_expr
     } else {
         Expression::Call(Box::new(CallExpression {
-            callee: t::member_id(t::id("$"), "escape"),
+            callee: t::member_id(t::id_dollar(), "escape"),
             arguments: vec![Argument::Expression(bind_expr)],
             optional: false,
             span: Span::ZERO,
@@ -3066,7 +3066,7 @@ fn lower_content_editable_bind_inline(
             test: body_source.clone(),
             consequent: Statement::Block(Box::new(BlockStatement {
                 body: vec![t::stmt(t::call(
-                    t::member_id(t::id("$$renderer"), "push"),
+                    t::member_id(t::id_renderer(), "push"),
                     vec![t::template_raw(
                         vec![String::new(), String::new()],
                         vec![body_source],
@@ -3092,7 +3092,7 @@ fn lower_content_editable_bind_inline(
             test: t::id(&body_var),
             consequent: Statement::Block(Box::new(BlockStatement {
                 body: vec![t::stmt(t::call(
-                    t::member_id(t::id("$$renderer"), "push"),
+                    t::member_id(t::id_renderer(), "push"),
                     vec![t::template_raw(
                         vec![String::new(), String::new()],
                         vec![t::id(&body_var)],
@@ -3173,7 +3173,7 @@ fn lower_textarea_server_inline(
                     first_text = false;
                     quasis.push(std::mem::take(&mut pending));
                     exprs.push(Expression::Call(Box::new(CallExpression {
-                        callee: t::member_id(t::id("$"), "stringify"),
+                        callee: t::member_id(t::id_dollar(), "stringify"),
                         arguments: vec![Argument::Expression(tag.expression.clone())],
                         optional: false,
                         span: Span::ZERO,
@@ -3188,7 +3188,7 @@ fn lower_textarea_server_inline(
     };
 
     let escape_call = Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$"), "escape"),
+        callee: t::member_id(t::id_dollar(), "escape"),
         arguments: vec![Argument::Expression(body_source)],
         optional: false,
         span: Span::ZERO,
@@ -3206,7 +3206,7 @@ fn lower_textarea_server_inline(
         test: t::id(&body_var),
         consequent: Statement::Block(Box::new(BlockStatement {
             body: vec![t::stmt(t::call(
-                t::member_id(t::id("$$renderer"), "push"),
+                t::member_id(t::id_renderer(), "push"),
                 vec![t::template_raw(
                     vec![String::new(), String::new()],
                     vec![t::id(&body_var)],
@@ -3289,7 +3289,7 @@ fn lower_textarea_server(
                     first_text = false;
                     quasis.push(std::mem::take(&mut pending));
                     exprs.push(Expression::Call(Box::new(CallExpression {
-                        callee: t::member_id(t::id("$"), "stringify"),
+                        callee: t::member_id(t::id_dollar(), "stringify"),
                         arguments: vec![Argument::Expression(tag.expression.clone())],
                         optional: false,
                         span: Span::ZERO,
@@ -3304,7 +3304,7 @@ fn lower_textarea_server(
     };
 
     let escape_call = Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$"), "escape"),
+        callee: t::member_id(t::id_dollar(), "escape"),
         arguments: vec![Argument::Expression(body_source)],
         optional: false,
         span: Span::ZERO,
@@ -3324,7 +3324,7 @@ fn lower_textarea_server(
     }
     out.push(t::const_decl(&body_var, escape_call));
     let push_body = t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "push"),
+        t::member_id(t::id_renderer(), "push"),
         vec![t::template_raw(
             vec![String::new(), String::new()],
             vec![t::id(&body_var)],
@@ -3490,7 +3490,7 @@ fn lower_select_with_value(
     };
 
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: inner_out,
@@ -3531,7 +3531,7 @@ fn lower_select_with_value(
         ))));
     }
     let select_call = t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "select"),
+        t::member_id(t::id_renderer(), "select"),
         select_args,
     ));
 
@@ -3551,7 +3551,7 @@ fn lower_select_with_value(
             span: Span::ZERO,
         }));
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![const_decl, select_call],
@@ -3561,7 +3561,7 @@ fn lower_select_with_value(
             span: Span::ZERO,
         }));
         return Some(t::stmt(t::call(
-            t::member_id(t::id("$$renderer"), "child"),
+            t::member_id(t::id_renderer(), "child"),
             vec![arrow],
         )));
     }
@@ -3726,7 +3726,7 @@ fn lower_select_child(
         FragmentChild::HtmlTag(t) => {
             // `{@html EXPR}` → `${$.html(EXPR)}` interpolation in buf.
             buf.push_expr(t::call(
-                t::member_id(t::id("$"), "html"),
+                t::member_id(t::id_dollar(), "html"),
                 vec![t.expression.clone()],
             ));
             // `@html` inside a select also emits a hydration anchor.
@@ -3777,7 +3777,7 @@ fn lower_select_child_loop_body(
         }
         FragmentChild::HtmlTag(t) => {
             buf.push_expr(t::call(
-                t::member_id(t::id("$"), "html"),
+                t::member_id(t::id_dollar(), "html"),
                 vec![t.expression.clone()],
             ));
         }
@@ -3815,7 +3815,7 @@ fn lower_render_tag_for_select(rt: &svelte_ast::tags::RenderTag) -> Option<State
         Expression::Call(c) => (c.callee.clone(), c.arguments.clone()),
         _ => return None,
     };
-    let mut arguments = vec![Argument::Expression(t::id("$$renderer"))];
+    let mut arguments = vec![Argument::Expression(t::id_renderer())];
     arguments.extend(args);
     Some(t::stmt(Expression::Call(Box::new(CallExpression {
         callee,
@@ -3949,7 +3949,7 @@ fn lower_each_for_select(
     let arr_decl = t::const_decl(
         &arr_name,
         t::call(
-            t::member_id(t::id("$"), "ensure_array_like"),
+            t::member_id(t::id_dollar(), "ensure_array_like"),
             vec![eb.expression.clone()],
         ),
     );
@@ -4164,7 +4164,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         declarations: vec![VariableDeclarator {
             id: t::pat_id(&each_array_name),
             init: Some(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "ensure_array_like"),
+                callee: t::member_id(t::id_dollar(), "ensure_array_like"),
                 arguments: vec![Argument::Expression(each_array_init)],
                 optional: false,
                 span: Span::ZERO,
@@ -4234,7 +4234,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             inside_body.push(for_stmt);
         }
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: inside_body,
@@ -4251,7 +4251,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             out.push(push_template("<!--[-->"));
         }
         out.push(t::stmt(t::call(
-            t::member_id(t::id("$$renderer"), "child_block"),
+            t::member_id(t::id_renderer(), "child_block"),
             vec![arrow],
         )));
         // Caller pushes `<!--]-->` into buf so adjacent content fuses.
@@ -4354,7 +4354,7 @@ fn lower_if_block_server(
     if test_is_async {
         // Wrap in `$$renderer.child_block(async ($$renderer) => { if(...) {...} else {...} })`
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![if_stmt],
@@ -4364,7 +4364,7 @@ fn lower_if_block_server(
             span: Span::ZERO,
         }));
         Some(vec![t::stmt(t::call(
-            t::member_id(t::id("$$renderer"), "child_block"),
+            t::member_id(t::id_renderer(), "child_block"),
             vec![arrow],
         ))])
     } else {
@@ -4631,7 +4631,7 @@ fn wrap_async_test(test: &Expression) -> Expression {
         match e {
             Expression::Await(a) => {
                 let inner = rewrite(&a.argument);
-                let save_call = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+                let save_call = t::call(t::member_id(t::id_dollar(), "save"), vec![inner]);
                 let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
                     expression: Expression::Await(Box::new(AwaitExpression {
                         argument: save_call,
@@ -4738,7 +4738,7 @@ fn lower_fragment_for_async_block(
                 inner_buf.push_str("</title>");
                 let inner_body = inner_buf.flush().into_iter().collect::<Vec<_>>();
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id("$$renderer")],
+                    params: vec![t::pat_id_renderer()],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
@@ -4748,7 +4748,7 @@ fn lower_fragment_for_async_block(
                     span: Span::ZERO,
                 }));
                 out.push(t::stmt(t::call(
-                    t::member_id(t::id("$$renderer"), "title"),
+                    t::member_id(t::id_renderer(), "title"),
                     vec![arrow],
                 )));
                 continue;
@@ -4764,7 +4764,7 @@ fn lower_fragment_for_async_block(
                 // the only content of an async push.
                 let inner = t.expression.clone();
                 let escape_call = t::call(
-                    t::member_id(t::id("$"), "escape"),
+                    t::member_id(t::id_dollar(), "escape"),
                     vec![inner],
                 );
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -4775,7 +4775,7 @@ fn lower_fragment_for_async_block(
                     span: Span::ZERO,
                 }));
                 out.push(t::stmt(t::call(
-                    t::member_id(t::id("$$renderer"), "push"),
+                    t::member_id(t::id_renderer(), "push"),
                     vec![arrow],
                 )));
                 continue;
@@ -4803,7 +4803,7 @@ fn lower_await_block_server(
     let then = build_block_arrow(ab.value.as_ref(), ab.then.as_ref())?;
 
     let mut args = vec![
-        Argument::Expression(t::id("$$renderer")),
+        Argument::Expression(t::id_renderer()),
         Argument::Expression(ab.expression.clone()),
         Argument::Expression(pending),
         Argument::Expression(then),
@@ -4814,7 +4814,7 @@ fn lower_await_block_server(
     }
 
     Some(vec![t::stmt(Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$"), "await"),
+        callee: t::member_id(t::id_dollar(), "await"),
         arguments: args,
         optional: false,
         span: Span::ZERO,
@@ -4965,7 +4965,7 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
     } else {
         let body_stmts = lower_fragment_with_marker(&el.fragment, false)?;
         Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: body_stmts,
@@ -5013,7 +5013,7 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
         ))));
     }
     let option_call = t::stmt(Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$$renderer"), "option"),
+        callee: t::member_id(t::id_renderer(), "option"),
         arguments,
         optional: false,
         span: Span::ZERO,
@@ -5033,7 +5033,7 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             span: Span::ZERO,
         }));
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: vec![const_decl, option_call],
@@ -5043,7 +5043,7 @@ fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Stat
             span: Span::ZERO,
         }));
         return Some(t::stmt(t::call(
-            t::member_id(t::id("$$renderer"), "child"),
+            t::member_id(t::id_renderer(), "child"),
             vec![arrow],
         )));
     }
@@ -5142,7 +5142,7 @@ fn is_customizable_option(el: &svelte_ast::elements::RegularElement) -> bool {
 /// `$$renderer.push(\`STR\`);`
 fn push_template(s: &str) -> Statement {
     t::stmt(Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$$renderer"), "push"),
+        callee: t::member_id(t::id_renderer(), "push"),
         arguments: vec![Argument::Expression(t::template_raw(
             vec![s.to_string()],
             Vec::new(),
@@ -5156,7 +5156,7 @@ fn push_template(s: &str) -> Statement {
 /// async child_block bodies for the `<!--[0-->`/`<!--[-1-->` markers.
 fn push_string(s: &str) -> Statement {
     t::stmt(Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$$renderer"), "push"),
+        callee: t::member_id(t::id_renderer(), "push"),
         arguments: vec![Argument::Expression(Expression::Literal(Box::new(
             Literal::String(StringLiteral {
                 value: s.to_string(),
@@ -5241,7 +5241,7 @@ fn lower_element_with_async_directive(
     }
     body.push(push_stmt);
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$renderer")],
+        params: vec![t::pat_id_renderer()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
@@ -5251,7 +5251,7 @@ fn lower_element_with_async_directive(
         span: Span::ZERO,
     }));
     Some(t::stmt(t::call(
-        t::member_id(t::id("$$renderer"), "child"),
+        t::member_id(t::id_renderer(), "child"),
         vec![arrow],
     )))
 }
@@ -5366,15 +5366,15 @@ fn lower_element_with_non_inline_children(
                 FragmentChild::HtmlTag(tag) if expr_has_await_top(&tag.expression) => {
                     let inner = wrap_async_test(&tag.expression);
                     let html_call = t::call(
-                        t::member_id(t::id("$"), "html"),
+                        t::member_id(t::id_dollar(), "html"),
                         vec![inner],
                     );
                     let push_call = t::stmt(t::call(
-                        t::member_id(t::id("$$renderer"), "push"),
+                        t::member_id(t::id_renderer(), "push"),
                         vec![html_call],
                     ));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                        params: vec![t::pat_id("$$renderer")],
+                        params: vec![t::pat_id_renderer()],
                         param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: vec![push_call],
@@ -5384,7 +5384,7 @@ fn lower_element_with_non_inline_children(
                         span: Span::ZERO,
                     }));
                     out.push(t::stmt(t::call(
-                        t::member_id(t::id("$$renderer"), "child_block"),
+                        t::member_id(t::id_renderer(), "child_block"),
                         vec![arrow],
                     )));
                 }
@@ -5393,7 +5393,7 @@ fn lower_element_with_non_inline_children(
                 FragmentChild::ExpressionTag(tag) if expr_has_await_top(&tag.expression) => {
                     let rewritten = wrap_async_test(&tag.expression);
                     let escape_call = t::call(
-                        t::member_id(t::id("$"), "escape"),
+                        t::member_id(t::id_dollar(), "escape"),
                         vec![rewritten],
                     );
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -5404,7 +5404,7 @@ fn lower_element_with_non_inline_children(
                         span: Span::ZERO,
                     }));
                     out.push(t::stmt(t::call(
-                        t::member_id(t::id("$$renderer"), "push"),
+                        t::member_id(t::id_renderer(), "push"),
                         vec![arrow],
                     )));
                 }
@@ -5441,7 +5441,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                 buf.push_str(&escape_text(&s));
             } else {
                 buf.push_expr(Expression::Call(Box::new(CallExpression {
-                    callee: t::member_id(t::id("$"), "escape"),
+                    callee: t::member_id(t::id_dollar(), "escape"),
                     arguments: vec![Argument::Expression(tag.expression.clone())],
                     optional: false,
                     span: Span::ZERO,
@@ -5457,7 +5457,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             }
             // `{@html EXPR}` → `${$.html(EXPR)}` (no escaping).
             buf.push_expr(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "html"),
+                callee: t::member_id(t::id_dollar(), "html"),
                 arguments: vec![Argument::Expression(tag.expression.clone())],
                 optional: false,
                 span: Span::ZERO,
@@ -5588,7 +5588,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                                     }))
                                 };
                                 buf.push_expr(Expression::Call(Box::new(CallExpression {
-                                    callee: t::member_id(t::id("$"), "attr"),
+                                    callee: t::member_id(t::id_dollar(), "attr"),
                                     arguments: vec![
                                         Argument::Expression(string_lit("checked")),
                                         Argument::Expression(checked_expr),
@@ -5904,7 +5904,7 @@ fn append_attributes_call_with_hoists(
         args.push(Argument::Expression(class_obj));
     }
     buf.push_expr(Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$"), "attributes"),
+        callee: t::member_id(t::id_dollar(), "attributes"),
         arguments: args,
         optional: false,
         span: Span::ZERO,
@@ -5982,7 +5982,7 @@ fn append_element_attribute_server(
             // `bind:value` on `<input type="file">` is omitted.
             // (Both are handled elsewhere; here we just emit the attribute.)
             buf.push_expr(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "attr"),
+                callee: t::member_id(t::id_dollar(), "attr"),
                 arguments: vec![
                     Argument::Expression(string_lit(&b.name)),
                     Argument::Expression(b.expression.clone()),
@@ -6017,7 +6017,7 @@ fn append_value_attribute(
             // runtime can scope/normalize the value correctly.
             if name == "style" {
                 buf.push_expr(Expression::Call(Box::new(CallExpression {
-                    callee: t::member_id(t::id("$"), "attr_style"),
+                    callee: t::member_id(t::id_dollar(), "attr_style"),
                     arguments: vec![Argument::Expression(tag.expression.clone())],
                     optional: false,
                     span: Span::ZERO,
@@ -6036,7 +6036,7 @@ fn append_value_attribute(
                 return Some(());
             }
             buf.push_expr(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "attr"),
+                callee: t::member_id(t::id_dollar(), "attr"),
                 arguments: vec![
                     Argument::Expression(string_lit(name)),
                     Argument::Expression(tag.expression.clone()),
@@ -6084,7 +6084,7 @@ fn append_value_attribute(
                             expecting_quasi = true;
                         }
                         exprs.push(Expression::Call(Box::new(CallExpression {
-                            callee: t::member_id(t::id("$"), "stringify"),
+                            callee: t::member_id(t::id_dollar(), "stringify"),
                             arguments: vec![Argument::Expression(tag.expression.clone())],
                             optional: false,
                             span: Span::ZERO,
@@ -6097,7 +6097,7 @@ fn append_value_attribute(
             // `style='...'` → `${$.attr_style(\`...\`)}` (no name arg).
             if name == "style" {
                 buf.push_expr(Expression::Call(Box::new(CallExpression {
-                    callee: t::member_id(t::id("$"), "attr_style"),
+                    callee: t::member_id(t::id_dollar(), "attr_style"),
                     arguments: vec![Argument::Expression(tpl)],
                     optional: false,
                     span: Span::ZERO,
@@ -6105,7 +6105,7 @@ fn append_value_attribute(
                 return Some(());
             }
             buf.push_expr(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "attr"),
+                callee: t::member_id(t::id_dollar(), "attr"),
                 arguments: vec![
                     Argument::Expression(string_lit(name)),
                     Argument::Expression(tpl),
@@ -6138,7 +6138,7 @@ fn append_class_attribute_with_hash(
         }
         AttributeValue::Single(tag) => {
             buf.push_expr(Expression::Call(Box::new(CallExpression {
-                callee: t::member_id(t::id("$"), "attr_class"),
+                callee: t::member_id(t::id_dollar(), "attr_class"),
                 arguments: vec![
                     Argument::Expression(tag.expression.clone()),
                     Argument::Expression(string_lit(hash)),
@@ -6182,7 +6182,7 @@ fn append_class_attribute_with_hash(
                                 expecting_quasi = true;
                             }
                             exprs.push(Expression::Call(Box::new(CallExpression {
-                                callee: t::member_id(t::id("$"), "stringify"),
+                                callee: t::member_id(t::id_dollar(), "stringify"),
                                 arguments: vec![Argument::Expression(tag.expression.clone())],
                                 optional: false,
                                 span: Span::ZERO,
@@ -6193,7 +6193,7 @@ fn append_class_attribute_with_hash(
                 quasis.push(pending);
                 let tpl = t::template_raw(quasis, exprs);
                 buf.push_expr(Expression::Call(Box::new(CallExpression {
-                    callee: t::member_id(t::id("$"), "attr_class"),
+                    callee: t::member_id(t::id_dollar(), "attr_class"),
                     arguments: vec![
                         Argument::Expression(tpl),
                         Argument::Expression(string_lit(hash)),
@@ -6353,7 +6353,7 @@ impl TemplateBuf {
         let exprs = std::mem::take(&mut self.exprs);
         self.parts.push(String::new());
         Some(t::stmt(Expression::Call(Box::new(CallExpression {
-            callee: t::member_id(t::id("$$renderer"), "push"),
+            callee: t::member_id(t::id_renderer(), "push"),
             arguments: vec![Argument::Expression(t::template_raw(parts, exprs))],
             optional: false,
             span: Span::ZERO,
@@ -6369,7 +6369,7 @@ fn lower_svelte_element_server(
     el: &svelte_ast::elements::SvelteElement,
 ) -> Option<Statement> {
     let mut args = vec![
-        Argument::Expression(t::id("$$renderer")),
+        Argument::Expression(t::id_renderer()),
         Argument::Expression(el.tag.clone()),
     ];
 
@@ -6431,7 +6431,7 @@ fn lower_svelte_element_server(
     }
 
     Some(t::stmt(Expression::Call(Box::new(CallExpression {
-        callee: t::member_id(t::id("$"), "element"),
+        callee: t::member_id(t::id_dollar(), "element"),
         arguments: args,
         optional: false,
         span: Span::ZERO,
@@ -6547,7 +6547,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
             lower_fragment_with_marker(&c.fragment, body_needs_marker(&c.fragment))?
         };
         let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: body_stmts,
@@ -6601,7 +6601,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
     }
 
     let args = vec![
-        Argument::Expression(t::id("$$renderer")),
+        Argument::Expression(t::id_renderer()),
         Argument::Expression(Expression::Object(Box::new(ObjectExpression {
             properties: props,
             span: Span::ZERO,
@@ -6669,7 +6669,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         }
         body.push(inner_stmt);
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$renderer")],
+            params: vec![t::pat_id_renderer()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body,
@@ -6679,7 +6679,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
             span: Span::ZERO,
         }));
         return Some(t::stmt(t::call(
-            t::member_id(t::id("$$renderer"), "child_block"),
+            t::member_id(t::id_renderer(), "child_block"),
             vec![arrow],
         )));
     }
@@ -6815,7 +6815,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
                                 expecting_quasi = true;
                             }
                             exprs.push(Expression::Call(Box::new(CallExpression {
-                                callee: t::member_id(t::id("$"), "stringify"),
+                                callee: t::member_id(t::id_dollar(), "stringify"),
                                 arguments: vec![Argument::Expression(tag.expression.clone())],
                                 optional: false,
                                 span: Span::ZERO,

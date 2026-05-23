@@ -64,7 +64,7 @@ fn sweep_compiler_error_fixtures() {
         };
         let result = std::panic::catch_unwind(|| {
             let root = parse(&source, false)?;
-            analyze_component(root, None)?;
+            analyze_component(&root, None)?;
             Ok::<_, svelte_diagnostics::CompileDiagnostic>(())
         });
         match result {

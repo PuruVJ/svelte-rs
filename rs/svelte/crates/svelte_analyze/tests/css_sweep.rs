@@ -21,7 +21,7 @@ const HASH: &str = "svelte-xyz";
 fn debug_basic() {
     let src = fs::read_to_string("../../../../packages/svelte/tests/css/samples/basic/input.svelte").unwrap();
     let root = parse(&src, false).unwrap();
-    let mut analysis = analyze_component(root, None).unwrap();
+    let mut analysis = analyze_component(&root, None).unwrap();
     analysis.css_hash = "svelte-xyz".to_string();
     let sheet = analysis.css.as_ref().unwrap();
     eprintln!("content range: {}..{}", sheet.content.start, sheet.content.end);
@@ -79,7 +79,7 @@ fn sweep_css_fixtures() {
         let hash_str = hash_for_fixture.clone();
         let result = std::panic::catch_unwind(move || {
             let root = parse(&source, false)?;
-            let mut analysis = analyze_component(root, None)?;
+            let mut analysis = analyze_component(&root, None)?;
             analysis.css_hash = hash_str.clone();
             let stylesheet = match analysis.css.as_ref() {
                 Some(s) => s,

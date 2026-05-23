@@ -10,7 +10,7 @@ fn main() {
     if let Some(s) = &root.instance {
         println!("instance decls: {}", s.content.body.len());
     }
-    let analysis = analyze_component(root, None).unwrap();
+    let analysis = analyze_component(&root, None).unwrap();
     println!("is_runes: {}", analysis.runes);
     println!("Warnings: {}", analysis.warnings.len());
     for w in &analysis.warnings {

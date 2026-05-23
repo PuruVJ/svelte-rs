@@ -53,7 +53,7 @@ fn run_once(source: &str) -> (f64, f64, f64, f64) {
     let p = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
-    let _analysis = svelte_analyze::analyze_component(root.clone(), None).expect("analyze");
+    let _analysis = svelte_analyze::analyze_component(&root, None).expect("analyze");
     let a = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();

@@ -191,7 +191,7 @@ fn emit_svelte_head_program(
             Vec::new()
         };
         head_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             next_arg,
         )));
     }
@@ -199,7 +199,7 @@ fn emit_svelte_head_program(
     if let Some(ref tx) = title_text {
         let assign = t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
             left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                object: t::member_id(t::id("$"), "document"),
+                object: t::member_id(t::id_dollar(), "document"),
                 property: MemberProperty::Identifier(Identifier {
                     name: "title".to_string(),
                     span: Span::ZERO,
@@ -227,18 +227,18 @@ fn emit_svelte_head_program(
             span: Span::ZERO,
         }));
         head_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "effect"),
+            t::member_id(t::id_dollar(), "effect"),
             vec![arrow],
         )));
     }
     if !head_non_ws.is_empty() {
         head_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
-            vec![t::id("$$anchor"), t::id("fragment")],
+            t::member_id(t::id_dollar(), "append"),
+            vec![t::id_anchor(), t::id_fragment()],
         )));
     }
     let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: head_body,
@@ -254,7 +254,7 @@ fn emit_svelte_head_program(
         func_body.push(t::var(&body_tag, t::call(t::id("root"), Vec::new())));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "head"),
+        t::member_id(t::id_dollar(), "head"),
         vec![
             Expression::Literal(Box::new(Literal::String(StringLiteral {
                 value: hash_val,
@@ -269,7 +269,7 @@ fn emit_svelte_head_program(
         func_body.push(t::stmt(t::call(
             t::id(&c.name),
             vec![
-                t::id("$$anchor"),
+                t::id_anchor(),
                 Expression::Object(Box::new(ObjectExpression {
                     properties: Vec::new(),
                     span: Span::ZERO,
@@ -278,12 +278,12 @@ fn emit_svelte_head_program(
         )));
     } else {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
-            vec![t::id("$$anchor"), t::id(&body_tag)],
+            t::member_id(t::id_dollar(), "append"),
+            vec![t::id_anchor(), t::id(&body_tag)],
         )));
     }
 
-    let params = vec![t::pat_id("$$anchor")];
+    let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(5 + script.imports.len());
@@ -302,14 +302,14 @@ fn emit_svelte_head_program(
         };
         prog.push(t::var(
             "root_1",
-            t::call(t::member_id(t::id("$"), "from_html"), head_args),
+            t::call(t::member_id(t::id_dollar(), "from_html"), head_args),
         ));
     }
     if body_el.is_some() {
         prog.push(t::var(
             "root",
             t::call(
-                t::member_id(t::id("$"), "from_html"),
+                t::member_id(t::id_dollar(), "from_html"),
                 vec![t::template_raw(vec![body_html], vec![])],
             ),
         ));
@@ -422,12 +422,12 @@ fn emit_head_if_block_program(
                     // sibling offset: positions are 0, 2, 4 for `<!> X <!>` (3 positions, 4 step = 2 elements between)
                     let offset = ((i - prev_slot_pos) * 2) as f64;
                     t::call(
-                        t::member_id(t::id("$"), "sibling"),
+                        t::member_id(t::id_dollar(), "sibling"),
                         vec![t::id(prev), t::lit_number(offset)],
                     )
                 } else {
                     t::call(
-                        t::member_id(t::id("$"), "first_child"),
+                        t::member_id(t::id_dollar(), "first_child"),
                         vec![t::id("fragment_1")],
                     )
                 };
@@ -440,7 +440,7 @@ fn emit_head_if_block_program(
                     span: Span::ZERO,
                 }));
                 cons_body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "html"),
+                    t::member_id(t::id_dollar(), "html"),
                     vec![t::id(&var_name), html_arrow],
                 )));
                 prev_node_var = Some(var_name);
@@ -456,12 +456,12 @@ fn emit_head_if_block_program(
                 let init = if let Some(prev) = &prev_node_var {
                     let offset = ((i - prev_slot_pos) * 2) as f64;
                     t::call(
-                        t::member_id(t::id("$"), "sibling"),
+                        t::member_id(t::id_dollar(), "sibling"),
                         vec![t::id(prev), t::lit_number(offset)],
                     )
                 } else {
                     t::call(
-                        t::member_id(t::id("$"), "first_child"),
+                        t::member_id(t::id_dollar(), "first_child"),
                         vec![t::id("fragment_1")],
                     )
                 };
@@ -486,12 +486,12 @@ fn emit_head_if_block_program(
         }
     }
     cons_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment_1")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("fragment_1")],
     )));
 
     let cons_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: cons_body,
@@ -502,7 +502,7 @@ fn emit_head_if_block_program(
     }));
 
     // The `$.if(node, ($$render) => { if (TEST) $$render(consequent); })`.
-    let render_arg = t::id("$$render");
+    let render_arg = t::id_render();
     let test_expr = ib.test.clone();
     let if_inner_stmt = Statement::If(Box::new(IfStatement {
         test: test_expr,
@@ -527,29 +527,29 @@ fn emit_head_if_block_program(
     let if_block_stmts: Vec<Statement> = vec![
         t::var("consequent", cons_arrow),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "if"),
+            t::member_id(t::id_dollar(), "if"),
             vec![t::id("node"), if_arrow],
         )),
     ];
 
     // Head body: var fragment = $.comment(); var node = $.first_child(fragment); { ... }; $.append($$anchor, fragment)
     let mut head_body_stmts: Vec<Statement> = Vec::new();
-    head_body_stmts.push(t::var("fragment", t::call(t::member_id(t::id("$"), "comment"), Vec::new())));
+    head_body_stmts.push(t::var("fragment", t::call(t::member_id(t::id_dollar(), "comment"), Vec::new())));
     head_body_stmts.push(t::var(
         "node",
-        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+        t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()]),
     ));
     head_body_stmts.push(Statement::Block(Box::new(BlockStatement {
         body: if_block_stmts,
         span: Span::ZERO,
     })));
     head_body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
     let head_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: head_body_stmts,
@@ -563,7 +563,7 @@ fn emit_head_if_block_program(
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "head"),
+        t::member_id(t::id_dollar(), "head"),
         vec![
             Expression::Literal(Box::new(Literal::String(StringLiteral {
                 value: hash_val,
@@ -576,7 +576,7 @@ fn emit_head_if_block_program(
     func_body.push(t::stmt(t::call(
         t::id(&body_component.name),
         vec![
-            t::id("$$anchor"),
+            t::id_anchor(),
             Expression::Object(Box::new(ObjectExpression {
                 properties: Vec::new(),
                 span: Span::ZERO,
@@ -584,7 +584,7 @@ fn emit_head_if_block_program(
         ],
     )));
 
-    let params = vec![t::pat_id("$$anchor")];
+    let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::new();
@@ -602,7 +602,7 @@ fn emit_head_if_block_program(
     };
     prog.push(t::var(
         "root_2",
-        t::call(t::member_id(t::id("$"), "from_html"), cons_args),
+        t::call(t::member_id(t::id_dollar(), "from_html"), cons_args),
     ));
     prog.push(export);
     Some(t::program(prog))
@@ -694,12 +694,12 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
     func_body.push(t::var(
         &inner_var,
-        t::call(t::member_id(t::id("$"), "child"), vec![t::id(&outer_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&outer_var)]),
     ));
     func_body.push(t::var(
         "text",
         t::call(
-            t::member_id(t::id("$"), "child"),
+            t::member_id(t::id_dollar(), "child"),
             vec![
                 t::id(&inner_var),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -710,13 +710,13 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
         ),
     ));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&inner_var)],
     )));
     func_body.push(t::var(
         "text_1",
         t::call(
-            t::member_id(t::id("$"), "sibling"),
+            t::member_id(t::id_dollar(), "sibling"),
             vec![
                 t::id(&inner_var),
                 t::lit_number(1.0),
@@ -728,16 +728,16 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
         ),
     ));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&outer_var)],
     )));
     // Combined template_effect.
     let set_text_inner = t::stmt(t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), inner_inline],
     ));
     let set_text_trailing = t::stmt(t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text_1"), trailing_inline],
     ));
     let eff_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -751,15 +751,15 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
         span: Span::ZERO,
     }));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![eff_arrow],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&outer_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&outer_var)],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -772,7 +772,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], Vec::new())],
         ),
     ));
@@ -910,10 +910,10 @@ fn emit_select_with_rich_options_static(
             format!("option_{}", i)
         };
         let init = if i == 0 {
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id("select")])
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id("select")])
         } else {
             let prev = if i == 1 { "option".to_string() } else { format!("option_{}", i - 1) };
-            t::call(t::member_id(t::id("$"), "sibling"), vec![t::id(&prev)])
+            t::call(t::member_id(t::id_dollar(), "sibling"), vec![t::id(&prev)])
         };
         func_body.push(t::var(&var_name, init));
         if info.rich_html.is_some() {
@@ -937,12 +937,12 @@ fn emit_select_with_rich_options_static(
             let arrow_body = vec![
                 t::var(
                     &anchor_name,
-                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(&var_name)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&var_name)]),
                 ),
                 t::var(&fragment_name, t::call(t::id(&template_name), Vec::new())),
-                t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+                t::stmt(t::call(t::member_id(t::id_dollar(), "next"), Vec::new())),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "append"),
+                    t::member_id(t::id_dollar(), "append"),
                     vec![t::id(&anchor_name), t::id(&fragment_name)],
                 )),
             ];
@@ -957,7 +957,7 @@ fn emit_select_with_rich_options_static(
                 span: Span::ZERO,
             }));
             func_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "customizable_select"),
+                t::member_id(t::id_dollar(), "customizable_select"),
                 vec![t::id(&var_name), arrow],
             )));
         }
@@ -1002,15 +1002,15 @@ fn emit_select_with_rich_options_static(
         }
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id("select")],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("select")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("select")],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -1036,7 +1036,7 @@ fn emit_select_with_rich_options_static(
             prog.push(t::var(
                 &template_name,
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![
                         t::template_raw(vec![html.clone()], Vec::new()),
                         t::lit_number(1.0),
@@ -1049,7 +1049,7 @@ fn emit_select_with_rich_options_static(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![select_html], Vec::new())],
         ),
     ));
@@ -1814,11 +1814,11 @@ fn emit_boundary_pending_attribute_program(
 
     // const SNIPPET = ($$anchor) => { $.next(); var text = $.text('TEXT'); $.append($$anchor, text); };
     let snippet_arrow_body = vec![
-        t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+        t::stmt(t::call(t::member_id(t::id_dollar(), "next"), Vec::new())),
         t::var(
             "text",
             t::call(
-                t::member_id(t::id("$"), "text"),
+                t::member_id(t::id_dollar(), "text"),
                 vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
                     value: snippet_text.clone(),
                     raw: Some(format!("'{}'", snippet_text.replace('\'', "\\'"))),
@@ -1827,8 +1827,8 @@ fn emit_boundary_pending_attribute_program(
             ),
         ),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
-            vec![t::id("$$anchor"), t::id("text")],
+            t::member_id(t::id_dollar(), "append"),
+            vec![t::id_anchor(), t::id("text")],
         )),
     ];
     let snippet_const = Statement::Variable(Box::new(VariableDeclaration {
@@ -1839,7 +1839,7 @@ fn emit_boundary_pending_attribute_program(
                 span: Span::ZERO,
             }),
             init: Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
-                params: vec![t::pat_id("$$anchor")],
+                params: vec![t::pat_id_anchor()],
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: snippet_arrow_body,
@@ -1864,7 +1864,7 @@ fn emit_boundary_pending_attribute_program(
     //   $.template_effect(() => $.set_text(text_1, $.get(data)), void 0, void 0, [promises[0]]);
     //   $.append($$anchor, text_1);
     let inner_save = t::call(
-        t::member_id(t::id("$"), "save"),
+        t::member_id(t::id_dollar(), "save"),
         vec![await_inner.clone()],
     );
     let inner_async_derived_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -1881,11 +1881,11 @@ fn emit_boundary_pending_attribute_program(
         span: Span::ZERO,
     }));
     let async_derived_call = t::call(
-        t::member_id(t::id("$"), "async_derived"),
+        t::member_id(t::id_dollar(), "async_derived"),
         vec![inner_async_derived_arrow],
     );
     let outer_save = t::call(
-        t::member_id(t::id("$"), "save"),
+        t::member_id(t::id_dollar(), "save"),
         vec![async_derived_call],
     );
     let outer_assign_rhs = t::call(
@@ -1928,17 +1928,17 @@ fn emit_boundary_pending_attribute_program(
     boundary_body.push(t::var(
         "promises",
         t::call(
-            t::member_id(t::id("$"), "run"),
+            t::member_id(t::id_dollar(), "run"),
             vec![Expression::Array(Box::new(ArrayExpression {
                 elements: vec![ArrayElement::Expression(run_async_arrow)],
                 span: Span::ZERO,
             }))],
         ),
     ));
-    boundary_body.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())));
+    boundary_body.push(t::stmt(t::call(t::member_id(t::id_dollar(), "next"), Vec::new())));
     boundary_body.push(t::var(
         "text_1",
-        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
     ));
     // $.template_effect with 4 args: callback, void 0, void 0, [promises[0]]
     let void_zero = || Expression::Unary(Box::new(UnaryExpression {
@@ -1948,10 +1948,10 @@ fn emit_boundary_pending_attribute_program(
         span: Span::ZERO,
     }));
     let set_text_call = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![
             t::id("text_1"),
-            t::call(t::member_id(t::id("$"), "get"), vec![t::id(&const_name)]),
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&const_name)]),
         ],
     );
     let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -1969,7 +1969,7 @@ fn emit_boundary_pending_attribute_program(
         span: Span::ZERO,
     }));
     boundary_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![
             effect_arrow,
             void_zero(),
@@ -1981,12 +1981,12 @@ fn emit_boundary_pending_attribute_program(
         ],
     )));
     boundary_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("text_1")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("text_1")],
     )));
 
     let boundary_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: boundary_body,
@@ -2032,21 +2032,21 @@ fn emit_boundary_pending_attribute_program(
     // Main function body.
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
-    func_body.push(t::var("fragment", t::call(t::member_id(t::id("$"), "comment"), Vec::new())));
+    func_body.push(t::var("fragment", t::call(t::member_id(t::id_dollar(), "comment"), Vec::new())));
     func_body.push(t::var(
         "node",
-        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+        t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()]),
     ));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "boundary"),
+        t::member_id(t::id_dollar(), "boundary"),
         vec![t::id("node"), props_obj, boundary_arrow],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let params = vec![t::pat_id("$$anchor")];
+    let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::new();
@@ -2147,7 +2147,7 @@ fn emit_select_with_optgroup_rich(
         let mut cb_body: Vec<Statement> = Vec::new();
         cb_body.push(t::var(
             anchor_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(parent_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(parent_var)]),
         ));
         cb_body.push(t::var(fragment_var, t::call(t::id(&{
             let tmpl_idx = content_templates.len();
@@ -2245,7 +2245,7 @@ fn emit_select_with_optgroup_rich(
         let anchor_var = "anchor".to_string();
         cb_body.push(t::var(
             &anchor_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(&select_optgroup_var(oi))]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&select_optgroup_var(oi))]),
         ));
         cb_body.push(t::var(&fragment_var, t::call(t::id(&optgroup_template_name), Vec::new())));
 
@@ -2321,7 +2321,7 @@ fn emit_select_with_optgroup_rich(
                             let opt_anchor_var = "anchor_1".to_string();
                             opt_cb_body.push(t::var(
                                 &opt_anchor_var,
-                                t::call(t::member_id(t::id("$"), "child"), vec![t::id(&opt_var)]),
+                                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&opt_var)]),
                             ));
                             opt_cb_body.push(t::var(&opt_fragment_var, t::call(t::id(&option_template_name), Vec::new())));
                             let mut opt_set_calls: Vec<Statement> = Vec::new();
@@ -2349,12 +2349,12 @@ fn emit_select_with_optgroup_rich(
                                         opt_text_idx += 1;
                                         let init = if let Some(prev) = &opt_prev_var {
                                             t::call(
-                                                t::member_id(t::id("$"), "sibling"),
+                                                t::member_id(t::id_dollar(), "sibling"),
                                                 vec![t::id(prev)],
                                             )
                                         } else {
                                             t::call(
-                                                t::member_id(t::id("$"), "first_child"),
+                                                t::member_id(t::id_dollar(), "first_child"),
                                                 vec![t::id(&opt_fragment_var)],
                                             )
                                         };
@@ -2385,7 +2385,7 @@ fn emit_select_with_optgroup_rich(
                                             span: Span::ZERO,
                                         }));
                                         opt_set_calls.push(t::stmt(t::call(
-                                            t::member_id(t::id("$"), "set_text"),
+                                            t::member_id(t::id_dollar(), "set_text"),
                                             vec![t::id(&txt), tpl_lit],
                                         )));
                                     }
@@ -2414,17 +2414,17 @@ fn emit_select_with_optgroup_rich(
                                             opt_elem_idx += 1;
                                             let init = if !opt_first_emit {
                                                 t::call(
-                                                    t::member_id(t::id("$"), "first_child"),
+                                                    t::member_id(t::id_dollar(), "first_child"),
                                                     vec![t::id(&opt_fragment_var)],
                                                 )
                                             } else if let Some(prev) = &opt_prev_var {
                                                 t::call(
-                                                    t::member_id(t::id("$"), "sibling"),
+                                                    t::member_id(t::id_dollar(), "sibling"),
                                                     vec![t::id(prev)],
                                                 )
                                             } else {
                                                 t::call(
-                                                    t::member_id(t::id("$"), "first_child"),
+                                                    t::member_id(t::id_dollar(), "first_child"),
                                                     vec![t::id(&opt_fragment_var)],
                                                 )
                                             };
@@ -2439,7 +2439,7 @@ fn emit_select_with_optgroup_rich(
                                             opt_cb_body.push(t::var(
                                                 &txt,
                                                 t::call(
-                                                    t::member_id(t::id("$"), "child"),
+                                                    t::member_id(t::id_dollar(), "child"),
                                                     vec![
                                                         t::id(&elem_name),
                                                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -2450,7 +2450,7 @@ fn emit_select_with_optgroup_rich(
                                                 ),
                                             ));
                                             opt_cb_body.push(t::stmt(t::call(
-                                                t::member_id(t::id("$"), "reset"),
+                                                t::member_id(t::id_dollar(), "reset"),
                                                 vec![t::id(&elem_name)],
                                             )));
                                             let mut parts: Vec<TextPart> = Vec::new();
@@ -2464,7 +2464,7 @@ fn emit_select_with_optgroup_rich(
                                             let inline = build_inline_template(&parts, &script.state_bindings);
                                             let inline = rewrite_props_destructured(&inline, &script.props_destructured);
                                             opt_set_calls.push(t::stmt(t::call(
-                                                t::member_id(t::id("$"), "set_text"),
+                                                t::member_id(t::id_dollar(), "set_text"),
                                                 vec![t::id(&txt), inline],
                                             )));
                                             opt_prev_var = Some(elem_name);
@@ -2491,7 +2491,7 @@ fn emit_select_with_optgroup_rich(
                                     }))
                                 };
                                 opt_cb_body.push(t::stmt(t::call(
-                                    t::member_id(t::id("$"), "template_effect"),
+                                    t::member_id(t::id_dollar(), "template_effect"),
                                     vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                                         params: Vec::new(),
                                         param_type_annotations: Vec::new(),
@@ -2502,7 +2502,7 @@ fn emit_select_with_optgroup_rich(
                                 )));
                             }
                             opt_cb_body.push(t::stmt(t::call(
-                                t::member_id(t::id("$"), "append"),
+                                t::member_id(t::id_dollar(), "append"),
                                 vec![t::id(&opt_anchor_var), t::id(&opt_fragment_var)],
                             )));
                             content_templates.push((option_template_name.clone(), opt_tpl));
@@ -2510,25 +2510,25 @@ fn emit_select_with_optgroup_rich(
                             // Navigate to this option in optgroup body.
                             let init = if !first_emitted {
                                 t::call(
-                                    t::member_id(t::id("$"), "first_child"),
+                                    t::member_id(t::id_dollar(), "first_child"),
                                     vec![t::id(&fragment_var)],
                                 )
                             } else if let Some(prev) = &prev_elem_var {
                                 let offset = (og_pos - prev_elem_pos) * 2;
                                 t::call(
-                                    t::member_id(t::id("$"), "sibling"),
+                                    t::member_id(t::id_dollar(), "sibling"),
                                     vec![t::id(prev), t::lit_number(offset as f64)],
                                 )
                             } else {
                                 t::call(
-                                    t::member_id(t::id("$"), "first_child"),
+                                    t::member_id(t::id_dollar(), "first_child"),
                                     vec![t::id(&fragment_var)],
                                 )
                             };
                             cb_body.push(t::var(&opt_var, init));
                             // Customizable_select call.
                             cb_body.push(t::stmt(t::call(
-                                t::member_id(t::id("$"), "customizable_select"),
+                                t::member_id(t::id_dollar(), "customizable_select"),
                                 vec![
                                     t::id(&opt_var),
                                     Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -2603,18 +2603,18 @@ fn emit_select_with_optgroup_rich(
                             option_in_og_idx += 1;
                             let init = if !first_emitted {
                                 t::call(
-                                    t::member_id(t::id("$"), "first_child"),
+                                    t::member_id(t::id_dollar(), "first_child"),
                                     vec![t::id(&fragment_var)],
                                 )
                             } else if let Some(prev) = &prev_elem_var {
                                 let offset = (og_pos - prev_elem_pos) * 2;
                                 t::call(
-                                    t::member_id(t::id("$"), "sibling"),
+                                    t::member_id(t::id_dollar(), "sibling"),
                                     vec![t::id(prev), t::lit_number(offset as f64)],
                                 )
                             } else {
                                 t::call(
-                                    t::member_id(t::id("$"), "first_child"),
+                                    t::member_id(t::id_dollar(), "first_child"),
                                     vec![t::id(&fragment_var)],
                                 )
                             };
@@ -2707,18 +2707,18 @@ fn emit_select_with_optgroup_rich(
                             *span_count += 1;
                             let init = if !first_emitted {
                                 t::call(
-                                    t::member_id(t::id("$"), "first_child"),
+                                    t::member_id(t::id_dollar(), "first_child"),
                                     vec![t::id(&fragment_var)],
                                 )
                             } else if let Some(prev) = &prev_elem_var {
                                 let offset = (og_pos - prev_elem_pos) * 2;
                                 t::call(
-                                    t::member_id(t::id("$"), "sibling"),
+                                    t::member_id(t::id_dollar(), "sibling"),
                                     vec![t::id(prev), t::lit_number(offset as f64)],
                                 )
                             } else {
                                 t::call(
-                                    t::member_id(t::id("$"), "first_child"),
+                                    t::member_id(t::id_dollar(), "first_child"),
                                     vec![t::id(&fragment_var)],
                                 )
                             };
@@ -2732,7 +2732,7 @@ fn emit_select_with_optgroup_rich(
                             cb_body.push(t::var(
                                 &txt,
                                 t::call(
-                                    t::member_id(t::id("$"), "child"),
+                                    t::member_id(t::id_dollar(), "child"),
                                     vec![
                                         t::id(&span_var_name),
                                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -2743,7 +2743,7 @@ fn emit_select_with_optgroup_rich(
                                 ),
                             ));
                             cb_body.push(t::stmt(t::call(
-                                t::member_id(t::id("$"), "reset"),
+                                t::member_id(t::id_dollar(), "reset"),
                                 vec![t::id(&span_var_name)],
                             )));
                             // Build inline template for span content.
@@ -2758,7 +2758,7 @@ fn emit_select_with_optgroup_rich(
                             let inline = build_inline_template(&parts, &script.state_bindings);
                             let inline = rewrite_props_destructured(&inline, &script.props_destructured);
                             og_set_text_calls.push(t::stmt(t::call(
-                                t::member_id(t::id("$"), "set_text"),
+                                t::member_id(t::id_dollar(), "set_text"),
                                 vec![t::id(&txt), inline],
                             )));
                             prev_elem_var = Some(span_var_name);
@@ -2797,7 +2797,7 @@ fn emit_select_with_optgroup_rich(
                 }))
             };
             cb_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
                     param_type_annotations: Vec::new(),
@@ -2808,7 +2808,7 @@ fn emit_select_with_optgroup_rich(
             )));
         }
         cb_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
+            t::member_id(t::id_dollar(), "append"),
             vec![t::id(&anchor_var), t::id(&fragment_var)],
         )));
         let _ = stripped;
@@ -2910,7 +2910,7 @@ fn emit_select_with_optgroup_rich(
     func_body.push(t::var("fragment", t::call(t::id("root"), Vec::new())));
     func_body.push(t::var(
         "select",
-        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+        t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()]),
     ));
     // Walk optgroup_els.
     let mut prev_og_var: Option<String> = None;
@@ -2918,10 +2918,10 @@ fn emit_select_with_optgroup_rich(
     for (oi, og) in optgroup_els.iter().enumerate() {
         let og_var = select_optgroup_var(oi);
         let init = if oi == 0 {
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id("select")])
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id("select")])
         } else {
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id(prev_og_var.as_ref().unwrap())],
             )
         };
@@ -2940,7 +2940,7 @@ fn emit_select_with_optgroup_rich(
                 span: Span::ZERO,
             }));
             func_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "customizable_select"),
+                t::member_id(t::id_dollar(), "customizable_select"),
                 vec![t::id(&og_var), cb],
             )));
         } else {
@@ -2970,9 +2970,9 @@ fn emit_select_with_optgroup_rich(
                         let opt_var = format!("option_{}", oi + static_opt_idx + 1);
                         static_opt_idx += 1;
                         let init = if let Some(prev) = &prev_opt_var {
-                            t::call(t::member_id(t::id("$"), "sibling"), vec![t::id(prev)])
+                            t::call(t::member_id(t::id_dollar(), "sibling"), vec![t::id(prev)])
                         } else {
-                            t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)])
+                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)])
                         };
                         func_body.push(t::var(&opt_var, init));
                         if let Some(val) = value_str {
@@ -3019,14 +3019,14 @@ fn emit_select_with_optgroup_rich(
             }
             // After processing static optgroup options, reset(optgroup_N).
             func_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "reset"),
+                t::member_id(t::id_dollar(), "reset"),
                 vec![t::id(&og_var)],
             )));
         }
         prev_og_var = Some(og_var);
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id("select")],
     )));
 
@@ -3035,7 +3035,7 @@ fn emit_select_with_optgroup_rich(
         func_body.push(t::var(
             &tel_var,
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id("select"), t::lit_number(2.0)],
             ),
         ));
@@ -3058,7 +3058,7 @@ fn emit_select_with_optgroup_rich(
     }
     for (ev, var, handler) in &delegated_events {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegated"),
+            t::member_id(t::id_dollar(), "delegated"),
             vec![
                 t::literal_str(ev),
                 t::id(var),
@@ -3067,11 +3067,11 @@ fn emit_select_with_optgroup_rich(
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -3089,7 +3089,7 @@ fn emit_select_with_optgroup_rich(
         prog.push(t::var(
             name,
             t::call(
-                t::member_id(t::id("$"), "from_html"),
+                t::member_id(t::id_dollar(), "from_html"),
                 vec![
                     t::template_raw(vec![html.clone()], Vec::new()),
                     t::lit_number(1.0),
@@ -3102,7 +3102,7 @@ fn emit_select_with_optgroup_rich(
         prog.push(t::var(
             &rich.template_name,
             t::call(
-                t::member_id(t::id("$"), "from_html"),
+                t::member_id(t::id_dollar(), "from_html"),
                 vec![
                     t::template_raw(vec![rich.template_html.clone()], Vec::new()),
                     t::lit_number(1.0),
@@ -3118,7 +3118,7 @@ fn emit_select_with_optgroup_rich(
     };
     prog.push(t::var(
         "root",
-        t::call(t::member_id(t::id("$"), "from_html"), root_args),
+        t::call(t::member_id(t::id_dollar(), "from_html"), root_args),
     ));
     prog.push(export);
     if !delegated_events.is_empty() {
@@ -3135,7 +3135,7 @@ fn emit_select_with_optgroup_rich(
             span: Span::ZERO,
         }));
         prog.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegate"),
+            t::member_id(t::id_dollar(), "delegate"),
             vec![arr],
         )));
     }
@@ -3332,7 +3332,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         cb_body.push(t::var(
             &anchor_var,
             t::call(
-                t::member_id(t::id("$"), "child"),
+                t::member_id(t::id_dollar(), "child"),
                 vec![t::id(&select_option_var(oi))],
             ),
         ));
@@ -3375,13 +3375,13 @@ fn emit_select_with_rich_reactive_and_trailing(
                     let init = if let Some(prev) = &prev_elem_var {
                         // sibling of last span etc.
                         t::call(
-                            t::member_id(t::id("$"), "sibling"),
+                            t::member_id(t::id_dollar(), "sibling"),
                             vec![t::id(prev)],
                         )
                     } else {
                         // First — first_child of fragment.
                         t::call(
-                            t::member_id(t::id("$"), "first_child"),
+                            t::member_id(t::id_dollar(), "first_child"),
                             vec![t::id(&fragment_var)],
                         )
                     };
@@ -3431,7 +3431,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         span: Span::ZERO,
                     }));
                     set_text_calls.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "set_text"),
+                        t::member_id(t::id_dollar(), "set_text"),
                         vec![t::id(&text_name), tpl_lit],
                     )));
                 }
@@ -3456,17 +3456,17 @@ fn emit_select_with_rich_reactive_and_trailing(
                         elem_var_local += 1;
                         let init = if !first_emitted {
                             t::call(
-                                t::member_id(t::id("$"), "first_child"),
+                                t::member_id(t::id_dollar(), "first_child"),
                                 vec![t::id(&fragment_var)],
                             )
                         } else if let Some(prev) = &prev_elem_var {
                             t::call(
-                                t::member_id(t::id("$"), "sibling"),
+                                t::member_id(t::id_dollar(), "sibling"),
                                 vec![t::id(prev)],
                             )
                         } else {
                             t::call(
-                                t::member_id(t::id("$"), "first_child"),
+                                t::member_id(t::id_dollar(), "first_child"),
                                 vec![t::id(&fragment_var)],
                             )
                         };
@@ -3482,7 +3482,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         cb_body.push(t::var(
                             &text_name,
                             t::call(
-                                t::member_id(t::id("$"), "child"),
+                                t::member_id(t::id_dollar(), "child"),
                                 vec![
                                     t::id(&elem_name),
                                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -3493,7 +3493,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                             ),
                         ));
                         cb_body.push(t::stmt(t::call(
-                            t::member_id(t::id("$"), "reset"),
+                            t::member_id(t::id_dollar(), "reset"),
                             vec![t::id(&elem_name)],
                         )));
                         // Build inline expression from element's children.
@@ -3508,7 +3508,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         let inline = build_inline_template(&parts, &script.state_bindings);
                         let inline = rewrite_props_destructured(&inline, &script.props_destructured);
                         set_text_calls.push(t::stmt(t::call(
-                            t::member_id(t::id("$"), "set_text"),
+                            t::member_id(t::id_dollar(), "set_text"),
                             vec![t::id(&text_name), inline],
                         )));
                         prev_elem_var = Some(elem_name);
@@ -3536,7 +3536,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                 }))
             };
             cb_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
                     param_type_annotations: Vec::new(),
@@ -3547,7 +3547,7 @@ fn emit_select_with_rich_reactive_and_trailing(
             )));
         }
         cb_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
+            t::member_id(t::id_dollar(), "append"),
             vec![t::id(&anchor_var), t::id(&fragment_var)],
         )));
         rich_options.push(RichOption {
@@ -3567,7 +3567,7 @@ fn emit_select_with_rich_reactive_and_trailing(
     // var select = $.first_child(fragment);
     func_body.push(t::var(
         "select",
-        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+        t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()]),
     ));
     // Walk options, allocate vars, emit customizable_select for rich + value assignments.
     let mut prev_opt_var: Option<String> = None;
@@ -3575,10 +3575,10 @@ fn emit_select_with_rich_reactive_and_trailing(
     for (oi, opt) in option_els.iter().enumerate() {
         let var_name = select_option_var(oi);
         let init = if oi == 0 {
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id("select")])
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id("select")])
         } else {
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id(prev_opt_var.as_ref().unwrap())],
             )
         };
@@ -3595,7 +3595,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                 span: Span::ZERO,
             }));
             func_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "customizable_select"),
+                t::member_id(t::id_dollar(), "customizable_select"),
                 vec![t::id(&var_name), cb],
             )));
         }
@@ -3642,7 +3642,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         let _ = opt;
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id("select")],
     )));
 
@@ -3652,7 +3652,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         func_body.push(t::var(
             &tel_var,
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id("select"), t::lit_number(2.0)],
             ),
         ));
@@ -3676,7 +3676,7 @@ fn emit_select_with_rich_reactive_and_trailing(
     }
     for (ev, var, handler) in &delegated_events {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegated"),
+            t::member_id(t::id_dollar(), "delegated"),
             vec![
                 t::literal_str(ev),
                 t::id(var),
@@ -3685,11 +3685,11 @@ fn emit_select_with_rich_reactive_and_trailing(
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -3707,7 +3707,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         prog.push(t::var(
             &rich.template_name,
             t::call(
-                t::member_id(t::id("$"), "from_html"),
+                t::member_id(t::id_dollar(), "from_html"),
                 vec![
                     t::template_raw(vec![rich.template_html.clone()], Vec::new()),
                     t::lit_number(1.0),
@@ -3724,7 +3724,7 @@ fn emit_select_with_rich_reactive_and_trailing(
     };
     prog.push(t::var(
         "root",
-        t::call(t::member_id(t::id("$"), "from_html"), root_args),
+        t::call(t::member_id(t::id_dollar(), "from_html"), root_args),
     ));
     prog.push(export);
     // $.delegate(['click', ...]) trailer.
@@ -3742,7 +3742,7 @@ fn emit_select_with_rich_reactive_and_trailing(
             span: Span::ZERO,
         }));
         prog.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegate"),
+            t::member_id(t::id_dollar(), "delegate"),
             vec![arr],
         )));
     }
@@ -3834,7 +3834,7 @@ fn emit_single_static_custom_element_program(
 
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "push"),
+        t::member_id(t::id_dollar(), "push"),
         vec![
             t::id("$$props"),
             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -3844,13 +3844,13 @@ fn emit_single_static_custom_element_program(
         ],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "init"),
+        t::member_id(t::id_dollar(), "init"),
         Vec::new(),
     )));
     func_body.push(t::var(&var, t::call(t::id("root"), Vec::new())));
     for (k, v) in &props {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "set_custom_element_data"),
+            t::member_id(t::id_dollar(), "set_custom_element_data"),
             vec![
                 t::id(&var),
                 t::literal_str(k),
@@ -3859,15 +3859,15 @@ fn emit_single_static_custom_element_program(
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&var)],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "pop"),
+        t::member_id(t::id_dollar(), "pop"),
         Vec::new(),
     )));
 
-    let params = vec![t::pat_id("$$anchor"), t::pat_id("$$props")];
+    let params = vec![t::pat_id_anchor(), t::pat_id("$$props")];
     let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::new();
@@ -3880,7 +3880,7 @@ fn emit_single_static_custom_element_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![html], Vec::new()),
                 t::lit_number(2.0),
@@ -4666,7 +4666,7 @@ pub fn try_typed_client_walker_with(
                 // `\$.remove_input_defaults(var);` immediately after nav.
                 if el.name == "input" && (dirs.bind_value.is_some() || !dirs.events.is_empty()) {
                     body_stmts.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "remove_input_defaults"),
+                        t::member_id(t::id_dollar(), "remove_input_defaults"),
                         vec![t::id(&var)],
                     )));
                 }
@@ -4722,7 +4722,7 @@ pub fn try_typed_client_walker_with(
                 let pending = Expression::Literal(Box::new(Literal::Null(Span::ZERO)));
                 let _ = &ab.pending;
                 // Then: `($$anchor, PAT) => { body }`.
-                let mut then_params = vec![t::pat_id("$$anchor")];
+                let mut then_params = vec![t::pat_id_anchor()];
                 if let Some(pat) = &ab.value {
                     then_params.push(pat.clone());
                 }
@@ -4737,7 +4737,7 @@ pub fn try_typed_client_walker_with(
                     span: Span::ZERO,
                 }));
                 body_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "await"),
+                    t::member_id(t::id_dollar(), "await"),
                     vec![t::id(&var), getter, pending, then],
                 )));
             }
@@ -4750,7 +4750,7 @@ pub fn try_typed_client_walker_with(
                     body_stmts.push(t::var(
                         &v,
                         t::call(
-                            t::member_id(t::id("$"), "sibling"),
+                            t::member_id(t::id_dollar(), "sibling"),
                             vec![t::id(
                                 prev_var.as_deref().expect("preceding node"),
                             )],
@@ -4793,7 +4793,7 @@ pub fn try_typed_client_walker_with(
                     // sibling base.
                     let init = match prev_var.as_deref() {
                         Some(prev) => t::call(
-                            t::member_id(t::id("$"), "sibling"),
+                            t::member_id(t::id_dollar(), "sibling"),
                             vec![t::id(prev)],
                         ),
                         None => return None,
@@ -4876,7 +4876,7 @@ pub fn try_typed_client_walker_with(
             // Inline form: `() => $.set_text(text, TEMPLATE)`.
             let (text_var, template_expr) = text_effects.pop().unwrap();
             let set_call = t::call(
-                t::member_id(t::id("$"), "set_text"),
+                t::member_id(t::id_dollar(), "set_text"),
                 vec![t::id(&text_var), template_expr],
             );
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -4887,7 +4887,7 @@ pub fn try_typed_client_walker_with(
                 span: Span::ZERO,
             }));
             body_stmts.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 vec![arrow],
             )));
         }
@@ -4896,7 +4896,7 @@ pub fn try_typed_client_walker_with(
             let mut block_body: Vec<Statement> = Vec::new();
             for (text_var, template_expr) in text_effects {
                 block_body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id(&text_var), template_expr],
                 )));
             }
@@ -4911,7 +4911,7 @@ pub fn try_typed_client_walker_with(
                 span: Span::ZERO,
             }));
             body_stmts.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 vec![arrow],
             )));
         }
@@ -4922,8 +4922,8 @@ pub fn try_typed_client_walker_with(
 
     // Final append.
     body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&root_holder)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&root_holder)],
     )));
 
     // Module-level `var root = $.from_html(\`HTML\`[, 1]);`
@@ -4933,10 +4933,10 @@ pub fn try_typed_client_walker_with(
     }
     let root_decl = t::var(
         "root",
-        t::call(t::member_id(t::id("$"), "from_html"), from_html_args),
+        t::call(t::member_id(t::id_dollar(), "from_html"), from_html_args),
     );
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -4974,7 +4974,7 @@ pub fn try_typed_client_walker_with(
             span: Span::ZERO,
         }));
         prog.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegate"),
+            t::member_id(t::id_dollar(), "delegate"),
             vec![arr],
         )));
     }
@@ -5001,7 +5001,7 @@ fn emit_directives(
             body: ArrowBody::Expression({
                 if state_bindings.contains(&target_name) {
                     t::call(
-                        t::member_id(t::id("$"), "get"),
+                        t::member_id(t::id_dollar(), "get"),
                         vec![t::id(&target_name)],
                     )
                 } else {
@@ -5017,7 +5017,7 @@ fn emit_directives(
             body: ArrowBody::Expression({
                 if state_bindings.contains(&target_name) {
                     t::call(
-                        t::member_id(t::id("$"), "set"),
+                        t::member_id(t::id_dollar(), "set"),
                         vec![t::id(&target_name), t::id("$$value")],
                     )
                 } else {
@@ -5033,7 +5033,7 @@ fn emit_directives(
             span: Span::ZERO,
         }));
         effects.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "bind_value"),
+            t::member_id(t::id_dollar(), "bind_value"),
             vec![t::id(var), getter, setter],
         )));
     }
@@ -5043,7 +5043,7 @@ fn emit_directives(
         let mut handler_expr = (*handler).clone();
         rewrite_expr_for_state(&mut handler_expr, state_bindings);
         effects.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegated"),
+            t::member_id(t::id_dollar(), "delegated"),
             vec![
                 Expression::Literal(Box::new(Literal::String(StringLiteral {
                     value: event.clone(),
@@ -5095,7 +5095,7 @@ fn emit_tree_program(
     }
     let root_decl = t::var(
         "root",
-        t::call(t::member_id(t::id("$"), "from_tree"), from_tree_args),
+        t::call(t::member_id(t::id_dollar(), "from_tree"), from_tree_args),
     );
 
     // Body: `var fragment = root(); $.next(N); $.append($$anchor, fragment);`
@@ -5103,18 +5103,18 @@ fn emit_tree_program(
     body.push(t::var("fragment", t::call(t::id("root"), vec![])));
     if is_multi_root {
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             vec![t::lit_number(classified.len() as f64)],
         )));
     }
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
     let export = t::export_default_function(
         component_name,
-        vec![t::pat_id("$$anchor")],
+        vec![t::pat_id_anchor()],
         body,
     );
 
@@ -5244,7 +5244,7 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
     let mut body: Vec<Statement> = Vec::new();
     // `$.push($$props, true);`
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "push"),
+        t::member_id(t::id_dollar(), "push"),
         vec![
             t::id("$$props"),
             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -5255,11 +5255,11 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
     )));
     body.extend(script.body.clone());
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "pop"),
+        t::member_id(t::id_dollar(), "pop"),
         Vec::new(),
     )));
 
-    let params = vec![t::pat_id("$$anchor"), t::pat_id("$$props")];
+    let params = vec![t::pat_id_anchor(), t::pat_id("$$props")];
     let export = t::export_default_function(component_name, params, body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(3 + script.imports.len());
@@ -5422,7 +5422,7 @@ fn emit_single_component_program(
                 module_extras.push(t::var(
                     &root_name,
                     t::call(
-                        t::member_id(t::id("$"), "from_html"),
+                        t::member_id(t::id_dollar(), "from_html"),
                         vec![t::template_raw(vec![html], vec![])],
                     ),
                 ));
@@ -5430,12 +5430,12 @@ fn emit_single_component_program(
                 let body: Vec<Statement> = vec![
                     t::var(&el_var, t::call(t::id(&root_name), Vec::new())),
                     t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
-                        vec![t::id("$$anchor"), t::id(&el_var)],
+                        t::member_id(t::id_dollar(), "append"),
+                        vec![t::id_anchor(), t::id(&el_var)],
                     )),
                 ];
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                    params: vec![t::pat_id_anchor(), t::pat_id("$$slotProps")],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body,
@@ -5472,11 +5472,11 @@ fn emit_single_component_program(
                 Vec::new()
             } else {
                 vec![
-                    t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+                    t::stmt(t::call(t::member_id(t::id_dollar(), "next"), Vec::new())),
                     t::var(
                         "text",
                         t::call(
-                            t::member_id(t::id("$"), "text"),
+                            t::member_id(t::id_dollar(), "text"),
                             vec![Expression::Literal(Box::new(Literal::String(
                                 StringLiteral {
                                     value: trimmed.to_string(),
@@ -5487,13 +5487,13 @@ fn emit_single_component_program(
                         ),
                     ),
                     t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
-                        vec![t::id("$$anchor"), t::id("text")],
+                        t::member_id(t::id_dollar(), "append"),
+                        vec![t::id_anchor(), t::id("text")],
                     )),
                 ]
             };
             let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                params: vec![t::pat_id_anchor(), t::pat_id("$$slotProps")],
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Block(Box::new(BlockStatement {
                     body: default_body,
@@ -5532,7 +5532,7 @@ fn emit_single_component_program(
             let component_call = Expression::Call(Box::new(CallExpression {
                 callee: t::id(&c.name),
                 arguments: vec![
-                    Argument::Expression(t::id("$$anchor")),
+                    Argument::Expression(t::id_anchor()),
                     Argument::Expression(Expression::Object(Box::new(ObjectExpression {
                         properties: props,
                         span: Span::ZERO,
@@ -5544,7 +5544,7 @@ fn emit_single_component_program(
             let mut func_body: Vec<Statement> = Vec::new();
             func_body.extend(script.body.clone());
             func_body.push(t::stmt(component_call));
-            let mut params = vec![t::pat_id("$$anchor")];
+            let mut params = vec![t::pat_id_anchor()];
             if script.uses_props {
                 params.push(t::pat_id("$$props"));
             }
@@ -5570,7 +5570,7 @@ fn emit_single_component_program(
                     let inner_call = t::stmt(t::call(
                         t::id(&inner.name),
                         vec![
-                            t::id("$$anchor"),
+                            t::id_anchor(),
                             Expression::Object(Box::new(ObjectExpression {
                                 properties: Vec::new(),
                                 span: Span::ZERO,
@@ -5578,7 +5578,7 @@ fn emit_single_component_program(
                         ],
                     ));
                     let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                        params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+                        params: vec![t::pat_id_anchor(), t::pat_id("$$slotProps")],
                         param_type_annotations: Vec::new(),
                         body: ArrowBody::Block(Box::new(BlockStatement {
                             body: vec![inner_call],
@@ -5631,7 +5631,7 @@ fn emit_single_component_program(
                     let component_call = Expression::Call(Box::new(CallExpression {
                         callee: t::id(&c.name),
                         arguments: vec![
-                            Argument::Expression(t::id("$$anchor")),
+                            Argument::Expression(t::id_anchor()),
                             Argument::Expression(Expression::Object(Box::new(ObjectExpression {
                                 properties: props,
                                 span: Span::ZERO,
@@ -5643,7 +5643,7 @@ fn emit_single_component_program(
                     let mut func_body: Vec<Statement> = Vec::new();
                     func_body.extend(script.body.clone());
                     func_body.push(t::stmt(component_call));
-                    let mut params = vec![t::pat_id("$$anchor")];
+                    let mut params = vec![t::pat_id_anchor()];
                     if script.uses_props {
                         params.push(t::pat_id("$$props"));
                     }
@@ -5698,16 +5698,16 @@ fn emit_single_component_program(
 
         let mut slot_body: Vec<Statement> = Vec::new();
         slot_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             Vec::new(),
         )));
         slot_body.push(t::var(
             "text",
-            t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+            t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
         ));
         let inline = build_inline_template(&parts, &script.state_bindings);
         let fn_body = t::call(
-            t::member_id(t::id("$"), "set_text"),
+            t::member_id(t::id_dollar(), "set_text"),
             vec![t::id("text"), inline],
         );
         let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -5718,15 +5718,15 @@ fn emit_single_component_program(
             span: Span::ZERO,
         }));
         slot_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![fn_arrow],
         )));
         slot_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
-            vec![t::id("$$anchor"), t::id("text")],
+            t::member_id(t::id_dollar(), "append"),
+            vec![t::id_anchor(), t::id("text")],
         )));
         let children_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor"), t::pat_id("$$slotProps")],
+            params: vec![t::pat_id_anchor(), t::pat_id("$$slotProps")],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: slot_body,
@@ -5782,7 +5782,7 @@ fn emit_single_component_program(
     let component_call = Expression::Call(Box::new(CallExpression {
         callee: t::id(&c.name),
         arguments: vec![
-            Argument::Expression(t::id("$$anchor")),
+            Argument::Expression(t::id_anchor()),
             Argument::Expression(Expression::Object(Box::new(ObjectExpression {
                 properties: props,
                 span: Span::ZERO,
@@ -5796,7 +5796,7 @@ fn emit_single_component_program(
     func_body.extend(script.body.clone());
     func_body.push(t::stmt(component_call));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -5824,15 +5824,15 @@ fn emit_single_async_expr_program(
     let mut body: Vec<Statement> = Vec::new();
     body.extend(script.body.clone());
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "next"),
+        t::member_id(t::id_dollar(), "next"),
         Vec::new(),
     )));
     body.push(t::var(
         "text",
-        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
     ));
     let set_call = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), expr.clone()],
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -5857,15 +5857,15 @@ fn emit_single_async_expr_program(
         span: Span::ZERO,
     }));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![effect_fn, void_zero_client(), void_zero_client(), blockers],
     )));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("text")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("text")],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -5923,12 +5923,12 @@ fn emit_async_branch_body(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         text_name,
-        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
     ));
     // template_effect:
     //   `($0) => $.set_text(TEXT, $0), void 0, [() => INNER_EXPR]`
     let set_text_call = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id(text_name), t::id("$0")],
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -5951,12 +5951,12 @@ fn emit_async_branch_body(
         span: Span::ZERO,
     }));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![effect_fn, void_zero_client(), deps_array],
     )));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(text_name)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(text_name)],
     )));
     Some(body)
 }
@@ -6069,7 +6069,7 @@ fn emit_multi_element_branch_body_with_context(
     roots.push(t::var(
         &root_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![template], vec![]), t::lit_number(flag)],
         ),
     ));
@@ -6091,12 +6091,12 @@ fn emit_multi_element_branch_body_with_context(
         var_names.push(var.clone());
         let init = if i == 0 {
             t::call(
-                t::member_id(t::id("$"), "first_child"),
+                t::member_id(t::id_dollar(), "first_child"),
                 vec![t::id(&frag_var)],
             )
         } else {
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id(&var_names[i - 1]), t::lit_number(2.0)],
             )
         };
@@ -6121,7 +6121,7 @@ fn emit_multi_element_branch_body_with_context(
                 let expr = rewrite_props_destructured(&expr, props_destructured);
                 let expr = rewrite_legacy_prop_reads(&expr, legacy_prop_names);
                 dyn_attr_calls.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "set_attribute"),
+                    t::member_id(t::id_dollar(), "set_attribute"),
                     vec![
                         t::id(&var),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
@@ -6151,7 +6151,7 @@ fn emit_multi_element_branch_body_with_context(
             }))
         };
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
@@ -6162,8 +6162,8 @@ fn emit_multi_element_branch_body_with_context(
         )));
     }
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&frag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&frag_var)],
     )));
     Some(body)
 }
@@ -6222,7 +6222,7 @@ fn emit_multi_element_each_body(
     roots.push(t::var(
         &root_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![template], vec![]), t::lit_number(flag)],
         ),
     ));
@@ -6246,12 +6246,12 @@ fn emit_multi_element_each_body(
         elem_vars.push(el_var.clone());
         let init = if i == 0 {
             t::call(
-                t::member_id(t::id("$"), "first_child"),
+                t::member_id(t::id_dollar(), "first_child"),
                 vec![t::id(&frag_var)],
             )
         } else {
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id(&elem_vars[i - 1]), t::lit_number(2.0)],
             )
         };
@@ -6286,7 +6286,7 @@ fn emit_multi_element_each_body(
         body.push(t::var(
             &text_name,
             t::call(
-                t::member_id(t::id("$"), "child"),
+                t::member_id(t::id_dollar(), "child"),
                 vec![
                     t::id(&el_var),
                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -6297,7 +6297,7 @@ fn emit_multi_element_each_body(
             ),
         ));
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "reset"),
+            t::member_id(t::id_dollar(), "reset"),
             vec![t::id(&el_var)],
         )));
         text_vars_with_expr.push((text_name, inline));
@@ -6308,7 +6308,7 @@ fn emit_multi_element_each_body(
         .into_iter()
         .map(|(name, expr)| {
             t::stmt(t::call(
-                t::member_id(t::id("$"), "set_text"),
+                t::member_id(t::id_dollar(), "set_text"),
                 vec![t::id(&name), expr],
             ))
         })
@@ -6328,7 +6328,7 @@ fn emit_multi_element_each_body(
         }))
     };
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
             param_type_annotations: Vec::new(),
@@ -6338,8 +6338,8 @@ fn emit_multi_element_each_body(
         }))],
     )));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&frag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&frag_var)],
     )));
     Some(body)
 }
@@ -6403,22 +6403,22 @@ fn emit_vanilla_branch_body_with_context(
             body.push(t::var(
                 text_name,
                 t::call(
-                    t::member_id(t::id("$"), "text"),
+                    t::member_id(t::id_dollar(), "text"),
                     vec![t::literal_str(t.data.trim())],
                 ),
             ));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(text_name)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(text_name)],
             )));
             Some(body)
         }
         FragmentChild::ExpressionTag(et) => {
             let expr = et.expression.clone();
             let mut body: Vec<Statement> = Vec::new();
-            body.push(t::var(text_name, t::call(t::member_id(t::id("$"), "text"), Vec::new())));
+            body.push(t::var(text_name, t::call(t::member_id(t::id_dollar(), "text"), Vec::new())));
             let set_text_call = t::call(
-                t::member_id(t::id("$"), "set_text"),
+                t::member_id(t::id_dollar(), "set_text"),
                 vec![t::id(text_name), expr],
             );
             let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -6429,12 +6429,12 @@ fn emit_vanilla_branch_body_with_context(
                 span: Span::ZERO,
             }));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 vec![effect_fn],
             )));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(text_name)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(text_name)],
             )));
             Some(body)
         }
@@ -6453,7 +6453,7 @@ fn emit_vanilla_branch_body_with_context(
             roots.push(t::var(
                 &root_name,
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![t::template_raw(vec![html], vec![])],
                 ),
             ));
@@ -6484,7 +6484,7 @@ fn emit_vanilla_branch_body_with_context(
                 body.push(t::var(
                     text_name,
                     t::call(
-                        t::member_id(t::id("$"), "child"),
+                        t::member_id(t::id_dollar(), "child"),
                         vec![
                             t::id(&var_name),
                             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -6495,11 +6495,11 @@ fn emit_vanilla_branch_body_with_context(
                     ),
                 ));
                 body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(&var_name)],
                 )));
                 let set_text = t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id(text_name), inline],
                 );
                 let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -6510,13 +6510,13 @@ fn emit_vanilla_branch_body_with_context(
                     span: Span::ZERO,
                 }));
                 body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "template_effect"),
+                    t::member_id(t::id_dollar(), "template_effect"),
                     vec![effect_fn],
                 )));
             }
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(&var_name)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(&var_name)],
             )));
             Some(body)
         }
@@ -6529,7 +6529,7 @@ fn emit_vanilla_branch_body_with_context(
             body.push(t::stmt(t::call(
                 t::id(&c.name),
                 vec![
-                    t::id("$$anchor"),
+                    t::id_anchor(),
                     Expression::Object(Box::new(ObjectExpression {
                         properties: Vec::new(),
                         span: Span::ZERO,
@@ -6546,7 +6546,7 @@ fn emit_vanilla_branch_body_with_context(
                 _ => return None,
             };
             let mut new_args: Vec<Argument> =
-                vec![Argument::Expression(t::id("$$anchor"))];
+                vec![Argument::Expression(t::id_anchor())];
             for a in &call.arguments {
                 new_args.push(a.clone());
             }
@@ -6565,12 +6565,12 @@ fn emit_vanilla_branch_body_with_context(
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::var(
                 "fragment_1",
-                t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+                t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
             ));
             body.push(t::var(
                 "node_1",
                 t::call(
-                    t::member_id(t::id("$"), "first_child"),
+                    t::member_id(t::id_dollar(), "first_child"),
                     vec![t::id("fragment_1")],
                 ),
             ));
@@ -6591,7 +6591,7 @@ fn emit_vanilla_branch_body_with_context(
                 }
             }
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "slot"),
+                t::member_id(t::id_dollar(), "slot"),
                 vec![
                     t::id("node_1"),
                     t::id("$$props"),
@@ -6608,8 +6608,8 @@ fn emit_vanilla_branch_body_with_context(
                 ],
             )));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id("fragment_1")],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id("fragment_1")],
             )));
             Some(body)
         }
@@ -6622,12 +6622,12 @@ fn emit_vanilla_branch_body_with_context(
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::var(
                 "fragment_1",
-                t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+                t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
             ));
             body.push(t::var(
                 "node_1",
                 t::call(
-                    t::member_id(t::id("$"), "first_child"),
+                    t::member_id(t::id_dollar(), "first_child"),
                     vec![t::id("fragment_1")],
                 ),
             ));
@@ -6639,12 +6639,12 @@ fn emit_vanilla_branch_body_with_context(
                 span: Span::ZERO,
             }));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "html"),
+                t::member_id(t::id_dollar(), "html"),
                 vec![t::id("node_1"), inner_arrow],
             )));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id("fragment_1")],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id("fragment_1")],
             )));
             Some(body)
         }
@@ -6690,7 +6690,7 @@ fn emit_single_vanilla_if_program(
     };
 
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent_body,
@@ -6704,7 +6704,7 @@ fn emit_single_vanilla_if_program(
     block_body.push(t::var("consequent", consequent_arrow));
     if let Some(alt_body) = alternate_body {
         let alt_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
+            params: vec![t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: alt_body,
@@ -6717,10 +6717,10 @@ fn emit_single_vanilla_if_program(
     }
 
     // Inner: `if (TEST) $$render(consequent); [else $$render(alternate, false);]`
-    let then_call = t::stmt(t::call(t::id("$$render"), vec![t::id("consequent")]));
+    let then_call = t::stmt(t::call(t::id_render(), vec![t::id("consequent")]));
     let else_call = if ib.alternate.is_some() {
         Some(t::stmt(t::call(
-            t::id("$$render"),
+            t::id_render(),
             vec![t::id("alternate"), t::lit_number(-1.0)],
         )))
     } else {
@@ -6750,7 +6750,7 @@ fn emit_single_vanilla_if_program(
         span: Span::ZERO,
     }));
     block_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "if"),
+        t::member_id(t::id_dollar(), "if"),
         vec![t::id("node"), render_arrow],
     )));
 
@@ -6759,7 +6759,7 @@ fn emit_single_vanilla_if_program(
     // Legacy props prelude.
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -6778,7 +6778,7 @@ fn emit_single_vanilla_if_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -6789,13 +6789,13 @@ fn emit_single_vanilla_if_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
     func_body.push(Statement::Block(Box::new(BlockStatement {
@@ -6803,20 +6803,20 @@ fn emit_single_vanilla_if_program(
         span: Span::ZERO,
     })));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -6904,7 +6904,7 @@ fn emit_top_level_html_tag_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -6923,7 +6923,7 @@ fn emit_top_level_html_tag_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -6934,13 +6934,13 @@ fn emit_top_level_html_tag_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
     let html_arg = if is_bare_legacy_prop {
@@ -6955,24 +6955,24 @@ fn emit_top_level_html_tag_program(
         }))
     };
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "html"),
+        t::member_id(t::id_dollar(), "html"),
         vec![t::id("node"), html_arg],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -7022,7 +7022,7 @@ fn emit_top_level_render_tag_program(
         Expression::Call(c) => c,
         _ => return None,
     };
-    let mut new_args: Vec<Argument> = vec![Argument::Expression(t::id("$$anchor"))];
+    let mut new_args: Vec<Argument> = vec![Argument::Expression(t::id_anchor())];
     for a in &call.arguments {
         new_args.push(a.clone());
     }
@@ -7037,7 +7037,7 @@ fn emit_top_level_render_tag_program(
     let needs_legacy_wrap = script.emit_legacy_flag;
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -7049,19 +7049,19 @@ fn emit_top_level_render_tag_program(
     func_body.extend(script.body.clone());
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "init"),
+            t::member_id(t::id_dollar(), "init"),
             Vec::new(),
         )));
     }
     func_body.push(t::stmt(render_call));
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "pop"),
+            t::member_id(t::id_dollar(), "pop"),
             Vec::new(),
         )));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || needs_legacy_wrap {
         params.push(t::pat_id("$$props"));
     }
@@ -7219,7 +7219,7 @@ fn emit_single_element_wrapping_html_tag_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -7238,7 +7238,7 @@ fn emit_single_element_wrapping_html_tag_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -7249,7 +7249,7 @@ fn emit_single_element_wrapping_html_tag_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "html"),
+        t::member_id(t::id_dollar(), "html"),
         vec![
             t::id(&tag_var),
             html_arg,
@@ -7259,24 +7259,24 @@ fn emit_single_element_wrapping_html_tag_program(
         ],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&tag_var)],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&tag_var)],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || !script.legacy_export_props.is_empty() {
         params.push(t::pat_id("$$props"));
     }
@@ -7292,7 +7292,7 @@ fn emit_single_element_wrapping_html_tag_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), from_fn),
+            t::member_id(t::id_dollar(), from_fn),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -7329,22 +7329,22 @@ fn emit_top_level_single_text_program(
     let mut func_body: Vec<Statement> = Vec::new();
     func_body.extend(script.body.clone());
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "next"),
+        t::member_id(t::id_dollar(), "next"),
         Vec::new(),
     )));
     func_body.push(t::var(
         "text",
         t::call(
-            t::member_id(t::id("$"), "text"),
+            t::member_id(t::id_dollar(), "text"),
             vec![t::literal_str(text)],
         ),
     ));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("text")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("text")],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -7398,7 +7398,7 @@ fn emit_top_level_single_expression_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -7417,7 +7417,7 @@ fn emit_top_level_single_expression_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -7427,15 +7427,15 @@ fn emit_top_level_single_expression_program(
     }
     func_body.extend(script.body.clone());
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "next"),
+        t::member_id(t::id_dollar(), "next"),
         Vec::new(),
     )));
     func_body.push(t::var(
         "text",
-        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
     ));
     let set_text = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), inner],
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -7446,24 +7446,24 @@ fn emit_top_level_single_expression_program(
         span: Span::ZERO,
     }));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![effect_fn],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("text")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("text")],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -7598,7 +7598,7 @@ fn emit_single_element_with_component_program(
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "child"),
+            t::member_id(t::id_dollar(), "child"),
             vec![t::id(&tag_var)],
         ),
     ));
@@ -7613,15 +7613,15 @@ fn emit_single_element_with_component_program(
         ],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&tag_var)],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&tag_var)],
     )));
 
-    let params = vec![t::pat_id("$$anchor")];
+    let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(4 + script.imports.len());
@@ -7634,7 +7634,7 @@ fn emit_single_element_with_component_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -7725,11 +7725,11 @@ fn emit_single_element_with_inner_snippet_program(
                 FragmentChild::Text(t) => {
                     let trimmed = t.data.trim();
                     vec![
-                        t::stmt(t::call(t::member_id(t::id("$"), "next"), Vec::new())),
+                        t::stmt(t::call(t::member_id(t::id_dollar(), "next"), Vec::new())),
                         t::var(
                             "text",
                             t::call(
-                                t::member_id(t::id("$"), "text"),
+                                t::member_id(t::id_dollar(), "text"),
                                 vec![Expression::Literal(Box::new(Literal::String(
                                     StringLiteral {
                                         value: trimmed.to_string(),
@@ -7740,15 +7740,15 @@ fn emit_single_element_with_inner_snippet_program(
                             ),
                         ),
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "append"),
-                            vec![t::id("$$anchor"), t::id("text")],
+                            t::member_id(t::id_dollar(), "append"),
+                            vec![t::id_anchor(), t::id("text")],
                         )),
                     ]
                 }
                 _ => return None,
             }
         };
-        let mut params = vec![t::pat_id("$$anchor")];
+        let mut params = vec![t::pat_id_anchor()];
         for p in &sb.parameters {
             params.push(p.clone());
         }
@@ -7784,7 +7784,7 @@ fn emit_single_element_with_inner_snippet_program(
             let mut props: Vec<ObjectMember> = Vec::new();
             for id in &dt.identifiers {
                 let snapshot_call = t::call(
-                    t::member_id(t::id("$"), "snapshot"),
+                    t::member_id(t::id_dollar(), "snapshot"),
                     vec![Expression::Identifier(id.clone())],
                 );
                 let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -7795,7 +7795,7 @@ fn emit_single_element_with_inner_snippet_program(
                     span: Span::ZERO,
                 }));
                 let untrack_call = t::call(
-                    t::member_id(t::id("$"), "untrack"),
+                    t::member_id(t::id_dollar(), "untrack"),
                     vec![inner_arrow],
                 );
                 props.push(ObjectMember::Property(Box::new(Property {
@@ -7832,16 +7832,16 @@ fn emit_single_element_with_inner_snippet_program(
             span: Span::ZERO,
         }));
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![effect_arrow],
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&tag_var)],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -7857,7 +7857,7 @@ fn emit_single_element_with_inner_snippet_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -8135,7 +8135,7 @@ fn emit_single_element_wrapping_ifs_program(
             format!("consequent_{}", i)
         };
         let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
+            params: vec![t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: consequent_body,
@@ -8150,7 +8150,7 @@ fn emit_single_element_wrapping_ifs_program(
         let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
         let render_if = Statement::If(Box::new(IfStatement {
             test,
-            consequent: t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)])),
+            consequent: t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)])),
             alternate: None,
             span: Span::ZERO,
         }));
@@ -8170,7 +8170,7 @@ fn emit_single_element_wrapping_ifs_program(
             format!("node_{}", i)
         };
         inner_block.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "if"),
+            t::member_id(t::id_dollar(), "if"),
             vec![t::id(&node_var), render_arrow],
         )));
         if i > 0 {
@@ -8186,7 +8186,7 @@ fn emit_single_element_wrapping_ifs_program(
             block_stmts.push(t::var(
                 &node_var,
                 t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     vec![t::id(&prev_node), t::lit_number(offset as f64)],
                 ),
             ));
@@ -8203,7 +8203,7 @@ fn emit_single_element_wrapping_ifs_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -8222,7 +8222,7 @@ fn emit_single_element_wrapping_ifs_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -8234,19 +8234,19 @@ fn emit_single_element_wrapping_ifs_program(
     func_body.push(t::var(&tag_var, t::call(t::id("root"), Vec::new())));
     // Navigate to first if-block anchor inside this element.
     let child_call = t::call(
-        t::member_id(t::id("$"), "child"),
+        t::member_id(t::id_dollar(), "child"),
         vec![t::id(&tag_var)],
     );
     let first_node_init = if first_if_pos == 0 {
         child_call
     } else if first_if_pos == 1 {
         t::call(
-            t::member_id(t::id("$"), "sibling"),
+            t::member_id(t::id_dollar(), "sibling"),
             vec![child_call],
         )
     } else {
         t::call(
-            t::member_id(t::id("$"), "sibling"),
+            t::member_id(t::id_dollar(), "sibling"),
             vec![child_call, t::lit_number(first_if_pos as f64)],
         )
     };
@@ -8260,29 +8260,29 @@ fn emit_single_element_wrapping_ifs_program(
             vec![t::lit_number(trailing_advance as f64)]
         };
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             arg,
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&tag_var)],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&tag_var)],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || !script.legacy_export_props.is_empty() {
         params.push(t::pat_id("$$props"));
     }
@@ -8300,7 +8300,7 @@ fn emit_single_element_wrapping_ifs_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -8814,7 +8814,7 @@ fn emit_top_level_multi_if_program(
             block_stmts.push(t::var(
                 &cur_var,
                 t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     nav_args,
                 ),
             ));
@@ -8843,7 +8843,7 @@ fn emit_top_level_multi_if_program(
                     format!("consequent_{}", if_i)
                 };
                 let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id("$$anchor")],
+                    params: vec![t::pat_id_anchor()],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: consequent_body,
@@ -8858,7 +8858,7 @@ fn emit_top_level_multi_if_program(
                 let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
                 let render_if = Statement::If(Box::new(IfStatement {
                     test,
-                    consequent: t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)])),
+                    consequent: t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)])),
                     alternate: None,
                     span: Span::ZERO,
                 }));
@@ -8873,7 +8873,7 @@ fn emit_top_level_multi_if_program(
                     span: Span::ZERO,
                 }));
                 inner_block.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "if"),
+                    t::member_id(t::id_dollar(), "if"),
                     vec![t::id(&cur_var), render_arrow],
                 )));
                 block_stmts.push(Statement::Block(Box::new(BlockStatement {
@@ -8964,7 +8964,7 @@ fn emit_top_level_multi_if_program(
                     ));
                     if body_is_text_anchored && !body_has_element {
                         inner_body.insert(0, t::stmt(t::call(
-                            t::member_id(t::id("$"), "next"),
+                            t::member_id(t::id_dollar(), "next"),
                             Vec::new(),
                         )));
                     }
@@ -8979,7 +8979,7 @@ fn emit_top_level_multi_if_program(
                     }
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+                    params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
@@ -9047,7 +9047,7 @@ fn emit_top_level_multi_if_program(
                             &legacy_prop_names,
                         )?;
                         Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
-                            params: vec![t::pat_id("$$anchor")],
+                            params: vec![t::pat_id_anchor()],
                             param_type_annotations: Vec::new(),
                             body: ArrowBody::Block(Box::new(BlockStatement {
                                 body: fb_body,
@@ -9061,7 +9061,7 @@ fn emit_top_level_multi_if_program(
                 };
                 // Key function: `$.index` for unkeyed, `(item) => KEY` otherwise.
                 let key_fn: Expression = match &eb.key {
-                    None => t::member_id(t::id("$"), "index"),
+                    None => t::member_id(t::id_dollar(), "index"),
                     Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id(&item_name)],
                         param_type_annotations: Vec::new(),
@@ -9081,7 +9081,7 @@ fn emit_top_level_multi_if_program(
                     each_args.push(fb);
                 }
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "each"),
+                    t::member_id(t::id_dollar(), "each"),
                     each_args,
                 )));
             }
@@ -9138,7 +9138,7 @@ fn emit_top_level_multi_if_program(
                     span: Span::ZERO,
                 }));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "html"),
+                    t::member_id(t::id_dollar(), "html"),
                     vec![t::id(&cur_var), arrow],
                 )));
             }
@@ -9174,7 +9174,7 @@ fn emit_top_level_multi_if_program(
                     span: Span::ZERO,
                 }));
                 spread_effects.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "attribute_effect"),
+                    t::member_id(t::id_dollar(), "attribute_effect"),
                     vec![t::id(&cur_var), attr_effect_arrow],
                 )));
             }
@@ -9229,7 +9229,7 @@ fn emit_top_level_multi_if_program(
                 let attr_call_for = |name: &str, expr: Expression| -> Statement {
                     if !is_custom && name == "class" {
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "set_class"),
+                            t::member_id(t::id_dollar(), "set_class"),
                             vec![
                                 t::id(&cur_var),
                                 t::lit_number(1.0),
@@ -9238,7 +9238,7 @@ fn emit_top_level_multi_if_program(
                         ))
                     } else if is_custom {
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "set_custom_element_data"),
+                            t::member_id(t::id_dollar(), "set_custom_element_data"),
                             vec![
                                 t::id(&cur_var),
                                 t::literal_str(name),
@@ -9247,7 +9247,7 @@ fn emit_top_level_multi_if_program(
                         ))
                     } else {
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "set_attribute"),
+                            t::member_id(t::id_dollar(), "set_attribute"),
                             vec![
                                 t::id(&cur_var),
                                 t::literal_str(name),
@@ -9283,7 +9283,7 @@ fn emit_top_level_multi_if_program(
                         span: Span::ZERO,
                     }));
                     event_stmts.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "template_effect"),
+                        t::member_id(t::id_dollar(), "template_effect"),
                         vec![effect_arrow],
                     )));
                 } else {
@@ -9316,7 +9316,7 @@ fn emit_top_level_multi_if_program(
                         &legacy_prop_names,
                     );
                     event_stmts.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "event"),
+                        t::member_id(t::id_dollar(), "event"),
                         vec![
                             Expression::Literal(Box::new(Literal::String(StringLiteral {
                                 value: od.name.clone(),
@@ -9398,7 +9398,7 @@ fn emit_top_level_multi_if_program(
                     ));
                     if body_is_text_anchored && !body_has_element {
                         inner_body.insert(0, t::stmt(t::call(
-                            t::member_id(t::id("$"), "next"),
+                            t::member_id(t::id_dollar(), "next"),
                             Vec::new(),
                         )));
                     }
@@ -9412,7 +9412,7 @@ fn emit_top_level_multi_if_program(
                     }
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+                    params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
@@ -9477,7 +9477,7 @@ fn emit_top_level_multi_if_program(
                             &legacy_prop_names,
                         )?;
                         Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
-                            params: vec![t::pat_id("$$anchor")],
+                            params: vec![t::pat_id_anchor()],
                             param_type_annotations: Vec::new(),
                             body: ArrowBody::Block(Box::new(BlockStatement {
                                 body: fb_body,
@@ -9490,7 +9490,7 @@ fn emit_top_level_multi_if_program(
                     None => None,
                 };
                 let key_fn: Expression = match &eb.key {
-                    None => t::member_id(t::id("$"), "index"),
+                    None => t::member_id(t::id_dollar(), "index"),
                     Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: vec![t::pat_id(&item_name)],
                         param_type_annotations: Vec::new(),
@@ -9510,11 +9510,11 @@ fn emit_top_level_multi_if_program(
                     each_args.push(fb);
                 }
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "each"),
+                    t::member_id(t::id_dollar(), "each"),
                     each_args,
                 )));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(&cur_var)],
                 )));
             }
@@ -9529,12 +9529,12 @@ fn emit_top_level_multi_if_program(
                 block_stmts.push(t::var(
                     &text_var,
                     t::call(
-                        t::member_id(t::id("$"), "child"),
+                        t::member_id(t::id_dollar(), "child"),
                         vec![t::id(&cur_var)],
                     ),
                 ));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(&cur_var)],
                 )));
                 // Build the inline template from body parts.
@@ -9580,12 +9580,12 @@ fn emit_top_level_multi_if_program(
                 block_stmts.push(t::var(
                     &slot_node_var,
                     t::call(
-                        t::member_id(t::id("$"), "child"),
+                        t::member_id(t::id_dollar(), "child"),
                         vec![t::id(&cur_var)],
                     ),
                 ));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "slot"),
+                    t::member_id(t::id_dollar(), "slot"),
                     vec![
                         t::id(&slot_node_var),
                         t::id("$$props"),
@@ -9602,7 +9602,7 @@ fn emit_top_level_multi_if_program(
                     ],
                 )));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(&cur_var)],
                 )));
             }
@@ -9621,7 +9621,7 @@ fn emit_top_level_multi_if_program(
                     span: Span::ZERO,
                 }));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "html"),
+                    t::member_id(t::id_dollar(), "html"),
                     vec![
                         t::id(&cur_var),
                         arrow,
@@ -9632,7 +9632,7 @@ fn emit_top_level_multi_if_program(
                     ],
                 )));
                 block_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(&cur_var)],
                 )));
                 let _ = el;
@@ -9728,7 +9728,7 @@ fn emit_top_level_multi_if_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -9747,7 +9747,7 @@ fn emit_top_level_multi_if_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -9784,7 +9784,7 @@ fn emit_top_level_multi_if_program(
         first_anchor_is_text && literal_full_text(first_anchor_slot).is_empty();
     if first_if_pos == 0 && first_anchor_is_text {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             Vec::new(),
         )));
     }
@@ -9795,29 +9795,29 @@ fn emit_top_level_multi_if_program(
     // second arg (uses default `$.sibling(NODE)`).
     let first_child_args: Vec<Expression> = if first_anchor_text_empty && first_if_pos == 0 {
         vec![
-            t::id("fragment"),
+            t::id_fragment(),
             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                 value: true,
                 span: Span::ZERO,
             }))),
         ]
     } else {
-        vec![t::id("fragment")]
+        vec![t::id_fragment()]
     };
     let first_child_call = t::call(
-        t::member_id(t::id("$"), "first_child"),
+        t::member_id(t::id_dollar(), "first_child"),
         first_child_args,
     );
     let first_node_init = if first_if_pos == 0 {
         first_child_call
     } else if first_if_pos == 1 {
         t::call(
-            t::member_id(t::id("$"), "sibling"),
+            t::member_id(t::id_dollar(), "sibling"),
             vec![first_child_call],
         )
     } else {
         t::call(
-            t::member_id(t::id("$"), "sibling"),
+            t::member_id(t::id_dollar(), "sibling"),
             vec![first_child_call, t::lit_number(first_if_pos as f64)],
         )
     };
@@ -9832,11 +9832,11 @@ fn emit_top_level_multi_if_program(
     if text_set_effects.len() == 1 {
         let (text_var, expr) = text_set_effects.into_iter().next().unwrap();
         let arrow_body = ArrowBody::Expression(t::call(
-            t::member_id(t::id("$"), "set_text"),
+            t::member_id(t::id_dollar(), "set_text"),
             vec![t::id(&text_var), expr],
         ));
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
@@ -9849,7 +9849,7 @@ fn emit_top_level_multi_if_program(
         let mut block_body: Vec<Statement> = Vec::new();
         for (text_var, expr) in text_set_effects {
             block_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "set_text"),
+                t::member_id(t::id_dollar(), "set_text"),
                 vec![t::id(&text_var), expr],
             )));
         }
@@ -9858,7 +9858,7 @@ fn emit_top_level_multi_if_program(
             span: Span::ZERO,
         }));
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
@@ -9917,7 +9917,7 @@ fn emit_top_level_multi_if_program(
                 };
                 func_body.push(t::var(
                     &var,
-                    t::call(t::member_id(t::id("$"), "sibling"), nav_args),
+                    t::call(t::member_id(t::id_dollar(), "sibling"), nav_args),
                 ));
                 // If the body's ExpressionTag folds to a non-empty literal,
                 // emit `<var>.textContent = 'LITERAL';`.
@@ -9962,25 +9962,25 @@ fn emit_top_level_multi_if_program(
             vec![t::lit_number(trailing_advance as f64)]
         };
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             arg,
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || !script.legacy_export_props.is_empty() {
         params.push(t::pat_id("$$props"));
     }
@@ -10331,7 +10331,7 @@ fn emit_top_level_multi_if_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![]), t::lit_number(flag)],
         ),
     ));
@@ -10545,7 +10545,7 @@ fn emit_single_element_wrapping_each_program(
     item_body.push(t::var(
         "text",
         t::call(
-            t::member_id(t::id("$"), "child"),
+            t::member_id(t::id_dollar(), "child"),
             vec![
                 t::id(&inner_var),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -10555,7 +10555,7 @@ fn emit_single_element_wrapping_each_program(
         ),
     ));
     item_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&inner_var)],
     )));
     // Detect iter source category. ITEM_IMMUTABLE (16) is set when the
@@ -10595,11 +10595,11 @@ fn emit_single_element_wrapping_each_program(
         rewrite_props_destructured(&inner_expr, &script.props_destructured)
     };
     let set_text = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), rewritten_inner],
     );
     item_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: Vec::new(),
             param_type_annotations: Vec::new(),
@@ -10609,11 +10609,11 @@ fn emit_single_element_wrapping_each_program(
         }))],
     )));
     item_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&inner_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&inner_var)],
     )));
     let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: item_body,
@@ -10664,11 +10664,11 @@ fn emit_single_element_wrapping_each_program(
             span: Span::ZERO,
         }));
         let untracked_call = t::call(
-            t::member_id(t::id("$"), "untrack"),
+            t::member_id(t::id_dollar(), "untrack"),
             vec![untracked_arrow],
         );
         let deep_read_call = t::call(
-            t::member_id(t::id("$"), "deep_read_state"),
+            t::member_id(t::id_dollar(), "deep_read_state"),
             vec![deep_obj],
         );
         let seq = Expression::Sequence(Box::new(SequenceExpression {
@@ -10705,7 +10705,7 @@ fn emit_single_element_wrapping_each_program(
         flag |= 16;
     }
     let key_fn: Expression = match &eb.key {
-        None => t::member_id(t::id("$"), "index"),
+        None => t::member_id(t::id_dollar(), "index"),
         Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![t::pat_id(&item_name)],
             param_type_annotations: Vec::new(),
@@ -10715,7 +10715,7 @@ fn emit_single_element_wrapping_each_program(
         })),
     };
     let each_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "each"),
+        t::member_id(t::id_dollar(), "each"),
         vec![
             t::id(&outer_var),
             t::lit_number(flag as f64),
@@ -10727,7 +10727,7 @@ fn emit_single_element_wrapping_each_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -10746,7 +10746,7 @@ fn emit_single_element_wrapping_each_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -10761,31 +10761,31 @@ fn emit_single_element_wrapping_each_program(
     let needs_init = deep_legacy_used;
     if needs_init {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "init"),
+            t::member_id(t::id_dollar(), "init"),
             Vec::new(),
         )));
     }
     func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
     func_body.push(each_call);
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&outer_var)],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&outer_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&outer_var)],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || !script.legacy_export_props.is_empty() {
         params.push(t::pat_id("$$props"));
     }
@@ -10801,14 +10801,14 @@ fn emit_single_element_wrapping_each_program(
     prog.push(t::var(
         "root_1",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![inner_html], vec![])],
         ),
     ));
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![outer_html], vec![])],
         ),
     ));
@@ -11218,7 +11218,7 @@ fn rewrite_stmt_get_for_each_var(s: &Statement, var_name: &str) -> Statement {
 fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
     match e {
         Expression::Identifier(id) if id.name == var_name => t::call(
-            t::member_id(t::id("$"), "get"),
+            t::member_id(t::id_dollar(), "get"),
             vec![Expression::Identifier(id.clone())],
         ),
         Expression::Member(m) => Expression::Member(Box::new(MemberExpression {
@@ -11416,15 +11416,15 @@ fn emit_single_element_with_spread_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "attribute_effect"),
+        t::member_id(t::id_dollar(), "attribute_effect"),
         vec![t::id(&var_name), attr_effect_arrow],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&var_name)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&var_name)],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -11440,7 +11440,7 @@ fn emit_single_element_with_spread_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -11606,7 +11606,7 @@ fn emit_single_element_with_bind_this_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -11625,7 +11625,7 @@ fn emit_single_element_with_bind_this_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -11636,24 +11636,24 @@ fn emit_single_element_with_bind_this_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "bind_this"),
+        t::member_id(t::id_dollar(), "bind_this"),
         vec![t::id(&var_name), setter_arrow, getter_arrow],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&var_name)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&var_name)],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || !script.legacy_export_props.is_empty() {
         params.push(t::pat_id("$$props"));
     }
@@ -11669,7 +11669,7 @@ fn emit_single_element_with_bind_this_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -11824,7 +11824,7 @@ fn emit_single_element_with_folded_prefix_program(
     };
     func_body.push(t::var(
         "text",
-        t::call(t::member_id(t::id("$"), "child"), child_args),
+        t::call(t::member_id(t::id_dollar(), "child"), child_args),
     ));
     // text.nodeValue = LITERAL;
     let nodevalue_assign = Expression::Assignment(Box::new(AssignmentExpression {
@@ -11856,20 +11856,20 @@ fn emit_single_element_with_folded_prefix_program(
             vec![t::lit_number(n as f64)]
         };
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             arg,
         )));
     }
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(&tag_var)],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&tag_var)],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -11885,7 +11885,7 @@ fn emit_single_element_with_folded_prefix_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -12093,7 +12093,7 @@ fn emit_single_dynamic_element_program(
     // Legacy props prelude: `$.push($$props, false); let X = $.prop($$props, 'X', N [, INIT]);`
     if !script.legacy_export_props.is_empty() {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(
@@ -12115,7 +12115,7 @@ fn emit_single_dynamic_element_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         // $$exports accessor object.
@@ -12128,12 +12128,12 @@ fn emit_single_dynamic_element_program(
         func_body.push(t::var(
             "text",
             t::call(
-                t::member_id(t::id("$"), "child"),
+                t::member_id(t::id_dollar(), "child"),
                 vec![t::id(&tag_var)],
             ),
         ));
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "reset"),
+            t::member_id(t::id_dollar(), "reset"),
             vec![t::id(&tag_var)],
         )));
     }
@@ -12144,7 +12144,7 @@ fn emit_single_dynamic_element_program(
     let is_input = el.name == "input";
     if is_input {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "remove_input_defaults"),
+            t::member_id(t::id_dollar(), "remove_input_defaults"),
             vec![t::id(&tag_var)],
         )));
     }
@@ -12154,13 +12154,13 @@ fn emit_single_dynamic_element_program(
         // Input-specific setters for `value` / `checked`.
         if is_input && name == "value" {
             return t::call(
-                t::member_id(t::id("$"), "set_value"),
+                t::member_id(t::id_dollar(), "set_value"),
                 vec![t::id(&tag_var), e],
             );
         }
         if is_input && name == "checked" {
             return t::call(
-                t::member_id(t::id("$"), "set_checked"),
+                t::member_id(t::id_dollar(), "set_checked"),
                 vec![t::id(&tag_var), e],
             );
         }
@@ -12168,16 +12168,16 @@ fn emit_single_dynamic_element_program(
         // flag marks the value as dynamic (matches upstream).
         if name == "class" {
             return t::call(
-                t::member_id(t::id("$"), "set_class"),
+                t::member_id(t::id_dollar(), "set_class"),
                 vec![
                     t::id(&tag_var),
                     t::lit_number(1.0),
-                    t::call(t::member_id(t::id("$"), "clsx"), vec![e]),
+                    t::call(t::member_id(t::id_dollar(), "clsx"), vec![e]),
                 ],
             );
         }
         t::call(
-            t::member_id(t::id("$"), "set_attribute"),
+            t::member_id(t::id_dollar(), "set_attribute"),
             vec![t::id(&tag_var), t::literal_str(name), e],
         )
     };
@@ -12187,7 +12187,7 @@ fn emit_single_dynamic_element_program(
     if body_has_expression {
         let tpl = build_inline_template(&body_parts_owned, &HashSet::new());
         effect_stmts.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "set_text"),
+            t::member_id(t::id_dollar(), "set_text"),
             vec![t::id("text"), tpl],
         )));
     }
@@ -12217,24 +12217,24 @@ fn emit_single_dynamic_element_program(
         }))
     };
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![effect_arrow],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&tag_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&tag_var)],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -12250,7 +12250,7 @@ fn emit_single_dynamic_element_program(
     prog.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![html], vec![])],
         ),
     ));
@@ -12280,7 +12280,7 @@ fn emit_single_async_if_program(
 
     // consequent arrow
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent_body,
@@ -12293,7 +12293,7 @@ fn emit_single_async_if_program(
     async_inner_body.push(t::var("consequent", consequent_arrow));
     if let Some(alt_body) = alternate_body {
         let alt_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
+            params: vec![t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: alt_body,
@@ -12307,13 +12307,13 @@ fn emit_single_async_if_program(
 
     // `$.if(node, ($$render) => { if ($.get($$condition)) $$render(consequent); else $$render(alternate, -1); })`
     let condition_get = t::call(
-        t::member_id(t::id("$"), "get"),
+        t::member_id(t::id_dollar(), "get"),
         vec![t::id("$$condition")],
     );
-    let then_call = t::stmt(t::call(t::id("$$render"), vec![t::id("consequent")]));
+    let then_call = t::stmt(t::call(t::id_render(), vec![t::id("consequent")]));
     let else_call = if ib.alternate.is_some() {
         Some(t::stmt(t::call(
-            t::id("$$render"),
+            t::id_render(),
             vec![t::id("alternate"), t::lit_number(-1.0)],
         )))
     } else {
@@ -12336,7 +12336,7 @@ fn emit_single_async_if_program(
         span: Span::ZERO,
     }));
     async_inner_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "if"),
+        t::member_id(t::id_dollar(), "if"),
         vec![t::id("node"), render_arrow],
     )));
 
@@ -12368,7 +12368,7 @@ fn emit_single_async_if_program(
         span: Span::ZERO,
     }));
     let async_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "async"),
+        t::member_id(t::id_dollar(), "async"),
         vec![
             t::id("node"),
             blockers_array,
@@ -12381,22 +12381,22 @@ fn emit_single_async_if_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
     func_body.push(async_call);
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -12476,7 +12476,7 @@ fn emit_async_const_chain_program(
     let root_decl = t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![template_html], Vec::new()),
                 t::lit_number(1.0),
@@ -12487,7 +12487,7 @@ fn emit_async_const_chain_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if needs_push_pop {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -12512,8 +12512,8 @@ fn emit_async_const_chain_program(
     func_body.push(t::var(
         &prev_node_name,
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
 
@@ -12525,7 +12525,7 @@ fn emit_async_const_chain_program(
             func_body.push(t::var(
                 &new_name,
                 t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     vec![t::id(&prev_node_name), t::lit_number(2.0)],
                 ),
             ));
@@ -12547,7 +12547,7 @@ fn emit_async_const_chain_program(
         consequent_idx += 1;
 
         let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
+            params: vec![t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: consequent_body,
@@ -12558,7 +12558,7 @@ fn emit_async_const_chain_program(
         }));
 
         // $.if call with literal test
-        let render_call = t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_name)]));
+        let render_call = t::stmt(t::call(t::id_render(), vec![t::id(&consequent_name)]));
         let render_if = Statement::If(Box::new(IfStatement {
             test: ib.test.clone(),
             consequent: render_call,
@@ -12576,7 +12576,7 @@ fn emit_async_const_chain_program(
             span: Span::ZERO,
         }));
         let if_call = t::stmt(t::call(
-            t::member_id(t::id("$"), "if"),
+            t::member_id(t::id_dollar(), "if"),
             vec![t::id(&node_name), render_arrow],
         ));
 
@@ -12590,17 +12590,17 @@ fn emit_async_const_chain_program(
     }
 
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
     if needs_push_pop {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "pop"),
+            t::member_id(t::id_dollar(), "pop"),
             Vec::new(),
         )));
     }
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props || needs_push_pop {
         params.push(t::pat_id("$$props"));
     }
@@ -12716,7 +12716,7 @@ fn build_async_const_consequent(
                         },
                     ));
                     let async_derived_call = t::call(
-                        t::member_id(t::id("$"), "async_derived"),
+                        t::member_id(t::id_dollar(), "async_derived"),
                         vec![async_derived_arrow],
                     );
                     let outer = save_await_call_client(async_derived_call);
@@ -12737,7 +12737,7 @@ fn build_async_const_consequent(
                     // Sync: wrap in $.derived(() => INIT_REWRITTEN)
                     let rewritten = rewrite_const_chain_init(init, derived_bindings);
                     let derived_call = t::call(
-                        t::member_id(t::id("$"), "derived"),
+                        t::member_id(t::id_dollar(), "derived"),
                         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                             params: Vec::new(),
                             param_type_annotations: Vec::new(),
@@ -12787,7 +12787,7 @@ fn build_async_const_consequent(
     body.push(t::var(
         &promises_name,
         t::call(
-            t::member_id(t::id("$"), "run"),
+            t::member_id(t::id_dollar(), "run"),
             vec![Expression::Array(Box::new(ArrayExpression {
                 elements: thunks.into_iter().map(ArrayElement::Expression).collect(),
                 span: Span::ZERO,
@@ -12804,7 +12804,7 @@ fn rewrite_async_save_client(e: &Expression) -> Expression {
     match e {
         Expression::Await(a) => {
             let inner = rewrite_async_save_client(&a.argument);
-            let saved = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+            let saved = t::call(t::member_id(t::id_dollar(), "save"), vec![inner]);
             let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
                 expression: Expression::Await(Box::new(AwaitExpression {
                     argument: saved,
@@ -12849,7 +12849,7 @@ fn rewrite_const_chain_init(
 ) -> Expression {
     match e {
         Expression::Identifier(id) if derived_bindings.contains(&id.name) => t::call(
-            t::member_id(t::id("$"), "get"),
+            t::member_id(t::id_dollar(), "get"),
             vec![Expression::Identifier(id.clone())],
         ),
         Expression::Call(c) => Expression::Call(Box::new(CallExpression {
@@ -12952,7 +12952,7 @@ fn emit_const_async_if_program(
                     span: Span::ZERO,
                 }));
                 let async_derived_call = t::call(
-                    t::member_id(t::id("$"), "async_derived"),
+                    t::member_id(t::id_dollar(), "async_derived"),
                     vec![async_derived_arrow],
                 );
                 let outer = save_await_call_client(async_derived_call);
@@ -12973,7 +12973,7 @@ fn emit_const_async_if_program(
                 // `() => X = $.derived(() => INIT_WITH_GET_REFS)`
                 let rewritten = rewrite_const_refs_with_get(init, &const_names);
                 let derived_call = t::call(
-                    t::member_id(t::id("$"), "derived"),
+                    t::member_id(t::id_dollar(), "derived"),
                     vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
                         param_type_annotations: Vec::new(),
@@ -13024,7 +13024,7 @@ fn emit_const_async_if_program(
     consequent.push(t::var(
         "promises",
         t::call(
-            t::member_id(t::id("$"), "run"),
+            t::member_id(t::id_dollar(), "run"),
             vec![Expression::Array(Box::new(array_expression_from_exprs(thunks)))],
         ),
     ));
@@ -13037,7 +13037,7 @@ fn emit_const_async_if_program(
     consequent.push(t::var(
         "text",
         t::call(
-            t::member_id(t::id("$"), "child"),
+            t::member_id(t::id_dollar(), "child"),
             vec![
                 t::id("p"),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -13049,16 +13049,16 @@ fn emit_const_async_if_program(
     ));
     // $.reset(p);
     consequent.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id("p")],
     )));
     // $.template_effect(() => $.set_text(text, $.get(TEXT_REF)), void 0, void 0, [promises[N]])
     let get_text_ref = t::call(
-        t::member_id(t::id("$"), "get"),
+        t::member_id(t::id_dollar(), "get"),
         vec![t::id(&text_ref_name)],
     );
     let set_text_call = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), get_text_ref],
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -13080,7 +13080,7 @@ fn emit_const_async_if_program(
         span: Span::ZERO,
     }));
     consequent.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![
             effect_fn,
             void_zero_client(),
@@ -13090,12 +13090,12 @@ fn emit_const_async_if_program(
     )));
     // $.append($$anchor, p);
     consequent.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("p")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("p")],
     )));
 
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent,
@@ -13109,7 +13109,7 @@ fn emit_const_async_if_program(
     let render_if = Statement::If(Box::new(IfStatement {
         test: ib.test.clone(),
         consequent: t::stmt(t::call(
-            t::id("$$render"),
+            t::id_render(),
             vec![t::id("consequent")],
         )),
         alternate: None,
@@ -13126,7 +13126,7 @@ fn emit_const_async_if_program(
         span: Span::ZERO,
     }));
     let if_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "if"),
+        t::member_id(t::id_dollar(), "if"),
         vec![t::id("node"), render_arrow],
     ));
     let wrap_block = Statement::Block(Box::new(BlockStatement {
@@ -13139,19 +13139,19 @@ fn emit_const_async_if_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
     func_body.push(wrap_block);
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
     // root_1 template at module scope. Element with single ExpressionTag
@@ -13160,12 +13160,12 @@ fn emit_const_async_if_program(
     let root_decl = t::var(
         "root_1",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![template_html], Vec::new())],
         ),
     );
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -13260,7 +13260,7 @@ fn emit_async_if_chain_program(
     let root_decl = t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![template_html], Vec::new()),
                 t::lit_number(1.0),
@@ -13286,8 +13286,8 @@ fn emit_async_if_chain_program(
     func_body.push(t::var(
         &prev_node_name,
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
 
@@ -13299,7 +13299,7 @@ fn emit_async_if_chain_program(
             func_body.push(t::var(
                 &new_name,
                 t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     vec![t::id(&prev_node_name), t::lit_number(2.0)],
                 ),
             ));
@@ -13318,11 +13318,11 @@ fn emit_async_if_chain_program(
     }
 
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -13390,11 +13390,11 @@ fn emit_async_if_block(
         //      use `$.get(d_N)`
         //   3. Otherwise → straight rewrite (with derived `$.get` wrapping)
         let test_expr = if branch_idx == 0 && test_is_async {
-            t::call(t::member_id(t::id("$"), "get"), vec![t::id("$$condition")])
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id("$$condition")])
         } else if !needs_async_wrap && expr_has_user_call(&cur.test, derived_bindings) {
             let d_name = counters.next_d();
             let derived_call = t::call(
-                t::member_id(t::id("$"), "derived"),
+                t::member_id(t::id_dollar(), "derived"),
                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
                     param_type_annotations: Vec::new(),
@@ -13404,7 +13404,7 @@ fn emit_async_if_block(
                 }))],
             );
             chain_body.push(t::var(&d_name, derived_call));
-            t::call(t::member_id(t::id("$"), "get"), vec![t::id(&d_name)])
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&d_name)])
         } else {
             rewrite_chain_test(&cur.test, &ai.blocker_bindings, derived_bindings, counters)
         };
@@ -13492,7 +13492,7 @@ fn emit_async_if_block(
         vec![t::id(node_name), render_arrow]
     };
     chain_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "if"),
+        t::member_id(t::id_dollar(), "if"),
         if_args,
     )));
 
@@ -13554,7 +13554,7 @@ fn emit_async_if_block(
             span: Span::ZERO,
         }));
         Some(t::stmt(t::call(
-            t::member_id(t::id("$"), "async"),
+            t::member_id(t::id_dollar(), "async"),
             vec![t::id(node_name), blockers_arr, tests_arg, cb],
         )))
     } else {
@@ -13742,12 +13742,12 @@ fn emit_select_rich_content_program(
         let select_name = ctx.next_select();
         let nav = if i == 0 {
             t::call(
-                t::member_id(t::id("$"), "first_child"),
-                vec![t::id("fragment")],
+                t::member_id(t::id_dollar(), "first_child"),
+                vec![t::id_fragment()],
             )
         } else {
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![
                     t::id(prev_select.as_ref().expect("prev set")),
                     t::lit_number(2.0),
@@ -13767,8 +13767,8 @@ fn emit_select_rich_content_program(
         prev_select = Some(select_name);
     }
     func_body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
     let func_body = func_body_stmts;
 
@@ -13777,7 +13777,7 @@ fn emit_select_rich_content_program(
     let mut snippet_consts: Vec<Statement> = Vec::new();
     for (name, body) in snippet_decls {
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
+            params: vec![t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body,
@@ -13793,7 +13793,7 @@ fn emit_select_rich_content_program(
     let root_decl = t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![root_html], Vec::new()),
                 t::lit_number(1.0),
@@ -13801,7 +13801,7 @@ fn emit_select_rich_content_program(
         ),
     );
 
-    let params = vec![t::pat_id("$$anchor")];
+    let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, func_body);
 
     let mut prog: Vec<Statement> = Vec::with_capacity(8 + script.imports.len());
@@ -13910,7 +13910,7 @@ fn build_snippet_body(
     ctx.module_decls.push(t::var(
         &root_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![template_html], Vec::new())],
         ),
     ));
@@ -13921,8 +13921,8 @@ fn build_snippet_body(
         t::call(t::id(&root_name), Vec::new()),
     ));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&option_var)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&option_var)],
     )));
     Some(body)
 }
@@ -14122,7 +14122,7 @@ fn lower_select_with_option(
             body.push(t::var(
                 &option_var,
                 t::call(
-                    t::member_id(t::id("$"), "child"),
+                    t::member_id(t::id_dollar(), "child"),
                     vec![t::id(select_var)],
                 ),
             ));
@@ -14145,7 +14145,7 @@ fn lower_select_with_option(
                 body.push(emit_option_value_set(&option_var, &val));
             }
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "reset"),
+                t::member_id(t::id_dollar(), "reset"),
                 vec![t::id(select_var)],
             )));
             Some((html, body))
@@ -14225,7 +14225,7 @@ fn build_customizable_select_body_with_html(
     ctx.module_decls.push(t::var(
         &oc_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec!["<!>".to_string()], Vec::new()),
                 t::lit_number(1.0),
@@ -14252,22 +14252,22 @@ fn build_customizable_select_body_with_html(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(target_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(target_var)]),
         ),
         t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
         t::var(
             &node_var,
             t::call(
-                t::member_id(t::id("$"), "first_child"),
+                t::member_id(t::id_dollar(), "first_child"),
                 vec![t::id(&fragment_var)],
             ),
         ),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "html"),
+            t::member_id(t::id_dollar(), "html"),
             vec![t::id(&node_var), getter],
         )),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
+            t::member_id(t::id_dollar(), "append"),
             vec![t::id(&anchor_var), t::id(&fragment_var)],
         )),
     ];
@@ -14282,7 +14282,7 @@ fn build_customizable_select_body_with_html(
         span: Span::ZERO,
     }));
     Some(t::stmt(t::call(
-        t::member_id(t::id("$"), "customizable_select"),
+        t::member_id(t::id_dollar(), "customizable_select"),
         vec![t::id(target_var), arrow],
     )))
 }
@@ -14300,7 +14300,7 @@ fn build_customizable_select_body_with_next(
     ctx.module_decls.push(t::var(
         &oc_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![html], Vec::new()),
                 t::lit_number(1.0),
@@ -14312,18 +14312,18 @@ fn build_customizable_select_body_with_next(
     let mut arrow_body: Vec<Statement> = Vec::new();
     arrow_body.push(t::var(
         &anchor_var,
-        t::call(t::member_id(t::id("$"), "child"), vec![t::id(target_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(target_var)]),
     ));
     arrow_body.push(t::var(
         &fragment_var,
         t::call(t::id(&oc_name), Vec::new()),
     ));
     arrow_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "next"),
+        t::member_id(t::id_dollar(), "next"),
         Vec::new(),
     )));
     arrow_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
+        t::member_id(t::id_dollar(), "append"),
         vec![t::id(&anchor_var), t::id(&fragment_var)],
     )));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -14337,7 +14337,7 @@ fn build_customizable_select_body_with_next(
         span: Span::ZERO,
     }));
     Some(t::stmt(t::call(
-        t::member_id(t::id("$"), "customizable_select"),
+        t::member_id(t::id_dollar(), "customizable_select"),
         vec![t::id(target_var), arrow],
     )))
 }
@@ -14413,7 +14413,7 @@ fn build_customizable_select_body(
     ctx.module_decls.push(t::var(
         &oc_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![html], Vec::new()),
                 t::lit_number(1.0),
@@ -14425,14 +14425,14 @@ fn build_customizable_select_body(
     let mut arrow_body: Vec<Statement> = Vec::new();
     arrow_body.push(t::var(
         &anchor_var,
-        t::call(t::member_id(t::id("$"), "child"), vec![t::id(target_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(target_var)]),
     ));
     arrow_body.push(t::var(
         &fragment_var,
         t::call(t::id(&oc_name), Vec::new()),
     ));
     arrow_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
+        t::member_id(t::id_dollar(), "append"),
         vec![t::id(&anchor_var), t::id(&fragment_var)],
     )));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -14446,7 +14446,7 @@ fn build_customizable_select_body(
         span: Span::ZERO,
     }));
     Some(t::stmt(t::call(
-        t::member_id(t::id("$"), "customizable_select"),
+        t::member_id(t::id_dollar(), "customizable_select"),
         vec![t::id(target_var), arrow],
     )))
 }
@@ -14528,7 +14528,7 @@ fn lower_select_with_each(
         ctx.module_decls.push(t::var(
             &sc_name,
             t::call(
-                t::member_id(t::id("$"), "from_html"),
+                t::member_id(t::id_dollar(), "from_html"),
                 vec![
                     t::template_raw(vec!["<!>".to_string()], Vec::new()),
                     t::lit_number(1.0),
@@ -14547,31 +14547,31 @@ fn lower_select_with_each(
             span: Span::ZERO,
         }));
         let each_call = t::stmt(t::call(
-            t::member_id(t::id("$"), "each"),
+            t::member_id(t::id_dollar(), "each"),
             vec![
                 t::id(&node_var),
                 t::lit_number(1.0),
                 expr_arrow,
-                t::member_id(t::id("$"), "index"),
+                t::member_id(t::id_dollar(), "index"),
                 body_arrow,
             ],
         ));
         let arrow_body = vec![
             t::var(
                 &anchor_var,
-                t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
             ),
             t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
             t::var(
                 &node_var,
                 t::call(
-                    t::member_id(t::id("$"), "first_child"),
+                    t::member_id(t::id_dollar(), "first_child"),
                     vec![t::id(&fragment_var)],
                 ),
             ),
             each_call,
             t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
+                t::member_id(t::id_dollar(), "append"),
                 vec![t::id(&anchor_var), t::id(&fragment_var)],
             )),
         ];
@@ -14586,7 +14586,7 @@ fn lower_select_with_each(
             span: Span::ZERO,
         }));
         let body = vec![t::stmt(t::call(
-            t::member_id(t::id("$"), "customizable_select"),
+            t::member_id(t::id_dollar(), "customizable_select"),
             vec![t::id(select_var), arrow],
         ))];
         // Bump fragment counter once more after the each-with-Component
@@ -14631,18 +14631,18 @@ fn build_each_body_for_select(
         span: Span::ZERO,
     }));
     let each_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "each"),
+        t::member_id(t::id_dollar(), "each"),
         vec![
             t::id(container_var),
             t::lit_number(flag),
             expr_arrow,
-            t::member_id(t::id("$"), "index"),
+            t::member_id(t::id_dollar(), "index"),
             body_arrow,
         ],
     ));
     let mut out = vec![each_call];
     out.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(container_var)],
     )));
     Some(out)
@@ -14698,7 +14698,7 @@ fn build_each_iter_arrow(
     for (name, init) in &const_decls {
         let rewritten = wrap_item_refs_with_get(init, &ctx_name);
         let derived_call = t::call(
-            t::member_id(t::id("$"), "derived_safe_equal"),
+            t::member_id(t::id_dollar(), "derived_safe_equal"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
@@ -14720,7 +14720,7 @@ fn build_each_iter_arrow(
                     ctx.module_decls.push(t::var(
                         &root_name,
                         t::call(
-                            t::member_id(t::id("$"), "from_html"),
+                            t::member_id(t::id_dollar(), "from_html"),
                             vec![t::template_raw(
                                 vec!["<option> </option>".to_string()],
                                 Vec::new(),
@@ -14738,7 +14738,7 @@ fn build_each_iter_arrow(
                     body.push(t::var(
                         &text_var,
                         t::call(
-                            t::member_id(t::id("$"), "child"),
+                            t::member_id(t::id_dollar(), "child"),
                             vec![
                                 t::id(&option_var),
                                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -14749,7 +14749,7 @@ fn build_each_iter_arrow(
                         ),
                     ));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "reset"),
+                        t::member_id(t::id_dollar(), "reset"),
                         vec![t::id(&option_var)],
                     )));
                     body.push(t::var(
@@ -14766,7 +14766,7 @@ fn build_each_iter_arrow(
                     //   }
                     // })
                     let set_text_call = t::stmt(t::call(
-                        t::member_id(t::id("$"), "set_text"),
+                        t::member_id(t::id_dollar(), "set_text"),
                         vec![t::id(&text_var), expr_with_get.clone()],
                     ));
                     let assign_inner = Expression::Assignment(Box::new(AssignmentExpression {
@@ -14825,12 +14825,12 @@ fn build_each_iter_arrow(
                         span: Span::ZERO,
                     }));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "template_effect"),
+                        t::member_id(t::id_dollar(), "template_effect"),
                         vec![effect_fn],
                     )));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
-                        vec![t::id("$$anchor"), t::id(&option_var)],
+                        t::member_id(t::id_dollar(), "append"),
+                        vec![t::id_anchor(), t::id(&option_var)],
                     )));
                 }
                 OptionShape::RichContent(nodes) => {
@@ -14848,7 +14848,7 @@ fn build_each_iter_arrow(
                     ctx.module_decls.push(t::var(
                         &oc_name,
                         t::call(
-                            t::member_id(t::id("$"), "from_html"),
+                            t::member_id(t::id_dollar(), "from_html"),
                             vec![
                                 t::template_raw(vec![html_inner], Vec::new()),
                                 t::lit_number(1.0),
@@ -14858,7 +14858,7 @@ fn build_each_iter_arrow(
                     ctx.module_decls.push(t::var(
                         &root_name,
                         t::call(
-                            t::member_id(t::id("$"), "from_html"),
+                            t::member_id(t::id_dollar(), "from_html"),
                             vec![t::template_raw(
                                 vec!["<option><!></option>".to_string()],
                                 Vec::new(),
@@ -14878,7 +14878,7 @@ fn build_each_iter_arrow(
                     arrow_body.push(t::var(
                         &anchor_var,
                         t::call(
-                            t::member_id(t::id("$"), "child"),
+                            t::member_id(t::id_dollar(), "child"),
                             vec![t::id(&option_var)],
                         ),
                     ));
@@ -14896,7 +14896,7 @@ fn build_each_iter_arrow(
                     );
                     arrow_body.extend(rich_emitted);
                     arrow_body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
+                        t::member_id(t::id_dollar(), "append"),
                         vec![t::id(&anchor_var), t::id(&fragment_var)],
                     )));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -14910,12 +14910,12 @@ fn build_each_iter_arrow(
                         span: Span::ZERO,
                     }));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "customizable_select"),
+                        t::member_id(t::id_dollar(), "customizable_select"),
                         vec![t::id(&option_var), arrow],
                     )));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
-                        vec![t::id("$$anchor"), t::id(&option_var)],
+                        t::member_id(t::id_dollar(), "append"),
+                        vec![t::id_anchor(), t::id(&option_var)],
                     )));
                 }
                 OptionShape::PlainText(_) => return None,
@@ -14926,7 +14926,7 @@ fn build_each_iter_arrow(
             body.push(t::stmt(t::call(
                 t::id("Option"),
                 vec![
-                    t::id("$$anchor"),
+                    t::id_anchor(),
                     Expression::Object(Box::new(ObjectExpression {
                         properties: Vec::new(),
                         span: Span::ZERO,
@@ -14937,7 +14937,7 @@ fn build_each_iter_arrow(
         _ => return None,
     }
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor"), t::pat_id(&ctx_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id(&ctx_name)],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
@@ -14952,7 +14952,7 @@ fn build_each_iter_arrow(
 fn wrap_item_refs_with_get(e: &Expression, item: &str) -> Expression {
     match e {
         Expression::Identifier(id) if id.name == item => t::call(
-            t::member_id(t::id("$"), "get"),
+            t::member_id(t::id_dollar(), "get"),
             vec![Expression::Identifier(id.clone())],
         ),
         Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
@@ -14992,7 +14992,7 @@ fn wrap_expr_with_get(
             // If id is the each item OR a const-declared name → wrap in $.get.
             if id.name == item || consts.iter().any(|(n, _)| n == &id.name) {
                 return t::call(
-                    t::member_id(t::id("$"), "get"),
+                    t::member_id(t::id_dollar(), "get"),
                     vec![Expression::Identifier(id.clone())],
                 );
             }
@@ -15064,14 +15064,14 @@ fn emit_rich_content_reactivity(
                     out.push(t::var(
                         &el_var,
                         t::call(
-                            t::member_id(t::id("$"), "first_child"),
+                            t::member_id(t::id_dollar(), "first_child"),
                             vec![t::id(fragment_var)],
                         ),
                     ));
                     out.push(t::var(
                         &text_var,
                         t::call(
-                            t::member_id(t::id("$"), "child"),
+                            t::member_id(t::id_dollar(), "child"),
                             vec![
                                 t::id(&el_var),
                                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -15082,12 +15082,12 @@ fn emit_rich_content_reactivity(
                         ),
                     ));
                     out.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "reset"),
+                        t::member_id(t::id_dollar(), "reset"),
                         vec![t::id(&el_var)],
                     )));
                     let expr_with_get = wrap_expr_with_get(&et.expression, consts, item_name);
                     let set_text_call = t::call(
-                        t::member_id(t::id("$"), "set_text"),
+                        t::member_id(t::id_dollar(), "set_text"),
                         vec![t::id(&text_var), expr_with_get],
                     );
                     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15098,7 +15098,7 @@ fn emit_rich_content_reactivity(
                         span: Span::ZERO,
                     }));
                     out.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "template_effect"),
+                        t::member_id(t::id_dollar(), "template_effect"),
                         vec![effect_fn],
                     )));
                 }
@@ -15127,7 +15127,7 @@ fn lower_select_with_if(
         ctx.module_decls.push(t::var(
             &sc_name,
             t::call(
-                t::member_id(t::id("$"), "from_html"),
+                t::member_id(t::id_dollar(), "from_html"),
                 vec![
                     t::template_raw(vec!["<!>".to_string()], Vec::new()),
                     t::lit_number(1.0),
@@ -15140,7 +15140,7 @@ fn lower_select_with_if(
         let consequent_var = ctx.next_named("consequent");
         let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
         let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$anchor")],
+            params: vec![t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: consequent_body,
@@ -15149,7 +15149,7 @@ fn lower_select_with_if(
             r#async: false,
             span: Span::ZERO,
         }));
-        let render_call = t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)]));
+        let render_call = t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)]));
         let render_if = Statement::If(Box::new(IfStatement {
             test: ib.test.clone(),
             consequent: render_call,
@@ -15170,7 +15170,7 @@ fn lower_select_with_if(
             body: vec![
                 t::var(&consequent_var, consequent_arrow),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "if"),
+                    t::member_id(t::id_dollar(), "if"),
                     vec![t::id(&node_var), render_arrow],
                 )),
             ],
@@ -15179,19 +15179,19 @@ fn lower_select_with_if(
         let arrow_body = vec![
             t::var(
                 &anchor_var,
-                t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
             ),
             t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
             t::var(
                 &node_var,
                 t::call(
-                    t::member_id(t::id("$"), "first_child"),
+                    t::member_id(t::id_dollar(), "first_child"),
                     vec![t::id(&fragment_var)],
                 ),
             ),
             inner_block,
             t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
+                t::member_id(t::id_dollar(), "append"),
                 vec![t::id(&anchor_var), t::id(&fragment_var)],
             )),
         ];
@@ -15206,7 +15206,7 @@ fn lower_select_with_if(
             span: Span::ZERO,
         }));
         let body = vec![t::stmt(t::call(
-            t::member_id(t::id("$"), "customizable_select"),
+            t::member_id(t::id_dollar(), "customizable_select"),
             vec![t::id(select_var), arrow],
         ))];
         return Some((html, body));
@@ -15217,12 +15217,12 @@ fn lower_select_with_if(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &node_var,
-        t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
     ));
     let consequent_var = ctx.next_named("consequent");
     let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
     let consequent_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: consequent_body,
@@ -15231,7 +15231,7 @@ fn lower_select_with_if(
         r#async: false,
         span: Span::ZERO,
     }));
-    let render_call = t::stmt(t::call(t::id("$$render"), vec![t::id(&consequent_var)]));
+    let render_call = t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)]));
     let render_if = Statement::If(Box::new(IfStatement {
         test: ib.test.clone(),
         consequent: render_call,
@@ -15249,7 +15249,7 @@ fn lower_select_with_if(
         span: Span::ZERO,
     }));
     let if_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "if"),
+        t::member_id(t::id_dollar(), "if"),
         vec![t::id(&node_var), render_arrow],
     ));
     body.push(Statement::Block(Box::new(BlockStatement {
@@ -15257,7 +15257,7 @@ fn lower_select_with_if(
         span: Span::ZERO,
     })));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(select_var)],
     )));
     Some((html, body))
@@ -15290,7 +15290,7 @@ fn build_if_consequent_for_select(
                     ctx.module_decls.push(t::var(
                         &root_name,
                         t::call(
-                            t::member_id(t::id("$"), "from_html"),
+                            t::member_id(t::id_dollar(), "from_html"),
                             vec![t::template_raw(vec![template], Vec::new())],
                         ),
                     ));
@@ -15298,8 +15298,8 @@ fn build_if_consequent_for_select(
                     Some(vec![
                         t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "append"),
-                            vec![t::id("$$anchor"), t::id(&opt_var)],
+                            t::member_id(t::id_dollar(), "append"),
+                            vec![t::id_anchor(), t::id(&opt_var)],
                         )),
                     ])
                 }
@@ -15313,12 +15313,12 @@ fn build_if_consequent_for_select(
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::var(
                 &fragment_var,
-                t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+                t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
             ));
             body.push(t::var(
                 &node_var,
                 t::call(
-                    t::member_id(t::id("$"), "first_child"),
+                    t::member_id(t::id_dollar(), "first_child"),
                     vec![t::id(&fragment_var)],
                 ),
             ));
@@ -15332,18 +15332,18 @@ fn build_if_consequent_for_select(
                 span: Span::ZERO,
             }));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "each"),
+                t::member_id(t::id_dollar(), "each"),
                 vec![
                     t::id(&node_var),
                     t::lit_number(1.0),
                     expr_arrow,
-                    t::member_id(t::id("$"), "index"),
+                    t::member_id(t::id_dollar(), "index"),
                     body_arrow,
                 ],
             )));
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(&fragment_var)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(&fragment_var)],
             )));
             Some(body)
         }
@@ -15360,7 +15360,7 @@ fn build_if_consequent_for_select(
             };
             Some(vec![t::stmt(t::call(
                 t::id(&callee_name),
-                vec![t::id("$$anchor")],
+                vec![t::id_anchor()],
             ))])
         }
         _ => None,
@@ -15378,7 +15378,7 @@ fn lower_select_with_key(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &node_var,
-        t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
     ));
     // body of key: single option (plain text).
     let non_ws: Vec<&FragmentChild> = kb
@@ -15404,20 +15404,20 @@ fn lower_select_with_key(
     ctx.module_decls.push(t::var(
         &root_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![format!("<option>{text}</option>")], Vec::new())],
         ),
     ));
     let opt_var = ctx.next_named("option");
     let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![
                 t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "append"),
-                    vec![t::id("$$anchor"), t::id(&opt_var)],
+                    t::member_id(t::id_dollar(), "append"),
+                    vec![t::id_anchor(), t::id(&opt_var)],
                 )),
             ],
             span: Span::ZERO,
@@ -15433,11 +15433,11 @@ fn lower_select_with_key(
         span: Span::ZERO,
     }));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "key"),
+        t::member_id(t::id_dollar(), "key"),
         vec![t::id(&node_var), key_expr_arrow, inner_arrow],
     )));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(select_var)],
     )));
     Some((html, body))
@@ -15454,7 +15454,7 @@ fn lower_select_with_boundary(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &node_var,
-        t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
     ));
     // Boundary body: single <option> (plain or rich).
     let non_ws: Vec<&FragmentChild> = b
@@ -15483,7 +15483,7 @@ fn lower_select_with_boundary(
             ctx.module_decls.push(t::var(
                 &root_name,
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![t::template_raw(
                         vec![format!("<option>{text}</option>")],
                         Vec::new(),
@@ -15492,8 +15492,8 @@ fn lower_select_with_boundary(
             ));
             arrow_body.push(t::var(&opt_var, t::call(t::id(&root_name), Vec::new())));
             arrow_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(&opt_var)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(&opt_var)],
             )));
         }
         OptionShape::RichContent(nodes) => {
@@ -15507,7 +15507,7 @@ fn lower_select_with_boundary(
             ctx.module_decls.push(t::var(
                 &root_name,
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![t::template_raw(
                         vec!["<option><!></option>".to_string()],
                         Vec::new(),
@@ -15515,14 +15515,14 @@ fn lower_select_with_boundary(
                 ),
             ));
             arrow_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(&opt_var)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(&opt_var)],
             )));
         }
         _ => return None,
     }
     let inner_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: arrow_body,
@@ -15532,7 +15532,7 @@ fn lower_select_with_boundary(
         span: Span::ZERO,
     }));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "boundary"),
+        t::member_id(t::id_dollar(), "boundary"),
         vec![
             t::id(&node_var),
             Expression::Object(Box::new(ObjectExpression {
@@ -15543,7 +15543,7 @@ fn lower_select_with_boundary(
         ],
     )));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "reset"),
+        t::member_id(t::id_dollar(), "reset"),
         vec![t::id(select_var)],
     )));
     Some((html, body))
@@ -15562,7 +15562,7 @@ fn lower_select_with_component(
     ctx.module_decls.push(t::var(
         &sc_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec!["<!>".to_string()], Vec::new()),
                 t::lit_number(1.0),
@@ -15576,13 +15576,13 @@ fn lower_select_with_component(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
         ),
         t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
         t::var(
             &node_var,
             t::call(
-                t::member_id(t::id("$"), "first_child"),
+                t::member_id(t::id_dollar(), "first_child"),
                 vec![t::id(&fragment_var)],
             ),
         ),
@@ -15597,7 +15597,7 @@ fn lower_select_with_component(
             ],
         )),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
+            t::member_id(t::id_dollar(), "append"),
             vec![t::id(&anchor_var), t::id(&fragment_var)],
         )),
     ];
@@ -15612,7 +15612,7 @@ fn lower_select_with_component(
         span: Span::ZERO,
     }));
     let body = vec![t::stmt(t::call(
-        t::member_id(t::id("$"), "customizable_select"),
+        t::member_id(t::id_dollar(), "customizable_select"),
         vec![t::id(select_var), arrow],
     ))];
     Some((html, body))
@@ -15629,7 +15629,7 @@ fn lower_select_with_render(
     ctx.module_decls.push(t::var(
         &sc_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec!["<!>".to_string()], Vec::new()),
                 t::lit_number(1.0),
@@ -15652,19 +15652,19 @@ fn lower_select_with_render(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
         ),
         t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
         t::var(
             &node_var,
             t::call(
-                t::member_id(t::id("$"), "first_child"),
+                t::member_id(t::id_dollar(), "first_child"),
                 vec![t::id(&fragment_var)],
             ),
         ),
         t::stmt(t::call(t::id(&callee_name), vec![t::id(&node_var)])),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
+            t::member_id(t::id_dollar(), "append"),
             vec![t::id(&anchor_var), t::id(&fragment_var)],
         )),
     ];
@@ -15679,7 +15679,7 @@ fn lower_select_with_render(
         span: Span::ZERO,
     }));
     let body = vec![t::stmt(t::call(
-        t::member_id(t::id("$"), "customizable_select"),
+        t::member_id(t::id_dollar(), "customizable_select"),
         vec![t::id(select_var), arrow],
     ))];
     Some((html, body))
@@ -15696,7 +15696,7 @@ fn lower_select_with_html(
     ctx.module_decls.push(t::var(
         &sc_name,
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec!["<!>".to_string()], Vec::new()),
                 t::lit_number(1.0),
@@ -15716,22 +15716,22 @@ fn lower_select_with_html(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
         ),
         t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
         t::var(
             &node_var,
             t::call(
-                t::member_id(t::id("$"), "first_child"),
+                t::member_id(t::id_dollar(), "first_child"),
                 vec![t::id(&fragment_var)],
             ),
         ),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "html"),
+            t::member_id(t::id_dollar(), "html"),
             vec![t::id(&node_var), getter],
         )),
         t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
+            t::member_id(t::id_dollar(), "append"),
             vec![t::id(&anchor_var), t::id(&fragment_var)],
         )),
     ];
@@ -15746,7 +15746,7 @@ fn lower_select_with_html(
         span: Span::ZERO,
     }));
     let body = vec![t::stmt(t::call(
-        t::member_id(t::id("$"), "customizable_select"),
+        t::member_id(t::id_dollar(), "customizable_select"),
         vec![t::id(select_var), arrow],
     ))];
     Some((html, body))
@@ -15787,19 +15787,19 @@ fn lower_select_with_optgroup(
                     let body = vec![
                         t::var(
                             &og_var,
-                            t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
                         ),
                         t::var(
                             &option_var,
-                            t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)]),
+                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)]),
                         ),
                         build_customizable_select_body(&option_var, nodes, ctx)?,
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "reset"),
+                            t::member_id(t::id_dollar(), "reset"),
                             vec![t::id(&og_var)],
                         )),
                         t::stmt(t::call(
-                            t::member_id(t::id("$"), "reset"),
+                            t::member_id(t::id_dollar(), "reset"),
                             vec![t::id(select_var)],
                         )),
                     ];
@@ -15813,11 +15813,11 @@ fn lower_select_with_optgroup(
             let html = format!("<select{attrs}><optgroup{og_attrs}></optgroup></select>");
             let mut body = vec![t::var(
                 &og_var,
-                t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
             )];
             body.extend(build_each_body_for_select(eb, &og_var, ctx, 5.0)?);
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "reset"),
+                t::member_id(t::id_dollar(), "reset"),
                 vec![t::id(select_var)],
             )));
             Some((html, body))
@@ -15829,7 +15829,7 @@ fn lower_select_with_optgroup(
             ctx.module_decls.push(t::var(
                 &oc_name,
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![
                         t::template_raw(vec!["<!>".to_string()], Vec::new()),
                         t::lit_number(1.0),
@@ -15843,13 +15843,13 @@ fn lower_select_with_optgroup(
             let arrow_body = vec![
                 t::var(
                     &anchor_var,
-                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)]),
                 ),
                 t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
                 t::var(
                     &node_var,
                     t::call(
-                        t::member_id(t::id("$"), "first_child"),
+                        t::member_id(t::id_dollar(), "first_child"),
                         vec![t::id(&fragment_var)],
                     ),
                 ),
@@ -15864,7 +15864,7 @@ fn lower_select_with_optgroup(
                     ],
                 )),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "append"),
+                    t::member_id(t::id_dollar(), "append"),
                     vec![t::id(&anchor_var), t::id(&fragment_var)],
                 )),
             ];
@@ -15881,14 +15881,14 @@ fn lower_select_with_optgroup(
             let body = vec![
                 t::var(
                     &og_var,
-                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
                 ),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "customizable_select"),
+                    t::member_id(t::id_dollar(), "customizable_select"),
                     vec![t::id(&og_var), arrow],
                 )),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(select_var)],
                 )),
             ];
@@ -15901,7 +15901,7 @@ fn lower_select_with_optgroup(
             ctx.module_decls.push(t::var(
                 &oc_name,
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![
                         t::template_raw(vec!["<!>".to_string()], Vec::new()),
                         t::lit_number(1.0),
@@ -15923,19 +15923,19 @@ fn lower_select_with_optgroup(
             let arrow_body = vec![
                 t::var(
                     &anchor_var,
-                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(&og_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)]),
                 ),
                 t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
                 t::var(
                     &node_var,
                     t::call(
-                        t::member_id(t::id("$"), "first_child"),
+                        t::member_id(t::id_dollar(), "first_child"),
                         vec![t::id(&fragment_var)],
                     ),
                 ),
                 t::stmt(t::call(t::id(&callee_name), vec![t::id(&node_var)])),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "append"),
+                    t::member_id(t::id_dollar(), "append"),
                     vec![t::id(&anchor_var), t::id(&fragment_var)],
                 )),
             ];
@@ -15952,14 +15952,14 @@ fn lower_select_with_optgroup(
             let body = vec![
                 t::var(
                     &og_var,
-                    t::call(t::member_id(t::id("$"), "child"), vec![t::id(select_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
                 ),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "customizable_select"),
+                    t::member_id(t::id_dollar(), "customizable_select"),
                     vec![t::id(&og_var), arrow],
                 )),
                 t::stmt(t::call(
-                    t::member_id(t::id("$"), "reset"),
+                    t::member_id(t::id_dollar(), "reset"),
                     vec![t::id(select_var)],
                 )),
             ];
@@ -16008,7 +16008,7 @@ fn emit_deep_static_walker_program(
         .unwrap_or(false);
     if first_is_non_element {
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             Vec::new(),
         )));
     }
@@ -16090,16 +16090,16 @@ fn emit_deep_static_walker_program(
         let this_pos = top_element_positions[i];
         let init = if !first_emitted {
             let first_child = t::call(
-                t::member_id(t::id("$"), "first_child"),
-                vec![t::id("fragment")],
+                t::member_id(t::id_dollar(), "first_child"),
+                vec![t::id_fragment()],
             );
             if this_pos == 0 {
                 first_child
             } else if this_pos == 1 {
-                t::call(t::member_id(t::id("$"), "sibling"), vec![first_child])
+                t::call(t::member_id(t::id_dollar(), "sibling"), vec![first_child])
             } else {
                 t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     vec![first_child, t::lit_number(this_pos as f64)],
                 )
             }
@@ -16109,7 +16109,7 @@ fn emit_deep_static_walker_program(
             let prev_pos = top_element_positions[prev_idx];
             let offset = this_pos - prev_pos;
             t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id(prev), t::lit_number(offset as f64)],
             )
         };
@@ -16133,7 +16133,7 @@ fn emit_deep_static_walker_program(
             });
         if input_needs_defaults {
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "remove_input_defaults"),
+                t::member_id(t::id_dollar(), "remove_input_defaults"),
                 vec![t::id(&var)],
             )));
             input_defaults_resets.push(var.clone());
@@ -16167,7 +16167,7 @@ fn emit_deep_static_walker_program(
         }
         if has_reactive_inside {
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "reset"),
+                t::member_id(t::id_dollar(), "reset"),
                 vec![t::id(&var)],
             )));
         }
@@ -16184,7 +16184,7 @@ fn emit_deep_static_walker_program(
             body.push(t::var(
                 &var,
                 t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     vec![
                         t::id(prev_var.as_ref().expect("prev_var set")),
                         t::lit_number(2.0),
@@ -16193,7 +16193,7 @@ fn emit_deep_static_walker_program(
             ));
             if trailing > 1 {
                 body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "next"),
+                    t::member_id(t::id_dollar(), "next"),
                     vec![t::lit_number(((trailing - 1) * 2) as f64)],
                 )));
             }
@@ -16228,7 +16228,7 @@ fn emit_deep_static_walker_program(
             }
             if has_trailing_nonelem {
                 body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "next"),
+                    t::member_id(t::id_dollar(), "next"),
                     Vec::new(),
                 )));
             }
@@ -16261,7 +16261,7 @@ fn emit_deep_static_walker_program(
             span: Span::ZERO,
         }));
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![effect_arrow],
         )));
     }
@@ -16270,12 +16270,12 @@ fn emit_deep_static_walker_program(
     if effects.len() == 1 {
         let (text_var, expr) = effects.pop().unwrap();
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id(&text_var), expr],
                 )),
                 r#async: false,
@@ -16286,12 +16286,12 @@ fn emit_deep_static_walker_program(
         let mut block_body: Vec<Statement> = Vec::new();
         for (text_var, expr) in effects {
             block_body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "set_text"),
+                t::member_id(t::id_dollar(), "set_text"),
                 vec![t::id(&text_var), expr],
             )));
         }
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
@@ -16325,14 +16325,14 @@ fn emit_deep_static_walker_program(
             target_expr.clone()
         };
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "bind_value"),
+            t::member_id(t::id_dollar(), "bind_value"),
             vec![t::id(var_name), target],
         )));
     }
 
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
     // `var root = $.from_html(\`HTML\`, FLAGS);` where FLAGS = 1 (multi-root)
@@ -16341,7 +16341,7 @@ fn emit_deep_static_walker_program(
     let root_decl = t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![
                 t::template_raw(vec![html], Vec::new()),
                 t::lit_number(flags),
@@ -16349,7 +16349,7 @@ fn emit_deep_static_walker_program(
         ),
     );
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     let has_legacy_props = !script.legacy_export_props.is_empty();
     let has_legacy_mutable = !script.legacy_mutable_bindings.is_empty();
     let needs_legacy_wrap = has_legacy_props || has_legacy_mutable;
@@ -16361,7 +16361,7 @@ fn emit_deep_static_walker_program(
     let mut func_body: Vec<Statement> = Vec::new();
     if needs_legacy_wrap {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "push"),
+            t::member_id(t::id_dollar(), "push"),
             vec![
                 t::id("$$props"),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -16385,7 +16385,7 @@ fn emit_deep_static_walker_program(
             }
             func_body.push(t::let_decl(
                 name,
-                Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
             ));
         }
         func_body.push(t::var(
@@ -16398,7 +16398,7 @@ fn emit_deep_static_walker_program(
     // bindings (mutable_source) — legacy export props alone don't need it.
     if has_legacy_mutable {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "init"),
+            t::member_id(t::id_dollar(), "init"),
             Vec::new(),
         )));
     }
@@ -16406,14 +16406,14 @@ fn emit_deep_static_walker_program(
     if has_legacy_props {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
             argument: Some(t::call(
-                t::member_id(t::id("$"), "pop"),
+                t::member_id(t::id_dollar(), "pop"),
                 vec![t::id("$$exports")],
             )),
             span: Span::ZERO,
         })));
     } else if has_legacy_mutable {
         func_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "pop"),
+            t::member_id(t::id_dollar(), "pop"),
             Vec::new(),
         )));
     }
@@ -16501,7 +16501,7 @@ fn walk_element_interior(
             body.push(t::var(
                 &text_var,
                 t::call(
-                    t::member_id(t::id("$"), "child"),
+                    t::member_id(t::id_dollar(), "child"),
                     vec![t::id(parent_var)],
                 ),
             ));
@@ -16603,24 +16603,24 @@ fn walk_element_interior(
             if i == 0 {
                 if pre_has_leading_text {
                     init = t::call(
-                        t::member_id(t::id("$"), "sibling"),
+                        t::member_id(t::id_dollar(), "sibling"),
                         vec![t::call(
-                            t::member_id(t::id("$"), "child"),
+                            t::member_id(t::id_dollar(), "child"),
                             vec![t::id(parent_var)],
                         )],
                     );
                 } else {
                     init = t::call(
-                        t::member_id(t::id("$"), "child"),
+                        t::member_id(t::id_dollar(), "child"),
                         vec![t::id(parent_var)],
                     );
                 }
             } else {
                 init = t::call(
-                    t::member_id(t::id("$"), "sibling"),
+                    t::member_id(t::id_dollar(), "sibling"),
                     vec![
                         t::call(
-                            t::member_id(t::id("$"), "first_child"),
+                            t::member_id(t::id_dollar(), "first_child"),
                             vec![t::id(parent_var)],
                         ),
                         t::lit_number(i as f64),
@@ -16639,7 +16639,7 @@ fn walk_element_interior(
             };
             var = allocate_named(&prefix, var_names);
             init = t::call(
-                t::member_id(t::id("$"), "sibling"),
+                t::member_id(t::id_dollar(), "sibling"),
                 vec![t::id(prev), t::lit_number(offset as f64)],
             );
         }
@@ -16660,7 +16660,7 @@ fn walk_element_interior(
                     span: Span::ZERO,
                 }));
                 body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "html"),
+                    t::member_id(t::id_dollar(), "html"),
                     vec![t::id(&var), getter],
                 )));
             }
@@ -16702,7 +16702,7 @@ fn walk_element_interior(
                         body.push(t::var(
                             &text_var,
                             t::call(
-                                t::member_id(t::id("$"), "child"),
+                                t::member_id(t::id_dollar(), "child"),
                                 vec![
                                     t::id(&var),
                                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -16714,7 +16714,7 @@ fn walk_element_interior(
                         ));
                         effects.push((text_var, inline));
                         body.push(t::stmt(t::call(
-                            t::member_id(t::id("$"), "reset"),
+                            t::member_id(t::id_dollar(), "reset"),
                             vec![t::id(&var)],
                         )));
                     }
@@ -16723,7 +16723,7 @@ fn walk_element_interior(
                     walk_element_interior(child_el, &var, body, effects, var_names, counters, script);
                     if fragment_has_deep_reactive(&child_el.fragment) {
                         body.push(t::stmt(t::call(
-                            t::member_id(t::id("$"), "reset"),
+                            t::member_id(t::id_dollar(), "reset"),
                             vec![t::id(&var)],
                         )));
                     }
@@ -16750,7 +16750,7 @@ fn walk_element_interior(
         });
         if has_trailing {
             body.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "next"),
+                t::member_id(t::id_dollar(), "next"),
                 Vec::new(),
             )));
         }
@@ -16760,7 +16760,7 @@ fn walk_element_interior(
     let trailing_count = children.len() - 1 - last_reactive;
     if trailing_count > 0 {
         body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             vec![t::lit_number(trailing_count as f64)],
         )));
     }
@@ -16779,7 +16779,7 @@ fn apply_reactive_attrs(
                 // `$.set_custom_element_data(var, NAME, VALUE)`.
                 let value_expr = attr_value_as_string_expr(&attr.value);
                 body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "set_custom_element_data"),
+                    t::member_id(t::id_dollar(), "set_custom_element_data"),
                     vec![
                         t::id(var),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
@@ -16795,7 +16795,7 @@ fn apply_reactive_attrs(
             match attr.name.as_str() {
                 "autofocus" => {
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "autofocus"),
+                        t::member_id(t::id_dollar(), "autofocus"),
                         vec![
                             t::id(var),
                             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -17531,7 +17531,7 @@ fn build_legacy_exports_object(props: &[(String, Option<Expression>)]) -> Expres
         })));
         let setter_body = vec![
             t::stmt(t::call(t::id(name), vec![t::id("$$value")])),
-            t::stmt(t::call(t::member_id(t::id("$"), "flush"), Vec::new())),
+            t::stmt(t::call(t::member_id(t::id_dollar(), "flush"), Vec::new())),
         ];
         members.push(ObjectMember::Property(Box::new(svelte_js_ast::Property {
             key: PropertyKey::Identifier(Identifier { name: name.clone(), span: Span::ZERO }),
@@ -17683,7 +17683,7 @@ fn build_branch_arrow(
     body.push(t::var(
         &text_name,
         t::call(
-            t::member_id(t::id("$"), "text"),
+            t::member_id(t::id_dollar(), "text"),
             vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
                 value: trimmed.clone(),
                 raw: Some(format!("'{}'", trimmed)),
@@ -17692,11 +17692,11 @@ fn build_branch_arrow(
         ),
     ));
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&text_name)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&text_name)],
     )));
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
@@ -17720,23 +17720,23 @@ fn build_breakout_alternate_arrow(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &fragment_name,
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     body.push(t::var(
         &node_name,
         t::call(
-            t::member_id(t::id("$"), "first_child"),
+            t::member_id(t::id_dollar(), "first_child"),
             vec![t::id(&fragment_name)],
         ),
     ));
     let inner_stmt = emit_async_if_block(inner, &node_name, ai, derived_bindings, counters, true)?;
     body.push(inner_stmt);
     body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&fragment_name)],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id(&fragment_name)],
     )));
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor")],
+        params: vec![t::pat_id_anchor()],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
@@ -17758,16 +17758,16 @@ fn build_render_body(
     // Build right-associative if/else if/else chain.
     let mut acc: Option<Statement> = alternate.map(|name| {
         t::stmt(t::call(
-            t::id("$$render"),
+            t::id_render(),
             vec![t::id(name), t::lit_number(-1.0)],
         ))
     });
     for (i, (cname, test, branch_idx)) in branches.iter().enumerate().rev() {
         let call = if i == 0 {
-            t::stmt(t::call(t::id("$$render"), vec![t::id(cname)]))
+            t::stmt(t::call(t::id_render(), vec![t::id(cname)]))
         } else {
             t::stmt(t::call(
-                t::id("$$render"),
+                t::id_render(),
                 vec![t::id(cname), t::lit_number(*branch_idx as f64)],
             ))
         };
@@ -17815,7 +17815,7 @@ fn rewrite_chain_expr(
             // resolved synchronously inside the $.async callback.
             if derived_bindings.contains(&id.name) {
                 t::call(
-                    t::member_id(t::id("$"), "get"),
+                    t::member_id(t::id_dollar(), "get"),
                     vec![Expression::Identifier(id.clone())],
                 )
             } else {
@@ -17877,7 +17877,7 @@ fn rewrite_async_test_client(e: &Expression) -> Expression {
     match e {
         Expression::Await(a) => {
             let inner = rewrite_async_test_client(&a.argument);
-            let saved = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+            let saved = t::call(t::member_id(t::id_dollar(), "save"), vec![inner]);
             let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
                 expression: Expression::Await(Box::new(AwaitExpression {
                     argument: saved,
@@ -17935,7 +17935,7 @@ fn rewrite_async_test_client(e: &Expression) -> Expression {
 
 /// `(await $.save(X))()` — wrap an expression for the async-const setter form.
 fn save_await_call_client(inner: Expression) -> Expression {
-    let saved = t::call(t::member_id(t::id("$"), "save"), vec![inner]);
+    let saved = t::call(t::member_id(t::id_dollar(), "save"), vec![inner]);
     let awaited = Expression::Paren(Box::new(ParenthesizedExpression {
         expression: Expression::Await(Box::new(AwaitExpression {
             argument: saved,
@@ -17952,7 +17952,7 @@ fn save_await_call_client(inner: Expression) -> Expression {
 fn rewrite_const_refs_with_get(e: &Expression, consts: &[String]) -> Expression {
     match e {
         Expression::Identifier(id) if consts.iter().any(|n| n == &id.name) => {
-            t::call(t::member_id(t::id("$"), "get"), vec![Expression::Identifier(id.clone())])
+            t::call(t::member_id(t::id_dollar(), "get"), vec![Expression::Identifier(id.clone())])
         }
         Expression::Binary(b) => Expression::Binary(Box::new(BinaryExpression {
             operator: b.operator,
@@ -18038,15 +18038,15 @@ fn emit_single_async_each_program(
     let each_flag: f64 = if body_uses_item { 17.0 } else { 16.0 };
     let mut each_body_stmts: Vec<Statement> = Vec::new();
     each_body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "next"),
+        t::member_id(t::id_dollar(), "next"),
         Vec::new(),
     )));
     each_body_stmts.push(t::var(
         "text",
-        t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
     ));
     let set_text_call = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), t::id("$0")],
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -18062,7 +18062,7 @@ fn emit_single_async_each_program(
     let body_inner = strip_outer_await(body_expr);
     let body_with_get = if let Expression::Identifier(i) = &body_inner {
         if i.name == item_name {
-            t::call(t::member_id(t::id("$"), "get"), vec![t::id(&i.name)])
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&i.name)])
         } else {
             body_inner
         }
@@ -18077,7 +18077,7 @@ fn emit_single_async_each_program(
         span: Span::ZERO,
     }));
     each_body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![
             effect_fn,
             void_zero_client(),
@@ -18088,12 +18088,12 @@ fn emit_single_async_each_program(
         ],
     )));
     each_body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("text")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("text")],
     )));
 
     let each_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: each_body_stmts,
@@ -18108,7 +18108,7 @@ fn emit_single_async_each_program(
         params: Vec::new(),
         param_type_annotations: Vec::new(),
         body: ArrowBody::Expression(t::call(
-            t::member_id(t::id("$"), "get"),
+            t::member_id(t::id_dollar(), "get"),
             vec![t::id("$$collection")],
         )),
         r#async: false,
@@ -18118,7 +18118,7 @@ fn emit_single_async_each_program(
         t::id("node"),
         t::lit_number(each_flag),
         getter,
-        t::member_id(t::id("$"), "index"),
+        t::member_id(t::id_dollar(), "index"),
         each_callback,
     ];
     if let Some(fallback) = &eb.fallback {
@@ -18138,15 +18138,15 @@ fn emit_single_async_each_program(
                 let inner_fb = strip_outer_await(&et.expression);
                 let mut fb_body: Vec<Statement> = Vec::new();
                 fb_body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "next"),
+                    t::member_id(t::id_dollar(), "next"),
                     Vec::new(),
                 )));
                 fb_body.push(t::var(
                     "text_1",
-                    t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+                    t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
                 ));
                 let fb_set = t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id("text_1"), t::id("$0")],
                 );
                 let fb_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -18164,7 +18164,7 @@ fn emit_single_async_each_program(
                     span: Span::ZERO,
                 }));
                 fb_body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "template_effect"),
+                    t::member_id(t::id_dollar(), "template_effect"),
                     vec![
                         fb_fn,
                         void_zero_client(),
@@ -18175,11 +18175,11 @@ fn emit_single_async_each_program(
                     ],
                 )));
                 fb_body.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "append"),
-                    vec![t::id("$$anchor"), t::id("text_1")],
+                    t::member_id(t::id_dollar(), "append"),
+                    vec![t::id_anchor(), t::id("text_1")],
                 )));
                 each_args.push(Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id("$$anchor")],
+                    params: vec![t::pat_id_anchor()],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: fb_body,
@@ -18196,7 +18196,7 @@ fn emit_single_async_each_program(
         }
     }
     let each_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "each"),
+        t::member_id(t::id_dollar(), "each"),
         each_args,
     ));
 
@@ -18211,7 +18211,7 @@ fn emit_single_async_each_program(
         span: Span::ZERO,
     }));
     let async_call = t::stmt(t::call(
-        t::member_id(t::id("$"), "async"),
+        t::member_id(t::id_dollar(), "async"),
         vec![
             t::id("node"),
             Expression::Array(Box::new(ArrayExpression {
@@ -18238,22 +18238,22 @@ fn emit_single_async_each_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
     func_body.push(async_call);
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -18326,7 +18326,7 @@ fn emit_single_svelte_element_program(
         let mut render_body: Vec<Statement> = Vec::new();
         render_body.push(t::var(
             "text",
-            t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+            t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
         ));
         let nodevalue_assign = Expression::Assignment(Box::new(AssignmentExpression {
             left: AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
@@ -18349,11 +18349,11 @@ fn emit_single_svelte_element_program(
         }));
         render_body.push(t::stmt(nodevalue_assign));
         render_body.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
-            vec![t::id("$$anchor"), t::id("text")],
+            t::member_id(t::id_dollar(), "append"),
+            vec![t::id_anchor(), t::id("text")],
         )));
         let render_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id("$$element"), t::pat_id("$$anchor")],
+            params: vec![t::pat_id("$$element"), t::pat_id_anchor()],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Block(Box::new(BlockStatement {
                 body: render_body,
@@ -18368,25 +18368,25 @@ fn emit_single_svelte_element_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "first_child"),
-            vec![t::id("fragment")],
+            t::member_id(t::id_dollar(), "first_child"),
+            vec![t::id_fragment()],
         ),
     ));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "element"),
+        t::member_id(t::id_dollar(), "element"),
         element_args,
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -18536,14 +18536,14 @@ fn emit_single_each_preserve_whitespace_program(
     hoisted.push(t::var(
         "root_1",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![inner_template], vec![]), t::lit_number(1.0)],
         ),
     ));
     hoisted.push(t::var(
         "root",
         t::call(
-            t::member_id(t::id("$"), "from_html"),
+            t::member_id(t::id_dollar(), "from_html"),
             vec![t::template_raw(vec![outer_template], vec![]), t::lit_number(1.0)],
         ),
     ));
@@ -18551,13 +18551,13 @@ fn emit_single_each_preserve_whitespace_program(
     // Function body.
     let mut body_stmts: Vec<Statement> = Vec::new();
     body_stmts.extend(script.body.clone());
-    body_stmts.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), vec![])));
+    body_stmts.push(t::stmt(t::call(t::member_id(t::id_dollar(), "next"), vec![])));
     body_stmts.push(t::var("fragment", t::call(t::id("root"), vec![])));
     body_stmts.push(t::var(
         "node",
         t::call(
-            t::member_id(t::id("$"), "sibling"),
-            vec![t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")])],
+            t::member_id(t::id_dollar(), "sibling"),
+            vec![t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()])],
         ),
     ));
 
@@ -18572,19 +18572,19 @@ fn emit_single_each_preserve_whitespace_program(
     let item_referenced = is_runes_iter
         && fragment_uses_identifier(&eb.body, &item_name);
     let mut item_body: Vec<Statement> = Vec::new();
-    item_body.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), vec![])));
+    item_body.push(t::stmt(t::call(t::member_id(t::id_dollar(), "next"), vec![])));
     item_body.push(t::var("fragment_1", t::call(t::id("root_1"), vec![])));
     item_body.push(t::var(
         "div",
         t::call(
-            t::member_id(t::id("$"), "sibling"),
-            vec![t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment_1")])],
+            t::member_id(t::id_dollar(), "sibling"),
+            vec![t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id("fragment_1")])],
         ),
     ));
     item_body.push(t::var(
         "text",
         t::call(
-            t::member_id(t::id("$"), "child"),
+            t::member_id(t::id_dollar(), "child"),
             vec![
                 t::id("div"),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -18594,19 +18594,19 @@ fn emit_single_each_preserve_whitespace_program(
             ],
         ),
     ));
-    item_body.push(t::stmt(t::call(t::member_id(t::id("$"), "reset"), vec![t::id("div")])));
-    item_body.push(t::stmt(t::call(t::member_id(t::id("$"), "next"), vec![])));
+    item_body.push(t::stmt(t::call(t::member_id(t::id_dollar(), "reset"), vec![t::id("div")])));
+    item_body.push(t::stmt(t::call(t::member_id(t::id_dollar(), "next"), vec![])));
     let inline = if item_referenced {
         rewrite_get_for_each_var(&inline, &item_name)
     } else {
         inline
     };
     let set_text = t::call(
-        t::member_id(t::id("$"), "set_text"),
+        t::member_id(t::id_dollar(), "set_text"),
         vec![t::id("text"), inline],
     );
     item_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "template_effect"),
+        t::member_id(t::id_dollar(), "template_effect"),
         vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: vec![],
             param_type_annotations: Vec::new(),
@@ -18616,12 +18616,12 @@ fn emit_single_each_preserve_whitespace_program(
         }))],
     )));
     item_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment_1")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id("fragment_1")],
     )));
 
     let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id("$$anchor"), t::pat_id(&item_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: item_body,
@@ -18640,21 +18640,21 @@ fn emit_single_each_preserve_whitespace_program(
         span: Span::ZERO,
     }));
     body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "each"),
+        t::member_id(t::id_dollar(), "each"),
         vec![
             t::id("node"),
             t::lit_number(0.0),
             getter,
-            t::member_id(t::id("$"), "index"),
+            t::member_id(t::id_dollar(), "index"),
             item_arrow,
         ],
     )));
     body_stmts.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let params = vec![t::pat_id("$$anchor")];
+    let params = vec![t::pat_id_anchor()];
     let export = t::export_default_function(component_name, params, body_stmts);
 
     let mut prog: Vec<Statement> = Vec::new();
@@ -18774,7 +18774,7 @@ fn emit_single_each_program(
             hoisted.push(t::var(
                 "root_1",
                 t::call(
-                    t::member_id(t::id("$"), "from_html"),
+                    t::member_id(t::id_dollar(), "from_html"),
                     vec![t::template_raw(vec![html], vec![])],
                 ),
             ));
@@ -18836,7 +18836,7 @@ fn emit_single_each_program(
             // Dynamic attribute setters.
             for (a, expr) in &dyn_attrs {
                 body_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "set_attribute"),
+                    t::member_id(t::id_dollar(), "set_attribute"),
                     vec![
                         t::id(&var),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
@@ -18852,7 +18852,7 @@ fn emit_single_each_program(
             for (event, handler) in &events {
                 delegated_events.insert(event.clone());
                 body_stmts.push(t::stmt(t::call(
-                    t::member_id(t::id("$"), "delegated"),
+                    t::member_id(t::id_dollar(), "delegated"),
                     vec![
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
                             value: event.clone(),
@@ -18865,8 +18865,8 @@ fn emit_single_each_program(
                 )));
             }
             body_stmts.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "append"),
-                vec![t::id("$$anchor"), t::id(&var)],
+                t::member_id(t::id_dollar(), "append"),
+                vec![t::id_anchor(), t::id(&var)],
             )));
         } else {
             return None;
@@ -18935,16 +18935,16 @@ fn emit_single_each_program(
             parts.pop();
         }
         body_stmts.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "next"),
+            t::member_id(t::id_dollar(), "next"),
             Vec::new(),
         )));
         body_stmts.push(t::var(
             "text",
-            t::call(t::member_id(t::id("$"), "text"), Vec::new()),
+            t::call(t::member_id(t::id_dollar(), "text"), Vec::new()),
         ));
         let inline = build_inline_template(&parts, &script.state_bindings);
         let fn_body = t::call(
-            t::member_id(t::id("$"), "set_text"),
+            t::member_id(t::id_dollar(), "set_text"),
             vec![t::id("text"), inline],
         );
         let fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -18955,18 +18955,18 @@ fn emit_single_each_program(
             span: Span::ZERO,
         }));
         body_stmts.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "template_effect"),
+            t::member_id(t::id_dollar(), "template_effect"),
             vec![fn_arrow],
         )));
         body_stmts.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "append"),
-            vec![t::id("$$anchor"), t::id("text")],
+            t::member_id(t::id_dollar(), "append"),
+            vec![t::id_anchor(), t::id("text")],
         )));
     }
 
     // Build the each-call arrow params: `($$anchor, ITEM, INDEX?)` or
     // `($$anchor, $$item, INDEX)` if no context.
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if let Some(ctx) = &eb.context {
         params.push(ctx.clone());
     } else {
@@ -18992,11 +18992,11 @@ fn emit_single_each_program(
     func_body.extend(script.body.clone());
     func_body.push(t::var(
         "fragment",
-        t::call(t::member_id(t::id("$"), "comment"), Vec::new()),
+        t::call(t::member_id(t::id_dollar(), "comment"), Vec::new()),
     ));
     func_body.push(t::var(
         "node",
-        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")]),
+        t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()]),
     ));
 
     // `$.each(node, FLAG, () => EXPR, KEY_FN, body_arrow)`
@@ -19042,7 +19042,7 @@ fn emit_single_each_program(
         flag |= 16;
     }
     let key_fn: Expression = match &eb.key {
-        None => t::member_id(t::id("$"), "index"),
+        None => t::member_id(t::id_dollar(), "index"),
         Some(k) => {
             let pname = item_name_opt.clone().unwrap_or_else(|| "$$item".into());
             Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -19055,7 +19055,7 @@ fn emit_single_each_program(
         }
     };
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "each"),
+        t::member_id(t::id_dollar(), "each"),
         vec![
             t::id("node"),
             t::lit_number(flag as f64),
@@ -19065,11 +19065,11 @@ fn emit_single_each_program(
         ],
     )));
     func_body.push(t::stmt(t::call(
-        t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id("fragment")],
+        t::member_id(t::id_dollar(), "append"),
+        vec![t::id_anchor(), t::id_fragment()],
     )));
 
-    let mut params = vec![t::pat_id("$$anchor")];
+    let mut params = vec![t::pat_id_anchor()];
     if script.uses_props {
         params.push(t::pat_id("$$props"));
     }
@@ -19103,7 +19103,7 @@ fn emit_single_each_program(
             span: Span::ZERO,
         }));
         prog.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "delegate"),
+            t::member_id(t::id_dollar(), "delegate"),
             vec![arr],
         )));
     }
@@ -19539,7 +19539,7 @@ fn analyze_script(
                         if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
                             if legacy_mutable_bindings.contains(&id.name) {
                                 new_d.init = Some(t::call(
-                                    t::member_id(t::id("$"), "mutable_source"),
+                                    t::member_id(t::id_dollar(), "mutable_source"),
                                     vec![init.clone()],
                                 ));
                             }
@@ -19647,7 +19647,7 @@ fn rewrite_async_derived_client(e: &Expression) -> Option<Expression> {
         span: Span::ZERO,
     }));
     let async_derived_call = t::call(
-        t::member_id(t::id("$"), "async_derived"),
+        t::member_id(t::id_dollar(), "async_derived"),
         vec![new_arrow],
     );
     Some(Expression::Await(Box::new(AwaitExpression {
@@ -19890,7 +19890,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
     setup_stmts.push(t::var(
         "$$promises",
         t::call(
-            t::member_id(t::id("$"), "run"),
+            t::member_id(t::id_dollar(), "run"),
             vec![Expression::Array(Box::new(ArrayExpression {
                 elements: groups.into_iter().map(ArrayElement::Expression).collect(),
                 span: Span::ZERO,
@@ -20114,7 +20114,7 @@ fn replace_props_init_with_rest_props(s: &mut Statement, names: &HashSet<String>
                         span: Span::ZERO,
                     }));
                     *init = t::call(
-                        t::member_id(t::id("$"), "rest_props"),
+                        t::member_id(t::id_dollar(), "rest_props"),
                         vec![t::id("$$props"), arr],
                     );
                 }
@@ -20307,7 +20307,7 @@ fn rewrite_top_stmt_multi(
                                 }
                                 out.push(t::let_decl(
                                     &local_name,
-                                    Some(t::call(t::member_id(t::id("$"), "prop"), args)),
+                                    Some(t::call(t::member_id(t::id_dollar(), "prop"), args)),
                                 ));
                             }
                             _ => return None,
@@ -20489,7 +20489,7 @@ fn rewrite_class_body_client(c: &mut ClassDeclaration) {
                             None => Vec::new(),
                         };
                         let state_expr = Expression::Call(Box::new(CallExpression {
-                            callee: t::member_id(t::id("$"), "state"),
+                            callee: t::member_id(t::id_dollar(), "state"),
                             arguments: state_call_args,
                             optional: false,
                             span: Span::ZERO,
@@ -20521,10 +20521,10 @@ fn rewrite_class_body_client(c: &mut ClassDeclaration) {
                                 span: Span::ZERO,
                             }));
                         let derived_expr = if by {
-                            t::call(t::member_id(t::id("$"), "derived"), vec![arg])
+                            t::call(t::member_id(t::id_dollar(), "derived"), vec![arg])
                         } else {
                             t::call(
-                                t::member_id(t::id("$"), "derived"),
+                                t::member_id(t::id_dollar(), "derived"),
                                 vec![Expression::Arrow(Box::new(ArrowFunctionExpression {
                                     params: Vec::new(),
                                     param_type_annotations: Vec::new(),
@@ -20592,7 +20592,7 @@ fn make_state_getter(public_name: &str) -> ClassMember {
     // `get X() { return $.get(this.#X); }`
     let body = vec![Statement::Return(Box::new(ReturnStatement {
         argument: Some(t::call(
-            t::member_id(t::id("$"), "get"),
+            t::member_id(t::id_dollar(), "get"),
             vec![this_private(public_name)],
         )),
         span: Span::ZERO,
@@ -20621,7 +20621,7 @@ fn make_state_getter(public_name: &str) -> ClassMember {
 fn make_state_setter(public_name: &str) -> ClassMember {
     // `set X(value) { $.set(this.#X, value, true); }`
     let body = vec![t::stmt(t::call(
-        t::member_id(t::id("$"), "set"),
+        t::member_id(t::id_dollar(), "set"),
         vec![
             this_private(public_name),
             t::id("value"),
@@ -20655,7 +20655,7 @@ fn make_state_setter(public_name: &str) -> ClassMember {
 fn make_derived_getter_client(public_name: &str) -> ClassMember {
     let body = vec![Statement::Return(Box::new(ReturnStatement {
         argument: Some(t::call(
-            t::member_id(t::id("$"), "get"),
+            t::member_id(t::id_dollar(), "get"),
             vec![this_private(public_name)],
         )),
         span: Span::ZERO,
@@ -20684,7 +20684,7 @@ fn make_derived_getter_client(public_name: &str) -> ClassMember {
 fn make_derived_setter_client(public_name: &str) -> ClassMember {
     // `set X(value) { $.set(this.#X, value); }`
     let body = vec![t::stmt(t::call(
-        t::member_id(t::id("$"), "set"),
+        t::member_id(t::id_dollar(), "set"),
         vec![this_private(public_name), t::id("value")],
     ))];
     ClassMember::Method(Box::new(MethodDefinition {
@@ -20797,7 +20797,7 @@ fn rewrite_expr_for_class_state(e: &mut Expression, state_privates: &HashSet<Str
                         Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
                     );
                     *e = t::call(
-                        t::member_id(t::id("$"), "set"),
+                        t::member_id(t::id_dollar(), "set"),
                         vec![this_private(&name), rhs],
                     );
                     return;
@@ -20835,13 +20835,13 @@ fn rewrite_expr_for_class_state(e: &mut Expression, state_privates: &HashSet<Str
 /// `$state(V)` → `$.state(V)` (in-place).
 fn lower_state_init(init: &mut Expression) {
     let Expression::Call(c) = init else { return };
-    c.callee = t::member_id(t::id("$"), "state");
+    c.callee = t::member_id(t::id_dollar(), "state");
 }
 
 /// `$state({...})` / `$state([...])` → `$.proxy({...})` (in-place).
 fn lower_to_proxy_init(init: &mut Expression) {
     let Expression::Call(c) = init else { return };
-    c.callee = t::member_id(t::id("$"), "proxy");
+    c.callee = t::member_id(t::id_dollar(), "proxy");
 }
 
 /// `$derived(EXPR)` → `$.derived(() => EXPR)`. `$derived.by(FN)` → `$.derived(FN)`.
@@ -20849,7 +20849,7 @@ fn lower_to_derived_init(init: &mut Expression) {
     let Expression::Call(c) = init else { return };
     let kp = global_keypath(&c.callee).unwrap_or_default();
     let by = kp == "$derived.by";
-    c.callee = t::member_id(t::id("$"), "derived");
+    c.callee = t::member_id(t::id_dollar(), "derived");
     if !by {
         // Wrap the first arg in `() => arg`.
         let arg = c.arguments.iter().find_map(|a| match a {
@@ -20952,7 +20952,7 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
         E::Identifier(i) => {
             if state.contains(&i.name) {
                 let name = i.name.clone();
-                *e = t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]);
+                *e = t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]);
             }
         }
         E::Assignment(a) => {
@@ -20977,33 +20977,33 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                             AssignmentOperator::Assign => rhs,
                             AssignmentOperator::AddAssign => binop(
                                 BinaryOperator::Plus,
-                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
                                 rhs,
                             ),
                             AssignmentOperator::SubAssign => binop(
                                 BinaryOperator::Minus,
-                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
                                 rhs,
                             ),
                             AssignmentOperator::MulAssign => binop(
                                 BinaryOperator::Mul,
-                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
                                 rhs,
                             ),
                             AssignmentOperator::DivAssign => binop(
                                 BinaryOperator::Div,
-                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
                                 rhs,
                             ),
                             AssignmentOperator::ModAssign => binop(
                                 BinaryOperator::Mod,
-                                t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
                                 rhs,
                             ),
                             _ => rhs,
                         };
                         *e = t::call(
-                            t::member_id(t::id("$"), "set"),
+                            t::member_id(t::id_dollar(), "set"),
                             vec![t::id(&name), new_value],
                         );
                         return;
@@ -21024,7 +21024,7 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                         UpdateOperator::Increment => vec![t::id(&name)],
                         UpdateOperator::Decrement => vec![t::id(&name), t::lit_number(-1.0)],
                     };
-                    *e = t::call(t::member_id(t::id("$"), "update"), increment_args);
+                    *e = t::call(t::member_id(t::id_dollar(), "update"), increment_args);
                     return;
                 }
             }
@@ -21104,7 +21104,7 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                                     Expression::Literal(Box::new(Literal::Null(Span::ZERO))),
                                 );
                                 *body_expr = t::call(
-                                    t::member_id(t::id("$"), "set"),
+                                    t::member_id(t::id_dollar(), "set"),
                                     vec![
                                         t::id(&name),
                                         rhs,
@@ -22065,11 +22065,11 @@ fn is_void(name: &str) -> bool {
 fn emit_nav(out: &mut Vec<Statement>, name: &str, prev: Option<&str>) {
     let init = if let Some(p) = prev {
         t::call(
-            t::member_id(t::id("$"), "sibling"),
+            t::member_id(t::id_dollar(), "sibling"),
             vec![t::id(p), t::lit_number(2.0)],
         )
     } else {
-        t::call(t::member_id(t::id("$"), "first_child"), vec![t::id("fragment")])
+        t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()])
     };
     out.push(t::var(name, init));
 }
@@ -22144,10 +22144,10 @@ fn emit_element_content_combined(
         let text_var = unique_var("text", var_counts);
         body_stmts.push(t::var(
             &text_var,
-            t::call(t::member_id(t::id("$"), "child"), vec![t::id(parent_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(parent_var)]),
         ));
         body_stmts.push(t::stmt(t::call(
-            t::member_id(t::id("$"), "reset"),
+            t::member_id(t::id_dollar(), "reset"),
             vec![t::id(parent_var)],
         )));
         let template_expr = build_inline_template(parts, state_bindings);
@@ -22204,7 +22204,7 @@ fn emit_element_content(
             body_stmts.push(t::var(
                 "text",
                 t::call(
-                    t::member_id(t::id("$"), "child"),
+                    t::member_id(t::id_dollar(), "child"),
                     vec![
                         t::id(parent_var),
                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -22215,7 +22215,7 @@ fn emit_element_content(
                 ),
             ));
             body_stmts.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "reset"),
+                t::member_id(t::id_dollar(), "reset"),
                 vec![t::id(parent_var)],
             )));
             // For a single expression Reactive part: pass the expression
@@ -22264,7 +22264,7 @@ fn emit_element_content(
                 params: Vec::new(),
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id("text"), set_text_arg],
                 )),
                 r#async: false,
@@ -22286,7 +22286,7 @@ fn emit_element_content(
                 span: Span::ZERO,
             }));
             effects.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 vec![
                     effect_fn,
                     void_zero_client(),
@@ -22348,10 +22348,10 @@ fn emit_element_content(
             let text_var = format!("text"); // Could conflict — keep simple for now.
             body_stmts.push(t::var(
                 &text_var,
-                t::call(t::member_id(t::id("$"), "child"), vec![t::id(parent_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(parent_var)]),
             ));
             body_stmts.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "reset"),
+                t::member_id(t::id_dollar(), "reset"),
                 vec![t::id(parent_var)],
             )));
 
@@ -22365,7 +22365,7 @@ fn emit_element_content(
                 // Inline form: `() => $.set_text(text, \`...${EXPR ?? ''}\`)`
                 let template_expr = build_inline_template(parts, state_bindings);
                 let fn_body = t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id(&text_var), template_expr],
                 );
                 fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -22384,7 +22384,7 @@ fn emit_element_content(
                     params.push(t::pat_id(&format!("${i}")));
                 }
                 let fn_body = t::call(
-                    t::member_id(t::id("$"), "set_text"),
+                    t::member_id(t::id_dollar(), "set_text"),
                     vec![t::id(&text_var), template_expr],
                 );
                 fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -22405,7 +22405,7 @@ fn emit_element_content(
                 call_args.push(deps_array);
             }
             effects.push(t::stmt(t::call(
-                t::member_id(t::id("$"), "template_effect"),
+                t::member_id(t::id_dollar(), "template_effect"),
                 call_args,
             )));
         }
@@ -22563,7 +22563,7 @@ fn extract_client_snippets(
             if body_non_ws.len() != 1 {
                 // Empty body: emit `const NAME = ($$anchor[, params]) => {};`.
                 if body_non_ws.is_empty() {
-                    let mut params = vec![t::pat_id("$$anchor")];
+                    let mut params = vec![t::pat_id_anchor()];
                     for p in &sb.parameters {
                         params.push(p.clone());
                     }
@@ -22588,13 +22588,13 @@ fn extract_client_snippets(
                     let text_var = unique_var("text", var_counts);
                     let mut body: Vec<Statement> = Vec::new();
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "next"),
+                        t::member_id(t::id_dollar(), "next"),
                         Vec::new(),
                     )));
                     body.push(t::var(
                         &text_var,
                         t::call(
-                            t::member_id(t::id("$"), "text"),
+                            t::member_id(t::id_dollar(), "text"),
                             vec![Expression::Literal(Box::new(Literal::String(
                                 StringLiteral {
                                     value: t.data.trim().to_string(),
@@ -22605,8 +22605,8 @@ fn extract_client_snippets(
                         ),
                     ));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
-                        vec![t::id("$$anchor"), t::id(&text_var)],
+                        t::member_id(t::id_dollar(), "append"),
+                        vec![t::id_anchor(), t::id(&text_var)],
                     )));
                     body
                 }
@@ -22623,7 +22623,7 @@ fn extract_client_snippets(
                     extra_roots.push(t::var(
                         &root_name,
                         t::call(
-                            t::member_id(t::id("$"), "from_html"),
+                            t::member_id(t::id_dollar(), "from_html"),
                             vec![t::template_raw(vec![html], vec![])],
                         ),
                     ));
@@ -22634,14 +22634,14 @@ fn extract_client_snippets(
                         t::call(t::id(&root_name), Vec::new()),
                     ));
                     body.push(t::stmt(t::call(
-                        t::member_id(t::id("$"), "append"),
-                        vec![t::id("$$anchor"), t::id(&el_var)],
+                        t::member_id(t::id_dollar(), "append"),
+                        vec![t::id_anchor(), t::id(&el_var)],
                     )));
                     body
                 }
                 _ => return None,
             };
-            let mut params = vec![t::pat_id("$$anchor")];
+            let mut params = vec![t::pat_id_anchor()];
             for p in &sb.parameters {
                 params.push(p.clone());
             }
@@ -22699,7 +22699,7 @@ fn component_call_with(
                         Expression::Identifier(i) => i.name.clone(),
                         _ => return None,
                     };
-                    t::call(t::member_id(t::id("$"), "get"), vec![t::id(&name)])
+                    t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)])
                 } else {
                     b.expression.clone()
                 };
@@ -22709,7 +22709,7 @@ fn component_call_with(
                         _ => return None,
                     };
                     t::call(
-                        t::member_id(t::id("$"), "set"),
+                        t::member_id(t::id_dollar(), "set"),
                         vec![
                             t::id(&name),
                             t::id("$$value"),

@@ -12,7 +12,7 @@ fn main() {
     }
     let dbg = std::env::args().any(|a| a == "--dbg-classes");
     let root_clone = root.clone();
-    let mut analysis = analyze_component(root, None).unwrap();
+    let mut analysis = analyze_component(&root, None).unwrap();
     analysis.css_hash = "svelte-xyz".to_string();
     if dbg {
         let elements = svelte_analyze::template_elements::collect(&root_clone.fragment);

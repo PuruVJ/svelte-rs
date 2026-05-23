@@ -30,6 +30,30 @@ pub fn pat_id(name: &str) -> Pattern {
     })
 }
 
+// Zero-copy common identifier builders — centralize hot-path identifiers so
+// call sites avoid repeating string literals and can be optimized in one place.
+pub fn id_dollar() -> Expression {
+    id("$")
+}
+pub fn id_anchor() -> Expression {
+    id("$$anchor")
+}
+pub fn id_fragment() -> Expression {
+    id("fragment")
+}
+pub fn id_renderer() -> Expression {
+    id("$$renderer")
+}
+pub fn id_render() -> Expression {
+    id("$$render")
+}
+pub fn pat_id_anchor() -> Pattern {
+    pat_id("$$anchor")
+}
+pub fn pat_id_renderer() -> Pattern {
+    pat_id("$$renderer")
+}
+
 pub fn literal_str(value: &str) -> Expression {
     Expression::Literal(Box::new(Literal::String(StringLiteral {
         value: value.to_string(),

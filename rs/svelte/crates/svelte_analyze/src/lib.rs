@@ -44,7 +44,7 @@ use svelte_diagnostics::CompileDiagnostic;
 /// validates the program, classifies bindings, and analyses CSS scoping is
 /// pending.
 pub fn analyze_component(
-    root: Root,
+    root: &Root,
     filename: Option<&str>,
 ) -> Result<Analysis, CompileDiagnostic> {
     let scope_root = ScopeRoot::new();
@@ -85,7 +85,7 @@ pub fn analyze_component(
         .unwrap_or_else(|| "Component".to_string());
 
     let mut analysis = Analysis {
-        root,
+        root: root.clone(),
         instance,
         module,
         scope_root,
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn analyzes_empty_component() {
         let r = parse("", false).unwrap();
-        let a = analyze_component(r, Some("Foo.svelte")).unwrap();
+        let a = analyze_component(&r, Some("Foo.svelte")).unwrap();
         assert_eq!(a.name, "Foo");
         assert!(!a.runes);
     }
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn detects_runes_in_instance_script() {
         let r = parse("<script>let count = $state(0);</script>", false).unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a.runes);
     }
 
@@ -247,7 +247,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         assert!(inst.get_local("a").is_some());
         assert!(inst.get_local("b").is_some());
@@ -262,7 +262,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         assert!(inst.get_local("foo").is_some());
         assert!(inst.get_local("bar").is_some());
@@ -284,7 +284,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         let b = inst.get_local("count").unwrap();
         assert_eq!(b.borrow().kind, BindingKind::State);
@@ -297,7 +297,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         assert_eq!(
             inst.get_local("doubled").unwrap().borrow().kind,
@@ -316,7 +316,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         assert_eq!(
             inst.get_local("big").unwrap().borrow().kind,
@@ -331,7 +331,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         assert_eq!(
             inst.get_local("foo").unwrap().borrow().kind,
@@ -354,7 +354,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         assert_eq!(
             inst.get_local("value").unwrap().borrow().kind,
@@ -369,7 +369,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         // `outer` and `f` visible at instance scope.
         assert!(inst.get_local("outer").is_some());
@@ -387,7 +387,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         // `blocked` is in the inner block, not at instance scope.
         assert!(inst.get_local("blocked").is_none());
@@ -401,7 +401,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         let count = inst.get_local("count").unwrap();
         // Two references: `$state(0)` initializer doesn't reference `count`,
@@ -417,7 +417,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         let outer = inst.get_local("outer").unwrap();
         // `outer` is referenced from inside `f`'s scope.
@@ -431,7 +431,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let inst = a.instance.borrow();
         let outer_x = inst.get_local("x").unwrap();
         // The inner `x` shadows the outer one — the reference inside `f`
@@ -446,7 +446,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let root = a.scope_root.borrow();
         assert!(root.conflicts.contains_key("console"));
     }
@@ -458,7 +458,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a.has_global_css());
         // The single rule should be marked as has_global_selectors.
         let css = a.css.as_ref().unwrap();
@@ -477,7 +477,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(!a.has_global_css());
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
@@ -495,7 +495,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
             panic!("expected rule");
@@ -511,7 +511,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert_eq!(a.css_meta.keyframes, vec!["spin"]);
     }
 
@@ -522,7 +522,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a.has_global_css());
         // The `-global-` keyframes should NOT be in the rename list.
         assert!(a.css_meta.keyframes.is_empty());
@@ -535,7 +535,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -556,7 +556,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -577,7 +577,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -598,7 +598,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a
             .warnings
             .iter()
@@ -625,7 +625,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(complex_used(&a, "", ""));
     }
 
@@ -636,7 +636,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(!complex_used(&a, "", ""));
     }
 
@@ -647,7 +647,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(complex_used(&a, "", ""));
     }
 
@@ -658,7 +658,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         // span is grandchild of div, not direct child.
         assert!(!complex_used(&a, "", ""));
     }
@@ -670,7 +670,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(complex_used(&a, "", ""));
     }
 
@@ -681,7 +681,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(complex_used(&a, "", ""));
     }
 
@@ -692,7 +692,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -715,7 +715,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -739,7 +739,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -762,7 +762,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -786,7 +786,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert_eq!(
             a.css_meta.scoped_elements.len(),
             1,
@@ -803,7 +803,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -824,7 +824,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         // Validator turns this into an error (matches upstream's
         // `illegal_element_attribute`). `analyze_component` returns Err
         // when validation finds any error.
@@ -840,7 +840,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok(), "event attributes are allowed on svelte:window");
     }
 
@@ -851,7 +851,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         let e = res.unwrap_err();
         assert_eq!(e.code, "svelte_head_illegal_attribute");
@@ -860,7 +860,7 @@ mod tests {
     #[test]
     fn validator_svelte_self_outside_block_is_error() {
         let r = parse("<svelte:self />", false).unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         let e = res.unwrap_err();
         assert_eq!(e.code, "svelte_self_invalid_placement");
@@ -873,7 +873,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok(), "svelte:self inside {{#if}} is permitted");
     }
 
@@ -884,7 +884,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "title_illegal_attribute");
     }
@@ -896,7 +896,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "title_invalid_content");
     }
@@ -908,7 +908,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
@@ -919,7 +919,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "svelte_boundary_invalid_attribute");
     }
@@ -931,7 +931,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
@@ -942,7 +942,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "import_svelte_internal_forbidden");
     }
@@ -954,7 +954,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "runes_mode_invalid_import");
     }
@@ -966,7 +966,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
@@ -977,7 +977,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(
             res.unwrap_err().code,
@@ -992,7 +992,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
@@ -1004,7 +1004,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "bind_invalid_target");
     }
@@ -1017,7 +1017,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "bind_invalid_name");
     }
@@ -1029,7 +1029,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "style_directive_invalid_modifier");
     }
@@ -1041,7 +1041,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
@@ -1052,7 +1052,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a
             .warnings
             .iter()
@@ -1066,7 +1066,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a
             .warnings
             .iter()
@@ -1080,7 +1080,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(!a
             .warnings
             .iter()
@@ -1094,7 +1094,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "svelte_fragment_invalid_placement");
     }
@@ -1106,14 +1106,14 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
     #[test]
     fn validator_const_tag_at_root_is_error() {
         let r = parse("{@const x = 1}", false).unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "const_tag_invalid_placement");
     }
@@ -1125,7 +1125,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_ok());
     }
 
@@ -1136,7 +1136,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(a.warnings.iter().any(|w| w.code == "block_empty"));
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let res = analyze_component(r, None);
+        let res = analyze_component(&r, None);
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().code, "snippet_invalid_rest_parameter");
     }
@@ -1167,7 +1167,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         assert!(!a
             .warnings
             .iter()
@@ -1181,7 +1181,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
             panic!("expected rule");
@@ -1202,7 +1202,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let a = analyze_component(r, None).unwrap();
+        let a = analyze_component(&r, None).unwrap();
         // `:root` is global-like, so the rule's complex selector is_global.
         let css = a.css.as_ref().unwrap();
         let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {

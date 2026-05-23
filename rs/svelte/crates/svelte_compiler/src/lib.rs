@@ -49,9 +49,6 @@ pub fn compile(
     options: CompileOptions,
 ) -> Result<CompileResult, CompileDiagnostic> {
     let mut root = svelte_parse::parse(source, false)?;
-    let _analysis =
-        svelte_analyze::analyze_component(root.clone(), options.module.filename.as_deref())?;
-
     // The pipeline is typed end-to-end: parse -> typed transform -> typed
     // print. If no typed transform can handle the input shape, we surface
     // an unsupported error (rather than fall back to a Value-based path —
@@ -71,7 +68,7 @@ pub fn compile(
             // a `<style>` block.
             let css_inject_args: Option<(String, String)> = if css_inject && root.css.is_some() {
                 let analysis_res = svelte_analyze::analyze_component(
-                    root.clone(),
+                    &root,
                     options.module.filename.as_deref(),
                 );
                 let mut analysis = match analysis_res {
