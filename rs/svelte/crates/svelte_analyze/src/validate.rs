@@ -20,6 +20,8 @@ use svelte_ast::{
 use svelte_diagnostics::{errors, warnings, CompileDiagnostic};
 
 use crate::analysis::Analysis;
+use crate::css_prune_data::Existence;
+use crate::template_elements::{self, CollectResult, ElementTree};
 
 /// State threaded through every visitor. `path` is the chain of
 /// ancestors (oldest first). `is_runes` mirrors `analysis.runes`.
@@ -47,6 +49,12 @@ pub struct ValidateState<'a> {
     /// `svelte:window` / `svelte:body` / `svelte:document` / `svelte:head`
     /// tags seen so far. Used for `svelte_meta_duplicate` detection.
     pub svelte_meta_seen: std::collections::HashSet<String>,
+    pub element_tree: ElementTree,
+    pub element_parent: Option<usize>,
+    pub element_existence: Existence,
+    pub element_fragment_id: usize,
+    pub last_collect: CollectResult,
+    pub collect_elements: bool,
 }
 
 impl<'a> ValidateState<'a> {
@@ -63,6 +71,12 @@ impl<'a> ValidateState<'a> {
             event_directive_node: None,
             uses_event_attributes: false,
             svelte_meta_seen: std::collections::HashSet::new(),
+            element_tree: template_elements::new_element_tree(),
+            element_parent: None,
+            element_existence: Existence::Definite,
+            element_fragment_id: 0,
+            last_collect: CollectResult::None,
+            collect_elements: false,
         }
     }
 }
@@ -71,8 +85,13 @@ impl<'a> ValidateState<'a> {
 /// to per-node visitors. Also walks the `<script>` / `<script module>`
 /// content (Program JSON) for JS-side validators (ImportDeclaration,
 /// LabeledStatement, etc.).
-pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Vec<CompileDiagnostic>) {
+pub fn validate(
+    root: &Root,
+    analysis: &Analysis,
+    collect_elements: bool,
+) -> (ElementTree, Vec<CompileDiagnostic>, Vec<CompileDiagnostic>) {
     let mut state = ValidateState::new(analysis);
+    state.collect_elements = collect_elements;
     state.imported_names = collect_imported_names(root);
     state.instance_declared = collect_instance_declared(root);
     // Detect `{@const X = ...}` declarations and emit
@@ -158,7 +177,12 @@ pub fn validate(root: &Root, analysis: &Analysis) -> (Vec<CompileDiagnostic>, Ve
             .errors
             .push(errors::mixed_event_handler_syntaxes(Some((start, end)), &name));
     }
-    (state.warnings, state.errors)
+    let elements = if collect_elements {
+        template_elements::finalize_element_tree(state.element_tree)
+    } else {
+        ElementTree::default()
+    };
+    (elements, state.warnings, state.errors)
 }
 
 /// `export_let_unused` — non-runes-mode `export let X` / `export var X`
@@ -5163,6 +5187,70 @@ const KNOWN_WARNING_CODES: &[&str] = &[
     "unknown_code",
 ];
 
+fn with_element_fragment<'a, F>(state: &mut ValidateState<'a>, el_idx: usize, f: F)
+where
+    F: FnOnce(&mut ValidateState<'a>),
+{
+    let body = state.element_tree.elements[el_idx]
+        .body_fragment
+        .expect("element body fragment");
+    let prev_parent = state.element_parent;
+    let prev_frag = state.element_fragment_id;
+    let prev_exist = state.element_existence;
+    state.element_parent = Some(el_idx);
+    state.element_fragment_id = body;
+    f(state);
+    state.element_parent = prev_parent;
+    state.element_fragment_id = prev_frag;
+    state.element_existence = prev_exist;
+}
+
+fn with_block_branch<'a, F>(
+    state: &mut ValidateState<'a>,
+    block_idx: usize,
+    branch: usize,
+    existence: Existence,
+    f: F,
+) where
+    F: FnOnce(&mut ValidateState<'a>),
+{
+    let branch_id = state.element_tree.blocks[block_idx].branches[branch];
+    let prev_frag = state.element_fragment_id;
+    let prev_exist = state.element_existence;
+    state.element_fragment_id = branch_id;
+    state.element_existence = existence;
+    f(state);
+    state.element_fragment_id = prev_frag;
+    state.element_existence = prev_exist;
+}
+
+fn visit_element_body<'a, F>(state: &mut ValidateState<'a>, fragment: &'a Fragment, f: F)
+where
+    F: FnOnce(&mut ValidateState<'a>),
+{
+    if let CollectResult::Element(el_idx) = state.last_collect {
+        with_element_fragment(state, el_idx, |state| f(state));
+    } else {
+        f(state);
+    }
+}
+
+fn visit_block_branch<'a, F>(
+    state: &mut ValidateState<'a>,
+    block_idx: usize,
+    branch: usize,
+    fragment: &'a Fragment,
+    existence: Existence,
+    f: F,
+) where
+    F: FnOnce(&mut ValidateState<'a>),
+{
+    with_block_branch(state, block_idx, branch, existence, |state| {
+        state.last_collect = CollectResult::None;
+        f(state);
+    });
+}
+
 fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
     // `{@const}` declared at this fragment level is scope-bound to the
     // fragment's *enclosing* element. When that enclosing element is a
@@ -5216,7 +5304,21 @@ fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
     }
 
     let mut pending_ignores: Vec<String> = Vec::new();
+    let mut element_siblings: Vec<usize> = Vec::new();
     for node in &fragment.nodes {
+        if state.collect_elements {
+            state.last_collect = template_elements::collect_child(
+                node,
+                state.element_parent,
+                state.element_existence,
+                state.element_fragment_id,
+                &mut state.element_tree,
+                &mut element_siblings,
+                true,
+            );
+        } else {
+            state.last_collect = CollectResult::None;
+        }
         match node {
             FragmentChild::Comment(c) => {
                 // In runes mode, emit `legacy_code` / `unknown_code` for
@@ -5252,6 +5354,9 @@ fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
                 pending_ignores.clear();
             }
         }
+    }
+    if state.collect_elements {
+        template_elements::link_element_siblings(&element_siblings, &mut state.element_tree);
     }
 }
 
@@ -5550,12 +5655,12 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                     ));
             }
             visit_attributes(node, &el.attributes, state);
-            visit_fragment(&el.fragment, state);
+            visit_element_body(state, &el.fragment, |state| visit_fragment(&el.fragment, state));
         }
         FragmentChild::Component(c) => {
             check_attribute_quoted(&c.attributes, state);
             visit_attributes(node, &c.attributes, state);
-            visit_fragment(&c.fragment, state);
+            visit_element_body(state, &c.fragment, |state| visit_fragment(&c.fragment, state));
         }
         FragmentChild::SvelteComponent(c) => {
             if state.is_runes {
@@ -5565,7 +5670,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             }
             check_attribute_quoted(&c.attributes, state);
             visit_attributes(node, &c.attributes, state);
-            visit_fragment(&c.fragment, state);
+            visit_element_body(state, &c.fragment, |state| visit_fragment(&c.fragment, state));
         }
         FragmentChild::TitleElement(el) => visit_title_element(el, state),
         FragmentChild::SlotElement(el) => {
@@ -5575,7 +5680,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                     .push(warnings::slot_element_deprecated(Some((el.start, el.end))));
             }
             visit_attributes(node, &el.attributes, state);
-            visit_fragment(&el.fragment, state);
+            visit_element_body(state, &el.fragment, |state| visit_fragment(&el.fragment, state));
         }
         FragmentChild::SvelteElement(el) => {
             // SvelteElement also gets a11y checks if the tag is statically known.
@@ -5587,7 +5692,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                     .push(warnings::a11y_autofocus(Some((el.start, el.end))));
             }
             visit_attributes(node, &el.attributes, state);
-            visit_fragment(&el.fragment, state);
+            visit_element_body(state, &el.fragment, |state| visit_fragment(&el.fragment, state));
         }
         FragmentChild::SvelteFragment(el) => visit_svelte_fragment(el, state),
         FragmentChild::SvelteBoundary(el) => visit_svelte_boundary(el, state),
@@ -5650,9 +5755,21 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             if let Some(alt) = &b.alternate {
                 validate_block_not_empty(Some(alt), state);
             }
-            visit_fragment(&b.consequent, state);
-            if let Some(alt) = &b.alternate {
-                visit_fragment(alt, state);
+            if let CollectResult::Block(block_idx) = state.last_collect {
+                let inner = Existence::min(state.element_existence, Existence::Probable);
+                visit_block_branch(state, block_idx, 0, &b.consequent, inner, |state| {
+                    visit_fragment(&b.consequent, state)
+                });
+                if let Some(alt) = &b.alternate {
+                    visit_block_branch(state, block_idx, 1, alt, inner, |state| {
+                        visit_fragment(alt, state)
+                    });
+                }
+            } else {
+                visit_fragment(&b.consequent, state);
+                if let Some(alt) = &b.alternate {
+                    visit_fragment(alt, state);
+                }
             }
         }
         FragmentChild::EachBlock(b) => {
@@ -5672,9 +5789,21 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                     }
                 });
             }
-            visit_fragment(&b.body, state);
-            if let Some(fb) = &b.fallback {
-                visit_fragment(fb, state);
+            if let CollectResult::Block(block_idx) = state.last_collect {
+                let inner = Existence::min(state.element_existence, Existence::Probable);
+                visit_block_branch(state, block_idx, 0, &b.body, inner, |state| {
+                    visit_fragment(&b.body, state)
+                });
+                if let Some(fb) = &b.fallback {
+                    visit_block_branch(state, block_idx, 1, fb, inner, |state| {
+                        visit_fragment(fb, state)
+                    });
+                }
+            } else {
+                visit_fragment(&b.body, state);
+                if let Some(fb) = &b.fallback {
+                    visit_fragment(fb, state);
+                }
             }
         }
         FragmentChild::AwaitBlock(b) => {
@@ -5717,19 +5846,52 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             if catch_meaningful {
                 validate_block_not_empty(b.catch_.as_ref(), state);
             }
-            if let Some(f) = &b.pending {
-                visit_fragment(f, state);
-            }
-            if let Some(f) = &b.then {
-                visit_fragment(f, state);
-            }
-            if let Some(f) = &b.catch_ {
-                visit_fragment(f, state);
+            if let CollectResult::Block(block_idx) = state.last_collect {
+                let inner = Existence::min(state.element_existence, Existence::Probable);
+                let mut branch = 0usize;
+                if let Some(f) = &b.pending {
+                    visit_block_branch(state, block_idx, branch, f, inner, |state| {
+                        visit_fragment(f, state)
+                    });
+                    branch += 1;
+                }
+                if let Some(f) = &b.then {
+                    visit_block_branch(state, block_idx, branch, f, inner, |state| {
+                        visit_fragment(f, state)
+                    });
+                    branch += 1;
+                }
+                if let Some(f) = &b.catch_ {
+                    visit_block_branch(state, block_idx, branch, f, inner, |state| {
+                        visit_fragment(f, state)
+                    });
+                }
+            } else {
+                if let Some(f) = &b.pending {
+                    visit_fragment(f, state);
+                }
+                if let Some(f) = &b.then {
+                    visit_fragment(f, state);
+                }
+                if let Some(f) = &b.catch_ {
+                    visit_fragment(f, state);
+                }
             }
         }
         FragmentChild::KeyBlock(b) => {
             validate_block_not_empty(Some(&b.fragment), state);
-            visit_fragment(&b.fragment, state);
+            if let CollectResult::Block(block_idx) = state.last_collect {
+                visit_block_branch(
+                    state,
+                    block_idx,
+                    0,
+                    &b.fragment,
+                    state.element_existence,
+                    |state| visit_fragment(&b.fragment, state),
+                );
+            } else {
+                visit_fragment(&b.fragment, state);
+            }
         }
         FragmentChild::SnippetBlock(b) => visit_snippet_block(b, state),
         FragmentChild::Text(t) => {

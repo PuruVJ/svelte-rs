@@ -176,6 +176,8 @@ pub fn compile(
             end: c.end,
         })
         .collect();
+    typed_opts.code_init_capacity =
+        svelte_codegen_js::estimate_code_init_capacity(source.len());
     let result = svelte_codegen_js::print_typed(&typed, &typed_opts);
 
     Ok(CompileResult {

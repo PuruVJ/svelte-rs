@@ -67,11 +67,14 @@ pub struct TypedComment {
 
 /// Options for `print_typed`. Subset of the legacy `PrintOptions` —
 /// `indent` (default tab), `source_map_source`, `source_map_content`.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct TypedPrintOptions {
     pub indent: Option<String>,
     pub source_map_source: Option<String>,
     pub source_map_content: Option<String>,
+    /// Initial `String` capacity for the emitted JS. Defaults to 4096; the
+    /// compiler sets this from input length via [`estimate_code_init_capacity`].
+    pub code_init_capacity: usize,
     /// Line-map for the original source: `LineMap[i] = byte offset of
     /// line i (0-indexed)`. Used to translate node `Span` byte offsets to
     /// (line, column) for sourcemaps. If None, no sourcemap is emitted.
@@ -79,6 +82,19 @@ pub struct TypedPrintOptions {
     /// Source comments to preserve in the output. Ordered by `start`.
     /// Used for inter-declarator and inter-statement comment placement.
     pub comments: Vec<TypedComment>,
+}
+
+impl Default for TypedPrintOptions {
+    fn default() -> Self {
+        Self {
+            indent: None,
+            source_map_source: None,
+            source_map_content: None,
+            code_init_capacity: CODE_INIT_CAPACITY_MIN,
+            line_map: None,
+            comments: Vec::new(),
+        }
+    }
 }
 
 /// Map from byte offset to (line, column). Precomputed once per input.
@@ -159,8 +175,16 @@ pub fn print_statements_str_with_comments(body: &[Statement], comments: &[TypedC
     emitter.code
 }
 
-const CODE_INIT_CAPACITY: usize = 4096;
+const CODE_INIT_CAPACITY_MIN: usize = 4096;
+const CODE_INIT_CAPACITY_RATIO: usize = 8;
 const MAPPINGS_INIT_CAPACITY: usize = 64;
+
+/// Estimate typed-printer output buffer size from `.svelte` input length.
+pub fn estimate_code_init_capacity(input_len: usize) -> usize {
+    input_len
+        .saturating_mul(CODE_INIT_CAPACITY_RATIO)
+        .max(CODE_INIT_CAPACITY_MIN)
+}
 const INDENT_LEVELS: usize = 128;
 
 thread_local! {
@@ -187,6 +211,7 @@ fn build_indent_table(indent_unit: &str) -> (Rc<str>, Rc<Vec<String>>, Rc<Vec<u3
 // ----- Emitter ------------------------------------------------------------
 
 struct Emitter<'a> {
+    code_init_capacity: usize,
     code: String,
     /// Current column on the current line (number of chars since last `\n`).
     col: u32,
@@ -224,7 +249,8 @@ impl<'a> Emitter<'a> {
             build_indent_table(indent_unit_str)
         };
         Self {
-            code: String::with_capacity(CODE_INIT_CAPACITY),
+            code_init_capacity: opts.code_init_capacity,
+            code: String::with_capacity(opts.code_init_capacity),
             col: 0,
             mappings: Vec::with_capacity(MAPPINGS_INIT_CAPACITY),
             current_line: Vec::new(),
@@ -1370,7 +1396,8 @@ impl<'a> Emitter<'a> {
     /// for the look-ahead measure pass in `emit_sequence`-shaped helpers.
     fn child_at_col(&self, col: u32) -> Emitter<'a> {
         Emitter {
-            code: String::with_capacity(CODE_INIT_CAPACITY),
+            code_init_capacity: self.code_init_capacity,
+            code: String::with_capacity(self.code_init_capacity),
             col,
             mappings: Vec::with_capacity(MAPPINGS_INIT_CAPACITY),
             current_line: Vec::new(),

@@ -25,6 +25,14 @@ use svelte_ast::{
 
 use crate::css_prune_data::Existence;
 
+/// Result of collecting a single fragment child during a fused template walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectResult {
+    None,
+    Element(usize),
+    Block(usize),
+}
+
 /// What kind of node this entry represents. Matches the relevant
 /// `node.type` discriminants from upstream's `apply_combinator` switch
 /// (the `'RenderTag' | 'SlotElement' | 'Component'` special-case in
@@ -284,6 +292,11 @@ pub fn collect(fragment: &Fragment) -> ElementTree {
     tree.fragments.push(Vec::new());
     tree.fragment_owners.push(FragmentOwner::Root);
     walk_fragment(fragment, None, Existence::Definite, 0, &mut tree);
+    finalize_element_tree(tree)
+}
+
+/// Post-process a collected element tree (RenderTag → snippet site wiring).
+pub fn finalize_element_tree(mut tree: ElementTree) -> ElementTree {
     // Wire RenderTags to their snippet block sites — mirrors upstream
     // 2-analyze/visitors/RenderTag.js:37 where `snippet.metadata.sites`
     // gets the render tag added when the snippet binding resolves.
@@ -305,6 +318,14 @@ pub fn collect(fragment: &Fragment) -> ElementTree {
             tree.blocks[block_idx].sites.push(el_idx);
         }
     }
+    tree
+}
+
+/// Initialize an empty element tree for incremental collection during validation.
+pub fn new_element_tree() -> ElementTree {
+    let mut tree = ElementTree::default();
+    tree.fragments.push(Vec::new());
+    tree.fragment_owners.push(FragmentOwner::Root);
     tree
 }
 
@@ -397,13 +418,20 @@ fn walk_fragment(
 ) -> Vec<usize> {
     let mut element_siblings: Vec<usize> = Vec::new();
     for node in &fragment.nodes {
-        walk_child(node, parent, existence, fragment_id, tree, &mut element_siblings);
+        let _ = collect_child(node, parent, existence, fragment_id, tree, &mut element_siblings, false);
     }
-    link_siblings(&element_siblings, tree);
+    link_element_siblings(&element_siblings, tree);
     element_siblings
 }
 
 /// Allocate a new fragment id and walk into it. Returns the new fragment id.
+fn alloc_fragment(owner: FragmentOwner, tree: &mut ElementTree) -> usize {
+    let id = tree.fragments.len();
+    tree.fragments.push(Vec::new());
+    tree.fragment_owners.push(owner);
+    id
+}
+
 fn make_fragment(
     inner: &Fragment,
     parent: Option<usize>,
@@ -411,9 +439,7 @@ fn make_fragment(
     owner: FragmentOwner,
     tree: &mut ElementTree,
 ) -> usize {
-    let id = tree.fragments.len();
-    tree.fragments.push(Vec::new());
-    tree.fragment_owners.push(owner);
+    let id = alloc_fragment(owner, tree);
     walk_fragment(inner, parent, existence, id, tree);
     id
 }
@@ -448,7 +474,7 @@ fn reserve_block(tree: &mut ElementTree, kind: BlockKind) -> usize {
     idx
 }
 
-fn link_siblings(siblings: &[usize], tree: &mut ElementTree) {
+pub(crate) fn link_element_siblings(siblings: &[usize], tree: &mut ElementTree) {
     for i in 0..siblings.len() {
         let prev = if i > 0 { Some(siblings[i - 1]) } else { None };
         let next = siblings.get(i + 1).copied();
@@ -471,15 +497,16 @@ fn link_siblings(siblings: &[usize], tree: &mut ElementTree) {
     }
 }
 
-fn walk_child(
+pub(crate) fn collect_child(
     node: &FragmentChild,
     parent: Option<usize>,
     existence: Existence,
     fragment_id: usize,
     tree: &mut ElementTree,
     out: &mut Vec<usize>,
-) {
-    match node {
+    shallow: bool,
+) -> CollectResult {
+    let result = match node {
         FragmentChild::RegularElement(el) => {
             let idx = push_element(
                 NodeKind::RegularElement,
@@ -491,8 +518,13 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
-            let body = make_fragment(&el.fragment, Some(idx), existence, FragmentOwner::Element(idx), tree);
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Element(idx), tree)
+            } else {
+                make_fragment(&el.fragment, Some(idx), existence, FragmentOwner::Element(idx), tree)
+            };
             tree.elements[idx].body_fragment = Some(body);
+            CollectResult::Element(idx)
         }
         FragmentChild::Component(c) => {
             let own_existence = Existence::min(existence, Existence::Probable);
@@ -506,8 +538,13 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
-            let body = make_fragment(&c.fragment, Some(idx), own_existence, FragmentOwner::Element(idx), tree);
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Element(idx), tree)
+            } else {
+                make_fragment(&c.fragment, Some(idx), own_existence, FragmentOwner::Element(idx), tree)
+            };
             tree.elements[idx].body_fragment = Some(body);
+            CollectResult::Element(idx)
         }
         FragmentChild::TitleElement(el) => {
             let idx = push_element(
@@ -520,8 +557,13 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
-            let body = make_fragment(&el.fragment, Some(idx), existence, FragmentOwner::Element(idx), tree);
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Element(idx), tree)
+            } else {
+                make_fragment(&el.fragment, Some(idx), existence, FragmentOwner::Element(idx), tree)
+            };
             tree.elements[idx].body_fragment = Some(body);
+            CollectResult::Element(idx)
         }
         FragmentChild::SlotElement(el) => {
             let own_existence = Existence::min(existence, Existence::Probable);
@@ -535,8 +577,13 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
-            let body = make_fragment(&el.fragment, Some(idx), own_existence, FragmentOwner::Element(idx), tree);
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Element(idx), tree)
+            } else {
+                make_fragment(&el.fragment, Some(idx), own_existence, FragmentOwner::Element(idx), tree)
+            };
             tree.elements[idx].body_fragment = Some(body);
+            CollectResult::Element(idx)
         }
         FragmentChild::SvelteBody(el) => {
             let idx = push_element(
@@ -549,8 +596,13 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
-            let body = make_fragment(&el.fragment, Some(idx), existence, FragmentOwner::Element(idx), tree);
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Element(idx), tree)
+            } else {
+                make_fragment(&el.fragment, Some(idx), existence, FragmentOwner::Element(idx), tree)
+            };
             tree.elements[idx].body_fragment = Some(body);
+            CollectResult::Element(idx)
         }
         FragmentChild::SvelteHead(el) => {
             // <svelte:head> body renders into the document <head> but the
@@ -558,13 +610,15 @@ fn walk_child(
             // against. Mirror upstream by treating the children as
             // siblings of the wrapper's parent at the same existence.
             for n in &el.fragment.nodes {
-                walk_child(n, parent, existence, fragment_id, tree, out);
+                let _ = collect_child(n, parent, existence, fragment_id, tree, out, shallow);
             }
+            CollectResult::None
         }
         FragmentChild::SvelteFragment(el) => {
             for n in &el.fragment.nodes {
-                walk_child(n, parent, existence, fragment_id, tree, out);
+                let _ = collect_child(n, parent, existence, fragment_id, tree, out, shallow);
             }
+            CollectResult::None
         }
         FragmentChild::SvelteSelf(el) => {
             let idx = push_element(
@@ -577,11 +631,13 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
+            CollectResult::Element(idx)
         }
         FragmentChild::SvelteBoundary(el) => {
             for n in &el.fragment.nodes {
-                walk_child(n, parent, existence, fragment_id, tree, out);
+                let _ = collect_child(n, parent, existence, fragment_id, tree, out, shallow);
             }
+            CollectResult::None
         }
         FragmentChild::SvelteElement(el) => {
             let own_existence = Existence::min(existence, Existence::Probable);
@@ -595,76 +651,103 @@ fn walk_child(
             );
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
-            let body = make_fragment(&el.fragment, Some(idx), own_existence, FragmentOwner::Element(idx), tree);
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Element(idx), tree)
+            } else {
+                make_fragment(&el.fragment, Some(idx), own_existence, FragmentOwner::Element(idx), tree)
+            };
             tree.elements[idx].body_fragment = Some(body);
+            CollectResult::Element(idx)
         }
         FragmentChild::SvelteWindow(_)
         | FragmentChild::SvelteDocument(_)
-        | FragmentChild::SvelteOptions(_) => {}
+        | FragmentChild::SvelteOptions(_) => CollectResult::None,
         FragmentChild::IfBlock(b) => {
             let inner = Existence::min(existence, Existence::Probable);
             let block_idx = reserve_block(tree, BlockKind::IfBlock);
-            let cons = make_fragment(
-                &b.consequent,
-                parent,
-                inner,
-                FragmentOwner::Block { block_idx, branch_index: 0 },
-                tree,
-            );
+            let cons = if shallow {
+                alloc_fragment(FragmentOwner::Block { block_idx, branch_index: 0 }, tree)
+            } else {
+                make_fragment(
+                    &b.consequent,
+                    parent,
+                    inner,
+                    FragmentOwner::Block { block_idx, branch_index: 0 },
+                    tree,
+                )
+            };
             let mut branches = vec![cons];
             let has_alt = b.alternate.is_some();
             if let Some(alt) = &b.alternate {
-                let alt_id = make_fragment(
-                    alt,
-                    parent,
-                    inner,
-                    FragmentOwner::Block { block_idx, branch_index: 1 },
-                    tree,
-                );
+                let alt_id = if shallow {
+                    alloc_fragment(FragmentOwner::Block { block_idx, branch_index: 1 }, tree)
+                } else {
+                    make_fragment(
+                        alt,
+                        parent,
+                        inner,
+                        FragmentOwner::Block { block_idx, branch_index: 1 },
+                        tree,
+                    )
+                };
                 branches.push(alt_id);
             }
-            for &b_id in &branches {
-                for ch in tree.fragments[b_id].clone() {
-                    if let FragChild::Element(e) = ch {
-                        out.push(e);
+            if !shallow {
+                for &b_id in &branches {
+                    for ch in tree.fragments[b_id].clone() {
+                        if let FragChild::Element(e) = ch {
+                            out.push(e);
+                        }
                     }
                 }
             }
             tree.blocks[block_idx].branches = branches;
             tree.blocks[block_idx].exhaustive = has_alt;
             tree.fragments[fragment_id].push(FragChild::Block(block_idx));
+            CollectResult::Block(block_idx)
         }
         FragmentChild::EachBlock(b) => {
             let inner = Existence::min(existence, Existence::Probable);
             let block_idx = reserve_block(tree, BlockKind::EachBlock);
-            let body = make_fragment(
-                &b.body,
-                parent,
-                inner,
-                FragmentOwner::Block { block_idx, branch_index: 0 },
-                tree,
-            );
+            let body = if shallow {
+                alloc_fragment(FragmentOwner::Block { block_idx, branch_index: 0 }, tree)
+            } else {
+                make_fragment(
+                    &b.body,
+                    parent,
+                    inner,
+                    FragmentOwner::Block { block_idx, branch_index: 0 },
+                    tree,
+                )
+            };
             let mut branches = vec![body];
             let has_fallback = b.fallback.is_some();
             if let Some(fb) = &b.fallback {
-                branches.push(make_fragment(
-                    fb,
-                    parent,
-                    inner,
-                    FragmentOwner::Block { block_idx, branch_index: 1 },
-                    tree,
-                ));
+                branches.push(if shallow {
+                    alloc_fragment(FragmentOwner::Block { block_idx, branch_index: 1 }, tree)
+                } else {
+                    make_fragment(
+                        fb,
+                        parent,
+                        inner,
+                        FragmentOwner::Block { block_idx, branch_index: 1 },
+                        tree,
+                    )
+                });
             }
-            for &b_id in &branches {
-                for ch in tree.fragments[b_id].clone() {
-                    if let FragChild::Element(e) = ch {
-                        out.push(e);
+            if !shallow {
+                for &b_id in &branches {
+                    for ch in tree.fragments[b_id].clone() {
+                        if let FragChild::Element(e) = ch {
+                            out.push(e);
+                        }
                     }
                 }
             }
             tree.blocks[block_idx].branches = branches;
             tree.blocks[block_idx].exhaustive = has_fallback;
             tree.fragments[fragment_id].push(FragChild::Block(block_idx));
+            CollectResult::Block(block_idx)
         }
         FragmentChild::AwaitBlock(b) => {
             let inner = Existence::min(existence, Existence::Probable);
@@ -672,38 +755,52 @@ fn walk_child(
             let mut branches = Vec::new();
             if let Some(f) = &b.pending {
                 let bi = branches.len();
-                branches.push(make_fragment(
-                    f,
-                    parent,
-                    inner,
-                    FragmentOwner::Block { block_idx, branch_index: bi },
-                    tree,
-                ));
+                branches.push(if shallow {
+                    alloc_fragment(FragmentOwner::Block { block_idx, branch_index: bi }, tree)
+                } else {
+                    make_fragment(
+                        f,
+                        parent,
+                        inner,
+                        FragmentOwner::Block { block_idx, branch_index: bi },
+                        tree,
+                    )
+                });
             }
             if let Some(f) = &b.then {
                 let bi = branches.len();
-                branches.push(make_fragment(
-                    f,
-                    parent,
-                    inner,
-                    FragmentOwner::Block { block_idx, branch_index: bi },
-                    tree,
-                ));
+                branches.push(if shallow {
+                    alloc_fragment(FragmentOwner::Block { block_idx, branch_index: bi }, tree)
+                } else {
+                    make_fragment(
+                        f,
+                        parent,
+                        inner,
+                        FragmentOwner::Block { block_idx, branch_index: bi },
+                        tree,
+                    )
+                });
             }
             if let Some(f) = &b.catch_ {
                 let bi = branches.len();
-                branches.push(make_fragment(
-                    f,
-                    parent,
-                    inner,
-                    FragmentOwner::Block { block_idx, branch_index: bi },
-                    tree,
-                ));
+                branches.push(if shallow {
+                    alloc_fragment(FragmentOwner::Block { block_idx, branch_index: bi }, tree)
+                } else {
+                    make_fragment(
+                        f,
+                        parent,
+                        inner,
+                        FragmentOwner::Block { block_idx, branch_index: bi },
+                        tree,
+                    )
+                });
             }
-            for &b_id in &branches {
-                for ch in tree.fragments[b_id].clone() {
-                    if let FragChild::Element(e) = ch {
-                        out.push(e);
+            if !shallow {
+                for &b_id in &branches {
+                    for ch in tree.fragments[b_id].clone() {
+                        if let FragChild::Element(e) = ch {
+                            out.push(e);
+                        }
                     }
                 }
             }
@@ -711,24 +808,32 @@ fn walk_child(
             tree.blocks[block_idx].branches = branches;
             tree.blocks[block_idx].exhaustive = exhaustive;
             tree.fragments[fragment_id].push(FragChild::Block(block_idx));
+            CollectResult::Block(block_idx)
         }
         FragmentChild::KeyBlock(b) => {
             let block_idx = reserve_block(tree, BlockKind::KeyBlock);
-            let inner = make_fragment(
-                &b.fragment,
-                parent,
-                existence,
-                FragmentOwner::Block { block_idx, branch_index: 0 },
-                tree,
-            );
-            for ch in tree.fragments[inner].clone() {
-                if let FragChild::Element(e) = ch {
-                    out.push(e);
+            let inner = if shallow {
+                alloc_fragment(FragmentOwner::Block { block_idx, branch_index: 0 }, tree)
+            } else {
+                make_fragment(
+                    &b.fragment,
+                    parent,
+                    existence,
+                    FragmentOwner::Block { block_idx, branch_index: 0 },
+                    tree,
+                )
+            };
+            if !shallow {
+                for ch in tree.fragments[inner].clone() {
+                    if let FragChild::Element(e) = ch {
+                        out.push(e);
+                    }
                 }
             }
             tree.blocks[block_idx].branches = vec![inner];
             tree.blocks[block_idx].exhaustive = true;
             tree.fragments[fragment_id].push(FragChild::Block(block_idx));
+            CollectResult::Block(block_idx)
         }
         FragmentChild::SnippetBlock(s) => {
             // Bodies of `{#snippet name(args)}` children are tracked
@@ -743,13 +848,20 @@ fn walk_child(
             let inner = Existence::min(existence, Existence::Probable);
             let snippet_block_idx = reserve_block(tree, BlockKind::SnippetBlock);
             tree.blocks[snippet_block_idx].snippet_name = Some(s.expression.name.to_string());
-            let body = make_fragment(
-                &s.body,
-                parent,
-                inner,
-                FragmentOwner::Block { block_idx: snippet_block_idx, branch_index: 0 },
-                tree,
-            );
+            let body = if shallow {
+                alloc_fragment(
+                    FragmentOwner::Block { block_idx: snippet_block_idx, branch_index: 0 },
+                    tree,
+                )
+            } else {
+                make_fragment(
+                    &s.body,
+                    parent,
+                    inner,
+                    FragmentOwner::Block { block_idx: snippet_block_idx, branch_index: 0 },
+                    tree,
+                )
+            };
             tree.blocks[snippet_block_idx].branches = vec![body];
             tree.blocks[snippet_block_idx].exhaustive = false;
             tree.fragments[fragment_id].push(FragChild::Block(snippet_block_idx));
@@ -774,6 +886,7 @@ fn walk_child(
                     tree.blocks[snippet_block_idx].sites.push(owner_el);
                 }
             }
+            CollectResult::Block(snippet_block_idx)
         }
         FragmentChild::RenderTag(rt) => {
             // {@render} renders a snippet's content — its identity is a
@@ -792,9 +905,11 @@ fn walk_child(
             });
             push_frag_element(tree, fragment_id, idx);
             out.push(idx);
+            CollectResult::Element(idx)
         }
-        _ => {}
-    }
+        _ => CollectResult::None,
+    };
+    result
 }
 
 fn push_element(

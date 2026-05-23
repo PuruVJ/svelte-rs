@@ -24,13 +24,15 @@ use crate::scope::{BindingKind, DeclarationKind, Scope, ScopePtr};
 
 /// Walk a Program node (the `content` field of a `Script`) and populate
 /// `root_scope` and its descendants.
-pub fn build_program_scope(program: &svelte_js_ast::Program, root_scope: &ScopePtr) {
+pub fn build_program_scope(program: &svelte_js_ast::Program, root_scope: &ScopePtr) -> bool {
     for stmt in &program.body {
         hoist_typed(stmt, root_scope);
     }
+    let uses_runes = program.body.iter().any(stmt_uses_runes);
     for stmt in &program.body {
         visit_stmt(stmt, root_scope);
     }
+    uses_runes
 }
 
 fn hoist_typed(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
@@ -331,9 +333,9 @@ fn rune_to_binding_kind(rune: &str) -> BindingKind {
     }
 }
 
-/// Returns true if the component uses any rune (`$state`, `$derived`,
-/// `$effect`, `$props`, `$bindable`, `$inspect`, `$host`, plus `.raw` /
-pub fn detect_runes(root: &Root) -> bool {
+/// Returns true if `<svelte:options runes />` (or equivalent) opts the
+/// component into runes mode without walking script bodies.
+pub fn runes_enabled_by_options(root: &Root) -> bool {
     // <svelte:options runes /> or <svelte:options runes={true} /> → explicit opt-in.
     if let Some(options) = &root.options {
         if options.runes == Some(true) {
@@ -355,22 +357,7 @@ pub fn detect_runes(root: &Root) -> bool {
             }
         }
     }
-    if let Some(s) = root.module.as_ref() {
-        if program_uses_runes(&s.content) {
-            return true;
-        }
-    }
-    if let Some(s) = root.instance.as_ref() {
-        if program_uses_runes(&s.content) {
-            return true;
-        }
-    }
     false
-}
-
-/// Walk a typed `Program` looking for a rune call expression.
-fn program_uses_runes(p: &svelte_js_ast::Program) -> bool {
-    p.body.iter().any(stmt_uses_runes)
 }
 
 fn stmt_uses_runes(s: &svelte_js_ast::Statement) -> bool {

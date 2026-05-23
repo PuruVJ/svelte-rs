@@ -51,30 +51,21 @@ pub fn analyze_component(
     let module = Scope::new_root(scope_root.clone(), 0);
     let instance = Scope::new_root(scope_root.clone(), 0);
 
-    // Walk module / instance scripts to populate declarations.
+    // Walk module / instance scripts to populate declarations and detect runes.
+    let mut runes = walker::runes_enabled_by_options(root);
     if let Some(s) = root.module.as_ref() {
-        walker::build_program_scope(&s.content, &module);
+        runes |= walker::build_program_scope(&s.content, &module);
     }
     if let Some(s) = root.instance.as_ref() {
-        walker::build_program_scope(&s.content, &instance);
+        runes |= walker::build_program_scope(&s.content, &instance);
     }
 
-    let runes = walker::detect_runes(&root);
-    let (mut css_meta, css_err) = match root.css.as_ref() {
+    let (css_meta, css_err) = match root.css.as_ref() {
         Some(sheet) => css_analyze::analyze_css_with_errors(sheet),
         None => (Default::default(), None),
     };
     if let Some(e) = css_err {
         return Err(e);
-    }
-
-    // CSS prune — match each selector against template elements, then
-    // emit `css_unused_selector` warnings for the leftovers.
-    let mut warnings: Vec<CompileDiagnostic> = Vec::new();
-    if let Some(sheet) = root.css.as_ref() {
-        let elements = template_elements::collect(&root.fragment);
-        css_prune::prune(sheet, &elements, &mut css_meta);
-        warnings.extend(css_warn::warn_unused(sheet, &css_meta));
     }
 
     let name = filename
@@ -93,7 +84,7 @@ pub fn analyze_component(
         filename: filename.map(|s| s.to_string()),
         name,
         css_hash: String::new(),
-        warnings,
+        warnings: Vec::new(),
         elements: Default::default(),
         uses_global: false,
         uses_async: false,
@@ -102,11 +93,20 @@ pub fn analyze_component(
 
     // Template validator pass — emits the warnings / errors from the
     // per-AST-node visitors (svelte:window / svelte:body / svelte:self /
-    // ...). Mirrors the `walk(root, visitors)` call in upstream
+    // ...). Also collects template elements for CSS prune in the same walk.
+    // Mirrors the `walk(root, visitors)` call in upstream
     // `phases/2-analyze/index.js`.
     // Parser-emitted soft diagnostics surface as analysis warnings.
     analysis.warnings.extend(std::mem::take(&mut analysis.root.parse_warnings));
-    let (validator_warnings, validator_errors) = validate::validate(&analysis.root, &analysis);
+    let collect_elements = root.css.is_some();
+    let (elements, validator_warnings, validator_errors) =
+        validate::validate(&analysis.root, &analysis, collect_elements);
+    if let Some(sheet) = root.css.as_ref() {
+        css_prune::prune(sheet, &elements, &mut analysis.css_meta);
+        analysis
+            .warnings
+            .extend(css_warn::warn_unused(sheet, &analysis.css_meta));
+    }
     analysis.warnings.extend(validator_warnings);
     // Apply top-of-file `<!-- svelte-ignore X -->` to script + CSS warnings
     // whose targets are hoisted out of the fragment by the parser. A comment

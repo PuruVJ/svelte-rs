@@ -5426,6 +5426,131 @@ fn lower_element_with_non_inline_children(
     Some(())
 }
 
+/// True when `el` and its entire subtree can be serialized to HTML without
+/// building per-element AST nodes — no dynamic attrs, blocks, components,
+/// or special-case elements (`<option>`, `<select>`, `<textarea>`).
+fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
+    if matches!(el.name.as_str(), "option" | "select" | "textarea") {
+        return false;
+    }
+    if element_has_async_directive(el) || has_option_child(el) {
+        return false;
+    }
+    for attr in &el.attributes {
+        match attr {
+            ElementAttribute::Attribute(a) => {
+                if is_event_handler_name(&a.name) {
+                    continue;
+                }
+                match &a.value {
+                    AttributeValue::Empty => {}
+                    AttributeValue::Many(parts) => {
+                        if !parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) {
+                            return false;
+                        }
+                    }
+                    AttributeValue::Single(tag) => {
+                        if literal_expr_to_string(&tag.expression).is_none() {
+                            return false;
+                        }
+                    }
+                }
+            }
+            _ => return false,
+        }
+    }
+    let children = trim_boundary_whitespace(&el.fragment.nodes);
+    for n in children {
+        match n {
+            FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(child) => {
+                if !is_fully_static_element(child) {
+                    return false;
+                }
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                if literal_expr_to_string(&tag.expression).is_none() {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Serialize a fully-static fragment subtree directly into `buf`, skipping
+/// per-element AST construction. Boundary whitespace trim matches the
+/// incremental walker without cloning nodes.
+fn serialize_static_fragment_to_template(
+    nodes: &[FragmentChild],
+    buf: &mut TemplateBuf,
+) -> Option<()> {
+    let nodes = trim_boundary_whitespace(nodes);
+    if nodes.is_empty() {
+        return Some(());
+    }
+    for (i, n) in nodes.iter().enumerate() {
+        let is_first = i == 0;
+        let is_last = i == nodes.len() - 1;
+        match n {
+            FragmentChild::Text(t) => {
+                let mut data = t.data.as_str();
+                if is_first {
+                    data = data.trim_start();
+                }
+                if is_last {
+                    data = data.trim_end();
+                }
+                if data.is_empty() {
+                    continue;
+                }
+                buf.push_str(&escape_text(&collapse_ws(data)));
+            }
+            FragmentChild::Comment(c) => {
+                if PRESERVE_COMMENTS.with(|p| p.get()) {
+                    buf.push_str("<!--");
+                    buf.push_str(&escape_text(&c.data));
+                    buf.push_str("-->");
+                }
+            }
+            FragmentChild::RegularElement(el) => {
+                serialize_static_element_to_template(el, buf)?;
+            }
+            FragmentChild::ExpressionTag(tag) => {
+                if let Some(s) = literal_expr_to_string(&tag.expression) {
+                    buf.push_str(&escape_text(&s));
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+/// Serialize one fully-static element (open tag, body, close tag) in bulk.
+fn serialize_static_element_to_template(
+    el: &svelte_ast::elements::RegularElement,
+    buf: &mut TemplateBuf,
+) -> Option<()> {
+    debug_assert!(is_fully_static_element(el));
+    buf.push_str("<");
+    buf.push_str(&el.name);
+    for attr in &el.attributes {
+        append_element_attribute_server(attr, buf)?;
+    }
+    if is_void(&el.name) {
+        buf.push_str("/>");
+        return Some(());
+    }
+    buf.push_str(">");
+    serialize_static_fragment_to_template(&el.fragment.nodes, buf)?;
+    buf.push_str("</");
+    buf.push_str(&el.name);
+    buf.push_str(">");
+    Some(())
+}
+
 fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<()> {
     match n {
         FragmentChild::Text(t) => {
@@ -5478,6 +5603,9 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             // `$$renderer.child(async ...)` wrap with const-hoisting; the
             // outer dispatch handles that.
             None
+        }
+        FragmentChild::RegularElement(el) if is_fully_static_element(el) => {
+            serialize_static_element_to_template(el, buf)
         }
         FragmentChild::RegularElement(el) => {
             buf.push_str("<");
