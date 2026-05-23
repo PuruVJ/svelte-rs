@@ -374,9 +374,9 @@ fn find_block_parent(tree: &ElementTree, block_idx: usize) -> Option<usize> {
 fn render_tag_callee_name(expr: &svelte_js_ast::Expression) -> Option<String> {
     use svelte_js_ast::Expression;
     match expr {
-        Expression::Identifier(id) => Some(id.name.clone()),
+        Expression::Identifier(id) => Some(id.name.to_string()),
         Expression::Call(call) => match &call.callee {
-            Expression::Identifier(id) => Some(id.name.clone()),
+            Expression::Identifier(id) => Some(id.name.to_string()),
             _ => None,
         },
         _ => None,
@@ -742,7 +742,7 @@ fn walk_child(
             // through `{@render}`).
             let inner = Existence::min(existence, Existence::Probable);
             let snippet_block_idx = reserve_block(tree, BlockKind::SnippetBlock);
-            tree.blocks[snippet_block_idx].snippet_name = Some(s.expression.name.clone());
+            tree.blocks[snippet_block_idx].snippet_name = Some(s.expression.name.to_string());
             let body = make_fragment(
                 &s.body,
                 parent,
@@ -828,7 +828,7 @@ fn describe_element(
     for a in attrs {
         match a {
             ElementAttribute::Attribute(attr) => {
-                info.attr_names.insert(attr.name.clone());
+                info.attr_names.insert(attr.name.to_string());
                 let mut values = AttrValueSet::default();
                 collect_attribute_values(&attr.value, &mut values);
 
@@ -859,10 +859,10 @@ fn describe_element(
                 info.has_spread_attribute = true;
             }
             ElementAttribute::BindDirective(b) => {
-                info.bind_directives.insert(b.name.clone());
+                info.bind_directives.insert(b.name.to_string());
             }
             ElementAttribute::ClassDirective(c) => {
-                info.class_directives.insert(c.name.clone());
+                info.class_directives.insert(c.name.to_string());
                 info.classes.add_known(c.name.clone());
             }
             ElementAttribute::StyleDirective(_) => {
@@ -932,7 +932,7 @@ fn collect_expression_values(expr: &svelte_js_ast::Expression, out: &mut AttrVal
     use svelte_js_ast::{Expression, Literal};
     match expr {
         Expression::Literal(lit) => match lit.as_ref() {
-            Literal::String(s) => out.add_known(s.value.clone()),
+            Literal::String(s) => out.add_known(s.value.to_string()),
             Literal::Boolean(b) => out.add_known(b.value.to_string()),
             Literal::Number(n) => out.add_known(n.value.to_string()),
             _ => out.add_unknown(),
@@ -995,15 +995,15 @@ fn collect_expression_values(expr: &svelte_js_ast::Expression, out: &mut AttrVal
                 match p {
                     svelte_js_ast::ObjectMember::Property(prop) => {
                         let key_str = match &prop.key {
-                            svelte_js_ast::PropertyKey::Identifier(id) => Some(id.name.clone()),
+                            svelte_js_ast::PropertyKey::Identifier(id) => Some(id.name.to_string()),
                             svelte_js_ast::PropertyKey::Literal(lit) => match lit.as_ref() {
-                                svelte_js_ast::Literal::String(s) => Some(s.value.clone()),
+                                svelte_js_ast::Literal::String(s) => Some(s.value.to_string()),
                                 _ => None,
                             },
                             svelte_js_ast::PropertyKey::Expression(e) => {
                                 if let svelte_js_ast::Expression::Literal(lit) = e {
                                     if let svelte_js_ast::Literal::String(s) = lit.as_ref() {
-                                        Some(s.value.clone())
+                                        Some(s.value.to_string())
                                     } else {
                                         None
                                     }

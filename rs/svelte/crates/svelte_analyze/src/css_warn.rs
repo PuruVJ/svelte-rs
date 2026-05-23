@@ -113,7 +113,7 @@ fn check_complex(
     for rel in &complex.children {
         for s in &rel.selectors {
             if let SimpleSelector::PseudoClassSelector(p) = s {
-                if matches!(p.name.as_str(), "is" | "where" | "not" | "has") {
+                if matches!(p.name.as_ref(), "is" | "where" | "not" | "has") {
                     if let Some(args) = &p.args {
                         for nested in &args.children {
                             check_complex(nested, sheet, css_meta, out);

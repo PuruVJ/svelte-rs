@@ -20,6 +20,8 @@
 //! - Auto-closing logic (`<p><p>` closes the first one).
 
 use serde_json::{json, Value};
+use std::borrow::Cow;
+
 use svelte_ast::{
     AnimateDirective,  AttachTag,  Attribute, 
     AttributeValue, AttributeValuePart, BindDirective,  ClassDirective,
@@ -538,7 +540,7 @@ fn build_svelte_this_expression(
 ) -> svelte_js_ast::Expression {
     fn placeholder() -> svelte_js_ast::Expression {
         svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
-            name: "__missing_this__".to_string(),
+            name: Cow::Borrowed("__missing_this__"),
             span: svelte_js_ast::Span::ZERO,
         })
     }
@@ -560,7 +562,7 @@ fn build_svelte_this_expression(
                     AttributeValuePart::Text(t) => {
                         svelte_js_ast::Expression::Literal(Box::new(
                             svelte_js_ast::Literal::String(svelte_js_ast::StringLiteral {
-                                value: t.data.clone(),
+                                value: Cow::Owned(t.data.clone()),
                                 raw: Some(format!("'{}'", t.raw)),
                                 span: svelte_js_ast::Span::new(t.start, t.end),
                             }),
@@ -820,7 +822,7 @@ fn read_braced_attribute(
     let id_loc_start = parser.line_map.position(id_start);
     let id_loc_end = parser.line_map.position(id_end);
     let id_expr = svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
-        name: id_name.clone(),
+        name: Cow::Owned(id_name.clone()),
         span: svelte_js_ast::Span::new(id_start as u32, id_end as u32),
     });
 
@@ -1265,7 +1267,7 @@ fn build_directive(
             // and `end` but no `loc`.
             let expr = expression.unwrap_or_else(|| {
                 svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
-                    name: directive_name.clone(),
+                    name: Cow::Owned(directive_name.clone()),
                     span: svelte_js_ast::Span::new(
                         (start + colon_index + 1) as u32,
                         end as u32,
@@ -1284,7 +1286,7 @@ fn build_directive(
         DirectiveKind::Class => {
             let expr = expression.unwrap_or_else(|| {
                 svelte_js_ast::Expression::Identifier(svelte_js_ast::Identifier {
-                    name: directive_name.clone(),
+                    name: Cow::Owned(directive_name.clone()),
                     span: svelte_js_ast::Span::new(
                         (start + colon_index + 1) as u32,
                         end as u32,

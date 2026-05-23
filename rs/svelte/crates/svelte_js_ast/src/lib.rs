@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
+
 mod span;
 
 pub use span::Span;
@@ -452,7 +454,7 @@ pub enum Expression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identifier {
-    pub name: String,
+    pub name: Cow<'static, str>,
     pub span: Span,
 }
 
@@ -468,7 +470,7 @@ pub enum Literal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringLiteral {
-    pub value: String,
+    pub value: Cow<'static, str>,
     /// Raw form including quotes — preserved so the emitter can replay the
     /// exact characters when known (`'foo'` vs `"foo"` vs `\x41`). When
     /// `None`, the emitter formats canonically with single quotes.
@@ -575,7 +577,7 @@ pub enum PropertyKey {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivateIdentifier {
-    pub name: String,
+    pub name: Cow<'static, str>,
     pub span: Span,
 }
 

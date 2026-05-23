@@ -10,34 +10,11 @@ If asked to do a performance investigation, use the `performance-investigation` 
 
 ## Cursor Cloud specific instructions
 
-This repo is on the `rs` branch, which adds a Rust reimplementation of the Svelte compiler under `rs/svelte/`. The branch is a superset of `main`.
+The Rust Svelte compiler lives in `rs/svelte/` (not the repo root). Use that directory for all `cargo` commands.
 
-### Project structure
+- **Check:** `cd rs/svelte && cargo check --workspace`
+- **Tests (compiler crates):** `cargo test -p svelte_parse -p svelte_compiler -p svelte_magic_string -p svelte_codegen_js -p svelte_transform_shared -p svelte_transform_server -p svelte_transform_client`
+- **Release CLI:** `cargo build --release -p svelte_compiler --bin svelte-rs`
+- **Snapshot fixtures:** `/workspace/packages/svelte/tests/snapshot/samples/<name>/index.svelte` (not relative `../../../../packages/...` from `rs/svelte`).
 
-- **JS Svelte package**: `packages/svelte/` — the original JS compiler and runtime (v5.55.7)
-- **Rust compiler**: `rs/svelte/` — 20-crate Cargo workspace reimplementing the compiler in Rust
-- **Playground**: `playgrounds/sandbox/` — Vite dev sandbox (optional)
-
-### Key commands
-
-| Task | Command | Notes |
-|---|---|---|
-| Install JS deps | `pnpm install` | Required even for Rust-only work (test harness uses Node) |
-| Build JS Svelte | `cd packages/svelte && pnpm build` | Needed before running `pnpm test` or playground |
-| JS lint | `pnpm lint` | ESLint + Prettier. 3 pre-existing errors from `rs/*.mjs` files not in tsconfig |
-| JS tests | `pnpm test` | Vitest. 32/33 suites pass; `runtime-browser` needs `pnpm playwright install chromium` |
-| Rust check | `cd rs/svelte && cargo check --workspace` | Fast type-check |
-| Rust build | `cd rs/svelte && cargo build --workspace` | Debug build of all 20 crates |
-| Rust release binary | `cd rs/svelte && cargo build --release -p svelte_compiler --bin svelte-rs` | Produces `target/release/svelte-rs` |
-| Rust tests | `cd rs/svelte && cargo test -p svelte_parse -p svelte_compiler -p svelte_magic_string` | Some crates (`svelte_analyze`, `svelte_migrate`, `svelte_codegen_js`) have pre-existing test failures |
-| Rust clippy | `cd rs/svelte && cargo clippy --workspace` | Passes with warnings only |
-| Compile a component | `target/release/svelte-rs <file.svelte> [--ssr]` | Client mode by default, `--ssr` for server |
-| Differential tests | `cd rs/svelte && cargo run -p svelte_test_harness -- all-parser-modern` | Compares Rust vs JS parser output |
-
-### Gotchas
-
-- The `rust-toolchain.toml` in `rs/svelte/` pins the stable channel and requests `wasm32-unknown-unknown` target. Running any `cargo` command from that directory auto-installs the correct toolchain.
-- esbuild's postinstall script is blocked by pnpm's build script policy. The binary still works — `pnpm build` in `packages/svelte` succeeds without manual intervention.
-- The Rust `svelte_codegen_js` crate has a test-only compile error (`missing field type_annotation`) that does not affect the library build. Run tests with `--exclude svelte_codegen_js` to skip it.
-- `svelte_analyze` and `svelte_migrate` have a few pre-existing test assertion failures unrelated to environment setup.
-- Codegen hot path: `rs/svelte/crates/svelte_codegen_js/src/typed.rs`. After codegen changes, compare CLI output to a baseline to ensure byte-identical JS.
+The typed JS AST (`svelte_js_ast`) uses `Cow<'static, str>` for `Identifier.name` and `StringLiteral.value`. Static identifiers go through `t::id("literal")` / `Cow::Borrowed`; dynamic names use `t::id_owned(...)` / `Cow::Owned`. When reading names in hash maps, prefer `.as_ref()` over `.as_str()` (unstable on `Cow` in this toolchain).

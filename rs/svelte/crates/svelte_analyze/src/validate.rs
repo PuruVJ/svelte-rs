@@ -56,7 +56,7 @@ impl<'a> ValidateState<'a> {
             warnings: Vec::new(),
             errors: Vec::new(),
             is_runes: analysis.runes,
-            component_name: analysis.name.clone(),
+            component_name: analysis.name.to_string(),
             filename: analysis.filename.clone(),
             imported_names: std::collections::HashSet::new(),
             instance_declared: std::collections::HashSet::new(),
@@ -191,7 +191,7 @@ fn validate_export_let_unused(
                 };
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
-                        decls.insert(id.name.clone(), match kind {
+                        decls.insert(id.name.to_string(), match kind {
                             DeclKind::Let => DeclKind::Let,
                             DeclKind::Var => DeclKind::Var,
                             _ => DeclKind::Const,
@@ -201,7 +201,7 @@ fn validate_export_let_unused(
             }
             Statement::Function(f) => {
                 if let Some(id) = &f.id {
-                    decls.insert(id.name.clone(), DeclKind::Function);
+                    decls.insert(id.name.to_string(), DeclKind::Function);
                 }
             }
             Statement::ExportNamed(e) => {
@@ -215,7 +215,7 @@ fn validate_export_let_unused(
                             };
                             for d in &v.declarations {
                                 if let Pattern::Identifier(id) = &d.id {
-                                    decls.insert(id.name.clone(), match kind {
+                                    decls.insert(id.name.to_string(), match kind {
                                         DeclKind::Let => DeclKind::Let,
                                         DeclKind::Var => DeclKind::Var,
                                         _ => DeclKind::Const,
@@ -225,7 +225,7 @@ fn validate_export_let_unused(
                         }
                         Statement::Function(f) => {
                             if let Some(id) = &f.id {
-                                decls.insert(id.name.clone(), DeclKind::Function);
+                                decls.insert(id.name.to_string(), DeclKind::Function);
                             }
                         }
                         _ => {}
@@ -247,7 +247,7 @@ fn validate_export_let_unused(
                     for d in &v.declarations {
                         if let Pattern::Identifier(id) = &d.id {
                             exports.push((
-                                id.name.clone(),
+                                id.name.to_string(),
                                 (id.span.start, id.span.end),
                             ));
                         }
@@ -258,7 +258,7 @@ fn validate_export_let_unused(
         }
         for spec in &e.specifiers {
             if let ModuleExportName::Identifier(local) = &spec.local {
-                exports.push((local.name.clone(), (local.span.start, local.span.end)));
+                exports.push((local.name.to_string(), (local.span.start, local.span.end)));
             }
         }
     }
@@ -312,8 +312,8 @@ fn collect_script_reads(
                     if cands.contains(stripped) {
                         store_refs.insert(stripped.to_string());
                     }
-                } else if cands.contains(&id.name) {
-                    refs.insert(id.name.clone());
+                } else if cands.contains(id.name.as_ref()) {
+                    refs.insert(id.name.to_string());
                 }
             }
             Expression::Member(m) => walk_expr(&m.object, cands, refs, store_refs),
@@ -467,8 +467,8 @@ fn collect_template_reads(
                     if cands.contains(stripped) {
                         store_refs.insert(stripped.to_string());
                     }
-                } else if cands.contains(&id.name) {
-                    refs.insert(id.name.clone());
+                } else if cands.contains(id.name.as_ref()) {
+                    refs.insert(id.name.to_string());
                 }
             }
             Expression::Member(m) => walk_expr(&m.object, cands, refs, store_refs),
@@ -650,7 +650,7 @@ fn collect_template_reads(
                 // Bare `style:height` desugars to `style:height={height}`,
                 // so the directive name itself is an identifier read.
                 if matches!(d.value, svelte_ast::AttributeValue::Empty) && cands.contains(&d.name) {
-                    refs.insert(d.name.clone());
+                    refs.insert(d.name.to_string());
                 }
                 match &d.value {
                     svelte_ast::AttributeValue::Single(et) => walk_expr(&et.expression, cands, refs, store_refs),
@@ -771,7 +771,7 @@ fn validate_reactive_declaration_module_dep(
     }
     fn collect_idents(e: &Expression, out: &mut Vec<(u32, u32, String)>) {
         match e {
-            Expression::Identifier(id) => out.push((id.span.start, id.span.end, id.name.clone())),
+            Expression::Identifier(id) => out.push((id.span.start, id.span.end, id.name.to_string())),
             Expression::Binary(b) => {
                 collect_idents(&b.left, out);
                 collect_idents(&b.right, out);
@@ -843,7 +843,7 @@ fn validate_legacy_component_creation(
             }
             for spec in &d.specifiers {
                 if let ImportSpecifierKind::Default(s) = spec {
-                    default_svelte_imports.insert(s.local.name.clone());
+                    default_svelte_imports.insert(s.local.name.to_string());
                 }
             }
         }
@@ -858,7 +858,7 @@ fn validate_legacy_component_creation(
             continue;
         }
         let Expression::Identifier(id) = &n.callee else { continue };
-        if !default_svelte_imports.contains(&id.name) {
+        if !default_svelte_imports.contains(id.name.as_ref()) {
             continue;
         }
         let Argument::Expression(Expression::Object(obj)) = &n.arguments[0] else {
@@ -1160,14 +1160,14 @@ fn validate_store_rune_conflict(
                 }
                 match &d.id {
                     Pattern::Identifier(id) if id.name == stripped => {
-                        exempt.insert(id.name.clone());
+                        exempt.insert(id.name.to_string());
                     }
                     Pattern::Object(obj) if stripped == "props" => {
                         // Rest captures the whole $props() output — exempt.
                         for m in &obj.properties {
                             if let ObjectPatternMember::Rest(r) = m {
                                 if let Pattern::Identifier(id) = &r.argument {
-                                    exempt.insert(id.name.clone());
+                                    exempt.insert(id.name.to_string());
                                 }
                             }
                         }
@@ -1498,7 +1498,7 @@ fn validate_script_const_assignment(
                     _ => None,
                 };
                 if let Some(name) = target_name {
-                    if consts.contains(name) {
+                    if consts.contains(name.as_ref()) {
                         let span = match &a.left {
                             AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
                                 (id.span.start, id.span.end)
@@ -1517,7 +1517,7 @@ fn validate_script_const_assignment(
             }
             Expression::Update(u) => {
                 if let Expression::Identifier(id) = &u.argument {
-                    if consts.contains(&id.name) {
+                    if consts.contains(id.name.as_ref()) {
                         state.errors.push(errors::constant_assignment(
                             Some((id.span.start, id.span.end)),
                             "constant",
@@ -1646,7 +1646,7 @@ fn validate_runes(
                 Expression::Member(m) => {
                     let Expression::Identifier(obj) = &m.object else { return None };
                     let MemberProperty::Identifier(prop) = &m.property else { return None };
-                    let full: &'static str = match (obj.name.as_str(), prop.name.as_str()) {
+                    let full: &'static str = match (obj.name.as_ref(), prop.name.as_ref()) {
                         ("$state", "raw") => "$state.raw",
                         ("$state", "snapshot") => "$state.snapshot",
                         ("$derived", "by") => "$derived.by",
@@ -1666,7 +1666,7 @@ fn validate_runes(
             _ => return None,
         };
         let name: Option<&'static str> = if let Expression::Identifier(id) = e {
-            match id.name.as_str() {
+            match id.name.as_ref() {
                 "$state" => Some("$state"),
                 "$derived" => Some("$derived"),
                 "$props" => Some("$props"),
@@ -1678,7 +1678,7 @@ fn validate_runes(
             }
         } else if let Expression::Call(c) = e {
             if let Expression::Identifier(id) = &c.callee {
-                match id.name.as_str() {
+                match id.name.as_ref() {
                     "$state" => Some("$state"),
                     "$derived" => Some("$derived"),
                     "$props" => Some("$props"),
@@ -1817,7 +1817,7 @@ fn validate_runes(
         if let Expression::Identifier(id) = e {
             if id.name.starts_with('$')
                 && matches!(
-                    id.name.as_str(),
+                    id.name.as_ref(),
                     "$bindable" | "$props" | "$state" | "$derived" | "$effect" | "$host"
                 )
             {
@@ -2017,7 +2017,7 @@ fn validate_runes(
             }
             if let Statement::Function(f) = stmt {
                 if let Some(id) = &f.id {
-                    names.insert(id.name.clone());
+                    names.insert(id.name.to_string());
                 }
             }
             if let Statement::Import(d) = stmt {
@@ -2027,7 +2027,7 @@ fn validate_runes(
                         ImportSpecifierKind::Default(s) => &s.local.name,
                         ImportSpecifierKind::Namespace(s) => &s.local.name,
                     };
-                    names.insert(local.clone());
+                    names.insert(local.to_string());
                 }
             }
         }
@@ -2064,7 +2064,7 @@ fn validate_runes(
                     if let Expression::Call(c) = init {
                         if let Expression::Identifier(id) = &c.callee {
                             if matches!(
-                                id.name.as_str(),
+                                id.name.as_ref(),
                                 "$state" | "$derived"
                             ) {
                                 let span = match &d.id {
@@ -2148,7 +2148,7 @@ fn validate_runes(
                         &c.callee,
                         Expression::Identifier(callee) if callee.name == "$props"
                     )) {
-                        props_identifier_names.insert(id.name.clone());
+                        props_identifier_names.insert(id.name.to_string());
                     }
                 }
             }
@@ -2174,7 +2174,7 @@ fn check_props_member_access(
             if let (Expression::Identifier(obj), MemberProperty::Identifier(prop)) =
                 (&m.object, &m.property)
             {
-                if props_names.contains(&obj.name) && prop.name.starts_with("$$") {
+                if props_names.contains(obj.name.as_ref()) && prop.name.starts_with("$$") {
                     state.errors.push(errors::props_illegal_name(Some((
                         prop.span.start,
                         prop.span.end,
@@ -2237,12 +2237,12 @@ fn validate_module_exports(
             }
             Statement::Function(f) => {
                 if let Some(id) = &f.id {
-                    declared.insert(id.name.clone());
+                    declared.insert(id.name.to_string());
                 }
             }
             Statement::Class(c) => {
                 if let Some(id) = &c.id {
-                    declared.insert(id.name.clone());
+                    declared.insert(id.name.to_string());
                 }
             }
             Statement::Import(d) => {
@@ -2252,7 +2252,7 @@ fn validate_module_exports(
                         ImportSpecifierKind::Default(s) => &s.local,
                         ImportSpecifierKind::Namespace(s) => &s.local,
                     };
-                    declared.insert(local.name.clone());
+                    declared.insert(local.name.to_string());
                 }
             }
             Statement::ExportNamed(e) => {
@@ -2265,12 +2265,12 @@ fn validate_module_exports(
                         }
                         Statement::Function(f) => {
                             if let Some(id) = &f.id {
-                                declared.insert(id.name.clone());
+                                declared.insert(id.name.to_string());
                             }
                         }
                         Statement::Class(c) => {
                             if let Some(id) = &c.id {
-                                declared.insert(id.name.clone());
+                                declared.insert(id.name.to_string());
                             }
                         }
                         _ => {}
@@ -2289,7 +2289,7 @@ fn validate_module_exports(
     ) {
         for n in &fragment.nodes {
             if let FragmentChild::SnippetBlock(b) = n {
-                out.insert(b.expression.name.clone());
+                out.insert(b.expression.name.to_string());
             }
         }
     }
@@ -2303,8 +2303,8 @@ fn validate_module_exports(
         for spec in &e.specifiers {
             if let ModuleExportName::Identifier(local) = &spec.local {
                 let span = (local.span.start, local.span.end);
-                if !declared.contains(&local.name) {
-                    if snippet_names.contains(&local.name) {
+                if !declared.contains(local.name.as_ref()) {
+                    if snippet_names.contains(local.name.as_ref()) {
                         state.errors.push(errors::snippet_invalid_export(Some(span)));
                     } else {
                         state.errors.push(errors::export_undefined(
@@ -2332,7 +2332,7 @@ fn validate_module_store_subscription(
                 if id.name.starts_with('$')
                     && id.name.len() > 1
                     && !matches!(
-                        id.name.as_str(),
+                        id.name.as_ref(),
                         "$state" | "$derived" | "$props" | "$effect"
                             | "$host" | "$bindable" | "$inspect"
                     ) =>
@@ -2412,7 +2412,7 @@ fn validate_store_scoped_subscription(
                         ImportSpecifierKind::Default(s) => &s.local,
                         ImportSpecifierKind::Namespace(s) => &s.local,
                     };
-                    top_level.insert(local.name.clone());
+                    top_level.insert(local.name.to_string());
                 }
             }
             Statement::ExportNamed(e) => {
@@ -2438,7 +2438,7 @@ fn validate_store_scoped_subscription(
                 let stripped = &id.name[1..];
                 // Skip rune names.
                 if matches!(
-                    id.name.as_str(),
+                    id.name.as_ref(),
                     "$state" | "$derived" | "$props" | "$effect" | "$host" | "$bindable" | "$inspect"
                 ) {
                     return;
@@ -2481,7 +2481,7 @@ fn validate_store_scoped_subscription(
                         if id.name.starts_with('$') && id.name.len() > 1 {
                             let stripped = &id.name[1..];
                             let is_rune = matches!(
-                                id.name.as_str(),
+                                id.name.as_ref(),
                                 "$state" | "$derived" | "$props" | "$effect"
                                     | "$host" | "$bindable" | "$inspect"
                             );
@@ -2853,7 +2853,7 @@ fn validate_dollar_bindings(
                 // Skip rune names and declared bindings — only fire for
                 // truly-unresolved store-sub-style references.
                 let is_rune = matches!(
-                    id.name.as_str(),
+                    id.name.as_ref(),
                     "$state" | "$derived" | "$props" | "$effect" | "$host" | "$bindable" | "$inspect"
                 );
                 if !is_rune && !declared.contains(stripped) {
@@ -2887,12 +2887,12 @@ fn validate_dollar_bindings(
             }
             Statement::Function(f) => {
                 if let Some(id) = &f.id {
-                    declared.insert(id.name.clone());
+                    declared.insert(id.name.to_string());
                 }
             }
             Statement::Class(c) => {
                 if let Some(id) = &c.id {
-                    declared.insert(id.name.clone());
+                    declared.insert(id.name.to_string());
                 }
             }
             Statement::Import(d) => {
@@ -2902,7 +2902,7 @@ fn validate_dollar_bindings(
                         ImportSpecifierKind::Default(s) => &s.local,
                         ImportSpecifierKind::Namespace(s) => &s.local,
                     };
-                    declared.insert(local.name.clone());
+                    declared.insert(local.name.to_string());
                 }
             }
             Statement::ExportNamed(e) => {
@@ -3032,7 +3032,7 @@ fn check_default_expr(e: &svelte_js_ast::Expression, state: &mut ValidateState) 
     match e {
         Expression::Identifier(id)
             if matches!(
-                id.name.as_str(),
+                id.name.as_ref(),
                 "$state" | "$derived" | "$props" | "$effect" | "$host"
                     | "$bindable" | "$inspect"
             ) =>
@@ -3073,7 +3073,7 @@ fn check_props_destructure(pat: &svelte_js_ast::Pattern, state: &mut ValidateSta
                 for m in &obj.properties {
                     if let ObjectPatternMember::Property(prop) = m {
                         let key_name = match &prop.key {
-                            PropertyKey::Identifier(id) => Some(id.name.as_str()),
+                            PropertyKey::Identifier(id) => Some(id.name.as_ref()),
                             _ => None,
                         };
                         if let Some(name) = key_name {
@@ -3466,7 +3466,7 @@ fn validate_const_assignments(
                     _ => None,
                 };
                 if let Some(name) = target_name {
-                    if consts.contains(name) {
+                    if consts.contains(name.as_ref()) {
                         let span = match &a.left {
                             AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
                                 (id.span.start, id.span.end)
@@ -3485,7 +3485,7 @@ fn validate_const_assignments(
             }
             Expression::Update(u) => {
                 if let Expression::Identifier(id) = &u.argument {
-                    if consts.contains(&id.name) {
+                    if consts.contains(id.name.as_ref()) {
                         state.errors.push(errors::constant_assignment(
                             Some((id.span.start, id.span.end)),
                             "constant",
@@ -3583,7 +3583,7 @@ fn validate_const_assignments(
                 if let svelte_js_ast::Pattern::Identifier(id) = &d.id {
                     if let Some(init) = &d.init {
                         const_decls.push((
-                            id.name.clone(),
+                            id.name.to_string(),
                             init,
                             (t.start, t.end),
                         ));
@@ -3598,7 +3598,7 @@ fn validate_const_assignments(
     fn collect_idents(e: &svelte_js_ast::Expression, out: &mut Vec<String>) {
         use svelte_js_ast::*;
         match e {
-            Expression::Identifier(id) => out.push(id.name.clone()),
+            Expression::Identifier(id) => out.push(id.name.to_string()),
             Expression::Member(m) => collect_idents(&m.object, out),
             Expression::Binary(b) => {
                 collect_idents(&b.left, out);
@@ -3806,7 +3806,7 @@ fn validate_non_reactive_update(
                     }
                 }
             }
-            bindings.insert(id.name.clone(), (id.span.start, id.span.end));
+            bindings.insert(id.name.to_string(), (id.span.start, id.span.end));
         }
     }
     if bindings.is_empty() {
@@ -3857,7 +3857,7 @@ fn collect_dynamic_bind_this_names(
                         if let ElementAttribute::BindDirective(b) = a {
                             if b.name == "this" {
                                 if let svelte_js_ast::Expression::Identifier(id) = &b.expression {
-                                    out.insert(id.name.clone());
+                                    out.insert(id.name.to_string());
                                 }
                             }
                         }
@@ -3919,8 +3919,8 @@ fn collect_template_mutated_names(
             out: &mut std::collections::HashSet<String>,
         ) {
             if let Expression::Identifier(id) = e {
-                if candidates.contains(&id.name) {
-                    out.insert(id.name.clone());
+                if candidates.contains(id.name.as_ref()) {
+                    out.insert(id.name.to_string());
                 }
             }
         }
@@ -3928,8 +3928,8 @@ fn collect_template_mutated_names(
             Expression::Assignment(a) => {
                 match &a.left {
                     AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
-                        if candidates.contains(&id.name) {
-                            out.insert(id.name.clone());
+                        if candidates.contains(id.name.as_ref()) {
+                            out.insert(id.name.to_string());
                         }
                     }
                     AssignmentTarget::Expression(e) => note_lhs(e, candidates, out),
@@ -4078,8 +4078,8 @@ fn collect_template_ident_reads(
         use svelte_js_ast::*;
         match e {
             Expression::Identifier(id) => {
-                if candidates.contains(&id.name) {
-                    out.insert(id.name.clone());
+                if candidates.contains(id.name.as_ref()) {
+                    out.insert(id.name.to_string());
                 }
             }
             Expression::Member(m) => walk_expr(&m.object, candidates, out),
@@ -4269,7 +4269,7 @@ fn validate_state_referenced_locally(
     fn rune_call_name(e: &Expression) -> Option<&'static str> {
         let Expression::Call(c) = e else { return None };
         match &c.callee {
-            Expression::Identifier(id) => match id.name.as_str() {
+            Expression::Identifier(id) => match id.name.as_ref() {
                 "$state" => Some("$state"),
                 "$derived" => Some("$derived"),
                 "$props" => Some("$props"),
@@ -4279,7 +4279,7 @@ fn validate_state_referenced_locally(
             Expression::Member(m) => {
                 let Expression::Identifier(obj) = &m.object else { return None };
                 let MemberProperty::Identifier(prop) = &m.property else { return None };
-                match (obj.name.as_str(), prop.name.as_str()) {
+                match (obj.name.as_ref(), prop.name.as_ref()) {
                     ("$state", "raw") => Some("$state.raw"),
                     ("$derived", "by") => Some("$derived"),
                     _ => None,
@@ -4348,11 +4348,11 @@ fn validate_state_referenced_locally(
     ) {
         match e {
             Expression::Identifier(id) => {
-                if !is_lhs && bound.contains(&id.name) {
+                if !is_lhs && bound.contains(id.name.as_ref()) {
                     out.push((
                         id.span.start,
                         id.span.end,
-                        id.name.clone(),
+                        id.name.to_string(),
                         inside_state_call,
                     ));
                 }
@@ -4590,7 +4590,7 @@ fn validate_script_attributes(
     state: &mut ValidateState,
 ) {
     for a in attributes {
-        match a.name.as_str() {
+        match a.name.as_ref() {
             "lang" | "module" | "generics" => {}
             "context" => {
                 // `context="module"` deprecated in favor of `module`.
@@ -4632,12 +4632,12 @@ fn collect_instance_declared(root: &Root) -> std::collections::HashSet<String> {
             }
             Statement::Function(f) => {
                 if let Some(id) = &f.id {
-                    out.insert(id.name.clone());
+                    out.insert(id.name.to_string());
                 }
             }
             Statement::Class(c) => {
                 if let Some(id) = &c.id {
-                    out.insert(id.name.clone());
+                    out.insert(id.name.to_string());
                 }
             }
             Statement::Import(decl) => {
@@ -4647,7 +4647,7 @@ fn collect_instance_declared(root: &Root) -> std::collections::HashSet<String> {
                         ImportSpecifierKind::Default(s) => &s.local.name,
                         ImportSpecifierKind::Namespace(s) => &s.local.name,
                     };
-                    out.insert(name.clone());
+                    out.insert(name.to_string());
                 }
             }
             _ => {}
@@ -4672,8 +4672,8 @@ fn collect_mutated_names(
         out: &mut std::collections::HashSet<String>,
     ) {
         if let Expression::Identifier(id) = e {
-            if candidates.contains(&id.name) {
-                out.insert(id.name.clone());
+            if candidates.contains(id.name.as_ref()) {
+                out.insert(id.name.to_string());
             }
         }
     }
@@ -4683,8 +4683,8 @@ fn collect_mutated_names(
         out: &mut std::collections::HashSet<String>,
     ) {
         if let Pattern::Identifier(id) = p {
-            if candidates.contains(&id.name) {
-                out.insert(id.name.clone());
+            if candidates.contains(id.name.as_ref()) {
+                out.insert(id.name.to_string());
             }
         }
     }
@@ -4805,7 +4805,7 @@ fn collect_pattern_names(
     use svelte_js_ast::*;
     match pat {
         Pattern::Identifier(id) => {
-            out.insert(id.name.clone());
+            out.insert(id.name.to_string());
         }
         Pattern::Object(obj) => {
             for m in &obj.properties {
@@ -4842,7 +4842,7 @@ fn collect_imported_names(root: &Root) -> std::collections::HashSet<String> {
                         svelte_js_ast::ImportSpecifierKind::Default(s) => &s.local.name,
                         svelte_js_ast::ImportSpecifierKind::Namespace(s) => &s.local.name,
                     };
-                    out.insert(name.clone());
+                    out.insert(name.to_string());
                 }
             }
         }
@@ -5193,7 +5193,7 @@ fn visit_fragment<'a>(fragment: &'a Fragment, state: &mut ValidateState<'a>) {
         if !const_names.is_empty() {
             for n in &fragment.nodes {
                 if let FragmentChild::SnippetBlock(sb) = n {
-                    let snippet_name = sb.expression.name.as_str();
+                    let snippet_name = sb.expression.name.as_ref();
                     let is_boundary_capture = matches!(
                         state.path.last(),
                         Some(FragmentChild::SvelteBoundary(_))
@@ -5261,7 +5261,7 @@ fn declared_const_names(t: &svelte_ast::ConstTag) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for d in &t.declaration.declarations {
         if let Pattern::Identifier(id) = &d.id {
-            out.push(id.name.clone());
+            out.push(id.name.to_string());
         }
     }
     if out.is_empty() { None } else { Some(out) }
@@ -5458,7 +5458,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                         if matches!(
                             &m.property,
                             svelte_js_ast::MemberProperty::Identifier(id)
-                                if matches!(id.name.as_str(), "apply" | "call" | "bind")
+                                if matches!(id.name.as_ref(), "apply" | "call" | "bind")
                         )
                 )
             );
@@ -5489,7 +5489,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
                 .rev()
                 .skip(1) // skip the element itself, which is the last entry
                 .find_map(|n| match n {
-                    FragmentChild::RegularElement(p) => Some(p.name.as_str()),
+                    FragmentChild::RegularElement(p) => Some(p.name.as_ref()),
                     _ => None,
                 });
             state
@@ -5500,7 +5500,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             // the only fixture in the suite. Fires as a WARNING when nested
             // inside an IfBlock / EachBlock / AwaitBlock / KeyBlock; as an
             // ERROR otherwise (mirrors RegularElement.js:160-201).
-            if matches!(el.name.as_str(), "form") {
+            if matches!(el.name.as_ref(), "form") {
                 let mut only_warn = false;
                 let mut nested_in_form = false;
                 for n in state.path.iter().rev().skip(1) {
@@ -6457,7 +6457,7 @@ fn visit_svelte_boundary<'a>(
 ) {
     const VALID: &[&str] = &["onerror", "failed", "pending"];
     for a in &el.attributes {
-        let name_ok = matches!(a, ElementAttribute::Attribute(x) if VALID.contains(&x.name.as_str()));
+        let name_ok = matches!(a, ElementAttribute::Attribute(x) if VALID.contains(&x.name.as_ref()));
         if !name_ok {
             if let Some(span) = attr_span(a) {
                 state
@@ -6540,7 +6540,7 @@ fn visit_attribute(attr: &svelte_ast::Attribute, state: &mut ValidateState) {
     // `xlink:*` (valid for SVG). Anything else fires.
     if attr.name.contains(':') && !is_svelte_directive_prefix(&attr.name) {
         let allowed = matches!(
-            attr.name.as_str(),
+            attr.name.as_ref(),
             "xmlns" | "xml:lang" | "xml:space" | "xml:base" | "xml:id"
         ) || attr.name.starts_with("xmlns:")
             || attr.name.starts_with("xlink:");
@@ -6659,7 +6659,7 @@ fn visit_bind_directive(
     // upstream: RegularElement / SvelteElement / SvelteWindow /
     // SvelteDocument / SvelteBody).
     let parent_name: Option<&str> = match parent {
-        FragmentChild::RegularElement(el) => Some(el.name.as_str()),
+        FragmentChild::RegularElement(el) => Some(el.name.as_ref()),
         FragmentChild::SvelteElement(_) => {
             // Dynamic element. Only `bind:this` is always-valid; everything
             // else is target-dependent and we can't validate at compile-time.
@@ -6887,7 +6887,7 @@ fn visit_import_declaration(
     if !state.is_runes {
         return;
     }
-    let source = d.source.value.as_str();
+    let source = d.source.value.as_ref();
     let start = d.span.start;
     let end = d.span.end;
     if source.starts_with("svelte/internal") {
@@ -6900,8 +6900,8 @@ fn visit_import_declaration(
         for spec in &d.specifiers {
             if let svelte_js_ast::ImportSpecifierKind::Named(s) = spec {
                 let imp_name = match &s.imported {
-                    svelte_js_ast::ModuleExportName::Identifier(i) => i.name.as_str(),
-                    svelte_js_ast::ModuleExportName::String(s) => s.value.as_str(),
+                    svelte_js_ast::ModuleExportName::Identifier(i) => i.name.as_ref(),
+                    svelte_js_ast::ModuleExportName::String(s) => s.value.as_ref(),
                 };
                 if imp_name == "beforeUpdate" || imp_name == "afterUpdate" {
                     state.errors.push(errors::runes_mode_invalid_import(

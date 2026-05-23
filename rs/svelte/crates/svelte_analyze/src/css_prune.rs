@@ -418,7 +418,7 @@ fn is_only_global_pseudo(rel: &RelativeSelector) -> bool {
                 || p.name == "root"
                 || p.name == "host"
                 || matches!(
-                    p.name.as_str(),
+                    p.name.as_ref(),
                     "hover"
                         | "active"
                         | "focus"
@@ -545,7 +545,7 @@ fn apply_combinator<'a>(
         return true;
     };
 
-    match combinator.name.as_str() {
+    match combinator.name.as_ref() {
         " " | ">" => {
             let is_adjacent = combinator.name == ">";
             let parents = match direction {
@@ -724,7 +724,7 @@ fn is_global_for_prune(
 /// most pseudo classes (`:hover`, `:root`, etc.) and `:has`/`:is`/`:where`/
 /// `:not` whose args are all global.
 fn is_unscoped_pseudo_class(p: &PseudoClassSelector) -> bool {
-    let scoped = matches!(p.name.as_str(), "has" | "is" | "where")
+    let scoped = matches!(p.name.as_ref(), "has" | "is" | "where")
         || (p.name == "not"
             && p.args
                 .as_ref()

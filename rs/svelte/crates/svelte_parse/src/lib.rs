@@ -14,6 +14,8 @@ pub mod parser;
 pub mod state;
 pub mod utils;
 
+use std::borrow::Cow;
+
 use svelte_ast::{
     Fragment, FragmentChild, JsComment, JsCommentKind, Position, Root, SourceLocation,
 };

@@ -14,6 +14,7 @@
 use oxc_ast::ast as oxc;
 use oxc_span::GetSpan;
 use svelte_js_ast::*;
+use std::borrow::Cow;
 
 // -------------------------------------------------------------------------
 // Span shifting
@@ -519,8 +520,8 @@ fn module_export_name(
 ) -> ModuleExportName {
     use oxc::ModuleExportName as M;
     match m {
-        M::IdentifierName(n) => ModuleExportName::Identifier(ident_from_name(n.name.as_str(), n.span, shift)),
-        M::IdentifierReference(r) => ModuleExportName::Identifier(ident_from_name(r.name.as_str(), r.span, shift)),
+        M::IdentifierName(n) => ModuleExportName::Identifier(ident_from_name(n.name.as_ref(), n.span, shift)),
+        M::IdentifierReference(r) => ModuleExportName::Identifier(ident_from_name(r.name.as_ref(), r.span, shift)),
         M::StringLiteral(s) => ModuleExportName::String(string_literal(s, shift)),
     }
 }
@@ -553,10 +554,10 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         }))),
         E::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
         E::TemplateLiteral(t) => Expression::Template(Box::new(template_literal(t, shift))),
-        E::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
+        E::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         E::MetaProperty(m) => Expression::Meta(Box::new(MetaProperty {
-            meta: ident_from_name(m.meta.name.as_str(), m.meta.span, shift),
-            property: ident_from_name(m.property.name.as_str(), m.property.span, shift),
+            meta: ident_from_name(m.meta.name.as_ref(), m.meta.span, shift),
+            property: ident_from_name(m.property.name.as_ref(), m.property.span, shift),
             span: span_of(m.span, shift),
         })),
         E::Super(s) => Expression::Super(span_of(s.span, shift)),
@@ -593,8 +594,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                         Some(oxc::Statement::ExpressionStatement(es)) => {
                             expression(&es.expression, shift)
                         }
-                        _ => Expression::Identifier(Identifier {
-                            name: String::new(),
+                        _ => Expression::Identifier(Identifier { name: Cow::Borrowed(""),
                             span: Span::ZERO,
                         }),
                     };
@@ -648,7 +648,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                 Expression::Member(Box::new(MemberExpression {
                     object: expression(&m.object, shift),
                     property: MemberProperty::Identifier(ident_from_name(
-                        m.property.name.as_str(),
+                        m.property.name.as_ref(),
                         m.property.span,
                         shift,
                     )),
@@ -661,7 +661,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                 Expression::Member(Box::new(MemberExpression {
                     object: expression(&m.object, shift),
                     property: MemberProperty::Private(PrivateIdentifier {
-                        name: m.field.name.as_str().into(),
+                        name: Cow::Owned(m.field.name.as_ref().to_string()),
                         span: span_of(m.field.span, shift),
                     }),
                     computed: false,
@@ -767,7 +767,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::PrivateInExpression(p) => Expression::Binary(Box::new(BinaryExpression {
             left: Expression::Identifier(Identifier {
-                name: format!("#{}", p.left.name.as_str()),
+                name: Cow::Owned(format!("#{}", p.left.name.as_ref())),
                 span: span_of(p.left.span, shift),
             }),
             operator: BinaryOperator::In,
@@ -785,7 +785,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::StaticMemberExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Identifier(ident_from_name(
-                m.property.name.as_str(),
+                m.property.name.as_ref(),
                 m.property.span,
                 shift,
             )),
@@ -796,7 +796,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::PrivateFieldExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Private(PrivateIdentifier {
-                name: m.field.name.as_str().into(),
+                name: Cow::Owned(m.field.name.as_ref().to_string()),
                 span: span_of(m.field.span, shift),
             }),
             computed: false,
@@ -822,7 +822,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::TSInstantiationExpression(t) => expression(&t.expression, shift),
 
         E::V8IntrinsicExpression(v) => Expression::Identifier(Identifier {
-            name: format!("%{}", v.name.name.as_str()),
+            name: Cow::Owned(format!("%{}", v.name.name.as_ref())),
             span: span_of(v.span, shift),
         }),
     }
@@ -844,7 +844,7 @@ fn expression_from_for_init(init: &oxc::ForStatementInit<'_>, shift: Shift) -> E
             span: span_of(n.span, shift),
         }))),
         F::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
-        F::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
+        F::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         F::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
             arguments: c.arguments.iter().map(|a| argument(a, shift)).collect(),
@@ -875,7 +875,7 @@ fn expression_from_for_left(left: &oxc::ForStatementLeft<'_>, shift: Shift) -> E
         // ForStatementLeft inherits from AssignmentTarget — most variants are
         // member/identifier-flavored targets.
         L::AssignmentTargetIdentifier(i) => {
-            Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift))
+            Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift))
         }
         L::ComputedMemberExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
@@ -887,7 +887,7 @@ fn expression_from_for_left(left: &oxc::ForStatementLeft<'_>, shift: Shift) -> E
         L::StaticMemberExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Identifier(ident_from_name(
-                m.property.name.as_str(),
+                m.property.name.as_ref(),
                 m.property.span,
                 shift,
             )),
@@ -929,7 +929,7 @@ fn expression_from_default_kind(
             span: span_of(n.span, shift),
         }))),
         K::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
-        K::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
+        K::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         K::ArrayExpression(a) => Expression::Array(Box::new(ArrayExpression {
             elements: {
                 let mut elements = Vec::with_capacity(a.elements.len());
@@ -990,7 +990,7 @@ fn expression_from_simple_target(
     use oxc::SimpleAssignmentTarget as T;
     match t {
         T::AssignmentTargetIdentifier(i) => {
-            Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift))
+            Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift))
         }
         T::ComputedMemberExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
@@ -1002,7 +1002,7 @@ fn expression_from_simple_target(
         T::StaticMemberExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Identifier(ident_from_name(
-                m.property.name.as_str(),
+                m.property.name.as_ref(),
                 m.property.span,
                 shift,
             )),
@@ -1013,7 +1013,7 @@ fn expression_from_simple_target(
         T::PrivateFieldExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Private(PrivateIdentifier {
-                name: m.field.name.as_str().into(),
+                name: Cow::Owned(m.field.name.as_ref().to_string()),
                 span: span_of(m.field.span, shift),
             }),
             computed: false,
@@ -1096,25 +1096,25 @@ fn formal_param_pattern(p: &oxc::FormalParameter<'_>, shift: Shift) -> Pattern {
 
 fn binding_identifier(b: &oxc::BindingIdentifier<'_>, shift: Shift) -> Identifier {
     Identifier {
-        name: b.name.as_str().into(),
+        name: Cow::Owned(b.name.as_ref().to_string()),
         span: span_of(b.span, shift),
     }
 }
 
 fn ident_from_name(name: &str, sp: oxc_span::Span, shift: Shift) -> Identifier {
-    Identifier { name: name.into(), span: span_of(sp, shift) }
+    Identifier { name: Cow::Owned(name.to_string()), span: span_of(sp, shift) }
 }
 
 fn ident_from_label(name: &str, sp: oxc_span::Span, shift: Shift) -> Identifier {
-    Identifier { name: name.into(), span: span_of(sp, shift) }
+    Identifier { name: Cow::Owned(name.to_string()), span: span_of(sp, shift) }
 }
 
 fn property_key(k: &oxc::PropertyKey<'_>, shift: Shift) -> PropertyKey {
     use oxc::PropertyKey as K;
     match k {
-        K::StaticIdentifier(n) => PropertyKey::Identifier(ident_from_name(n.name.as_str(), n.span, shift)),
+        K::StaticIdentifier(n) => PropertyKey::Identifier(ident_from_name(n.name.as_ref(), n.span, shift)),
         K::PrivateIdentifier(p) => PropertyKey::Private(PrivateIdentifier {
-            name: p.name.as_str().into(),
+            name: Cow::Owned(p.name.as_ref().to_string()),
             span: span_of(p.span, shift),
         }),
         // The Expression-inherited variants — convert via expression().
@@ -1131,7 +1131,7 @@ fn property_key_as_expr(k: &oxc::PropertyKey<'_>, shift: Shift) -> Expression {
     use oxc::PropertyKey as K;
     match k {
         K::StaticIdentifier(_) | K::PrivateIdentifier(_) => unreachable!(),
-        K::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
+        K::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         K::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
         K::NumericLiteral(n) => Expression::Literal(Box::new(Literal::Number(NumberLiteral {
             value: n.value,
@@ -1149,8 +1149,8 @@ fn property_key_as_expr(k: &oxc::PropertyKey<'_>, shift: Shift) -> Expression {
 
 fn string_literal(s: &oxc::StringLiteral<'_>, shift: Shift) -> StringLiteral {
     StringLiteral {
-        value: s.value.as_str().into(),
-        raw: s.raw.as_ref().map(|r| r.as_str().into()),
+        value: Cow::Owned(s.value.as_ref().to_string()),
+        raw: s.raw.as_ref().map(|r| r.as_str().to_string()),
         span: span_of(s.span, shift),
     }
 }
@@ -1236,7 +1236,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
             span: span_of(n.span, shift),
         }))),
         A::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
-        A::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_str(), i.span, shift)),
+        A::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         A::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
             arguments: c.arguments.iter().map(|a| argument(a, shift)).collect(),
@@ -1289,7 +1289,7 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
     use oxc::AssignmentTarget as T;
     match t {
         T::AssignmentTargetIdentifier(i) => AssignmentTarget::Pattern(Pattern::Identifier(
-            ident_from_name(i.name.as_str(), i.span, shift),
+            ident_from_name(i.name.as_ref(), i.span, shift),
         )),
         T::ComputedMemberExpression(m) => AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
@@ -1301,7 +1301,7 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
         T::StaticMemberExpression(m) => AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Identifier(ident_from_name(
-                m.property.name.as_str(),
+                m.property.name.as_ref(),
                 m.property.span,
                 shift,
             )),
@@ -1312,7 +1312,7 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
         T::PrivateFieldExpression(m) => AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Private(PrivateIdentifier {
-                name: m.field.name.as_str().into(),
+                name: Cow::Owned(m.field.name.as_ref().to_string()),
                 span: span_of(m.field.span, shift),
             }),
             computed: false,
@@ -1363,14 +1363,14 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
                         oxc::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
                             ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
                                 key: PropertyKey::Identifier(ident_from_name(
-                                    id.binding.name.as_str(),
+                                    id.binding.name.as_ref(),
                                     id.binding.span,
                                     shift,
                                 )),
                                 value: match &id.init {
                                     Some(init) => Pattern::Assignment(Box::new(AssignmentPattern {
                                         left: Pattern::Identifier(ident_from_name(
-                                            id.binding.name.as_str(),
+                                            id.binding.name.as_ref(),
                                             id.binding.span,
                                             shift,
                                         )),
@@ -1378,7 +1378,7 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
                                         span: span_of(id.span, shift),
                                     })),
                                     None => Pattern::Identifier(ident_from_name(
-                                        id.binding.name.as_str(),
+                                        id.binding.name.as_ref(),
                                         id.binding.span,
                                         shift,
                                     )),
@@ -1444,7 +1444,7 @@ fn assignment_target_maybe_default_to_pattern(
             span: span_of(w.span, shift),
         })),
         M::AssignmentTargetIdentifier(i) => {
-            Pattern::Identifier(ident_from_name(i.name.as_str(), i.span, shift))
+            Pattern::Identifier(ident_from_name(i.name.as_ref(), i.span, shift))
         }
         M::ComputedMemberExpression(m) => Pattern::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
@@ -1456,7 +1456,7 @@ fn assignment_target_maybe_default_to_pattern(
         M::StaticMemberExpression(m) => Pattern::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
             property: MemberProperty::Identifier(ident_from_name(
-                m.property.name.as_str(),
+                m.property.name.as_ref(),
                 m.property.span,
                 shift,
             )),

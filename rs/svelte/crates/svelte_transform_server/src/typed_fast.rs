@@ -16,6 +16,7 @@ use svelte_ast::root::Root;
 use svelte_ast::fragment::{Fragment, FragmentChild};
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
+use std::borrow::Cow;
 
 /// Try to lower `root` end-to-end via the typed path. Returns `None` for
 /// shapes that need the legacy/Value path (any script, dynamic content,
@@ -48,7 +49,7 @@ pub fn try_typed_server_with(
 
     let func = ExportDefault::Function(Box::new(FunctionDeclaration {
         id: Some(Identifier {
-            name: component_name.to_string(),
+            name: Cow::Owned(component_name.to_string()),
             span: Span::ZERO,
         }),
         params: vec![t::pat_id("$$renderer")],

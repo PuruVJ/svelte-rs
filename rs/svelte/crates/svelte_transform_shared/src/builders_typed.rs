@@ -7,25 +7,41 @@
 //! Visitors that mix typed and Value during migration use `to_value` (TBD)
 //! or `from_value` adapters at the boundary.
 
+use std::borrow::Cow;
+
 use svelte_js_ast::*;
 
-pub fn id(name: &str) -> Expression {
+pub fn id(name: &'static str) -> Expression {
     Expression::Identifier(Identifier {
-        name: name.to_string(),
+        name: Cow::Borrowed(name),
         span: Span::ZERO,
     })
 }
 
-pub fn id_with_span(name: &str, span: Span) -> Expression {
+pub fn id_owned(name: String) -> Expression {
     Expression::Identifier(Identifier {
-        name: name.to_string(),
+        name: Cow::Owned(name),
+        span: Span::ZERO,
+    })
+}
+
+pub fn id_with_span(name: &'static str, span: Span) -> Expression {
+    Expression::Identifier(Identifier {
+        name: Cow::Borrowed(name),
         span,
     })
 }
 
-pub fn pat_id(name: &str) -> Pattern {
+pub fn pat_id(name: &'static str) -> Pattern {
     Pattern::Identifier(Identifier {
-        name: name.to_string(),
+        name: Cow::Borrowed(name),
+        span: Span::ZERO,
+    })
+}
+
+pub fn pat_id_owned(name: String) -> Pattern {
+    Pattern::Identifier(Identifier {
+        name: Cow::Owned(name),
         span: Span::ZERO,
     })
 }
@@ -54,9 +70,17 @@ pub fn pat_id_renderer() -> Pattern {
     pat_id("$$renderer")
 }
 
-pub fn literal_str(value: &str) -> Expression {
+pub fn literal_str(value: &'static str) -> Expression {
     Expression::Literal(Box::new(Literal::String(StringLiteral {
-        value: value.to_string(),
+        value: Cow::Borrowed(value),
+        raw: None,
+        span: Span::ZERO,
+    })))
+}
+
+pub fn literal_str_owned(value: String) -> Expression {
+    Expression::Literal(Box::new(Literal::String(StringLiteral {
+        value: Cow::Owned(value),
         raw: None,
         span: Span::ZERO,
     })))
@@ -156,7 +180,7 @@ pub fn object(properties: Vec<ObjectMember>) -> Expression {
 pub fn init(name: &str, value: Expression) -> ObjectMember {
     ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: name.to_string(),
+            name: Cow::Owned(name.to_string()),
             span: Span::ZERO,
         }),
         value,
@@ -204,14 +228,14 @@ pub fn call(callee: Expression, args: Vec<Expression>) -> Expression {
 }
 
 pub fn call_id(name: &str, args: Vec<Expression>) -> Expression {
-    call(id(name), args)
+    call(id_owned(name.to_string()), args)
 }
 
 pub fn member_id(object: Expression, property: &str) -> Expression {
     Expression::Member(Box::new(MemberExpression {
         object,
         property: MemberProperty::Identifier(Identifier {
-            name: property.to_string(),
+            name: Cow::Owned(property.to_string()),
             span: Span::ZERO,
         }),
         computed: false,
@@ -234,7 +258,7 @@ pub fn var(name: &str, init: Expression) -> Statement {
     Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Var,
         declarations: vec![VariableDeclarator {
-            id: pat_id(name),
+            id: pat_id_owned(name.to_string()),
             init: Some(init),
             type_annotation: None,
             span: Span::ZERO,
@@ -247,7 +271,7 @@ pub fn let_decl(name: &str, init: Option<Expression>) -> Statement {
     Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Let,
         declarations: vec![VariableDeclarator {
-            id: pat_id(name),
+            id: pat_id_owned(name.to_string()),
             init,
             type_annotation: None,
             span: Span::ZERO,
@@ -260,7 +284,7 @@ pub fn const_decl(name: &str, init: Expression) -> Statement {
     Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Const,
         declarations: vec![VariableDeclarator {
-            id: pat_id(name),
+            id: pat_id_owned(name.to_string()),
             init: Some(init),
             type_annotation: None,
             span: Span::ZERO,
@@ -276,7 +300,7 @@ pub fn function_decl(
 ) -> Statement {
     Statement::Function(Box::new(FunctionDeclaration {
         id: Some(Identifier {
-            name: name.to_string(),
+            name: Cow::Owned(name.to_string()),
             span: Span::ZERO,
         }),
         params,
@@ -299,7 +323,7 @@ pub fn export_default_function(
     Statement::ExportDefault(Box::new(ExportDefaultDeclaration {
         declaration: ExportDefault::Function(Box::new(FunctionDeclaration {
             id: Some(Identifier {
-                name: name.to_string(),
+                name: Cow::Owned(name.to_string()),
                 span: Span::ZERO,
             }),
             params,
@@ -321,7 +345,7 @@ pub fn import_side_effect(source: &str) -> Statement {
     Statement::Import(Box::new(ImportDeclaration {
         specifiers: Vec::new(),
         source: StringLiteral {
-            value: source.to_string(),
+            value: Cow::Owned(source.to_string()),
             raw: None,
             span: Span::ZERO,
         },
@@ -335,13 +359,13 @@ pub fn import_namespace(local: &str, source: &str) -> Statement {
     Statement::Import(Box::new(ImportDeclaration {
         specifiers: vec![ImportSpecifierKind::Namespace(ImportNamespaceSpecifier {
             local: Identifier {
-                name: local.to_string(),
+                name: Cow::Owned(local.to_string()),
                 span: Span::ZERO,
             },
             span: Span::ZERO,
         })],
         source: StringLiteral {
-            value: source.to_string(),
+            value: Cow::Owned(source.to_string()),
             raw: None,
             span: Span::ZERO,
         },
@@ -355,13 +379,13 @@ pub fn import_default(local: &str, source: &str) -> Statement {
     Statement::Import(Box::new(ImportDeclaration {
         specifiers: vec![ImportSpecifierKind::Default(ImportDefaultSpecifier {
             local: Identifier {
-                name: local.to_string(),
+                name: Cow::Owned(local.to_string()),
                 span: Span::ZERO,
             },
             span: Span::ZERO,
         })],
         source: StringLiteral {
-            value: source.to_string(),
+            value: Cow::Owned(source.to_string()),
             raw: None,
             span: Span::ZERO,
         },

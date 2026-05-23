@@ -495,7 +495,7 @@ fn analyze_relative_selector(rel: &RelativeSelector, a: &mut CssAnalysis) {
                 }
                 SimpleSelector::PseudoElementSelector(p)
                     if matches!(
-                        p.name.as_str(),
+                        p.name.as_ref(),
                         "view-transition"
                             | "view-transition-group"
                             | "view-transition-old"
@@ -664,7 +664,7 @@ fn is_unscoped_pseudo_class(s: &SimpleSelector) -> bool {
     };
     // First branch: non-scoping pseudo (`:hover`, `:focus`, etc.) — always
     // unscoped. For `:not`, args must be single-relative-selector form.
-    let is_non_scoping = !matches!(p.name.as_str(), "has" | "is" | "where")
+    let is_non_scoping = !matches!(p.name.as_ref(), "has" | "is" | "where")
         && (p.name != "not"
             || p.args.is_none()
             || p.args

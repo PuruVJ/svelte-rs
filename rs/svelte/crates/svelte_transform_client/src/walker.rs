@@ -18,6 +18,7 @@
 //! take over, currently surfacing as `typed_client_unsupported`.
 
 use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
 
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
 use svelte_ast::elements::{Component, RegularElement};
@@ -201,7 +202,7 @@ fn emit_svelte_head_program(
             left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
                 object: t::member_id(t::id_dollar(), "document"),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "title".to_string(),
+                    name: Cow::Borrowed("title"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -210,7 +211,7 @@ fn emit_svelte_head_program(
             }))),
             operator: AssignmentOperator::Assign,
             right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: tx.clone(),
+                value: Cow::Owned(tx.clone()),
                 raw: Some(format!("'{}'", tx.replace('\'', "\\'"))),
                 span: Span::ZERO,
             }))),
@@ -257,7 +258,7 @@ fn emit_svelte_head_program(
         t::member_id(t::id_dollar(), "head"),
         vec![
             Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: hash_val,
+                value: Cow::Owned(hash_val),
                 raw: None,
                 span: Span::ZERO,
             }))),
@@ -267,7 +268,7 @@ fn emit_svelte_head_program(
     if let Some(c) = body_component {
         // Bare Component: `Comp($$anchor, {})`.
         func_body.push(t::stmt(t::call(
-            t::id(&c.name),
+            t::id_owned(c.name.to_string()),
             vec![
                 t::id_anchor(),
                 Expression::Object(Box::new(ObjectExpression {
@@ -279,7 +280,7 @@ fn emit_svelte_head_program(
     } else {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id_anchor(), t::id(&body_tag)],
+            vec![t::id_anchor(), t::id_owned(body_tag.to_string())],
         )));
     }
 
@@ -423,7 +424,7 @@ fn emit_head_if_block_program(
                     let offset = ((i - prev_slot_pos) * 2) as f64;
                     t::call(
                         t::member_id(t::id_dollar(), "sibling"),
-                        vec![t::id(prev), t::lit_number(offset)],
+                        vec![t::id_owned(prev.to_string()), t::lit_number(offset)],
                     )
                 } else {
                     t::call(
@@ -441,7 +442,7 @@ fn emit_head_if_block_program(
                 }));
                 cons_body.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "html"),
-                    vec![t::id(&var_name), html_arrow],
+                    vec![t::id_owned(var_name.to_string()), html_arrow],
                 )));
                 prev_node_var = Some(var_name);
                 prev_slot_pos = i;
@@ -457,7 +458,7 @@ fn emit_head_if_block_program(
                     let offset = ((i - prev_slot_pos) * 2) as f64;
                     t::call(
                         t::member_id(t::id_dollar(), "sibling"),
-                        vec![t::id(prev), t::lit_number(offset)],
+                        vec![t::id_owned(prev.to_string()), t::lit_number(offset)],
                     )
                 } else {
                     t::call(
@@ -467,9 +468,9 @@ fn emit_head_if_block_program(
                 };
                 cons_body.push(t::var(&var_name, init));
                 cons_body.push(t::stmt(t::call(
-                    t::id(&c.name),
+                    t::id_owned(c.name.to_string()),
                     vec![
-                        t::id(&var_name),
+                        t::id_owned(var_name.to_string()),
                         Expression::Object(Box::new(ObjectExpression {
                             properties: Vec::new(),
                             span: Span::ZERO,
@@ -566,7 +567,7 @@ fn emit_head_if_block_program(
         t::member_id(t::id_dollar(), "head"),
         vec![
             Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: hash_val,
+                value: Cow::Owned(hash_val),
                 raw: None,
                 span: Span::ZERO,
             }))),
@@ -574,7 +575,7 @@ fn emit_head_if_block_program(
         ],
     )));
     func_body.push(t::stmt(t::call(
-        t::id(&body_component.name),
+        t::id_owned(body_component.name.to_string()),
         vec![
             t::id_anchor(),
             Expression::Object(Box::new(ObjectExpression {
@@ -694,14 +695,14 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     func_body.push(t::var(&outer_var, t::call(t::id("root"), Vec::new())));
     func_body.push(t::var(
         &inner_var,
-        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&outer_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(outer_var.to_string())]),
     ));
     func_body.push(t::var(
         "text",
         t::call(
             t::member_id(t::id_dollar(), "child"),
             vec![
-                t::id(&inner_var),
+                t::id_owned(inner_var.to_string()),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                     value: true,
                     span: Span::ZERO,
@@ -711,14 +712,14 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     ));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&inner_var)],
+        vec![t::id_owned(inner_var.to_string())],
     )));
     func_body.push(t::var(
         "text_1",
         t::call(
             t::member_id(t::id_dollar(), "sibling"),
             vec![
-                t::id(&inner_var),
+                t::id_owned(inner_var.to_string()),
                 t::lit_number(1.0),
                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                     value: true,
@@ -729,7 +730,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     ));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&outer_var)],
+        vec![t::id_owned(outer_var.to_string())],
     )));
     // Combined template_effect.
     let set_text_inner = t::stmt(t::call(
@@ -756,7 +757,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&outer_var)],
+        vec![t::id_anchor(), t::id_owned(outer_var.to_string())],
     )));
 
     let mut params = vec![t::pat_id_anchor()];
@@ -913,7 +914,7 @@ fn emit_select_with_rich_options_static(
             t::call(t::member_id(t::id_dollar(), "child"), vec![t::id("select")])
         } else {
             let prev = if i == 1 { "option".to_string() } else { format!("option_{}", i - 1) };
-            t::call(t::member_id(t::id_dollar(), "sibling"), vec![t::id(&prev)])
+            t::call(t::member_id(t::id_dollar(), "sibling"), vec![t::id_owned(prev.to_string())])
         };
         func_body.push(t::var(&var_name, init));
         if info.rich_html.is_some() {
@@ -937,13 +938,13 @@ fn emit_select_with_rich_options_static(
             let arrow_body = vec![
                 t::var(
                     &anchor_name,
-                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&var_name)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(var_name.to_string())]),
                 ),
-                t::var(&fragment_name, t::call(t::id(&template_name), Vec::new())),
+                t::var(&fragment_name, t::call(t::id_owned(template_name.to_string()), Vec::new())),
                 t::stmt(t::call(t::member_id(t::id_dollar(), "next"), Vec::new())),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "append"),
-                    vec![t::id(&anchor_name), t::id(&fragment_name)],
+                    vec![t::id_owned(anchor_name.to_string()), t::id_owned(fragment_name.to_string())],
                 )),
             ];
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -958,21 +959,21 @@ fn emit_select_with_rich_options_static(
             }));
             func_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "customizable_select"),
-                vec![t::id(&var_name), arrow],
+                vec![t::id_owned(var_name.to_string()), arrow],
             )));
         }
         // option_N.value = option_N.__value = 'X';
         if let Some(value) = &info.value {
             let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: value.clone(),
+                value: Cow::Owned(value.clone()),
                 raw: Some(format!("'{}'", value.replace('\'', "\\'"))),
                 span: Span::ZERO,
             })));
             let inner_assign = Expression::Assignment(Box::new(AssignmentExpression {
                 left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                    object: t::id(&var_name),
+                    object: t::id_owned(var_name.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "__value".to_string(),
+                        name: Cow::Borrowed("__value"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -985,9 +986,9 @@ fn emit_select_with_rich_options_static(
             }));
             let outer_assign = Expression::Assignment(Box::new(AssignmentExpression {
                 left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                    object: t::id(&var_name),
+                    object: t::id_owned(var_name.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "value".to_string(),
+                        name: Cow::Borrowed("value"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -1091,7 +1092,7 @@ fn emit_rich_select_program(
             FragmentChild::Text(t) if t.data.trim().is_empty() => {}
             FragmentChild::Comment(_) => {}
             FragmentChild::SvelteOptions(_) => {}
-            FragmentChild::SnippetBlock(sb) => snippet_names.push(sb.expression.name.clone()),
+            FragmentChild::SnippetBlock(sb) => snippet_names.push(sb.expression.name.to_string()),
             FragmentChild::RegularElement(el) if el.name == "select" => select_count += 1,
             _ => return None,
         }
@@ -1820,7 +1821,7 @@ fn emit_boundary_pending_attribute_program(
             t::call(
                 t::member_id(t::id_dollar(), "text"),
                 vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
-                    value: snippet_text.clone(),
+                    value: Cow::Owned(snippet_text.clone()),
                     raw: Some(format!("'{}'", snippet_text.replace('\'', "\\'"))),
                     span: Span::ZERO,
                 })))],
@@ -1951,7 +1952,7 @@ fn emit_boundary_pending_attribute_program(
         t::member_id(t::id_dollar(), "set_text"),
         vec![
             t::id("text_1"),
-            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&const_name)]),
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(const_name.to_string())]),
         ],
     );
     let effect_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -1998,7 +1999,7 @@ fn emit_boundary_pending_attribute_program(
 
     // Props object with getter accessor for the snippet prop.
     let getter_body = vec![Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
-        argument: Some(t::id(&snippet_name)),
+        argument: Some(t::id_owned(snippet_name.to_string())),
         span: Span::ZERO,
     }))];
     let getter_method = ObjectMember::Property(Box::new(Property {
@@ -2147,9 +2148,9 @@ fn emit_select_with_optgroup_rich(
         let mut cb_body: Vec<Statement> = Vec::new();
         cb_body.push(t::var(
             anchor_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(parent_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(parent_var.to_string())]),
         ));
-        cb_body.push(t::var(fragment_var, t::call(t::id(&{
+        cb_body.push(t::var(fragment_var, t::call(t::id_owned({
             let tmpl_idx = content_templates.len();
             if tmpl_idx == 0 { "optgroup_content".to_string() } else { format!("optgroup_content_{}", tmpl_idx) }
         }), Vec::new())));
@@ -2245,9 +2246,9 @@ fn emit_select_with_optgroup_rich(
         let anchor_var = "anchor".to_string();
         cb_body.push(t::var(
             &anchor_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&select_optgroup_var(oi))]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_optgroup_var(oi))]),
         ));
-        cb_body.push(t::var(&fragment_var, t::call(t::id(&optgroup_template_name), Vec::new())));
+        cb_body.push(t::var(&fragment_var, t::call(t::id_owned(optgroup_template_name.to_string()), Vec::new())));
 
         let mut og_set_text_calls: Vec<Statement> = Vec::new();
         let mut og_rich_option_blocks: Vec<Vec<Statement>> = Vec::new();
@@ -2321,9 +2322,9 @@ fn emit_select_with_optgroup_rich(
                             let opt_anchor_var = "anchor_1".to_string();
                             opt_cb_body.push(t::var(
                                 &opt_anchor_var,
-                                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&opt_var)]),
+                                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(opt_var.to_string())]),
                             ));
-                            opt_cb_body.push(t::var(&opt_fragment_var, t::call(t::id(&option_template_name), Vec::new())));
+                            opt_cb_body.push(t::var(&opt_fragment_var, t::call(t::id_owned(option_template_name.to_string()), Vec::new())));
                             let mut opt_set_calls: Vec<Statement> = Vec::new();
                             let mut opt_prev_var: Option<String> = None;
                             let mut opt_text_idx = 0usize;
@@ -2350,12 +2351,12 @@ fn emit_select_with_optgroup_rich(
                                         let init = if let Some(prev) = &opt_prev_var {
                                             t::call(
                                                 t::member_id(t::id_dollar(), "sibling"),
-                                                vec![t::id(prev)],
+                                                vec![t::id_owned(prev.to_string())],
                                             )
                                         } else {
                                             t::call(
                                                 t::member_id(t::id_dollar(), "first_child"),
-                                                vec![t::id(&opt_fragment_var)],
+                                                vec![t::id_owned(opt_fragment_var.to_string())],
                                             )
                                         };
                                         opt_cb_body.push(t::var(&txt, init));
@@ -2370,7 +2371,7 @@ fn emit_select_with_optgroup_rich(
                                             left: expr,
                                             operator: LogicalOperator::Coalesce,
                                             right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                                value: String::new(),
+                                                value: Cow::Owned(String::new()),
                                                 raw: Some("''".to_string()),
                                                 span: Span::ZERO,
                                             }))),
@@ -2386,7 +2387,7 @@ fn emit_select_with_optgroup_rich(
                                         }));
                                         opt_set_calls.push(t::stmt(t::call(
                                             t::member_id(t::id_dollar(), "set_text"),
-                                            vec![t::id(&txt), tpl_lit],
+                                            vec![t::id_owned(txt.to_string()), tpl_lit],
                                         )));
                                     }
                                     FragmentChild::RegularElement(child_el) => {
@@ -2415,17 +2416,17 @@ fn emit_select_with_optgroup_rich(
                                             let init = if !opt_first_emit {
                                                 t::call(
                                                     t::member_id(t::id_dollar(), "first_child"),
-                                                    vec![t::id(&opt_fragment_var)],
+                                                    vec![t::id_owned(opt_fragment_var.to_string())],
                                                 )
                                             } else if let Some(prev) = &opt_prev_var {
                                                 t::call(
                                                     t::member_id(t::id_dollar(), "sibling"),
-                                                    vec![t::id(prev)],
+                                                    vec![t::id_owned(prev.to_string())],
                                                 )
                                             } else {
                                                 t::call(
                                                     t::member_id(t::id_dollar(), "first_child"),
-                                                    vec![t::id(&opt_fragment_var)],
+                                                    vec![t::id_owned(opt_fragment_var.to_string())],
                                                 )
                                             };
                                             opt_cb_body.push(t::var(&elem_name, init));
@@ -2441,7 +2442,7 @@ fn emit_select_with_optgroup_rich(
                                                 t::call(
                                                     t::member_id(t::id_dollar(), "child"),
                                                     vec![
-                                                        t::id(&elem_name),
+                                                        t::id_owned(elem_name.to_string()),
                                                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                                             value: true,
                                                             span: Span::ZERO,
@@ -2451,7 +2452,7 @@ fn emit_select_with_optgroup_rich(
                                             ));
                                             opt_cb_body.push(t::stmt(t::call(
                                                 t::member_id(t::id_dollar(), "reset"),
-                                                vec![t::id(&elem_name)],
+                                                vec![t::id_owned(elem_name.to_string())],
                                             )));
                                             let mut parts: Vec<TextPart> = Vec::new();
                                             for cc in &child_el.fragment.nodes {
@@ -2465,7 +2466,7 @@ fn emit_select_with_optgroup_rich(
                                             let inline = rewrite_props_destructured(&inline, &script.props_destructured);
                                             opt_set_calls.push(t::stmt(t::call(
                                                 t::member_id(t::id_dollar(), "set_text"),
-                                                vec![t::id(&txt), inline],
+                                                vec![t::id_owned(txt.to_string()), inline],
                                             )));
                                             opt_prev_var = Some(elem_name);
                                         } else {
@@ -2503,7 +2504,7 @@ fn emit_select_with_optgroup_rich(
                             }
                             opt_cb_body.push(t::stmt(t::call(
                                 t::member_id(t::id_dollar(), "append"),
-                                vec![t::id(&opt_anchor_var), t::id(&opt_fragment_var)],
+                                vec![t::id_owned(opt_anchor_var.to_string()), t::id_owned(opt_fragment_var.to_string())],
                             )));
                             content_templates.push((option_template_name.clone(), opt_tpl));
 
@@ -2511,18 +2512,18 @@ fn emit_select_with_optgroup_rich(
                             let init = if !first_emitted {
                                 t::call(
                                     t::member_id(t::id_dollar(), "first_child"),
-                                    vec![t::id(&fragment_var)],
+                                    vec![t::id_owned(fragment_var.to_string())],
                                 )
                             } else if let Some(prev) = &prev_elem_var {
                                 let offset = (og_pos - prev_elem_pos) * 2;
                                 t::call(
                                     t::member_id(t::id_dollar(), "sibling"),
-                                    vec![t::id(prev), t::lit_number(offset as f64)],
+                                    vec![t::id_owned(prev.to_string()), t::lit_number(offset as f64)],
                                 )
                             } else {
                                 t::call(
                                     t::member_id(t::id_dollar(), "first_child"),
-                                    vec![t::id(&fragment_var)],
+                                    vec![t::id_owned(fragment_var.to_string())],
                                 )
                             };
                             cb_body.push(t::var(&opt_var, init));
@@ -2530,7 +2531,7 @@ fn emit_select_with_optgroup_rich(
                             cb_body.push(t::stmt(t::call(
                                 t::member_id(t::id_dollar(), "customizable_select"),
                                 vec![
-                                    t::id(&opt_var),
+                                    t::id_owned(opt_var.to_string()),
                                     Expression::Arrow(Box::new(ArrowFunctionExpression {
                                         params: Vec::new(),
                                         param_type_annotations: Vec::new(),
@@ -2546,15 +2547,15 @@ fn emit_select_with_optgroup_rich(
                             // Emit value assignment.
                             if let Some(val) = value_str {
                                 let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                    value: val.clone(),
+                                    value: Cow::Owned(val.clone()),
                                     raw: Some(format!("'{}'", val.replace('\'', "\\'"))),
                                     span: Span::ZERO,
                                 })));
                                 let inner = Expression::Assignment(Box::new(AssignmentExpression {
                                     left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                                        object: t::id(&opt_var),
+                                        object: t::id_owned(opt_var.to_string()),
                                         property: MemberProperty::Identifier(Identifier {
-                                            name: "__value".to_string(),
+                                            name: Cow::Borrowed("__value"),
                                             span: Span::ZERO,
                                         }),
                                         computed: false,
@@ -2567,9 +2568,9 @@ fn emit_select_with_optgroup_rich(
                                 }));
                                 let outer = Expression::Assignment(Box::new(AssignmentExpression {
                                     left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                                        object: t::id(&opt_var),
+                                        object: t::id_owned(opt_var.to_string()),
                                         property: MemberProperty::Identifier(Identifier {
-                                            name: "value".to_string(),
+                                            name: Cow::Borrowed("value"),
                                             span: Span::ZERO,
                                         }),
                                         computed: false,
@@ -2604,32 +2605,32 @@ fn emit_select_with_optgroup_rich(
                             let init = if !first_emitted {
                                 t::call(
                                     t::member_id(t::id_dollar(), "first_child"),
-                                    vec![t::id(&fragment_var)],
+                                    vec![t::id_owned(fragment_var.to_string())],
                                 )
                             } else if let Some(prev) = &prev_elem_var {
                                 let offset = (og_pos - prev_elem_pos) * 2;
                                 t::call(
                                     t::member_id(t::id_dollar(), "sibling"),
-                                    vec![t::id(prev), t::lit_number(offset as f64)],
+                                    vec![t::id_owned(prev.to_string()), t::lit_number(offset as f64)],
                                 )
                             } else {
                                 t::call(
                                     t::member_id(t::id_dollar(), "first_child"),
-                                    vec![t::id(&fragment_var)],
+                                    vec![t::id_owned(fragment_var.to_string())],
                                 )
                             };
                             cb_body.push(t::var(&opt_var, init));
                             if let Some(val) = value_str {
                                 let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                    value: val.clone(),
+                                    value: Cow::Owned(val.clone()),
                                     raw: Some(format!("'{}'", val.replace('\'', "\\'"))),
                                     span: Span::ZERO,
                                 })));
                                 let inner = Expression::Assignment(Box::new(AssignmentExpression {
                                     left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                                        object: t::id(&opt_var),
+                                        object: t::id_owned(opt_var.to_string()),
                                         property: MemberProperty::Identifier(Identifier {
-                                            name: "__value".to_string(),
+                                            name: Cow::Borrowed("__value"),
                                             span: Span::ZERO,
                                         }),
                                         computed: false,
@@ -2642,9 +2643,9 @@ fn emit_select_with_optgroup_rich(
                                 }));
                                 let outer = Expression::Assignment(Box::new(AssignmentExpression {
                                     left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                                        object: t::id(&opt_var),
+                                        object: t::id_owned(opt_var.to_string()),
                                         property: MemberProperty::Identifier(Identifier {
-                                            name: "value".to_string(),
+                                            name: Cow::Borrowed("value"),
                                             span: Span::ZERO,
                                         }),
                                         computed: false,
@@ -2708,18 +2709,18 @@ fn emit_select_with_optgroup_rich(
                             let init = if !first_emitted {
                                 t::call(
                                     t::member_id(t::id_dollar(), "first_child"),
-                                    vec![t::id(&fragment_var)],
+                                    vec![t::id_owned(fragment_var.to_string())],
                                 )
                             } else if let Some(prev) = &prev_elem_var {
                                 let offset = (og_pos - prev_elem_pos) * 2;
                                 t::call(
                                     t::member_id(t::id_dollar(), "sibling"),
-                                    vec![t::id(prev), t::lit_number(offset as f64)],
+                                    vec![t::id_owned(prev.to_string()), t::lit_number(offset as f64)],
                                 )
                             } else {
                                 t::call(
                                     t::member_id(t::id_dollar(), "first_child"),
-                                    vec![t::id(&fragment_var)],
+                                    vec![t::id_owned(fragment_var.to_string())],
                                 )
                             };
                             cb_body.push(t::var(&span_var_name, init));
@@ -2734,7 +2735,7 @@ fn emit_select_with_optgroup_rich(
                                 t::call(
                                     t::member_id(t::id_dollar(), "child"),
                                     vec![
-                                        t::id(&span_var_name),
+                                        t::id_owned(span_var_name.to_string()),
                                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                             value: true,
                                             span: Span::ZERO,
@@ -2744,7 +2745,7 @@ fn emit_select_with_optgroup_rich(
                             ));
                             cb_body.push(t::stmt(t::call(
                                 t::member_id(t::id_dollar(), "reset"),
-                                vec![t::id(&span_var_name)],
+                                vec![t::id_owned(span_var_name.to_string())],
                             )));
                             // Build inline template for span content.
                             let mut parts: Vec<TextPart> = Vec::new();
@@ -2759,7 +2760,7 @@ fn emit_select_with_optgroup_rich(
                             let inline = rewrite_props_destructured(&inline, &script.props_destructured);
                             og_set_text_calls.push(t::stmt(t::call(
                                 t::member_id(t::id_dollar(), "set_text"),
-                                vec![t::id(&txt), inline],
+                                vec![t::id_owned(txt.to_string()), inline],
                             )));
                             prev_elem_var = Some(span_var_name);
                             prev_elem_pos = og_pos;
@@ -2809,7 +2810,7 @@ fn emit_select_with_optgroup_rich(
         }
         cb_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id(&anchor_var), t::id(&fragment_var)],
+            vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
         )));
         let _ = stripped;
         let _ = option_idx;
@@ -2922,7 +2923,7 @@ fn emit_select_with_optgroup_rich(
         } else {
             t::call(
                 t::member_id(t::id_dollar(), "sibling"),
-                vec![t::id(prev_og_var.as_ref().unwrap())],
+                vec![t::id_owned(prev_og_var.as_ref().unwrap().clone())],
             )
         };
         func_body.push(t::var(&og_var, init));
@@ -2941,7 +2942,7 @@ fn emit_select_with_optgroup_rich(
             }));
             func_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "customizable_select"),
-                vec![t::id(&og_var), cb],
+                vec![t::id_owned(og_var.to_string()), cb],
             )));
         } else {
             // Static optgroup: navigate to plain option children and assign values.
@@ -2970,22 +2971,22 @@ fn emit_select_with_optgroup_rich(
                         let opt_var = format!("option_{}", oi + static_opt_idx + 1);
                         static_opt_idx += 1;
                         let init = if let Some(prev) = &prev_opt_var {
-                            t::call(t::member_id(t::id_dollar(), "sibling"), vec![t::id(prev)])
+                            t::call(t::member_id(t::id_dollar(), "sibling"), vec![t::id_owned(prev.to_string())])
                         } else {
-                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)])
+                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(og_var.to_string())])
                         };
                         func_body.push(t::var(&opt_var, init));
                         if let Some(val) = value_str {
                             let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                value: val.clone(),
+                                value: Cow::Owned(val.clone()),
                                 raw: Some(format!("'{}'", val.replace('\'', "\\'"))),
                                 span: Span::ZERO,
                             })));
                             let inner = Expression::Assignment(Box::new(AssignmentExpression {
                                 left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                                    object: t::id(&opt_var),
+                                    object: t::id_owned(opt_var.to_string()),
                                     property: MemberProperty::Identifier(Identifier {
-                                        name: "__value".to_string(),
+                                        name: Cow::Borrowed("__value"),
                                         span: Span::ZERO,
                                     }),
                                     computed: false,
@@ -2998,9 +2999,9 @@ fn emit_select_with_optgroup_rich(
                             }));
                             let outer = Expression::Assignment(Box::new(AssignmentExpression {
                                 left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                                    object: t::id(&opt_var),
+                                    object: t::id_owned(opt_var.to_string()),
                                     property: MemberProperty::Identifier(Identifier {
-                                        name: "value".to_string(),
+                                        name: Cow::Borrowed("value"),
                                         span: Span::ZERO,
                                     }),
                                     computed: false,
@@ -3020,7 +3021,7 @@ fn emit_select_with_optgroup_rich(
             // After processing static optgroup options, reset(optgroup_N).
             func_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
-                vec![t::id(&og_var)],
+                vec![t::id_owned(og_var.to_string())],
             )));
         }
         prev_og_var = Some(og_var);
@@ -3060,8 +3061,8 @@ fn emit_select_with_optgroup_rich(
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "delegated"),
             vec![
-                t::literal_str(ev),
-                t::id(var),
+                t::literal_str_owned(ev.to_string()),
+                t::id_owned(var.to_string()),
                 handler.clone(),
             ],
         )));
@@ -3129,7 +3130,7 @@ fn emit_select_with_optgroup_rich(
             elements: names
                 .into_iter()
                 .map(|n| ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
-                    StringLiteral { value: n, raw: None, span: Span::ZERO }
+                    StringLiteral { value: Cow::Owned(n), raw: None, span: Span::ZERO }
                 )))))
                 .collect(),
             span: Span::ZERO,
@@ -3333,10 +3334,10 @@ fn emit_select_with_rich_reactive_and_trailing(
             &anchor_var,
             t::call(
                 t::member_id(t::id_dollar(), "child"),
-                vec![t::id(&select_option_var(oi))],
+                vec![t::id_owned(select_option_var(oi))],
             ),
         ));
-        cb_body.push(t::var(&fragment_var, t::call(t::id(&template_name), Vec::new())));
+        cb_body.push(t::var(&fragment_var, t::call(t::id_owned(template_name.to_string()), Vec::new())));
 
         // Walk children: build template HTML + collect reactive set_text calls.
         // We treat the option body as a multi-root template (flag 1).
@@ -3376,13 +3377,13 @@ fn emit_select_with_rich_reactive_and_trailing(
                         // sibling of last span etc.
                         t::call(
                             t::member_id(t::id_dollar(), "sibling"),
-                            vec![t::id(prev)],
+                            vec![t::id_owned(prev.to_string())],
                         )
                     } else {
                         // First — first_child of fragment.
                         t::call(
                             t::member_id(t::id_dollar(), "first_child"),
-                            vec![t::id(&fragment_var)],
+                            vec![t::id_owned(fragment_var.to_string())],
                         )
                     };
                     cb_body.push(t::var(&text_name, init));
@@ -3406,7 +3407,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         left: expr,
                         operator: LogicalOperator::Coalesce,
                         right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: String::new(),
+                            value: Cow::Owned(String::new()),
                             raw: Some("''".to_string()),
                             span: Span::ZERO,
                         }))),
@@ -3432,7 +3433,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                     }));
                     set_text_calls.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "set_text"),
-                        vec![t::id(&text_name), tpl_lit],
+                        vec![t::id_owned(text_name.to_string()), tpl_lit],
                     )));
                 }
                 FragmentChild::RegularElement(child_el) => {
@@ -3457,17 +3458,17 @@ fn emit_select_with_rich_reactive_and_trailing(
                         let init = if !first_emitted {
                             t::call(
                                 t::member_id(t::id_dollar(), "first_child"),
-                                vec![t::id(&fragment_var)],
+                                vec![t::id_owned(fragment_var.to_string())],
                             )
                         } else if let Some(prev) = &prev_elem_var {
                             t::call(
                                 t::member_id(t::id_dollar(), "sibling"),
-                                vec![t::id(prev)],
+                                vec![t::id_owned(prev.to_string())],
                             )
                         } else {
                             t::call(
                                 t::member_id(t::id_dollar(), "first_child"),
-                                vec![t::id(&fragment_var)],
+                                vec![t::id_owned(fragment_var.to_string())],
                             )
                         };
                         cb_body.push(t::var(&elem_name, init));
@@ -3484,7 +3485,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                             t::call(
                                 t::member_id(t::id_dollar(), "child"),
                                 vec![
-                                    t::id(&elem_name),
+                                    t::id_owned(elem_name.to_string()),
                                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                         value: true,
                                         span: Span::ZERO,
@@ -3494,7 +3495,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         ));
                         cb_body.push(t::stmt(t::call(
                             t::member_id(t::id_dollar(), "reset"),
-                            vec![t::id(&elem_name)],
+                            vec![t::id_owned(elem_name.to_string())],
                         )));
                         // Build inline expression from element's children.
                         let mut parts: Vec<TextPart> = Vec::new();
@@ -3509,7 +3510,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         let inline = rewrite_props_destructured(&inline, &script.props_destructured);
                         set_text_calls.push(t::stmt(t::call(
                             t::member_id(t::id_dollar(), "set_text"),
-                            vec![t::id(&text_name), inline],
+                            vec![t::id_owned(text_name.to_string()), inline],
                         )));
                         prev_elem_var = Some(elem_name);
                     } else {
@@ -3548,7 +3549,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         }
         cb_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id(&anchor_var), t::id(&fragment_var)],
+            vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
         )));
         rich_options.push(RichOption {
             option_idx: oi,
@@ -3579,7 +3580,7 @@ fn emit_select_with_rich_reactive_and_trailing(
         } else {
             t::call(
                 t::member_id(t::id_dollar(), "sibling"),
-                vec![t::id(prev_opt_var.as_ref().unwrap())],
+                vec![t::id_owned(prev_opt_var.as_ref().unwrap().clone())],
             )
         };
         func_body.push(t::var(&var_name, init));
@@ -3596,21 +3597,21 @@ fn emit_select_with_rich_reactive_and_trailing(
             }));
             func_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "customizable_select"),
-                vec![t::id(&var_name), cb],
+                vec![t::id_owned(var_name.to_string()), cb],
             )));
         }
         // option.value = option.__value = 'X';
         if let Some(val) = &infos[oi].value {
             let value_expr = Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: val.clone(),
+                value: Cow::Owned(val.clone()),
                 raw: Some(format!("'{}'", val.replace('\'', "\\'"))),
                 span: Span::ZERO,
             })));
             let inner_assign = Expression::Assignment(Box::new(AssignmentExpression {
                 left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                    object: t::id(&var_name),
+                    object: t::id_owned(var_name.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "__value".to_string(),
+                        name: Cow::Borrowed("__value"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -3623,9 +3624,9 @@ fn emit_select_with_rich_reactive_and_trailing(
             }));
             let outer_assign = Expression::Assignment(Box::new(AssignmentExpression {
                 left: AssignmentTarget::Pattern(Pattern::Member(Box::new(MemberExpression {
-                    object: t::id(&var_name),
+                    object: t::id_owned(var_name.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "value".to_string(),
+                        name: Cow::Borrowed("value"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -3678,8 +3679,8 @@ fn emit_select_with_rich_reactive_and_trailing(
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "delegated"),
             vec![
-                t::literal_str(ev),
-                t::id(var),
+                t::literal_str_owned(ev.to_string()),
+                t::id_owned(var.to_string()),
                 handler.clone(),
             ],
         )));
@@ -3736,7 +3737,7 @@ fn emit_select_with_rich_reactive_and_trailing(
             elements: names
                 .into_iter()
                 .map(|n| ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
-                    StringLiteral { value: n, raw: None, span: Span::ZERO }
+                    StringLiteral { value: Cow::Owned(n), raw: None, span: Span::ZERO }
                 )))))
                 .collect(),
             span: Span::ZERO,
@@ -3818,7 +3819,7 @@ fn emit_single_static_custom_element_program(
             }
             _ => return None,
         };
-        props.push((attr.name.clone(), value));
+        props.push((attr.name.to_string(), value));
     }
 
     // HTML template with attrs stripped: `<TAG></TAG>`.
@@ -3852,15 +3853,15 @@ fn emit_single_static_custom_element_program(
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "set_custom_element_data"),
             vec![
-                t::id(&var),
-                t::literal_str(k),
-                t::literal_str(v),
+                t::id_owned(var.to_string()),
+                t::literal_str_owned(k.to_string()),
+                t::literal_str_owned(v.to_string()),
             ],
         )));
     }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&var)],
+        vec![t::id_anchor(), t::id_owned(var.to_string())],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "pop"),
@@ -4667,7 +4668,7 @@ pub fn try_typed_client_walker_with(
                 if el.name == "input" && (dirs.bind_value.is_some() || !dirs.events.is_empty()) {
                     body_stmts.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "remove_input_defaults"),
-                        vec![t::id(&var)],
+                        vec![t::id_owned(var.to_string())],
                     )));
                 }
                 emit_element_content_combined(
@@ -4738,7 +4739,7 @@ pub fn try_typed_client_walker_with(
                 }));
                 body_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "await"),
-                    vec![t::id(&var), getter, pending, then],
+                    vec![t::id_owned(var.to_string()), getter, pending, then],
                 )));
             }
             NodeKind::TopLevelExpr(e) => {
@@ -4751,9 +4752,7 @@ pub fn try_typed_client_walker_with(
                         &v,
                         t::call(
                             t::member_id(t::id_dollar(), "sibling"),
-                            vec![t::id(
-                                prev_var.as_deref().expect("preceding node"),
-                            )],
+                            vec![t::id_owned(prev_var.as_deref().expect("preceding node").to_string())],
                         ),
                     ));
                     prev_var = Some(v.clone());
@@ -4769,7 +4768,7 @@ pub fn try_typed_client_walker_with(
                             operator: LogicalOperator::Coalesce,
                             right: Expression::Literal(Box::new(Literal::String(
                                 StringLiteral {
-                                    value: String::new(),
+                                    value: Cow::Owned(String::new()),
                                     raw: None,
                                     span: Span::ZERO,
                                 },
@@ -4794,7 +4793,7 @@ pub fn try_typed_client_walker_with(
                     let init = match prev_var.as_deref() {
                         Some(prev) => t::call(
                             t::member_id(t::id_dollar(), "sibling"),
-                            vec![t::id(prev)],
+                            vec![t::id_owned(prev.to_string())],
                         ),
                         None => return None,
                     };
@@ -4844,7 +4843,7 @@ pub fn try_typed_client_walker_with(
                                     operator: LogicalOperator::Coalesce,
                                     right: Expression::Literal(Box::new(Literal::String(
                                         StringLiteral {
-                                            value: String::new(),
+                                            value: Cow::Owned(String::new()),
                                             raw: None,
                                             span: Span::ZERO,
                                         },
@@ -4877,7 +4876,7 @@ pub fn try_typed_client_walker_with(
             let (text_var, template_expr) = text_effects.pop().unwrap();
             let set_call = t::call(
                 t::member_id(t::id_dollar(), "set_text"),
-                vec![t::id(&text_var), template_expr],
+                vec![t::id_owned(text_var.to_string()), template_expr],
             );
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
@@ -4897,7 +4896,7 @@ pub fn try_typed_client_walker_with(
             for (text_var, template_expr) in text_effects {
                 block_body.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "set_text"),
-                    vec![t::id(&text_var), template_expr],
+                    vec![t::id_owned(text_var.to_string()), template_expr],
                 )));
             }
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -4923,7 +4922,7 @@ pub fn try_typed_client_walker_with(
     // Final append.
     body_stmts.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&root_holder)],
+        vec![t::id_anchor(), t::id_owned(root_holder.to_string())],
     )));
 
     // Module-level `var root = $.from_html(\`HTML\`[, 1]);`
@@ -4964,7 +4963,7 @@ pub fn try_typed_client_walker_with(
                 .map(|n| {
                     ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
                         StringLiteral {
-                            value: n,
+                            value: Cow::Owned(n),
                             raw: None,
                             span: Span::ZERO,
                         },
@@ -4999,13 +4998,13 @@ fn emit_directives(
             params: Vec::new(),
             param_type_annotations: Vec::new(),
             body: ArrowBody::Expression({
-                if state_bindings.contains(&target_name) {
+                if state_bindings.contains(target_name.as_ref()) {
                     t::call(
                         t::member_id(t::id_dollar(), "get"),
-                        vec![t::id(&target_name)],
+                        vec![t::id_owned(target_name.to_string())],
                     )
                 } else {
-                    t::id(&target_name)
+                    t::id_owned(target_name.to_string())
                 }
             }),
             r#async: false,
@@ -5015,14 +5014,14 @@ fn emit_directives(
             params: vec![t::pat_id("$$value")],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Expression({
-                if state_bindings.contains(&target_name) {
+                if state_bindings.contains(target_name.as_ref()) {
                     t::call(
                         t::member_id(t::id_dollar(), "set"),
-                        vec![t::id(&target_name), t::id("$$value")],
+                        vec![t::id_owned(target_name.to_string()), t::id("$$value")],
                     )
                 } else {
                     Expression::Assignment(Box::new(AssignmentExpression {
-                        left: AssignmentTarget::Expression(t::id(&target_name)),
+                        left: AssignmentTarget::Expression(t::id_owned(target_name.to_string())),
                         operator: AssignmentOperator::Assign,
                         right: t::id("$$value"),
                         span: Span::ZERO,
@@ -5034,7 +5033,7 @@ fn emit_directives(
         }));
         effects.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "bind_value"),
-            vec![t::id(var), getter, setter],
+            vec![t::id_owned(var.to_string()), getter, setter],
         )));
     }
     // Event handlers: `\$.delegated("click", var, handler)`.
@@ -5046,11 +5045,11 @@ fn emit_directives(
             t::member_id(t::id_dollar(), "delegated"),
             vec![
                 Expression::Literal(Box::new(Literal::String(StringLiteral {
-                    value: event.clone(),
+                    value: Cow::Owned(event.clone()),
                     raw: None,
                     span: Span::ZERO,
                 }))),
-                t::id(var),
+                t::id_owned(var.to_string()),
                 handler_expr,
             ],
         )));
@@ -5079,7 +5078,7 @@ fn emit_tree_program(
         }
         if is_multi_root && i < last {
             tree_elements.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: " ".to_string(),
+                value: Cow::Borrowed(" "),
                 raw: None,
                 span: Span::ZERO,
             }))));
@@ -5131,7 +5130,7 @@ fn emit_tree_program(
 fn element_to_tree(el: &RegularElement) -> Option<Expression> {
     let mut parts: Vec<Expression> = Vec::new();
     parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
-        value: el.name.clone(),
+        value: Cow::Owned(el.name.clone()),
         raw: None,
         span: Span::ZERO,
     }))));
@@ -5158,7 +5157,7 @@ fn element_to_tree(el: &RegularElement) -> Option<Expression> {
                             }
                         }
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: s,
+                            value: Cow::Owned(s),
                             raw: None,
                             span: Span::ZERO,
                         })))
@@ -5167,7 +5166,7 @@ fn element_to_tree(el: &RegularElement) -> Option<Expression> {
                 };
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: a.name.clone(),
+                        name: Cow::Owned(a.name.clone()),
                         span: Span::ZERO,
                     }),
                     value,
@@ -5196,7 +5195,7 @@ fn element_to_tree(el: &RegularElement) -> Option<Expression> {
             FragmentChild::RegularElement(child) => {
                 if !pending_text.is_empty() {
                     parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: collapse_ws(&std::mem::take(&mut pending_text)),
+                        value: Cow::Owned(collapse_ws(&std::mem::take(&mut pending_text))),
                         raw: None,
                         span: Span::ZERO,
                     }))));
@@ -5208,7 +5207,7 @@ fn element_to_tree(el: &RegularElement) -> Option<Expression> {
     }
     if !pending_text.is_empty() {
         parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
-            value: collapse_ws(&pending_text),
+            value: Cow::Owned(collapse_ws(&pending_text)),
             raw: None,
             span: Span::ZERO,
         }))));
@@ -5303,7 +5302,7 @@ fn emit_single_component_program(
                             match &parts[0] {
                                 AttributeValuePart::Text(t) => {
                                     Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                        value: t.data.clone(),
+                                        value: Cow::Owned(t.data.clone()),
                                         raw: None,
                                         span: Span::ZERO,
                                     })))
@@ -5325,7 +5324,7 @@ fn emit_single_component_program(
                 let shorthand = matches!(&value, Expression::Identifier(i) if i.name == a.name);
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: a.name.clone(),
+                        name: Cow::Owned(a.name.clone()),
                         span: Span::ZERO,
                     }),
                     value,
@@ -5400,7 +5399,7 @@ fn emit_single_component_program(
             // default: true marker comes first in `$$slots` object.
             slots_props.push(ObjectMember::Property(Box::new(Property {
                 key: PropertyKey::Identifier(Identifier {
-                    name: "default".to_string(),
+                    name: Cow::Borrowed("default"),
                     span: Span::ZERO,
                 }),
                 value: Expression::Literal(Box::new(Literal::Boolean(
@@ -5428,10 +5427,10 @@ fn emit_single_component_program(
                 ));
                 let el_var = sanitize_name(&sel.name);
                 let body: Vec<Statement> = vec![
-                    t::var(&el_var, t::call(t::id(&root_name), Vec::new())),
+                    t::var(&el_var, t::call(t::id_owned(root_name.to_string()), Vec::new())),
                     t::stmt(t::call(
                         t::member_id(t::id_dollar(), "append"),
-                        vec![t::id_anchor(), t::id(&el_var)],
+                        vec![t::id_anchor(), t::id_owned(el_var.to_string())],
                     )),
                 ];
                 let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -5446,7 +5445,7 @@ fn emit_single_component_program(
                 }));
                 slots_props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: sname.clone(),
+                        name: Cow::Owned(sname.clone()),
                         span: Span::ZERO,
                     }),
                     value: arrow,
@@ -5479,7 +5478,7 @@ fn emit_single_component_program(
                             t::member_id(t::id_dollar(), "text"),
                             vec![Expression::Literal(Box::new(Literal::String(
                                 StringLiteral {
-                                    value: trimmed.to_string(),
+                                    value: Cow::Owned(trimmed.to_string()),
                                     raw: None,
                                     span: Span::ZERO,
                                 },
@@ -5504,7 +5503,7 @@ fn emit_single_component_program(
             }));
             props.push(ObjectMember::Property(Box::new(Property {
                 key: PropertyKey::Identifier(Identifier {
-                    name: "children".to_string(),
+                    name: Cow::Borrowed("children"),
                     span: Span::ZERO,
                 }),
                 value: children_arrow,
@@ -5516,7 +5515,7 @@ fn emit_single_component_program(
             })));
             props.push(ObjectMember::Property(Box::new(Property {
                 key: PropertyKey::Identifier(Identifier {
-                    name: "$$slots".to_string(),
+                    name: Cow::Borrowed("$$slots"),
                     span: Span::ZERO,
                 }),
                 value: Expression::Object(Box::new(ObjectExpression {
@@ -5530,7 +5529,7 @@ fn emit_single_component_program(
                 span: Span::ZERO,
             })));
             let component_call = Expression::Call(Box::new(CallExpression {
-                callee: t::id(&c.name),
+                callee: t::id_owned(c.name.to_string()),
                 arguments: vec![
                     Argument::Expression(t::id_anchor()),
                     Argument::Expression(Expression::Object(Box::new(ObjectExpression {
@@ -5568,7 +5567,7 @@ fn emit_single_component_program(
             if let FragmentChild::Component(inner) = body_non_ws[0] {
                 if inner.attributes.is_empty() && inner.fragment.nodes.is_empty() {
                     let inner_call = t::stmt(t::call(
-                        t::id(&inner.name),
+                        t::id_owned(inner.name.to_string()),
                         vec![
                             t::id_anchor(),
                             Expression::Object(Box::new(ObjectExpression {
@@ -5589,7 +5588,7 @@ fn emit_single_component_program(
                     }));
                     props.push(ObjectMember::Property(Box::new(Property {
                         key: PropertyKey::Identifier(Identifier {
-                            name: "children".to_string(),
+                            name: Cow::Borrowed("children"),
                             span: Span::ZERO,
                         }),
                         value: children_arrow,
@@ -5601,13 +5600,13 @@ fn emit_single_component_program(
                     })));
                     props.push(ObjectMember::Property(Box::new(Property {
                         key: PropertyKey::Identifier(Identifier {
-                            name: "$$slots".to_string(),
+                            name: Cow::Borrowed("$$slots"),
                             span: Span::ZERO,
                         }),
                         value: Expression::Object(Box::new(ObjectExpression {
                             properties: vec![ObjectMember::Property(Box::new(Property {
                                 key: PropertyKey::Identifier(Identifier {
-                                    name: "default".to_string(),
+                                    name: Cow::Borrowed("default"),
                                     span: Span::ZERO,
                                 }),
                                 value: Expression::Literal(Box::new(Literal::Boolean(
@@ -5629,7 +5628,7 @@ fn emit_single_component_program(
                     })));
                     // Skip the text-build pathway below.
                     let component_call = Expression::Call(Box::new(CallExpression {
-                        callee: t::id(&c.name),
+                        callee: t::id_owned(c.name.to_string()),
                         arguments: vec![
                             Argument::Expression(t::id_anchor()),
                             Argument::Expression(Expression::Object(Box::new(ObjectExpression {
@@ -5737,7 +5736,7 @@ fn emit_single_component_program(
         }));
         props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: "children".to_string(),
+                name: Cow::Borrowed("children"),
                 span: Span::ZERO,
             }),
             value: children_arrow,
@@ -5750,13 +5749,13 @@ fn emit_single_component_program(
         // `$$slots: { default: true }`
         props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: "$$slots".to_string(),
+                name: Cow::Borrowed("$$slots"),
                 span: Span::ZERO,
             }),
             value: Expression::Object(Box::new(ObjectExpression {
                 properties: vec![ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: "default".to_string(),
+                        name: Cow::Borrowed("default"),
                         span: Span::ZERO,
                     }),
                     value: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -5780,7 +5779,7 @@ fn emit_single_component_program(
     }
 
     let component_call = Expression::Call(Box::new(CallExpression {
-        callee: t::id(&c.name),
+        callee: t::id_owned(c.name.to_string()),
         arguments: vec![
             Argument::Expression(t::id_anchor()),
             Argument::Expression(Expression::Object(Box::new(ObjectExpression {
@@ -5929,7 +5928,7 @@ fn emit_async_branch_body(
     //   `($0) => $.set_text(TEXT, $0), void 0, [() => INNER_EXPR]`
     let set_text_call = t::call(
         t::member_id(t::id_dollar(), "set_text"),
-        vec![t::id(text_name), t::id("$0")],
+        vec![t::id_owned(text_name.to_string()), t::id("$0")],
     );
     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id("$0")],
@@ -5956,7 +5955,7 @@ fn emit_async_branch_body(
     )));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(text_name)],
+        vec![t::id_anchor(), t::id_owned(text_name.to_string())],
     )));
     Some(body)
 }
@@ -6078,7 +6077,7 @@ fn emit_multi_element_branch_body_with_context(
     // Always use `fragment_N` inside branch bodies (outer scope already
     // owns `fragment`). N matches the root_idx.
     let frag_var = format!("fragment_{}", *root_idx);
-    body.push(t::var(&frag_var, t::call(t::id(&root_name), Vec::new())));
+    body.push(t::var(&frag_var, t::call(t::id_owned(root_name.to_string()), Vec::new())));
 
     // Allocate var names for each element + track dyn attrs. Inside a
     // branch_body the outer scope already uses bare `<name>`, so suffix
@@ -6092,12 +6091,12 @@ fn emit_multi_element_branch_body_with_context(
         let init = if i == 0 {
             t::call(
                 t::member_id(t::id_dollar(), "first_child"),
-                vec![t::id(&frag_var)],
+                vec![t::id_owned(frag_var.to_string())],
             )
         } else {
             t::call(
                 t::member_id(t::id_dollar(), "sibling"),
-                vec![t::id(&var_names[i - 1]), t::lit_number(2.0)],
+                vec![t::id_owned(var_names[i - 1].to_string()), t::lit_number(2.0)],
             )
         };
         body.push(t::var(&var, init));
@@ -6123,9 +6122,9 @@ fn emit_multi_element_branch_body_with_context(
                 dyn_attr_calls.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "set_attribute"),
                     vec![
-                        t::id(&var),
+                        t::id_owned(var.to_string()),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: attr.name.clone(),
+                            value: Cow::Owned(attr.name.clone()),
                             raw: None,
                             span: Span::ZERO,
                         }))),
@@ -6163,7 +6162,7 @@ fn emit_multi_element_branch_body_with_context(
     }
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&frag_var)],
+        vec![t::id_anchor(), t::id_owned(frag_var.to_string())],
     )));
     Some(body)
 }
@@ -6230,7 +6229,7 @@ fn emit_multi_element_each_body(
     let mut body: Vec<Statement> = Vec::new();
     *frag_idx += 1;
     let frag_var = format!("fragment_{}", *frag_idx);
-    body.push(t::var(&frag_var, t::call(t::id(&root_name), Vec::new())));
+    body.push(t::var(&frag_var, t::call(t::id_owned(root_name.to_string()), Vec::new())));
 
     let mut elem_vars: Vec<String> = Vec::new();
     let mut text_vars_with_expr: Vec<(String, Expression)> = Vec::new();
@@ -6247,12 +6246,12 @@ fn emit_multi_element_each_body(
         let init = if i == 0 {
             t::call(
                 t::member_id(t::id_dollar(), "first_child"),
-                vec![t::id(&frag_var)],
+                vec![t::id_owned(frag_var.to_string())],
             )
         } else {
             t::call(
                 t::member_id(t::id_dollar(), "sibling"),
-                vec![t::id(&elem_vars[i - 1]), t::lit_number(2.0)],
+                vec![t::id_owned(elem_vars[i - 1].to_string()), t::lit_number(2.0)],
             )
         };
         body.push(t::var(&el_var, init));
@@ -6288,7 +6287,7 @@ fn emit_multi_element_each_body(
             t::call(
                 t::member_id(t::id_dollar(), "child"),
                 vec![
-                    t::id(&el_var),
+                    t::id_owned(el_var.to_string()),
                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                         value: true,
                         span: Span::ZERO,
@@ -6298,7 +6297,7 @@ fn emit_multi_element_each_body(
         ));
         body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "reset"),
-            vec![t::id(&el_var)],
+            vec![t::id_owned(el_var.to_string())],
         )));
         text_vars_with_expr.push((text_name, inline));
     }
@@ -6309,7 +6308,7 @@ fn emit_multi_element_each_body(
         .map(|(name, expr)| {
             t::stmt(t::call(
                 t::member_id(t::id_dollar(), "set_text"),
-                vec![t::id(&name), expr],
+                vec![t::id_owned(name.to_string()), expr],
             ))
         })
         .collect();
@@ -6339,7 +6338,7 @@ fn emit_multi_element_each_body(
     )));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&frag_var)],
+        vec![t::id_anchor(), t::id_owned(frag_var.to_string())],
     )));
     Some(body)
 }
@@ -6404,12 +6403,12 @@ fn emit_vanilla_branch_body_with_context(
                 text_name,
                 t::call(
                     t::member_id(t::id_dollar(), "text"),
-                    vec![t::literal_str(t.data.trim())],
+                    vec![t::literal_str_owned(t.data.trim().to_string())],
                 ),
             ));
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(text_name)],
+                vec![t::id_anchor(), t::id_owned(text_name.to_string())],
             )));
             Some(body)
         }
@@ -6419,7 +6418,7 @@ fn emit_vanilla_branch_body_with_context(
             body.push(t::var(text_name, t::call(t::member_id(t::id_dollar(), "text"), Vec::new())));
             let set_text_call = t::call(
                 t::member_id(t::id_dollar(), "set_text"),
-                vec![t::id(text_name), expr],
+                vec![t::id_owned(text_name.to_string()), expr],
             );
             let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                 params: Vec::new(),
@@ -6434,7 +6433,7 @@ fn emit_vanilla_branch_body_with_context(
             )));
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(text_name)],
+                vec![t::id_anchor(), t::id_owned(text_name.to_string())],
             )));
             Some(body)
         }
@@ -6465,7 +6464,7 @@ fn emit_vanilla_branch_body_with_context(
                 format!("{}_{}", safe, *elem_var_idx - 1)
             };
             let mut body: Vec<Statement> = Vec::new();
-            body.push(t::var(&var_name, t::call(t::id(&root_name), Vec::new())));
+            body.push(t::var(&var_name, t::call(t::id_owned(root_name.to_string()), Vec::new())));
             if is_text_anchor {
                 // Build the inline text expression from the element body's
                 // mixed Text + ExpressionTag run.
@@ -6486,7 +6485,7 @@ fn emit_vanilla_branch_body_with_context(
                     t::call(
                         t::member_id(t::id_dollar(), "child"),
                         vec![
-                            t::id(&var_name),
+                            t::id_owned(var_name.to_string()),
                             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                 value: true,
                                 span: Span::ZERO,
@@ -6496,11 +6495,11 @@ fn emit_vanilla_branch_body_with_context(
                 ));
                 body.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(&var_name)],
+                    vec![t::id_owned(var_name.to_string())],
                 )));
                 let set_text = t::call(
                     t::member_id(t::id_dollar(), "set_text"),
-                    vec![t::id(text_name), inline],
+                    vec![t::id_owned(text_name.to_string()), inline],
                 );
                 let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
@@ -6516,7 +6515,7 @@ fn emit_vanilla_branch_body_with_context(
             }
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(&var_name)],
+                vec![t::id_anchor(), t::id_owned(var_name.to_string())],
             )));
             Some(body)
         }
@@ -6527,7 +6526,7 @@ fn emit_vanilla_branch_body_with_context(
             }
             let mut body: Vec<Statement> = Vec::new();
             body.push(t::stmt(t::call(
-                t::id(&c.name),
+                t::id_owned(c.name.to_string()),
                 vec![
                     t::id_anchor(),
                     Expression::Object(Box::new(ObjectExpression {
@@ -6596,7 +6595,7 @@ fn emit_vanilla_branch_body_with_context(
                     t::id("node_1"),
                     t::id("$$props"),
                     Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: slot_name,
+                        value: Cow::Owned(slot_name),
                         raw: None,
                         span: Span::ZERO,
                     }))),
@@ -6770,7 +6769,7 @@ fn emit_single_vanilla_if_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -6890,7 +6889,7 @@ fn emit_top_level_html_tag_program(
     // no `() => raw()` thunk. Detect that bare-prop case.
     let is_bare_legacy_prop = matches!(
         expr,
-        Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+        Expression::Identifier(id) if legacy_prop_names.contains(id.name.as_ref())
     );
     let inner = rewrite_props_destructured(expr, &script.props_destructured);
     let inner = if is_bare_legacy_prop {
@@ -6915,7 +6914,7 @@ fn emit_top_level_html_tag_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -7160,7 +7159,7 @@ fn emit_single_element_wrapping_html_tag_program(
         .collect();
     let is_bare_legacy_prop = matches!(
         &ht.expression,
-        Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+        Expression::Identifier(id) if legacy_prop_names.contains(id.name.as_ref())
     );
     let inner = rewrite_props_destructured(&ht.expression, &script.props_destructured);
     let inner = if is_bare_legacy_prop {
@@ -7230,7 +7229,7 @@ fn emit_single_element_wrapping_html_tag_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -7251,7 +7250,7 @@ fn emit_single_element_wrapping_html_tag_program(
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "html"),
         vec![
-            t::id(&tag_var),
+            t::id_owned(tag_var.to_string()),
             html_arg,
             Expression::Literal(Box::new(Literal::Boolean(
                 svelte_js_ast::BooleanLiteral { value: true, span: Span::ZERO },
@@ -7260,11 +7259,11 @@ fn emit_single_element_wrapping_html_tag_program(
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&tag_var)],
+        vec![t::id_owned(tag_var.to_string())],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&tag_var)],
+        vec![t::id_anchor(), t::id_owned(tag_var.to_string())],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
@@ -7336,7 +7335,7 @@ fn emit_top_level_single_text_program(
         "text",
         t::call(
             t::member_id(t::id_dollar(), "text"),
-            vec![t::literal_str(text)],
+            vec![t::literal_str_owned(text.to_string())],
         ),
     ));
     func_body.push(t::stmt(t::call(
@@ -7409,7 +7408,7 @@ fn emit_top_level_single_expression_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -7599,11 +7598,11 @@ fn emit_single_element_with_component_program(
         "node",
         t::call(
             t::member_id(t::id_dollar(), "child"),
-            vec![t::id(&tag_var)],
+            vec![t::id_owned(tag_var.to_string())],
         ),
     ));
     func_body.push(t::stmt(t::call(
-        t::id(&comp.name),
+        t::id_owned(comp.name.to_string()),
         vec![
             t::id("node"),
             Expression::Object(Box::new(ObjectExpression {
@@ -7614,11 +7613,11 @@ fn emit_single_element_with_component_program(
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&tag_var)],
+        vec![t::id_owned(tag_var.to_string())],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&tag_var)],
+        vec![t::id_anchor(), t::id_owned(tag_var.to_string())],
     )));
 
     let params = vec![t::pat_id_anchor()];
@@ -7732,7 +7731,7 @@ fn emit_single_element_with_inner_snippet_program(
                                 t::member_id(t::id_dollar(), "text"),
                                 vec![Expression::Literal(Box::new(Literal::String(
                                     StringLiteral {
-                                        value: trimmed.to_string(),
+                                        value: Cow::Owned(trimmed.to_string()),
                                         raw: None,
                                         span: Span::ZERO,
                                     },
@@ -7838,7 +7837,7 @@ fn emit_single_element_with_inner_snippet_program(
     }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&tag_var)],
+        vec![t::id_anchor(), t::id_owned(tag_var.to_string())],
     )));
 
     let mut params = vec![t::pat_id_anchor()];
@@ -8150,7 +8149,7 @@ fn emit_single_element_wrapping_ifs_program(
         let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
         let render_if = Statement::If(Box::new(IfStatement {
             test,
-            consequent: t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)])),
+            consequent: t::stmt(t::call(t::id_render(), vec![t::id_owned(consequent_var.to_string())])),
             alternate: None,
             span: Span::ZERO,
         }));
@@ -8171,7 +8170,7 @@ fn emit_single_element_wrapping_ifs_program(
         };
         inner_block.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "if"),
-            vec![t::id(&node_var), render_arrow],
+            vec![t::id_owned(node_var.to_string()), render_arrow],
         )));
         if i > 0 {
             let prev_node = if i - 1 == 0 {
@@ -8187,7 +8186,7 @@ fn emit_single_element_wrapping_ifs_program(
                 &node_var,
                 t::call(
                     t::member_id(t::id_dollar(), "sibling"),
-                    vec![t::id(&prev_node), t::lit_number(offset as f64)],
+                    vec![t::id_owned(prev_node.to_string()), t::lit_number(offset as f64)],
                 ),
             ));
         }
@@ -8214,7 +8213,7 @@ fn emit_single_element_wrapping_ifs_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -8235,7 +8234,7 @@ fn emit_single_element_wrapping_ifs_program(
     // Navigate to first if-block anchor inside this element.
     let child_call = t::call(
         t::member_id(t::id_dollar(), "child"),
-        vec![t::id(&tag_var)],
+        vec![t::id_owned(tag_var.to_string())],
     );
     let first_node_init = if first_if_pos == 0 {
         child_call
@@ -8266,11 +8265,11 @@ fn emit_single_element_wrapping_ifs_program(
     }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&tag_var)],
+        vec![t::id_owned(tag_var.to_string())],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&tag_var)],
+        vec![t::id_anchor(), t::id_owned(tag_var.to_string())],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
@@ -8798,10 +8797,10 @@ fn emit_top_level_multi_if_program(
                 full.is_empty()
             });
             let nav_args: Vec<Expression> = if offset == 1 && !is_empty_literal {
-                vec![t::id(&prev_node)]
+                vec![t::id_owned(prev_node.to_string())]
             } else if is_empty_literal {
                 vec![
-                    t::id(&prev_node),
+                    t::id_owned(prev_node.to_string()),
                     t::lit_number(offset as f64),
                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                         value: true,
@@ -8809,7 +8808,7 @@ fn emit_top_level_multi_if_program(
                     }))),
                 ]
             } else {
-                vec![t::id(&prev_node), t::lit_number(offset as f64)]
+                vec![t::id_owned(prev_node.to_string()), t::lit_number(offset as f64)]
             };
             block_stmts.push(t::var(
                 &cur_var,
@@ -8858,7 +8857,7 @@ fn emit_top_level_multi_if_program(
                 let test = rewrite_legacy_prop_reads(&test, &legacy_prop_names);
                 let render_if = Statement::If(Box::new(IfStatement {
                     test,
-                    consequent: t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)])),
+                    consequent: t::stmt(t::call(t::id_render(), vec![t::id_owned(consequent_var.to_string())])),
                     alternate: None,
                     span: Span::ZERO,
                 }));
@@ -8874,7 +8873,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 inner_block.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "if"),
-                    vec![t::id(&cur_var), render_arrow],
+                    vec![t::id_owned(cur_var.to_string()), render_arrow],
                 )));
                 block_stmts.push(Statement::Block(Box::new(BlockStatement {
                     body: inner_block,
@@ -8979,7 +8978,7 @@ fn emit_top_level_multi_if_program(
                     }
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
+                    params: vec![t::pat_id_anchor(), t::pat_id_owned(item_name.to_string())],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
@@ -8990,7 +8989,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 let is_bare_legacy = matches!(
                     &eb.expression,
-                    Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+                    Expression::Identifier(id) if legacy_prop_names.contains(id.name.as_ref())
                 );
                 let each_collection: Expression = if is_bare_legacy {
                     eb.expression.clone()
@@ -9013,7 +9012,7 @@ fn emit_top_level_multi_if_program(
                 // expression comes from `$props()` destructuring).
                 let is_runes_iter = matches!(
                     &eb.expression,
-                    Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+                    Expression::Identifier(id) if script.props_destructured.contains(id.name.as_ref())
                 ) || expression_uses_props_destructured(
                     &eb.expression,
                     &script.props_destructured,
@@ -9063,7 +9062,7 @@ fn emit_top_level_multi_if_program(
                 let key_fn: Expression = match &eb.key {
                     None => t::member_id(t::id_dollar(), "index"),
                     Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
-                        params: vec![t::pat_id(&item_name)],
+                        params: vec![t::pat_id_owned(item_name.to_string())],
                         param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(k.clone()),
                         r#async: false,
@@ -9071,7 +9070,7 @@ fn emit_top_level_multi_if_program(
                     })),
                 };
                 let mut each_args = vec![
-                    t::id(&cur_var),
+                    t::id_owned(cur_var.to_string()),
                     t::lit_number(flag as f64),
                     each_collection,
                     key_fn,
@@ -9101,9 +9100,9 @@ fn emit_top_level_multi_if_program(
                 let assign = Expression::Assignment(Box::new(AssignmentExpression {
                     left: AssignmentTarget::Expression(Expression::Member(Box::new(
                         MemberExpression {
-                            object: t::id(&cur_var),
+                            object: t::id_owned(cur_var.to_string()),
                             property: MemberProperty::Identifier(Identifier {
-                                name: "nodeValue".to_string(),
+                                name: Cow::Borrowed("nodeValue"),
                                 span: Span::ZERO,
                             }),
                             computed: false,
@@ -9113,7 +9112,7 @@ fn emit_top_level_multi_if_program(
                     ))),
                     operator: AssignmentOperator::Assign,
                     right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: text_content,
+                        value: Cow::Owned(text_content),
                         raw: None,
                         span: Span::ZERO,
                     }))),
@@ -9139,7 +9138,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "html"),
-                    vec![t::id(&cur_var), arrow],
+                    vec![t::id_owned(cur_var.to_string()), arrow],
                 )));
             }
             Slot::ElementWithSpread(el) => {
@@ -9175,7 +9174,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 spread_effects.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "attribute_effect"),
-                    vec![t::id(&cur_var), attr_effect_arrow],
+                    vec![t::id_owned(cur_var.to_string()), attr_effect_arrow],
                 )));
             }
             Slot::DynamicEl(el) => {
@@ -9223,7 +9222,7 @@ fn emit_top_level_multi_if_program(
                     if expression_has_any_binding(&rewritten, &reactive_bindings) {
                         any_reactive = true;
                     }
-                    attr_pairs.push((attr.name.clone(), rewritten));
+                    attr_pairs.push((attr.name.to_string(), rewritten));
                 }
                 let is_custom = el.name.contains('-');
                 let attr_call_for = |name: &str, expr: Expression| -> Statement {
@@ -9231,7 +9230,7 @@ fn emit_top_level_multi_if_program(
                         t::stmt(t::call(
                             t::member_id(t::id_dollar(), "set_class"),
                             vec![
-                                t::id(&cur_var),
+                                t::id_owned(cur_var.to_string()),
                                 t::lit_number(1.0),
                                 expr,
                             ],
@@ -9240,8 +9239,8 @@ fn emit_top_level_multi_if_program(
                         t::stmt(t::call(
                             t::member_id(t::id_dollar(), "set_custom_element_data"),
                             vec![
-                                t::id(&cur_var),
-                                t::literal_str(name),
+                                t::id_owned(cur_var.to_string()),
+                                t::literal_str_owned(name.to_string()),
                                 expr,
                             ],
                         ))
@@ -9249,8 +9248,8 @@ fn emit_top_level_multi_if_program(
                         t::stmt(t::call(
                             t::member_id(t::id_dollar(), "set_attribute"),
                             vec![
-                                t::id(&cur_var),
-                                t::literal_str(name),
+                                t::id_owned(cur_var.to_string()),
+                                t::literal_str_owned(name.to_string()),
                                 expr,
                             ],
                         ))
@@ -9319,11 +9318,11 @@ fn emit_top_level_multi_if_program(
                         t::member_id(t::id_dollar(), "event"),
                         vec![
                             Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                value: od.name.clone(),
+                                value: Cow::Owned(od.name.clone()),
                                 raw: None,
                                 span: Span::ZERO,
                             }))),
-                            t::id(&cur_var),
+                            t::id_owned(cur_var.to_string()),
                             handler,
                         ],
                     )));
@@ -9412,7 +9411,7 @@ fn emit_top_level_multi_if_program(
                     }
                 };
                 let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-                    params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
+                    params: vec![t::pat_id_anchor(), t::pat_id_owned(item_name.to_string())],
                     param_type_annotations: Vec::new(),
                     body: ArrowBody::Block(Box::new(BlockStatement {
                         body: inner_body,
@@ -9423,7 +9422,7 @@ fn emit_top_level_multi_if_program(
                 }));
                 let is_bare_legacy = matches!(
                     &eb.expression,
-                    Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+                    Expression::Identifier(id) if legacy_prop_names.contains(id.name.as_ref())
                 );
                 let each_collection: Expression = if is_bare_legacy {
                     eb.expression.clone()
@@ -9443,7 +9442,7 @@ fn emit_top_level_multi_if_program(
                 };
                 let is_runes_iter = matches!(
                     &eb.expression,
-                    Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+                    Expression::Identifier(id) if script.props_destructured.contains(id.name.as_ref())
                 ) || expression_uses_props_destructured(
                     &eb.expression,
                     &script.props_destructured,
@@ -9492,7 +9491,7 @@ fn emit_top_level_multi_if_program(
                 let key_fn: Expression = match &eb.key {
                     None => t::member_id(t::id_dollar(), "index"),
                     Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
-                        params: vec![t::pat_id(&item_name)],
+                        params: vec![t::pat_id_owned(item_name.to_string())],
                         param_type_annotations: Vec::new(),
                         body: ArrowBody::Expression(k.clone()),
                         r#async: false,
@@ -9500,7 +9499,7 @@ fn emit_top_level_multi_if_program(
                     })),
                 };
                 let mut each_args = vec![
-                    t::id(&cur_var),
+                    t::id_owned(cur_var.to_string()),
                     t::lit_number(flag as f64),
                     each_collection,
                     key_fn,
@@ -9515,7 +9514,7 @@ fn emit_top_level_multi_if_program(
                 )));
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(&cur_var)],
+                    vec![t::id_owned(cur_var.to_string())],
                 )));
             }
             Slot::TextAnchorEl(el) => {
@@ -9530,12 +9529,12 @@ fn emit_top_level_multi_if_program(
                     &text_var,
                     t::call(
                         t::member_id(t::id_dollar(), "child"),
-                        vec![t::id(&cur_var)],
+                        vec![t::id_owned(cur_var.to_string())],
                     ),
                 ));
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(&cur_var)],
+                    vec![t::id_owned(cur_var.to_string())],
                 )));
                 // Build the inline template from body parts.
                 let mut parts: Vec<TextPart> = Vec::new();
@@ -9581,16 +9580,16 @@ fn emit_top_level_multi_if_program(
                     &slot_node_var,
                     t::call(
                         t::member_id(t::id_dollar(), "child"),
-                        vec![t::id(&cur_var)],
+                        vec![t::id_owned(cur_var.to_string())],
                     ),
                 ));
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "slot"),
                     vec![
-                        t::id(&slot_node_var),
+                        t::id_owned(slot_node_var.to_string()),
                         t::id("$$props"),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: slot_name,
+                            value: Cow::Owned(slot_name),
                             raw: None,
                             span: Span::ZERO,
                         }))),
@@ -9603,7 +9602,7 @@ fn emit_top_level_multi_if_program(
                 )));
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(&cur_var)],
+                    vec![t::id_owned(cur_var.to_string())],
                 )));
             }
             Slot::ElementWithHtml(el, ht) => {
@@ -9623,7 +9622,7 @@ fn emit_top_level_multi_if_program(
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "html"),
                     vec![
-                        t::id(&cur_var),
+                        t::id_owned(cur_var.to_string()),
                         arrow,
                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                             value: true,
@@ -9633,7 +9632,7 @@ fn emit_top_level_multi_if_program(
                 )));
                 block_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(&cur_var)],
+                    vec![t::id_owned(cur_var.to_string())],
                 )));
                 let _ = el;
             }
@@ -9665,7 +9664,7 @@ fn emit_top_level_multi_if_program(
                                         match &parts[0] {
                                             AttributeValuePart::Text(t) => Expression::Literal(
                                                 Box::new(Literal::String(StringLiteral {
-                                                    value: t.data.clone(),
+                                                    value: Cow::Owned(t.data.clone()),
                                                     raw: None,
                                                     span: Span::ZERO,
                                                 })),
@@ -9687,7 +9686,7 @@ fn emit_top_level_multi_if_program(
                                 matches!(&value, Expression::Identifier(id) if id.name == attr.name);
                             props.push(ObjectMember::Property(Box::new(Property {
                                 key: PropertyKey::Identifier(Identifier {
-                                    name: attr.name.clone(),
+                                    name: Cow::Owned(attr.name.clone()),
                                     span: Span::ZERO,
                                 }),
                                 value,
@@ -9708,9 +9707,9 @@ fn emit_top_level_multi_if_program(
                     }
                 }
                 block_stmts.push(t::stmt(t::call(
-                    t::id(&c.name),
+                    t::id_owned(c.name.to_string()),
                     vec![
-                        t::id(&cur_var),
+                        t::id_owned(cur_var.to_string()),
                         Expression::Object(Box::new(ObjectExpression {
                             properties: props,
                             span: Span::ZERO,
@@ -9739,7 +9738,7 @@ fn emit_top_level_multi_if_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -9833,7 +9832,7 @@ fn emit_top_level_multi_if_program(
         let (text_var, expr) = text_set_effects.into_iter().next().unwrap();
         let arrow_body = ArrowBody::Expression(t::call(
             t::member_id(t::id_dollar(), "set_text"),
-            vec![t::id(&text_var), expr],
+            vec![t::id_owned(text_var.to_string()), expr],
         ));
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "template_effect"),
@@ -9850,7 +9849,7 @@ fn emit_top_level_multi_if_program(
         for (text_var, expr) in text_set_effects {
             block_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "set_text"),
-                vec![t::id(&text_var), expr],
+                vec![t::id_owned(text_var.to_string()), expr],
             )));
         }
         let arrow_body = ArrowBody::Block(Box::new(BlockStatement {
@@ -9911,9 +9910,9 @@ fn emit_top_level_multi_if_program(
                 let this_pos = positions[*slot_i];
                 let offset = this_pos - prev_pos;
                 let nav_args: Vec<Expression> = if offset == 1 {
-                    vec![t::id(&prev_var)]
+                    vec![t::id_owned(prev_var.to_string())]
                 } else {
-                    vec![t::id(&prev_var), t::lit_number(offset as f64)]
+                    vec![t::id_owned(prev_var.to_string()), t::lit_number(offset as f64)]
                 };
                 func_body.push(t::var(
                     &var,
@@ -9930,9 +9929,9 @@ fn emit_top_level_multi_if_program(
                         let assign = Expression::Assignment(Box::new(AssignmentExpression {
                             left: AssignmentTarget::Expression(Expression::Member(Box::new(
                                 MemberExpression {
-                                    object: t::id(&var),
+                                    object: t::id_owned(var.to_string()),
                                     property: MemberProperty::Identifier(Identifier {
-                                        name: "textContent".to_string(),
+                                        name: Cow::Borrowed("textContent"),
                                         span: Span::ZERO,
                                     }),
                                     computed: false,
@@ -9942,7 +9941,7 @@ fn emit_top_level_multi_if_program(
                             ))),
                             operator: AssignmentOperator::Assign,
                             right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                value: text,
+                                value: Cow::Owned(text),
                                 raw: None,
                                 span: Span::ZERO,
                             }))),
@@ -10547,7 +10546,7 @@ fn emit_single_element_wrapping_each_program(
         t::call(
             t::member_id(t::id_dollar(), "child"),
             vec![
-                t::id(&inner_var),
+                t::id_owned(inner_var.to_string()),
                 Expression::Literal(Box::new(Literal::Boolean(
                     svelte_js_ast::BooleanLiteral { value: true, span: Span::ZERO },
                 ))),
@@ -10556,7 +10555,7 @@ fn emit_single_element_wrapping_each_program(
     ));
     item_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&inner_var)],
+        vec![t::id_owned(inner_var.to_string())],
     )));
     // Detect iter source category. ITEM_IMMUTABLE (16) is set when the
     // iterable comes from `$props()` destructuring. ITEM_REACTIVE (1) is
@@ -10564,7 +10563,7 @@ fn emit_single_element_wrapping_each_program(
     // key isn't the item identifier itself.
     let is_runes_iter = matches!(
         &eb.expression,
-        Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+        Expression::Identifier(id) if script.props_destructured.contains(id.name.as_ref())
     ) || expression_uses_props_destructured(
         &eb.expression,
         &script.props_destructured,
@@ -10575,13 +10574,13 @@ fn emit_single_element_wrapping_each_program(
         .map(|(n, _)| n.clone())
         .collect();
     let is_legacy_iter = match &eb.expression {
-        Expression::Identifier(id) => legacy_prop_names_for_iter.contains(&id.name),
+        Expression::Identifier(id) => legacy_prop_names_for_iter.contains(id.name.as_ref()),
         Expression::Member(m) => match &m.object {
-            Expression::Identifier(id) => legacy_prop_names_for_iter.contains(&id.name),
+            Expression::Identifier(id) => legacy_prop_names_for_iter.contains(id.name.as_ref()),
             _ => false,
         },
         Expression::Call(c) => match &c.callee {
-            Expression::Identifier(id) => legacy_prop_names_for_iter.contains(&id.name),
+            Expression::Identifier(id) => legacy_prop_names_for_iter.contains(id.name.as_ref()),
             _ => false,
         },
         _ => false,
@@ -10610,10 +10609,10 @@ fn emit_single_element_wrapping_each_program(
     )));
     item_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&inner_var)],
+        vec![t::id_anchor(), t::id_owned(inner_var.to_string())],
     )));
     let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id_owned(item_name.to_string())],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: item_body,
@@ -10633,14 +10632,14 @@ fn emit_single_element_wrapping_each_program(
         .collect();
     let is_bare_legacy = matches!(
         &eb.expression,
-        Expression::Identifier(id) if legacy_prop_names.contains(&id.name)
+        Expression::Identifier(id) if legacy_prop_names.contains(id.name.as_ref())
     );
     // Detect deep access to a legacy prop (e.g. `things().foo`) — wrap with
     // `($.deep_read_state(LEGACY_CALL), $.untrack(() => ORIG))`.
     let deep_legacy_object: Option<Expression> = if let Expression::Member(m) = &eb.expression {
         if let Expression::Identifier(id) = &m.object {
-            if legacy_prop_names.contains(&id.name) {
-                Some(t::call(t::id(&id.name), Vec::new()))
+            if legacy_prop_names.contains(id.name.as_ref()) {
+                Some(t::call(t::id_owned(id.name.to_string()), Vec::new()))
             } else {
                 None
             }
@@ -10707,7 +10706,7 @@ fn emit_single_element_wrapping_each_program(
     let key_fn: Expression = match &eb.key {
         None => t::member_id(t::id_dollar(), "index"),
         Some(k) => Expression::Arrow(Box::new(ArrowFunctionExpression {
-            params: vec![t::pat_id(&item_name)],
+            params: vec![t::pat_id_owned(item_name.to_string())],
             param_type_annotations: Vec::new(),
             body: ArrowBody::Expression(k.clone()),
             r#async: false,
@@ -10717,7 +10716,7 @@ fn emit_single_element_wrapping_each_program(
     let each_call = t::stmt(t::call(
         t::member_id(t::id_dollar(), "each"),
         vec![
-            t::id(&outer_var),
+            t::id_owned(outer_var.to_string()),
             t::lit_number(flag as f64),
             each_collection,
             key_fn,
@@ -10738,7 +10737,7 @@ fn emit_single_element_wrapping_each_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -10769,11 +10768,11 @@ fn emit_single_element_wrapping_each_program(
     func_body.push(each_call);
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&outer_var)],
+        vec![t::id_owned(outer_var.to_string())],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&outer_var)],
+        vec![t::id_anchor(), t::id_owned(outer_var.to_string())],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
@@ -10823,7 +10822,7 @@ fn expression_uses_props_destructured(
     names: &HashSet<String>,
 ) -> bool {
     match e {
-        Expression::Identifier(id) => names.contains(&id.name),
+        Expression::Identifier(id) => names.contains(id.name.as_ref()),
         Expression::Member(m) => expression_uses_props_destructured(&m.object, names),
         Expression::Call(c) => {
             expression_uses_props_destructured(&c.callee, names)
@@ -10846,7 +10845,7 @@ fn expression_has_any_binding(
 ) -> bool {
     match e {
         Expression::Identifier(id) => {
-            id.name == "$$props" || names.contains(&id.name)
+            id.name == "$$props" || names.contains(id.name.as_ref())
         }
         Expression::Member(m) => expression_has_any_binding(&m.object, names),
         Expression::Call(c) => {
@@ -11022,16 +11021,16 @@ fn rewrite_legacy_prop_writes_to_calls(
             // `X = v` → `X(v)` if X is a legacy prop accessor.
             if matches!(asn.operator, AssignmentOperator::Assign) {
                 let ident_name: Option<&str> = match &asn.left {
-                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(id.name.as_str()),
+                    AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(id.name.as_ref()),
                     AssignmentTarget::Expression(Expression::Identifier(id)) => {
-                        Some(id.name.as_str())
+                        Some(id.name.as_ref())
                     }
                     _ => None,
                 };
                 if let Some(name) = ident_name {
                     if legacy_props.contains(name) {
                         return Expression::Call(Box::new(CallExpression {
-                            callee: t::id(name),
+                            callee: t::id_owned(name.to_string()),
                             arguments: vec![Argument::Expression(asn.right.clone())],
                             optional: false,
                             span: asn.span,
@@ -11417,11 +11416,11 @@ fn emit_single_element_with_spread_program(
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "attribute_effect"),
-        vec![t::id(&var_name), attr_effect_arrow],
+        vec![t::id_owned(var_name.to_string()), attr_effect_arrow],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&var_name)],
+        vec![t::id_anchor(), t::id_owned(var_name.to_string())],
     )));
 
     let mut params = vec![t::pat_id_anchor()];
@@ -11561,14 +11560,14 @@ fn emit_single_element_with_bind_this_program(
         .iter()
         .map(|(n, _)| n.clone())
         .collect();
-    let is_legacy_prop = legacy_prop_names.contains(&target_name);
+    let is_legacy_prop = legacy_prop_names.contains(target_name.as_ref());
 
     // bind_this setter / getter.
     // Setter: `($$value) => target($$value)` or `($$value) => target = $$value`
     // Getter: `() => target()` or `() => target`
     let setter_body: Expression = if is_legacy_prop {
         t::call(
-            t::id(&target_name),
+            t::id_owned(target_name.to_string()),
             vec![t::id("$$value")],
         )
     } else {
@@ -11591,9 +11590,9 @@ fn emit_single_element_with_bind_this_program(
         span: Span::ZERO,
     }));
     let getter_body: Expression = if is_legacy_prop {
-        t::call(t::id(&target_name), Vec::new())
+        t::call(t::id_owned(target_name.to_string()), Vec::new())
     } else {
-        t::id(&target_name)
+        t::id_owned(target_name.to_string())
     };
     let getter_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
@@ -11617,7 +11616,7 @@ fn emit_single_element_with_bind_this_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -11637,11 +11636,11 @@ fn emit_single_element_with_bind_this_program(
     func_body.push(t::var(&var_name, t::call(t::id("root"), Vec::new())));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "bind_this"),
-        vec![t::id(&var_name), setter_arrow, getter_arrow],
+        vec![t::id_owned(var_name.to_string()), setter_arrow, getter_arrow],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&var_name)],
+        vec![t::id_anchor(), t::id_owned(var_name.to_string())],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
@@ -11812,10 +11811,10 @@ fn emit_single_element_with_folded_prefix_program(
     // only ExpressionTag-with-literal — so the runtime knows to create
     // a text node if the hydrated DOM doesn't have one.
     let child_args: Vec<Expression> = if had_text {
-        vec![t::id(&tag_var)]
+        vec![t::id_owned(tag_var.to_string())]
     } else {
         vec![
-            t::id(&tag_var),
+            t::id_owned(tag_var.to_string()),
             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                 value: true,
                 span: Span::ZERO,
@@ -11831,7 +11830,7 @@ fn emit_single_element_with_folded_prefix_program(
         left: AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
             object: t::id("text"),
             property: MemberProperty::Identifier(Identifier {
-                name: "nodeValue".to_string(),
+                name: Cow::Borrowed("nodeValue"),
                 span: Span::ZERO,
             }),
             computed: false,
@@ -11840,7 +11839,7 @@ fn emit_single_element_with_folded_prefix_program(
         }))),
         operator: AssignmentOperator::Assign,
         right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-            value: folded,
+            value: Cow::Owned(folded),
             raw: None,
             span: Span::ZERO,
         }))),
@@ -11862,11 +11861,11 @@ fn emit_single_element_with_folded_prefix_program(
     }
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(&tag_var)],
+        vec![t::id_owned(tag_var.to_string())],
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&tag_var)],
+        vec![t::id_anchor(), t::id_owned(tag_var.to_string())],
     )));
 
     let mut params = vec![t::pat_id_anchor()];
@@ -11947,7 +11946,7 @@ fn emit_single_dynamic_element_program(
                         }
                     }
                     AttributeValue::Single(et) => {
-                        dyn_attrs.push((attr.name.as_str(), et.expression.clone()));
+                        dyn_attrs.push((attr.name.as_ref(), et.expression.clone()));
                     }
                 }
             }
@@ -12107,7 +12106,7 @@ fn emit_single_dynamic_element_program(
             // snapshot we've inspected.
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -12129,12 +12128,12 @@ fn emit_single_dynamic_element_program(
             "text",
             t::call(
                 t::member_id(t::id_dollar(), "child"),
-                vec![t::id(&tag_var)],
+                vec![t::id_owned(tag_var.to_string())],
             ),
         ));
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "reset"),
-            vec![t::id(&tag_var)],
+            vec![t::id_owned(tag_var.to_string())],
         )));
     }
 
@@ -12145,7 +12144,7 @@ fn emit_single_dynamic_element_program(
     if is_input {
         func_body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "remove_input_defaults"),
-            vec![t::id(&tag_var)],
+            vec![t::id_owned(tag_var.to_string())],
         )));
     }
     // Single dyn attr → `$.template_effect(() => $.set_attribute(TAG, NAME, EXPR));`
@@ -12155,13 +12154,13 @@ fn emit_single_dynamic_element_program(
         if is_input && name == "value" {
             return t::call(
                 t::member_id(t::id_dollar(), "set_value"),
-                vec![t::id(&tag_var), e],
+                vec![t::id_owned(tag_var.to_string()), e],
             );
         }
         if is_input && name == "checked" {
             return t::call(
                 t::member_id(t::id_dollar(), "set_checked"),
-                vec![t::id(&tag_var), e],
+                vec![t::id_owned(tag_var.to_string()), e],
             );
         }
         // `class={expr}` → `$.set_class(TAG, 1, $.clsx(expr))`. The `1`
@@ -12170,7 +12169,7 @@ fn emit_single_dynamic_element_program(
             return t::call(
                 t::member_id(t::id_dollar(), "set_class"),
                 vec![
-                    t::id(&tag_var),
+                    t::id_owned(tag_var.to_string()),
                     t::lit_number(1.0),
                     t::call(t::member_id(t::id_dollar(), "clsx"), vec![e]),
                 ],
@@ -12178,7 +12177,7 @@ fn emit_single_dynamic_element_program(
         }
         t::call(
             t::member_id(t::id_dollar(), "set_attribute"),
-            vec![t::id(&tag_var), t::literal_str(name), e],
+            vec![t::id_owned(tag_var.to_string()), t::literal_str_owned(name.to_string()), e],
         )
     };
     // Collect all effect statements: `$.set_text(text, …)` for the body
@@ -12222,7 +12221,7 @@ fn emit_single_dynamic_element_program(
     )));
     func_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&tag_var)],
+        vec![t::id_anchor(), t::id_owned(tag_var.to_string())],
     )));
     if !script.legacy_export_props.is_empty() {
         func_body.push(Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
@@ -12526,7 +12525,7 @@ fn emit_async_const_chain_program(
                 &new_name,
                 t::call(
                     t::member_id(t::id_dollar(), "sibling"),
-                    vec![t::id(&prev_node_name), t::lit_number(2.0)],
+                    vec![t::id_owned(prev_node_name.to_string()), t::lit_number(2.0)],
                 ),
             ));
             new_name
@@ -12558,7 +12557,7 @@ fn emit_async_const_chain_program(
         }));
 
         // $.if call with literal test
-        let render_call = t::stmt(t::call(t::id_render(), vec![t::id(&consequent_name)]));
+        let render_call = t::stmt(t::call(t::id_render(), vec![t::id_owned(consequent_name.to_string())]));
         let render_if = Statement::If(Box::new(IfStatement {
             test: ib.test.clone(),
             consequent: render_call,
@@ -12577,7 +12576,7 @@ fn emit_async_const_chain_program(
         }));
         let if_call = t::stmt(t::call(
             t::member_id(t::id_dollar(), "if"),
-            vec![t::id(&node_name), render_arrow],
+            vec![t::id_owned(node_name.to_string()), render_arrow],
         ));
 
         let block = Statement::Block(Box::new(BlockStatement {
@@ -12665,7 +12664,7 @@ fn build_async_const_consequent(
                     std::collections::BTreeSet::new();
                 collect_blocker_indices_in_expr(init, &ai.blocker_bindings, &mut blocker_idx_set);
                 let blockers: Vec<usize> = blocker_idx_set.iter().copied().collect();
-                const_names.push(id.name.clone());
+                const_names.push(id.name.to_string());
 
                 // Blocker thunks for non-await consts that depend on a
                 // promise slot.
@@ -12682,7 +12681,7 @@ fn build_async_const_consequent(
                         let with_promise = Expression::Member(Box::new(MemberExpression {
                             object: member,
                             property: MemberProperty::Identifier(Identifier {
-                                name: "promise".to_string(),
+                                name: Cow::Borrowed("promise"),
                                 span: Span::ZERO,
                             }),
                             computed: false,
@@ -12721,7 +12720,7 @@ fn build_async_const_consequent(
                     );
                     let outer = save_await_call_client(async_derived_call);
                     let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                        left: AssignmentTarget::Expression(t::id(&id.name)),
+                        left: AssignmentTarget::Expression(t::id_owned(id.name.to_string())),
                         operator: AssignmentOperator::Assign,
                         right: outer,
                         span: Span::ZERO,
@@ -12747,7 +12746,7 @@ fn build_async_const_consequent(
                         }))],
                     );
                     let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                        left: AssignmentTarget::Expression(t::id(&id.name)),
+                        left: AssignmentTarget::Expression(t::id_owned(id.name.to_string())),
                         operator: AssignmentOperator::Assign,
                         right: derived_call,
                         span: Span::ZERO,
@@ -12769,7 +12768,7 @@ fn build_async_const_consequent(
         body.push(Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Let,
             declarations: vec![VariableDeclarator {
-                id: t::pat_id(name),
+                id: t::pat_id_owned(name.to_string()),
                 init: None,
                 type_annotation: None,
                 span: Span::ZERO,
@@ -12848,7 +12847,7 @@ fn rewrite_const_chain_init(
     derived_bindings: &HashSet<String>,
 ) -> Expression {
     match e {
-        Expression::Identifier(id) if derived_bindings.contains(&id.name) => t::call(
+        Expression::Identifier(id) if derived_bindings.contains(id.name.as_ref()) => t::call(
             t::member_id(t::id_dollar(), "get"),
             vec![Expression::Identifier(id.clone())],
         ),
@@ -12932,9 +12931,9 @@ fn emit_const_async_if_program(
             let Pattern::Identifier(id) = &d.id else { return None };
             let Some(init) = &d.init else { return None };
             let has_await = expr_top_await(init);
-            const_names.push(id.name.clone());
+            const_names.push(id.name.to_string());
             let idx = thunks.len();
-            const_blocker_idx.insert(id.name.clone(), idx);
+            const_blocker_idx.insert(id.name.to_string(), idx);
             if has_await {
                 // `async () => X = (await $.save($.async_derived(async () =>
                 // (await $.save(INNER))())))()`
@@ -12957,7 +12956,7 @@ fn emit_const_async_if_program(
                 );
                 let outer = save_await_call_client(async_derived_call);
                 let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                    left: AssignmentTarget::Expression(t::id(&id.name)),
+                    left: AssignmentTarget::Expression(t::id_owned(id.name.to_string())),
                     operator: AssignmentOperator::Assign,
                     right: outer,
                     span: Span::ZERO,
@@ -12983,7 +12982,7 @@ fn emit_const_async_if_program(
                     }))],
                 );
                 let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                    left: AssignmentTarget::Expression(t::id(&id.name)),
+                    left: AssignmentTarget::Expression(t::id_owned(id.name.to_string())),
                     operator: AssignmentOperator::Assign,
                     right: derived_call,
                     span: Span::ZERO,
@@ -13004,7 +13003,7 @@ fn emit_const_async_if_program(
         Expression::Identifier(id) => id.name.clone(),
         _ => return None,
     };
-    let text_blocker_idx = *const_blocker_idx.get(&text_ref_name)?;
+    let text_blocker_idx = *const_blocker_idx.get(text_ref_name.as_ref())?;
 
     // Build the consequent body.
     let mut consequent: Vec<Statement> = Vec::new();
@@ -13012,7 +13011,7 @@ fn emit_const_async_if_program(
         consequent.push(Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Let,
             declarations: vec![VariableDeclarator {
-                id: t::pat_id(name),
+                id: t::pat_id_owned(name.to_string()),
                 init: None,
                 type_annotation: None,
                 span: Span::ZERO,
@@ -13055,7 +13054,7 @@ fn emit_const_async_if_program(
     // $.template_effect(() => $.set_text(text, $.get(TEXT_REF)), void 0, void 0, [promises[N]])
     let get_text_ref = t::call(
         t::member_id(t::id_dollar(), "get"),
-        vec![t::id(&text_ref_name)],
+        vec![t::id_owned(text_ref_name.to_string())],
     );
     let set_text_call = t::call(
         t::member_id(t::id_dollar(), "set_text"),
@@ -13300,7 +13299,7 @@ fn emit_async_if_chain_program(
                 &new_name,
                 t::call(
                     t::member_id(t::id_dollar(), "sibling"),
-                    vec![t::id(&prev_node_name), t::lit_number(2.0)],
+                    vec![t::id_owned(prev_node_name.to_string()), t::lit_number(2.0)],
                 ),
             ));
             new_name
@@ -13404,7 +13403,7 @@ fn emit_async_if_block(
                 }))],
             );
             chain_body.push(t::var(&d_name, derived_call));
-            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&d_name)])
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(d_name.to_string())])
         } else {
             rewrite_chain_test(&cur.test, &ai.blocker_bindings, derived_bindings, counters)
         };
@@ -13481,7 +13480,7 @@ fn emit_async_if_block(
     }));
     let if_args = if in_async_ctx {
         vec![
-            t::id(node_name),
+            t::id_owned(node_name.to_string()),
             render_arrow,
             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                 value: true,
@@ -13489,7 +13488,7 @@ fn emit_async_if_block(
             }))),
         ]
     } else {
-        vec![t::id(node_name), render_arrow]
+        vec![t::id_owned(node_name.to_string()), render_arrow]
     };
     chain_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "if"),
@@ -13539,9 +13538,9 @@ fn emit_async_if_block(
             void_zero_client()
         };
         let cb_params = if matches!(&tests_arg, Expression::Array(_)) {
-            vec![t::pat_id(node_name), t::pat_id("$$condition")]
+            vec![t::pat_id_owned(node_name.to_string()), t::pat_id("$$condition")]
         } else {
-            vec![t::pat_id(node_name)]
+            vec![t::pat_id_owned(node_name.to_string())]
         };
         let cb = Expression::Arrow(Box::new(ArrowFunctionExpression {
             params: cb_params,
@@ -13555,7 +13554,7 @@ fn emit_async_if_block(
         }));
         Some(t::stmt(t::call(
             t::member_id(t::id_dollar(), "async"),
-            vec![t::id(node_name), blockers_arr, tests_arg, cb],
+            vec![t::id_owned(node_name.to_string()), blockers_arr, tests_arg, cb],
         )))
     } else {
         // Plain `{ ... }` block.
@@ -13653,7 +13652,7 @@ fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool 
                 if is_custom {
                     return true;
                 }
-                match attr.name.as_str() {
+                match attr.name.as_ref() {
                     "autofocus" => return true,
                     "muted" if el.name == "source" || el.name == "video" || el.name == "audio" => {
                         return true
@@ -13708,7 +13707,7 @@ fn emit_select_rich_content_program(
                 // root_N template for it.
                 let name = sb.expression.name.clone();
                 let body_stmts = build_snippet_body(&sb.body, &mut ctx)?;
-                snippet_decls.push((name, body_stmts));
+                snippet_decls.push((name.to_string(), body_stmts));
             }
             FragmentChild::RegularElement(el) if el.name == "select" => {
                 top_selects.push(el);
@@ -13749,7 +13748,7 @@ fn emit_select_rich_content_program(
             t::call(
                 t::member_id(t::id_dollar(), "sibling"),
                 vec![
-                    t::id(prev_select.as_ref().expect("prev set")),
+                    t::id_owned(prev_select.as_ref().expect("prev set").to_string()),
                     t::lit_number(2.0),
                 ],
             )
@@ -13918,11 +13917,11 @@ fn build_snippet_body(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &option_var,
-        t::call(t::id(&root_name), Vec::new()),
+        t::call(t::id_owned(root_name.to_string()), Vec::new()),
     ));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&option_var)],
+        vec![t::id_anchor(), t::id_owned(option_var.to_string())],
     )));
     Some(body)
 }
@@ -14123,7 +14122,7 @@ fn lower_select_with_option(
                 &option_var,
                 t::call(
                     t::member_id(t::id_dollar(), "child"),
-                    vec![t::id(select_var)],
+                    vec![t::id_owned(select_var.to_string())],
                 ),
             ));
             // Build option_content template + the customizable_select call.
@@ -14146,7 +14145,7 @@ fn lower_select_with_option(
             }
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
-                vec![t::id(select_var)],
+                vec![t::id_owned(select_var.to_string())],
             )));
             Some((html, body))
         }
@@ -14160,7 +14159,7 @@ fn build_static_attrs_excluding(
     let mut out = String::new();
     for a in &el.attributes {
         if let ElementAttribute::Attribute(attr) = a {
-            if exclude.contains(&attr.name.as_str()) {
+            if exclude.contains(&attr.name.as_ref()) {
                 continue;
             }
             if let AttributeValue::Many(parts) = &attr.value {
@@ -14252,23 +14251,23 @@ fn build_customizable_select_body_with_html(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(target_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(target_var.to_string())]),
         ),
-        t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
+        t::var(&fragment_var, t::call(t::id_owned(oc_name.to_string()), Vec::new())),
         t::var(
             &node_var,
             t::call(
                 t::member_id(t::id_dollar(), "first_child"),
-                vec![t::id(&fragment_var)],
+                vec![t::id_owned(fragment_var.to_string())],
             ),
         ),
         t::stmt(t::call(
             t::member_id(t::id_dollar(), "html"),
-            vec![t::id(&node_var), getter],
+            vec![t::id_owned(node_var.to_string()), getter],
         )),
         t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id(&anchor_var), t::id(&fragment_var)],
+            vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
         )),
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -14283,7 +14282,7 @@ fn build_customizable_select_body_with_html(
     }));
     Some(t::stmt(t::call(
         t::member_id(t::id_dollar(), "customizable_select"),
-        vec![t::id(target_var), arrow],
+        vec![t::id_owned(target_var.to_string()), arrow],
     )))
 }
 
@@ -14312,11 +14311,11 @@ fn build_customizable_select_body_with_next(
     let mut arrow_body: Vec<Statement> = Vec::new();
     arrow_body.push(t::var(
         &anchor_var,
-        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(target_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(target_var.to_string())]),
     ));
     arrow_body.push(t::var(
         &fragment_var,
-        t::call(t::id(&oc_name), Vec::new()),
+        t::call(t::id_owned(oc_name.to_string()), Vec::new()),
     ));
     arrow_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "next"),
@@ -14324,7 +14323,7 @@ fn build_customizable_select_body_with_next(
     )));
     arrow_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id(&anchor_var), t::id(&fragment_var)],
+        vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
     )));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
@@ -14338,7 +14337,7 @@ fn build_customizable_select_body_with_next(
     }));
     Some(t::stmt(t::call(
         t::member_id(t::id_dollar(), "customizable_select"),
-        vec![t::id(target_var), arrow],
+        vec![t::id_owned(target_var.to_string()), arrow],
     )))
 }
 
@@ -14364,9 +14363,9 @@ fn emit_option_value_set(var: &str, value: &str) -> Statement {
     let inner = Expression::Assignment(Box::new(AssignmentExpression {
         left: AssignmentTarget::Expression(Expression::Member(Box::new(
             MemberExpression {
-                object: t::id(var),
+                object: t::id_owned(var.to_string()),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "__value".to_string(),
+                    name: Cow::Borrowed("__value"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -14376,7 +14375,7 @@ fn emit_option_value_set(var: &str, value: &str) -> Statement {
         ))),
         operator: AssignmentOperator::Assign,
         right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-            value: value.to_string(),
+            value: Cow::Owned(value.to_string()),
             raw: Some(format!("'{value}'")),
             span: Span::ZERO,
         }))),
@@ -14385,9 +14384,9 @@ fn emit_option_value_set(var: &str, value: &str) -> Statement {
     let outer = Expression::Assignment(Box::new(AssignmentExpression {
         left: AssignmentTarget::Expression(Expression::Member(Box::new(
             MemberExpression {
-                object: t::id(var),
+                object: t::id_owned(var.to_string()),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "value".to_string(),
+                    name: Cow::Borrowed("value"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -14425,15 +14424,15 @@ fn build_customizable_select_body(
     let mut arrow_body: Vec<Statement> = Vec::new();
     arrow_body.push(t::var(
         &anchor_var,
-        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(target_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(target_var.to_string())]),
     ));
     arrow_body.push(t::var(
         &fragment_var,
-        t::call(t::id(&oc_name), Vec::new()),
+        t::call(t::id_owned(oc_name.to_string()), Vec::new()),
     ));
     arrow_body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id(&anchor_var), t::id(&fragment_var)],
+        vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
     )));
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: Vec::new(),
@@ -14447,7 +14446,7 @@ fn build_customizable_select_body(
     }));
     Some(t::stmt(t::call(
         t::member_id(t::id_dollar(), "customizable_select"),
-        vec![t::id(target_var), arrow],
+        vec![t::id_owned(target_var.to_string()), arrow],
     )))
 }
 
@@ -14549,7 +14548,7 @@ fn lower_select_with_each(
         let each_call = t::stmt(t::call(
             t::member_id(t::id_dollar(), "each"),
             vec![
-                t::id(&node_var),
+                t::id_owned(node_var.to_string()),
                 t::lit_number(1.0),
                 expr_arrow,
                 t::member_id(t::id_dollar(), "index"),
@@ -14559,20 +14558,20 @@ fn lower_select_with_each(
         let arrow_body = vec![
             t::var(
                 &anchor_var,
-                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
             ),
-            t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+            t::var(&fragment_var, t::call(t::id_owned(sc_name.to_string()), Vec::new())),
             t::var(
                 &node_var,
                 t::call(
                     t::member_id(t::id_dollar(), "first_child"),
-                    vec![t::id(&fragment_var)],
+                    vec![t::id_owned(fragment_var.to_string())],
                 ),
             ),
             each_call,
             t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id(&anchor_var), t::id(&fragment_var)],
+                vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
             )),
         ];
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -14587,7 +14586,7 @@ fn lower_select_with_each(
         }));
         let body = vec![t::stmt(t::call(
             t::member_id(t::id_dollar(), "customizable_select"),
-            vec![t::id(select_var), arrow],
+            vec![t::id_owned(select_var.to_string()), arrow],
         ))];
         // Bump fragment counter once more after the each-with-Component
         // pattern — upstream's analyze allocates a phantom slot in this
@@ -14633,7 +14632,7 @@ fn build_each_body_for_select(
     let each_call = t::stmt(t::call(
         t::member_id(t::id_dollar(), "each"),
         vec![
-            t::id(container_var),
+            t::id_owned(container_var.to_string()),
             t::lit_number(flag),
             expr_arrow,
             t::member_id(t::id_dollar(), "index"),
@@ -14643,7 +14642,7 @@ fn build_each_body_for_select(
     let mut out = vec![each_call];
     out.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(container_var)],
+        vec![t::id_owned(container_var.to_string())],
     )));
     Some(out)
 }
@@ -14675,7 +14674,7 @@ fn build_each_iter_arrow(
             FragmentChild::ConstTag(ct) => {
                 for d in &ct.declaration.declarations {
                     if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
-                        const_decls.push((id.name.clone(), init.clone()));
+                        const_decls.push((id.name.to_string(), init.clone()));
                     } else {
                         return None;
                     }
@@ -14733,14 +14732,14 @@ fn build_each_iter_arrow(
                     let expr_with_get = wrap_expr_with_get(expr, &const_decls, &ctx_name);
                     body.push(t::var(
                         &option_var,
-                        t::call(t::id(&root_name), Vec::new()),
+                        t::call(t::id_owned(root_name.to_string()), Vec::new()),
                     ));
                     body.push(t::var(
                         &text_var,
                         t::call(
                             t::member_id(t::id_dollar(), "child"),
                             vec![
-                                t::id(&option_var),
+                                t::id_owned(option_var.to_string()),
                                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                     value: true,
                                     span: Span::ZERO,
@@ -14750,7 +14749,7 @@ fn build_each_iter_arrow(
                     ));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "reset"),
-                        vec![t::id(&option_var)],
+                        vec![t::id_owned(option_var.to_string())],
                     )));
                     body.push(t::var(
                         &option_value_var,
@@ -14767,10 +14766,10 @@ fn build_each_iter_arrow(
                     // })
                     let set_text_call = t::stmt(t::call(
                         t::member_id(t::id_dollar(), "set_text"),
-                        vec![t::id(&text_var), expr_with_get.clone()],
+                        vec![t::id_owned(text_var.to_string()), expr_with_get.clone()],
                     ));
                     let assign_inner = Expression::Assignment(Box::new(AssignmentExpression {
-                        left: AssignmentTarget::Expression(t::id(&option_value_var)),
+                        left: AssignmentTarget::Expression(t::id_owned(option_value_var.to_string())),
                         operator: AssignmentOperator::Assign,
                         right: expr_with_get.clone(),
                         span: Span::ZERO,
@@ -14781,7 +14780,7 @@ fn build_each_iter_arrow(
                     }));
                     let neq_test = Expression::Binary(Box::new(BinaryExpression {
                         operator: BinaryOperator::StrictNotEq,
-                        left: t::id(&option_value_var),
+                        left: t::id_owned(option_value_var.to_string()),
                         right: assign_paren,
                         span: Span::ZERO,
                     }));
@@ -14789,9 +14788,9 @@ fn build_each_iter_arrow(
                         AssignmentExpression {
                             left: AssignmentTarget::Expression(Expression::Member(Box::new(
                                 MemberExpression {
-                                    object: t::id(&option_var),
+                                    object: t::id_owned(option_var.to_string()),
                                     property: MemberProperty::Identifier(Identifier {
-                                        name: "__value".to_string(),
+                                        name: Cow::Borrowed("__value"),
                                         span: Span::ZERO,
                                     }),
                                     computed: false,
@@ -14830,7 +14829,7 @@ fn build_each_iter_arrow(
                     )));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "append"),
-                        vec![t::id_anchor(), t::id(&option_var)],
+                        vec![t::id_anchor(), t::id_owned(option_var.to_string())],
                     )));
                 }
                 OptionShape::RichContent(nodes) => {
@@ -14868,7 +14867,7 @@ fn build_each_iter_arrow(
                     let option_var = ctx.next_named("option");
                     body.push(t::var(
                         &option_var,
-                        t::call(t::id(&root_name), Vec::new()),
+                        t::call(t::id_owned(root_name.to_string()), Vec::new()),
                     ));
                     // Arrow body: navigate into fragment + setup span/text + template_effect.
                     // For rich content like <span>{item}</span>:
@@ -14879,12 +14878,12 @@ fn build_each_iter_arrow(
                         &anchor_var,
                         t::call(
                             t::member_id(t::id_dollar(), "child"),
-                            vec![t::id(&option_var)],
+                            vec![t::id_owned(option_var.to_string())],
                         ),
                     ));
                     arrow_body.push(t::var(
                         &fragment_var,
-                        t::call(t::id(&oc_name), Vec::new()),
+                        t::call(t::id_owned(oc_name.to_string()), Vec::new()),
                     ));
                     // Recursively handle the rich content for reactive expressions.
                     let rich_emitted = emit_rich_content_reactivity(
@@ -14897,7 +14896,7 @@ fn build_each_iter_arrow(
                     arrow_body.extend(rich_emitted);
                     arrow_body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "append"),
-                        vec![t::id(&anchor_var), t::id(&fragment_var)],
+                        vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
                     )));
                     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
@@ -14911,11 +14910,11 @@ fn build_each_iter_arrow(
                     }));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "customizable_select"),
-                        vec![t::id(&option_var), arrow],
+                        vec![t::id_owned(option_var.to_string()), arrow],
                     )));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "append"),
-                        vec![t::id_anchor(), t::id(&option_var)],
+                        vec![t::id_anchor(), t::id_owned(option_var.to_string())],
                     )));
                 }
                 OptionShape::PlainText(_) => return None,
@@ -14937,7 +14936,7 @@ fn build_each_iter_arrow(
         _ => return None,
     }
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id_anchor(), t::pat_id(&ctx_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id_owned(ctx_name.to_string())],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body,
@@ -15065,7 +15064,7 @@ fn emit_rich_content_reactivity(
                         &el_var,
                         t::call(
                             t::member_id(t::id_dollar(), "first_child"),
-                            vec![t::id(fragment_var)],
+                            vec![t::id_owned(fragment_var.to_string())],
                         ),
                     ));
                     out.push(t::var(
@@ -15073,7 +15072,7 @@ fn emit_rich_content_reactivity(
                         t::call(
                             t::member_id(t::id_dollar(), "child"),
                             vec![
-                                t::id(&el_var),
+                                t::id_owned(el_var.to_string()),
                                 Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                     value: true,
                                     span: Span::ZERO,
@@ -15083,12 +15082,12 @@ fn emit_rich_content_reactivity(
                     ));
                     out.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "reset"),
-                        vec![t::id(&el_var)],
+                        vec![t::id_owned(el_var.to_string())],
                     )));
                     let expr_with_get = wrap_expr_with_get(&et.expression, consts, item_name);
                     let set_text_call = t::call(
                         t::member_id(t::id_dollar(), "set_text"),
-                        vec![t::id(&text_var), expr_with_get],
+                        vec![t::id_owned(text_var.to_string()), expr_with_get],
                     );
                     let effect_fn = Expression::Arrow(Box::new(ArrowFunctionExpression {
                         params: Vec::new(),
@@ -15149,7 +15148,7 @@ fn lower_select_with_if(
             r#async: false,
             span: Span::ZERO,
         }));
-        let render_call = t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)]));
+        let render_call = t::stmt(t::call(t::id_render(), vec![t::id_owned(consequent_var.to_string())]));
         let render_if = Statement::If(Box::new(IfStatement {
             test: ib.test.clone(),
             consequent: render_call,
@@ -15171,7 +15170,7 @@ fn lower_select_with_if(
                 t::var(&consequent_var, consequent_arrow),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "if"),
-                    vec![t::id(&node_var), render_arrow],
+                    vec![t::id_owned(node_var.to_string()), render_arrow],
                 )),
             ],
             span: Span::ZERO,
@@ -15179,20 +15178,20 @@ fn lower_select_with_if(
         let arrow_body = vec![
             t::var(
                 &anchor_var,
-                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
             ),
-            t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+            t::var(&fragment_var, t::call(t::id_owned(sc_name.to_string()), Vec::new())),
             t::var(
                 &node_var,
                 t::call(
                     t::member_id(t::id_dollar(), "first_child"),
-                    vec![t::id(&fragment_var)],
+                    vec![t::id_owned(fragment_var.to_string())],
                 ),
             ),
             inner_block,
             t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id(&anchor_var), t::id(&fragment_var)],
+                vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
             )),
         ];
         let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15207,7 +15206,7 @@ fn lower_select_with_if(
         }));
         let body = vec![t::stmt(t::call(
             t::member_id(t::id_dollar(), "customizable_select"),
-            vec![t::id(select_var), arrow],
+            vec![t::id_owned(select_var.to_string()), arrow],
         ))];
         return Some((html, body));
     }
@@ -15217,7 +15216,7 @@ fn lower_select_with_if(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &node_var,
-        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
     ));
     let consequent_var = ctx.next_named("consequent");
     let consequent_body = build_if_consequent_for_select(&ib.consequent, ctx)?;
@@ -15231,7 +15230,7 @@ fn lower_select_with_if(
         r#async: false,
         span: Span::ZERO,
     }));
-    let render_call = t::stmt(t::call(t::id_render(), vec![t::id(&consequent_var)]));
+    let render_call = t::stmt(t::call(t::id_render(), vec![t::id_owned(consequent_var.to_string())]));
     let render_if = Statement::If(Box::new(IfStatement {
         test: ib.test.clone(),
         consequent: render_call,
@@ -15250,7 +15249,7 @@ fn lower_select_with_if(
     }));
     let if_call = t::stmt(t::call(
         t::member_id(t::id_dollar(), "if"),
-        vec![t::id(&node_var), render_arrow],
+        vec![t::id_owned(node_var.to_string()), render_arrow],
     ));
     body.push(Statement::Block(Box::new(BlockStatement {
         body: vec![t::var(&consequent_var, consequent_arrow), if_call],
@@ -15258,7 +15257,7 @@ fn lower_select_with_if(
     })));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(select_var)],
+        vec![t::id_owned(select_var.to_string())],
     )));
     Some((html, body))
 }
@@ -15296,10 +15295,10 @@ fn build_if_consequent_for_select(
                     ));
                     let opt_var = ctx.next_named("option");
                     Some(vec![
-                        t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
+                        t::var(&opt_var, t::call(t::id_owned(root_name.to_string()), Vec::new())),
                         t::stmt(t::call(
                             t::member_id(t::id_dollar(), "append"),
-                            vec![t::id_anchor(), t::id(&opt_var)],
+                            vec![t::id_anchor(), t::id_owned(opt_var.to_string())],
                         )),
                     ])
                 }
@@ -15319,7 +15318,7 @@ fn build_if_consequent_for_select(
                 &node_var,
                 t::call(
                     t::member_id(t::id_dollar(), "first_child"),
-                    vec![t::id(&fragment_var)],
+                    vec![t::id_owned(fragment_var.to_string())],
                 ),
             ));
             // Each inside if: flag=1 (not 5 — that's for select-direct).
@@ -15334,7 +15333,7 @@ fn build_if_consequent_for_select(
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "each"),
                 vec![
-                    t::id(&node_var),
+                    t::id_owned(node_var.to_string()),
                     t::lit_number(1.0),
                     expr_arrow,
                     t::member_id(t::id_dollar(), "index"),
@@ -15343,7 +15342,7 @@ fn build_if_consequent_for_select(
             )));
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(&fragment_var)],
+                vec![t::id_anchor(), t::id_owned(fragment_var.to_string())],
             )));
             Some(body)
         }
@@ -15359,7 +15358,7 @@ fn build_if_consequent_for_select(
                 return None;
             };
             Some(vec![t::stmt(t::call(
-                t::id(&callee_name),
+                t::id_owned(callee_name.to_string()),
                 vec![t::id_anchor()],
             ))])
         }
@@ -15378,7 +15377,7 @@ fn lower_select_with_key(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &node_var,
-        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
     ));
     // body of key: single option (plain text).
     let non_ws: Vec<&FragmentChild> = kb
@@ -15414,10 +15413,10 @@ fn lower_select_with_key(
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: vec![
-                t::var(&opt_var, t::call(t::id(&root_name), Vec::new())),
+                t::var(&opt_var, t::call(t::id_owned(root_name.to_string()), Vec::new())),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "append"),
-                    vec![t::id_anchor(), t::id(&opt_var)],
+                    vec![t::id_anchor(), t::id_owned(opt_var.to_string())],
                 )),
             ],
             span: Span::ZERO,
@@ -15434,11 +15433,11 @@ fn lower_select_with_key(
     }));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "key"),
-        vec![t::id(&node_var), key_expr_arrow, inner_arrow],
+        vec![t::id_owned(node_var.to_string()), key_expr_arrow, inner_arrow],
     )));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(select_var)],
+        vec![t::id_owned(select_var.to_string())],
     )));
     Some((html, body))
 }
@@ -15454,7 +15453,7 @@ fn lower_select_with_boundary(
     let mut body: Vec<Statement> = Vec::new();
     body.push(t::var(
         &node_var,
-        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+        t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
     ));
     // Boundary body: single <option> (plain or rich).
     let non_ws: Vec<&FragmentChild> = b
@@ -15490,10 +15489,10 @@ fn lower_select_with_boundary(
                     )],
                 ),
             ));
-            arrow_body.push(t::var(&opt_var, t::call(t::id(&root_name), Vec::new())));
+            arrow_body.push(t::var(&opt_var, t::call(t::id_owned(root_name.to_string()), Vec::new())));
             arrow_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(&opt_var)],
+                vec![t::id_anchor(), t::id_owned(opt_var.to_string())],
             )));
         }
         OptionShape::RichContent(nodes) => {
@@ -15501,7 +15500,7 @@ fn lower_select_with_boundary(
             // inner option_content template, so the module-decl order
             // matches `var option_content_N = ...; var root_N = ...;`.
             let root_name = ctx.next_root();
-            arrow_body.push(t::var(&opt_var, t::call(t::id(&root_name), Vec::new())));
+            arrow_body.push(t::var(&opt_var, t::call(t::id_owned(root_name.to_string()), Vec::new())));
             let cs = build_customizable_select_body(&opt_var, nodes, ctx)?;
             arrow_body.push(cs);
             ctx.module_decls.push(t::var(
@@ -15516,7 +15515,7 @@ fn lower_select_with_boundary(
             ));
             arrow_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(&opt_var)],
+                vec![t::id_anchor(), t::id_owned(opt_var.to_string())],
             )));
         }
         _ => return None,
@@ -15534,7 +15533,7 @@ fn lower_select_with_boundary(
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "boundary"),
         vec![
-            t::id(&node_var),
+            t::id_owned(node_var.to_string()),
             Expression::Object(Box::new(ObjectExpression {
                 properties: Vec::new(),
                 span: Span::ZERO,
@@ -15544,7 +15543,7 @@ fn lower_select_with_boundary(
     )));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "reset"),
-        vec![t::id(select_var)],
+        vec![t::id_owned(select_var.to_string())],
     )));
     Some((html, body))
 }
@@ -15576,20 +15575,20 @@ fn lower_select_with_component(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
         ),
-        t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+        t::var(&fragment_var, t::call(t::id_owned(sc_name.to_string()), Vec::new())),
         t::var(
             &node_var,
             t::call(
                 t::member_id(t::id_dollar(), "first_child"),
-                vec![t::id(&fragment_var)],
+                vec![t::id_owned(fragment_var.to_string())],
             ),
         ),
         t::stmt(t::call(
-            t::id(&component_name),
+            t::id_owned(component_name.to_string()),
             vec![
-                t::id(&node_var),
+                t::id_owned(node_var.to_string()),
                 Expression::Object(Box::new(ObjectExpression {
                     properties: Vec::new(),
                     span: Span::ZERO,
@@ -15598,7 +15597,7 @@ fn lower_select_with_component(
         )),
         t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id(&anchor_var), t::id(&fragment_var)],
+            vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
         )),
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15613,7 +15612,7 @@ fn lower_select_with_component(
     }));
     let body = vec![t::stmt(t::call(
         t::member_id(t::id_dollar(), "customizable_select"),
-        vec![t::id(select_var), arrow],
+        vec![t::id_owned(select_var.to_string()), arrow],
     ))];
     Some((html, body))
 }
@@ -15652,20 +15651,20 @@ fn lower_select_with_render(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
         ),
-        t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+        t::var(&fragment_var, t::call(t::id_owned(sc_name.to_string()), Vec::new())),
         t::var(
             &node_var,
             t::call(
                 t::member_id(t::id_dollar(), "first_child"),
-                vec![t::id(&fragment_var)],
+                vec![t::id_owned(fragment_var.to_string())],
             ),
         ),
-        t::stmt(t::call(t::id(&callee_name), vec![t::id(&node_var)])),
+        t::stmt(t::call(t::id_owned(callee_name.to_string()), vec![t::id_owned(node_var.to_string())])),
         t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id(&anchor_var), t::id(&fragment_var)],
+            vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
         )),
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15680,7 +15679,7 @@ fn lower_select_with_render(
     }));
     let body = vec![t::stmt(t::call(
         t::member_id(t::id_dollar(), "customizable_select"),
-        vec![t::id(select_var), arrow],
+        vec![t::id_owned(select_var.to_string()), arrow],
     ))];
     Some((html, body))
 }
@@ -15716,23 +15715,23 @@ fn lower_select_with_html(
     let arrow_body = vec![
         t::var(
             &anchor_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
         ),
-        t::var(&fragment_var, t::call(t::id(&sc_name), Vec::new())),
+        t::var(&fragment_var, t::call(t::id_owned(sc_name.to_string()), Vec::new())),
         t::var(
             &node_var,
             t::call(
                 t::member_id(t::id_dollar(), "first_child"),
-                vec![t::id(&fragment_var)],
+                vec![t::id_owned(fragment_var.to_string())],
             ),
         ),
         t::stmt(t::call(
             t::member_id(t::id_dollar(), "html"),
-            vec![t::id(&node_var), getter],
+            vec![t::id_owned(node_var.to_string()), getter],
         )),
         t::stmt(t::call(
             t::member_id(t::id_dollar(), "append"),
-            vec![t::id(&anchor_var), t::id(&fragment_var)],
+            vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
         )),
     ];
     let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15747,7 +15746,7 @@ fn lower_select_with_html(
     }));
     let body = vec![t::stmt(t::call(
         t::member_id(t::id_dollar(), "customizable_select"),
-        vec![t::id(select_var), arrow],
+        vec![t::id_owned(select_var.to_string()), arrow],
     ))];
     Some((html, body))
 }
@@ -15787,20 +15786,20 @@ fn lower_select_with_optgroup(
                     let body = vec![
                         t::var(
                             &og_var,
-                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
                         ),
                         t::var(
                             &option_var,
-                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)]),
+                            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(og_var.to_string())]),
                         ),
                         build_customizable_select_body(&option_var, nodes, ctx)?,
                         t::stmt(t::call(
                             t::member_id(t::id_dollar(), "reset"),
-                            vec![t::id(&og_var)],
+                            vec![t::id_owned(og_var.to_string())],
                         )),
                         t::stmt(t::call(
                             t::member_id(t::id_dollar(), "reset"),
-                            vec![t::id(select_var)],
+                            vec![t::id_owned(select_var.to_string())],
                         )),
                     ];
                     Some((html, body))
@@ -15813,12 +15812,12 @@ fn lower_select_with_optgroup(
             let html = format!("<select{attrs}><optgroup{og_attrs}></optgroup></select>");
             let mut body = vec![t::var(
                 &og_var,
-                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
             )];
             body.extend(build_each_body_for_select(eb, &og_var, ctx, 5.0)?);
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
-                vec![t::id(select_var)],
+                vec![t::id_owned(select_var.to_string())],
             )));
             Some((html, body))
         }
@@ -15843,20 +15842,20 @@ fn lower_select_with_optgroup(
             let arrow_body = vec![
                 t::var(
                     &anchor_var,
-                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(og_var.to_string())]),
                 ),
-                t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
+                t::var(&fragment_var, t::call(t::id_owned(oc_name.to_string()), Vec::new())),
                 t::var(
                     &node_var,
                     t::call(
                         t::member_id(t::id_dollar(), "first_child"),
-                        vec![t::id(&fragment_var)],
+                        vec![t::id_owned(fragment_var.to_string())],
                     ),
                 ),
                 t::stmt(t::call(
-                    t::id(&component_name),
+                    t::id_owned(component_name.to_string()),
                     vec![
-                        t::id(&node_var),
+                        t::id_owned(node_var.to_string()),
                         Expression::Object(Box::new(ObjectExpression {
                             properties: Vec::new(),
                             span: Span::ZERO,
@@ -15865,7 +15864,7 @@ fn lower_select_with_optgroup(
                 )),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "append"),
-                    vec![t::id(&anchor_var), t::id(&fragment_var)],
+                    vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
                 )),
             ];
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15881,15 +15880,15 @@ fn lower_select_with_optgroup(
             let body = vec![
                 t::var(
                     &og_var,
-                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
                 ),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "customizable_select"),
-                    vec![t::id(&og_var), arrow],
+                    vec![t::id_owned(og_var.to_string()), arrow],
                 )),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(select_var)],
+                    vec![t::id_owned(select_var.to_string())],
                 )),
             ];
             Some((html, body))
@@ -15923,20 +15922,20 @@ fn lower_select_with_optgroup(
             let arrow_body = vec![
                 t::var(
                     &anchor_var,
-                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(&og_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(og_var.to_string())]),
                 ),
-                t::var(&fragment_var, t::call(t::id(&oc_name), Vec::new())),
+                t::var(&fragment_var, t::call(t::id_owned(oc_name.to_string()), Vec::new())),
                 t::var(
                     &node_var,
                     t::call(
                         t::member_id(t::id_dollar(), "first_child"),
-                        vec![t::id(&fragment_var)],
+                        vec![t::id_owned(fragment_var.to_string())],
                     ),
                 ),
-                t::stmt(t::call(t::id(&callee_name), vec![t::id(&node_var)])),
+                t::stmt(t::call(t::id_owned(callee_name.to_string()), vec![t::id_owned(node_var.to_string())])),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "append"),
-                    vec![t::id(&anchor_var), t::id(&fragment_var)],
+                    vec![t::id_owned(anchor_var.to_string()), t::id_owned(fragment_var.to_string())],
                 )),
             ];
             let arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -15952,15 +15951,15 @@ fn lower_select_with_optgroup(
             let body = vec![
                 t::var(
                     &og_var,
-                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(select_var)]),
+                    t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(select_var.to_string())]),
                 ),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "customizable_select"),
-                    vec![t::id(&og_var), arrow],
+                    vec![t::id_owned(og_var.to_string()), arrow],
                 )),
                 t::stmt(t::call(
                     t::member_id(t::id_dollar(), "reset"),
-                    vec![t::id(select_var)],
+                    vec![t::id_owned(select_var.to_string())],
                 )),
             ];
             Some((html, body))
@@ -16110,7 +16109,7 @@ fn emit_deep_static_walker_program(
             let offset = this_pos - prev_pos;
             t::call(
                 t::member_id(t::id_dollar(), "sibling"),
-                vec![t::id(prev), t::lit_number(offset as f64)],
+                vec![t::id_owned(prev.to_string()), t::lit_number(offset as f64)],
             )
         };
         body.push(t::var(&var, init));
@@ -16124,17 +16123,17 @@ fn emit_deep_static_walker_program(
         let input_needs_defaults = el.name == "input"
             && el.attributes.iter().any(|a| match a {
                 ElementAttribute::Attribute(attr) => {
-                    matches!(attr.name.as_str(), "checked" | "value")
+                    matches!(attr.name.as_ref(), "checked" | "value")
                 }
                 ElementAttribute::BindDirective(bd) => {
-                    matches!(bd.name.as_str(), "value" | "checked" | "group" | "files")
+                    matches!(bd.name.as_ref(), "value" | "checked" | "group" | "files")
                 }
                 _ => false,
             });
         if input_needs_defaults {
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "remove_input_defaults"),
-                vec![t::id(&var)],
+                vec![t::id_owned(var.to_string())],
             )));
             input_defaults_resets.push(var.clone());
         }
@@ -16168,7 +16167,7 @@ fn emit_deep_static_walker_program(
         if has_reactive_inside {
             body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
-                vec![t::id(&var)],
+                vec![t::id_owned(var.to_string())],
             )));
         }
     }
@@ -16186,7 +16185,7 @@ fn emit_deep_static_walker_program(
                 t::call(
                     t::member_id(t::id_dollar(), "sibling"),
                     vec![
-                        t::id(prev_var.as_ref().expect("prev_var set")),
+                        t::id_owned(prev_var.as_ref().expect("prev_var set").to_string()),
                         t::lit_number(2.0),
                     ],
                 ),
@@ -16238,9 +16237,9 @@ fn emit_deep_static_walker_program(
     // Dir-attribute self-assignment effects (Chromium hydration fix).
     for var_name in &dir_self_assigns {
         let dir_member = Expression::Member(Box::new(MemberExpression {
-            object: t::id(var_name),
+            object: t::id_owned(var_name.to_string()),
             property: MemberProperty::Identifier(Identifier {
-                name: "dir".to_string(),
+                name: Cow::Borrowed("dir"),
                 span: Span::ZERO,
             }),
             computed: false,
@@ -16276,7 +16275,7 @@ fn emit_deep_static_walker_program(
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(t::call(
                     t::member_id(t::id_dollar(), "set_text"),
-                    vec![t::id(&text_var), expr],
+                    vec![t::id_owned(text_var.to_string()), expr],
                 )),
                 r#async: false,
                 span: Span::ZERO,
@@ -16287,7 +16286,7 @@ fn emit_deep_static_walker_program(
         for (text_var, expr) in effects {
             block_body.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "set_text"),
-                vec![t::id(&text_var), expr],
+                vec![t::id_owned(text_var.to_string()), expr],
             )));
         }
         body.push(t::stmt(t::call(
@@ -16317,7 +16316,7 @@ fn emit_deep_static_walker_program(
     for (var_name, target_expr) in &bind_value_calls {
         let target_is_legacy_prop = matches!(
             target_expr,
-            Expression::Identifier(id) if legacy_prop_names_for_bind.contains(&id.name)
+            Expression::Identifier(id) if legacy_prop_names_for_bind.contains(id.name.as_ref())
         );
         let target = if target_is_legacy_prop {
             target_expr.clone()
@@ -16326,7 +16325,7 @@ fn emit_deep_static_walker_program(
         };
         body.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "bind_value"),
-            vec![t::id(var_name), target],
+            vec![t::id_owned(var_name.to_string()), target],
         )));
     }
 
@@ -16377,7 +16376,7 @@ fn emit_deep_static_walker_program(
         for (name, init) in &script.legacy_export_props {
             let mut args = vec![
                 t::id("$$props"),
-                t::literal_str(name),
+                t::literal_str_owned(name.to_string()),
                 t::lit_number(12.0),
             ];
             if let Some(default) = init {
@@ -16502,7 +16501,7 @@ fn walk_element_interior(
                 &text_var,
                 t::call(
                     t::member_id(t::id_dollar(), "child"),
-                    vec![t::id(parent_var)],
+                    vec![t::id_owned(parent_var.to_string())],
                 ),
             ));
             let mut parts: Vec<TextPart> = Vec::new();
@@ -16606,13 +16605,13 @@ fn walk_element_interior(
                         t::member_id(t::id_dollar(), "sibling"),
                         vec![t::call(
                             t::member_id(t::id_dollar(), "child"),
-                            vec![t::id(parent_var)],
+                            vec![t::id_owned(parent_var.to_string())],
                         )],
                     );
                 } else {
                     init = t::call(
                         t::member_id(t::id_dollar(), "child"),
-                        vec![t::id(parent_var)],
+                        vec![t::id_owned(parent_var.to_string())],
                     );
                 }
             } else {
@@ -16621,7 +16620,7 @@ fn walk_element_interior(
                     vec![
                         t::call(
                             t::member_id(t::id_dollar(), "first_child"),
-                            vec![t::id(parent_var)],
+                            vec![t::id_owned(parent_var.to_string())],
                         ),
                         t::lit_number(i as f64),
                     ],
@@ -16640,7 +16639,7 @@ fn walk_element_interior(
             var = allocate_named(&prefix, var_names);
             init = t::call(
                 t::member_id(t::id_dollar(), "sibling"),
-                vec![t::id(prev), t::lit_number(offset as f64)],
+                vec![t::id_owned(prev.to_string()), t::lit_number(offset as f64)],
             );
         }
         body.push(t::var(&var, init));
@@ -16661,7 +16660,7 @@ fn walk_element_interior(
                 }));
                 body.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "html"),
-                    vec![t::id(&var), getter],
+                    vec![t::id_owned(var.to_string()), getter],
                 )));
             }
             FragmentChild::RegularElement(child_el) => {
@@ -16704,7 +16703,7 @@ fn walk_element_interior(
                             t::call(
                                 t::member_id(t::id_dollar(), "child"),
                                 vec![
-                                    t::id(&var),
+                                    t::id_owned(var.to_string()),
                                     Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                         value: true,
                                         span: Span::ZERO,
@@ -16715,7 +16714,7 @@ fn walk_element_interior(
                         effects.push((text_var, inline));
                         body.push(t::stmt(t::call(
                             t::member_id(t::id_dollar(), "reset"),
-                            vec![t::id(&var)],
+                            vec![t::id_owned(var.to_string())],
                         )));
                     }
                 } else {
@@ -16724,7 +16723,7 @@ fn walk_element_interior(
                     if fragment_has_deep_reactive(&child_el.fragment) {
                         body.push(t::stmt(t::call(
                             t::member_id(t::id_dollar(), "reset"),
-                            vec![t::id(&var)],
+                            vec![t::id_owned(var.to_string())],
                         )));
                     }
                 }
@@ -16781,9 +16780,9 @@ fn apply_reactive_attrs(
                 body.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "set_custom_element_data"),
                     vec![
-                        t::id(var),
+                        t::id_owned(var.to_string()),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: attr.name.clone(),
+                            value: Cow::Owned(attr.name.clone()),
                             raw: Some(format!("'{}'", attr.name)),
                             span: Span::ZERO,
                         }))),
@@ -16792,12 +16791,12 @@ fn apply_reactive_attrs(
                 )));
                 continue;
             }
-            match attr.name.as_str() {
+            match attr.name.as_ref() {
                 "autofocus" => {
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "autofocus"),
                         vec![
-                            t::id(var),
+                            t::id_owned(var.to_string()),
                             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                 value: true,
                                 span: Span::ZERO,
@@ -16810,9 +16809,9 @@ fn apply_reactive_attrs(
                     body.push(t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
                         left: AssignmentTarget::Expression(Expression::Member(Box::new(
                             MemberExpression {
-                                object: t::id(var),
+                                object: t::id_owned(var.to_string()),
                                 property: MemberProperty::Identifier(Identifier {
-                                    name: "muted".to_string(),
+                                    name: Cow::Borrowed("muted"),
                                     span: Span::ZERO,
                                 }),
                                 computed: false,
@@ -16844,9 +16843,9 @@ fn apply_reactive_attrs(
                     let inner = Expression::Assignment(Box::new(AssignmentExpression {
                         left: AssignmentTarget::Expression(Expression::Member(Box::new(
                             MemberExpression {
-                                object: t::id(var),
+                                object: t::id_owned(var.to_string()),
                                 property: MemberProperty::Identifier(Identifier {
-                                    name: "__value".to_string(),
+                                    name: Cow::Borrowed("__value"),
                                     span: Span::ZERO,
                                 }),
                                 computed: false,
@@ -16862,9 +16861,9 @@ fn apply_reactive_attrs(
                     let outer = Expression::Assignment(Box::new(AssignmentExpression {
                         left: AssignmentTarget::Expression(Expression::Member(Box::new(
                             MemberExpression {
-                                object: t::id(var),
+                                object: t::id_owned(var.to_string()),
                                 property: MemberProperty::Identifier(Identifier {
-                                    name: "value".to_string(),
+                                    name: Cow::Borrowed("value"),
                                     span: Span::ZERO,
                                 }),
                                 computed: false,
@@ -16889,7 +16888,7 @@ fn attr_value_as_string_expr(v: &AttributeValue) -> Expression {
         AttributeValue::Many(parts) if parts.len() == 1 => {
             if let AttributeValuePart::Text(t) = &parts[0] {
                 return Expression::Literal(Box::new(Literal::String(StringLiteral {
-                    value: t.data.clone(),
+                    value: Cow::Owned(t.data.clone()),
                     raw: Some(format!("'{}'", t.data)),
                     span: Span::ZERO,
                 })));
@@ -17025,7 +17024,7 @@ fn serialize_element_to_html(
             let skip = if is_custom {
                 true
             } else {
-                matches!(attr.name.as_str(), "autofocus" | "muted")
+                matches!(attr.name.as_ref(), "autofocus" | "muted")
                     || (el.name == "option" && attr.name == "value")
             };
             if skip {
@@ -17291,7 +17290,7 @@ fn is_void_client(name: &str) -> bool {
 fn rewrite_props_destructured(e: &Expression, names: &HashSet<String>) -> Expression {
     fn go(e: &Expression, names: &HashSet<String>) -> Expression {
         match e {
-            Expression::Identifier(id) if names.contains(&id.name) => {
+            Expression::Identifier(id) if names.contains(id.name.as_ref()) => {
                 Expression::Member(Box::new(MemberExpression {
                     object: t::id("$$props"),
                     property: MemberProperty::Identifier(Identifier {
@@ -17435,7 +17434,7 @@ fn rewrite_stmt_props_destructured(s: &Statement, names: &HashSet<String>) -> St
 fn rewrite_legacy_prop_reads(e: &Expression, names: &HashSet<String>) -> Expression {
     fn go(e: &Expression, names: &HashSet<String>) -> Expression {
         match e {
-            Expression::Identifier(id) if names.contains(&id.name) => {
+            Expression::Identifier(id) if names.contains(id.name.as_ref()) => {
                 Expression::Call(Box::new(CallExpression {
                     callee: Expression::Identifier(id.clone()),
                     arguments: Vec::new(),
@@ -17509,11 +17508,11 @@ fn build_legacy_exports_object(props: &[(String, Option<Expression>)]) -> Expres
     let mut members: Vec<ObjectMember> = Vec::new();
     for (name, _) in props {
         let getter_body = vec![Statement::Return(Box::new(svelte_js_ast::ReturnStatement {
-            argument: Some(t::call(t::id(name), Vec::new())),
+            argument: Some(t::call(t::id_owned(name.to_string()), Vec::new())),
             span: Span::ZERO,
         }))];
         members.push(ObjectMember::Property(Box::new(svelte_js_ast::Property {
-            key: PropertyKey::Identifier(Identifier { name: name.clone(), span: Span::ZERO }),
+            key: PropertyKey::Identifier(Identifier { name: Cow::Owned(name.clone()), span: Span::ZERO }),
             value: Expression::Function(Box::new(FunctionExpression {
                 id: None,
                 params: Vec::new(),
@@ -17530,11 +17529,11 @@ fn build_legacy_exports_object(props: &[(String, Option<Expression>)]) -> Expres
             span: Span::ZERO,
         })));
         let setter_body = vec![
-            t::stmt(t::call(t::id(name), vec![t::id("$$value")])),
+            t::stmt(t::call(t::id_owned(name.to_string()), vec![t::id("$$value")])),
             t::stmt(t::call(t::member_id(t::id_dollar(), "flush"), Vec::new())),
         ];
         members.push(ObjectMember::Property(Box::new(svelte_js_ast::Property {
-            key: PropertyKey::Identifier(Identifier { name: name.clone(), span: Span::ZERO }),
+            key: PropertyKey::Identifier(Identifier { name: Cow::Owned(name.clone()), span: Span::ZERO }),
             value: Expression::Function(Box::new(FunctionExpression {
                 id: None,
                 params: vec![t::pat_id("$$value")],
@@ -17564,7 +17563,7 @@ fn expr_has_user_call(e: &Expression, derived_bindings: &HashSet<String>) -> boo
             // A call whose callee is a derived binding (e.g. `blocking()`)
             // doesn't count — those are sync reads. Anything else does.
             if let Expression::Identifier(id) = &c.callee {
-                if derived_bindings.contains(&id.name) {
+                if derived_bindings.contains(id.name.as_ref()) {
                     return c.arguments.iter().any(|a| match a {
                         Argument::Expression(e) => expr_has_user_call(e, derived_bindings),
                         Argument::Spread(s) => expr_has_user_call(&s.argument, derived_bindings),
@@ -17626,7 +17625,7 @@ fn collect_blocker_indices_in_expr(
 ) {
     match e {
         Expression::Identifier(id) => {
-            if let Some(idx) = blocker_bindings.get(&id.name) {
+            if let Some(idx) = blocker_bindings.get(id.name.as_ref()) {
                 out.insert(*idx);
             }
         }
@@ -17685,7 +17684,7 @@ fn build_branch_arrow(
         t::call(
             t::member_id(t::id_dollar(), "text"),
             vec![Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: trimmed.clone(),
+                value: Cow::Owned(trimmed.clone()),
                 raw: Some(format!("'{}'", trimmed)),
                 span: Span::ZERO,
             })))],
@@ -17693,7 +17692,7 @@ fn build_branch_arrow(
     ));
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&text_name)],
+        vec![t::id_anchor(), t::id_owned(text_name.to_string())],
     )));
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id_anchor()],
@@ -17726,14 +17725,14 @@ fn build_breakout_alternate_arrow(
         &node_name,
         t::call(
             t::member_id(t::id_dollar(), "first_child"),
-            vec![t::id(&fragment_name)],
+            vec![t::id_owned(fragment_name.to_string())],
         ),
     ));
     let inner_stmt = emit_async_if_block(inner, &node_name, ai, derived_bindings, counters, true)?;
     body.push(inner_stmt);
     body.push(t::stmt(t::call(
         t::member_id(t::id_dollar(), "append"),
-        vec![t::id_anchor(), t::id(&fragment_name)],
+        vec![t::id_anchor(), t::id_owned(fragment_name.to_string())],
     )));
     Some(Expression::Arrow(Box::new(ArrowFunctionExpression {
         params: vec![t::pat_id_anchor()],
@@ -17759,16 +17758,16 @@ fn build_render_body(
     let mut acc: Option<Statement> = alternate.map(|name| {
         t::stmt(t::call(
             t::id_render(),
-            vec![t::id(name), t::lit_number(-1.0)],
+            vec![t::id_owned(name.to_string()), t::lit_number(-1.0)],
         ))
     });
     for (i, (cname, test, branch_idx)) in branches.iter().enumerate().rev() {
         let call = if i == 0 {
-            t::stmt(t::call(t::id_render(), vec![t::id(cname)]))
+            t::stmt(t::call(t::id_render(), vec![t::id_owned(cname.to_string())]))
         } else {
             t::stmt(t::call(
                 t::id_render(),
-                vec![t::id(cname), t::lit_number(*branch_idx as f64)],
+                vec![t::id_owned(cname.to_string()), t::lit_number(*branch_idx as f64)],
             ))
         };
         let if_stmt = Statement::If(Box::new(IfStatement {
@@ -17813,7 +17812,7 @@ fn rewrite_chain_expr(
             // wrapped at read sites. Non-derived `let` names — even when
             // touched by an async statement — stay raw, because they're
             // resolved synchronously inside the $.async callback.
-            if derived_bindings.contains(&id.name) {
+            if derived_bindings.contains(id.name.as_ref()) {
                 t::call(
                     t::member_id(t::id_dollar(), "get"),
                     vec![Expression::Identifier(id.clone())],
@@ -18032,7 +18031,7 @@ fn emit_single_async_each_program(
     // }
     let item_name = match &eb.context {
         Some(Pattern::Identifier(i)) => i.name.clone(),
-        _ => "$$item".to_string(),
+        _ => Cow::Borrowed("$$item"),
     };
     let body_uses_item = expr_contains_ident(body_expr, &item_name);
     let each_flag: f64 = if body_uses_item { 17.0 } else { 16.0 };
@@ -18062,7 +18061,7 @@ fn emit_single_async_each_program(
     let body_inner = strip_outer_await(body_expr);
     let body_with_get = if let Expression::Identifier(i) = &body_inner {
         if i.name == item_name {
-            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&i.name)])
+            t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(i.name.to_string())])
         } else {
             body_inner
         }
@@ -18093,7 +18092,7 @@ fn emit_single_async_each_program(
     )));
 
     let each_callback = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id_owned(item_name.to_string())],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: each_body_stmts,
@@ -18332,7 +18331,7 @@ fn emit_single_svelte_element_program(
             left: AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
                 object: t::id("text"),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "nodeValue".to_string(),
+                    name: Cow::Borrowed("nodeValue"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -18341,7 +18340,7 @@ fn emit_single_svelte_element_program(
             }))),
             operator: AssignmentOperator::Assign,
             right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: lit,
+                value: Cow::Owned(lit),
                 raw: None,
                 span: Span::ZERO,
             }))),
@@ -18564,7 +18563,7 @@ fn emit_single_each_preserve_whitespace_program(
     // Build the each-body arrow.
     let is_runes_iter = matches!(
         &eb.expression,
-        Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+        Expression::Identifier(id) if script.props_destructured.contains(id.name.as_ref())
     ) || expression_uses_props_destructured(
         &eb.expression,
         &script.props_destructured,
@@ -18621,7 +18620,7 @@ fn emit_single_each_preserve_whitespace_program(
     )));
 
     let item_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
-        params: vec![t::pat_id_anchor(), t::pat_id(&item_name)],
+        params: vec![t::pat_id_anchor(), t::pat_id_owned(item_name.to_string())],
         param_type_annotations: Vec::new(),
         body: ArrowBody::Block(Box::new(BlockStatement {
             body: item_body,
@@ -18814,9 +18813,9 @@ fn emit_single_each_program(
                 quasis.push(current);
                 let tmpl = t::template_raw(quasis, subs);
                 let target = Expression::Member(Box::new(MemberExpression {
-                    object: t::id(&var),
+                    object: t::id_owned(var.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "textContent".to_string(),
+                        name: Cow::Borrowed("textContent"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -18838,9 +18837,9 @@ fn emit_single_each_program(
                 body_stmts.push(t::stmt(t::call(
                     t::member_id(t::id_dollar(), "set_attribute"),
                     vec![
-                        t::id(&var),
+                        t::id_owned(var.to_string()),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: a.name.clone(),
+                            value: Cow::Owned(a.name.clone()),
                             raw: None,
                             span: Span::ZERO,
                         }))),
@@ -18855,18 +18854,18 @@ fn emit_single_each_program(
                     t::member_id(t::id_dollar(), "delegated"),
                     vec![
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: event.clone(),
+                            value: Cow::Owned(event.clone()),
                             raw: None,
                             span: Span::ZERO,
                         }))),
-                        t::id(&var),
+                        t::id_owned(var.to_string()),
                         (*handler).clone(),
                     ],
                 )));
             }
             body_stmts.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "append"),
-                vec![t::id_anchor(), t::id(&var)],
+                vec![t::id_anchor(), t::id_owned(var.to_string())],
             )));
         } else {
             return None;
@@ -18973,7 +18972,7 @@ fn emit_single_each_program(
         params.push(t::pat_id("$$item"));
     }
     if let Some(idx) = &eb.index {
-        params.push(t::pat_id(idx));
+        params.push(t::pat_id_owned(idx.to_string()));
     }
 
     let body_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
@@ -19015,7 +19014,7 @@ fn emit_single_each_program(
     // $props() destructuring. ITEM_REACTIVE (1) when body reads the iter
     // var and key isn't the item identifier itself.
     let item_name_opt = match eb.context.as_ref() {
-        Some(svelte_js_ast::Pattern::Identifier(id)) => Some(id.name.clone()),
+        Some(svelte_js_ast::Pattern::Identifier(id)) => Some(id.name.to_string()),
         _ => None,
     };
     let key_is_self_ident = match (&eb.key, &item_name_opt) {
@@ -19024,7 +19023,7 @@ fn emit_single_each_program(
     };
     let is_runes_iter = matches!(
         &eb.expression,
-        Expression::Identifier(id) if script.props_destructured.contains(&id.name)
+        Expression::Identifier(id) if script.props_destructured.contains(id.name.as_ref())
     ) || expression_uses_props_destructured(
         &eb.expression,
         &script.props_destructured,
@@ -19046,7 +19045,7 @@ fn emit_single_each_program(
         Some(k) => {
             let pname = item_name_opt.clone().unwrap_or_else(|| "$$item".into());
             Expression::Arrow(Box::new(ArrowFunctionExpression {
-                params: vec![t::pat_id(&pname)],
+                params: vec![t::pat_id_owned(pname.to_string())],
                 param_type_annotations: Vec::new(),
                 body: ArrowBody::Expression(k.clone()),
                 r#async: false,
@@ -19093,7 +19092,7 @@ fn emit_single_each_program(
                 .map(|n| {
                     ArrayElement::Expression(Expression::Literal(Box::new(Literal::String(
                         StringLiteral {
-                            value: n,
+                            value: Cow::Owned(n),
                             raw: None,
                             span: Span::ZERO,
                         },
@@ -19237,12 +19236,12 @@ fn analyze_script(
                     if is_state_call(init) {
                         // `$state({...})` / `$state([...])` lowers to `$.proxy(...)`.
                         if state_call_inner_is_proxy_init(init) {
-                            proxy_bindings.insert(id.name.clone());
-                        } else if assigned.contains(&id.name) {
-                            state_bindings.insert(id.name.clone());
+                            proxy_bindings.insert(id.name.to_string());
+                        } else if assigned.contains(id.name.as_ref()) {
+                            state_bindings.insert(id.name.to_string());
                         }
                     } else if is_derived_call(init) {
-                        derived_bindings.insert(id.name.clone());
+                        derived_bindings.insert(id.name.to_string());
                     }
                 }
             }
@@ -19300,7 +19299,7 @@ fn analyze_script(
                     if matches!(v.kind, VariableKind::Let) {
                         for d in &v.declarations {
                             if let Pattern::Identifier(id) = &d.id {
-                                export_let_names.insert(id.name.clone());
+                                export_let_names.insert(id.name.to_string());
                             }
                         }
                     }
@@ -19314,7 +19313,7 @@ fn analyze_script(
                         for m in &obj.properties {
                             if let ObjectPatternMember::Property(p) = m {
                                 if let PropertyKey::Identifier(id) = &p.key {
-                                    probe_props_destructured.insert(id.name.clone());
+                                    probe_props_destructured.insert(id.name.to_string());
                                 }
                             }
                         }
@@ -19336,20 +19335,20 @@ fn analyze_script(
                 }
                 for d in &v.declarations {
                     if let (Pattern::Identifier(id), Some(_init)) = (&d.id, &d.init) {
-                        if export_let_names.contains(&id.name) {
+                        if export_let_names.contains(id.name.as_ref()) {
                             continue;
                         }
-                        if state_bindings.contains(&id.name)
-                            || proxy_bindings.contains(&id.name)
-                            || derived_bindings.contains(&id.name)
-                            || probe_props_destructured.contains(&id.name)
+                        if state_bindings.contains(id.name.as_ref())
+                            || proxy_bindings.contains(id.name.as_ref())
+                            || derived_bindings.contains(id.name.as_ref())
+                            || probe_props_destructured.contains(id.name.as_ref())
                         {
                             continue;
                         }
-                        if !assigned.contains(&id.name) {
+                        if !assigned.contains(id.name.as_ref()) {
                             continue;
                         }
-                        legacy_mutable_bindings.insert(id.name.clone());
+                        legacy_mutable_bindings.insert(id.name.to_string());
                     }
                 }
             }
@@ -19380,7 +19379,7 @@ fn analyze_script(
                         for d in &v.declarations {
                             if let Pattern::Identifier(id) = &d.id {
                                 legacy_export_props
-                                    .push((id.name.clone(), d.init.clone()));
+                                    .push((id.name.to_string(), d.init.clone()));
                                 uses_props = true;
                             }
                         }
@@ -19425,7 +19424,7 @@ fn analyze_script(
                                     for m in &obj.properties {
                                         if let ObjectPatternMember::Property(p) = m {
                                             if let PropertyKey::Identifier(id) = &p.key {
-                                                props_destructured.insert(id.name.clone());
+                                                props_destructured.insert(id.name.to_string());
                                             }
                                         }
                                     }
@@ -19457,11 +19456,11 @@ fn analyze_script(
         if let Statement::Variable(v) = s {
             for d in &v.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
-                    if assigned.contains(&id.name) || state_bindings.contains(&id.name) {
+                    if assigned.contains(id.name.as_ref()) || state_bindings.contains(id.name.as_ref()) {
                         continue;
                     }
                     if is_literal_expression(init) {
-                        constants.insert(id.name.clone(), init.clone());
+                        constants.insert(id.name.to_string(), init.clone());
                     }
                 }
             }
@@ -19478,7 +19477,7 @@ fn analyze_script(
             for d in &v.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
                     if is_props_call(init) {
-                        rest_props_bindings.insert(id.name.clone());
+                        rest_props_bindings.insert(id.name.to_string());
                     }
                 }
             }
@@ -19537,7 +19536,7 @@ fn analyze_script(
                     for d in &v.declarations {
                         let mut new_d = d.clone();
                         if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
-                            if legacy_mutable_bindings.contains(&id.name) {
+                            if legacy_mutable_bindings.contains(id.name.as_ref()) {
                                 new_d.init = Some(t::call(
                                     t::member_id(t::id_dollar(), "mutable_source"),
                                     vec![init.clone()],
@@ -19728,7 +19727,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
             Statement::Variable(v) => {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
-                        hoisted_names.push(id.name.clone());
+                        hoisted_names.push(id.name.to_string());
                         hoisted_spans.push(id.span);
                         let init = d
                             .init
@@ -19738,14 +19737,14 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                         // `await $.async_derived(() => E)`.
                         if let Some(rewritten) = rewrite_async_derived_client(&init) {
                             lowered.push(Lowered::AsyncSet {
-                                name: id.name.clone(),
+                                name: id.name.to_string(),
                                 init: rewritten,
                             });
                             continue;
                         }
                         if expr_top_await(&init) {
                             lowered.push(Lowered::AsyncSet {
-                                name: id.name.clone(),
+                                name: id.name.to_string(),
                                 init,
                             });
                         } else {
@@ -19753,7 +19752,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                                 ExpressionStatement {
                                     expression: Expression::Assignment(Box::new(
                                         AssignmentExpression {
-                                            left: AssignmentTarget::Expression(t::id(&id.name)),
+                                            left: AssignmentTarget::Expression(t::id_owned(id.name.to_string())),
                                             operator: AssignmentOperator::Assign,
                                             right: init,
                                             span: Span::ZERO,
@@ -19835,7 +19834,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                     flush_sync(&mut groups, &mut current_sync);
                 }
                 let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                    left: AssignmentTarget::Expression(t::id(&name)),
+                    left: AssignmentTarget::Expression(t::id_owned(name.to_string())),
                     operator: AssignmentOperator::Assign,
                     right: init,
                     span: Span::ZERO,
@@ -19873,7 +19872,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
             .enumerate()
             .map(|(i, n)| VariableDeclarator {
                 id: Pattern::Identifier(Identifier {
-                    name: n.clone(),
+                    name: Cow::Owned(n.clone()),
                     span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
                 }),
                 init: None,
@@ -19907,7 +19906,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
         if let Statement::Variable(v) = s {
             for d in &v.declarations {
                 if let Pattern::Identifier(id) = &d.id {
-                    script_let_bindings.insert(id.name.clone());
+                    script_let_bindings.insert(id.name.to_string());
                 }
             }
         }
@@ -19933,12 +19932,12 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                                 sync_pending = false;
                             }
                             let idx = groups_count;
-                            blocker_bindings.entry(id.name.clone()).or_insert(idx);
+                            blocker_bindings.entry(id.name.to_string()).or_insert(idx);
                             if let Some(init) = init {
                                 let mut touched: HashSet<String> = HashSet::new();
                                 collect_touched_async_client(init, &mut touched);
                                 for name in touched {
-                                    if script_let_bindings.contains(&name) {
+                                    if script_let_bindings.contains(name.as_str()) {
                                         blocker_bindings.entry(name).or_insert(idx);
                                     }
                                 }
@@ -19948,7 +19947,7 @@ fn transform_async_script_client(body: &[Statement]) -> Option<AsyncInfo> {
                         } else {
                             if awaited_seen {
                                 blocker_bindings
-                                    .entry(id.name.clone())
+                                    .entry(id.name.to_string())
                                     .or_insert(groups_count);
                             }
                             sync_pending = true;
@@ -19977,7 +19976,7 @@ fn collect_touched_async_client(e: &Expression, out: &mut HashSet<String>) {
     match e {
         Expression::Identifier(id) => {
             if id.name != "undefined" {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Expression::Call(c) => {
@@ -20053,7 +20052,7 @@ fn expr_contains_ident(e: &Expression, name: &str) -> bool {
 
 fn expr_refs_any_client(e: &Expression, names: &HashSet<String>) -> bool {
     match e {
-        Expression::Identifier(i) => names.contains(&i.name),
+        Expression::Identifier(i) => names.contains(i.name.as_ref()),
         Expression::Member(m) => expr_refs_any_client(&m.object, names),
         Expression::Call(c) => {
             expr_refs_any_client(&c.callee, names)
@@ -20097,14 +20096,14 @@ fn replace_props_init_with_rest_props(s: &mut Statement, names: &HashSet<String>
     if let Statement::Variable(v) = s {
         for d in &mut v.declarations {
             if let (Pattern::Identifier(id), Some(init)) = (&d.id, &mut d.init) {
-                if names.contains(&id.name) && is_props_call(init) {
+                if names.contains(id.name.as_ref()) && is_props_call(init) {
                     let arr = Expression::Array(Box::new(ArrayExpression {
                         elements: ["$$slots", "$$events", "$$legacy"]
                             .iter()
                             .map(|n| {
                                 ArrayElement::Expression(Expression::Literal(Box::new(
                                     Literal::String(StringLiteral {
-                                        value: (*n).to_string(),
+                                        value: Cow::Owned((*n).to_string()),
                                         raw: None,
                                         span: Span::ZERO,
                                     }),
@@ -20172,7 +20171,7 @@ fn rewrite_expr_for_rest_props(
             // we're NOT at the outermost LHS (write target), rewrite it.
             if !in_lhs_outermost {
                 if let E::Identifier(id) = &m.object {
-                    if names.contains(&id.name) && !m.computed {
+                    if names.contains(id.name.as_ref()) && !m.computed {
                         if let MemberProperty::Identifier(_) = &m.property {
                             m.object = t::id("$$props");
                             return;
@@ -20292,7 +20291,7 @@ fn rewrite_top_stmt_multi(
                                     t::id("$$props"),
                                     Expression::Literal(Box::new(Literal::String(
                                         StringLiteral {
-                                            value: key_name,
+                                            value: key_name.clone(),
                                             raw: None,
                                             span: Span::ZERO,
                                         },
@@ -20383,7 +20382,7 @@ fn rewrite_top_stmt(
                         // Try lower $state(V) → $.state(V) if this binding is
                         // a state binding.
                         if let Pattern::Identifier(id) = &d.id {
-                            if state_bindings.contains(&id.name) && is_state_call(init) {
+                            if state_bindings.contains(id.name.as_ref()) && is_state_call(init) {
                                 *uses_runes = true;
                                 lower_state_init(init);
                                 continue;
@@ -20455,9 +20454,9 @@ fn rewrite_class_body_client(c: &mut ClassDeclaration) {
                     if let Some(kp) = global_keypath(&call.callee) {
                         if matches!(kp.as_str(), "$state" | "$state.raw" | "$state.eager") {
                             if let PropertyKey::Private(pi) = &p.key {
-                                state_privates.insert(pi.name.clone());
+                                state_privates.insert(pi.name.to_string());
                             } else if let PropertyKey::Identifier(id) = &p.key {
-                                state_privates.insert(id.name.clone());
+                                state_privates.insert(id.name.to_string());
                             }
                         }
                     }
@@ -20517,7 +20516,7 @@ fn rewrite_class_body_client(c: &mut ClassDeclaration) {
                         };
                         let arg = property_rune_inner_client(p.value.as_ref().unwrap())
                             .unwrap_or_else(|| Expression::Identifier(Identifier {
-                                name: "undefined".to_string(),
+                                name: Cow::Borrowed("undefined"),
                                 span: Span::ZERO,
                             }));
                         let derived_expr = if by {
@@ -20599,7 +20598,7 @@ fn make_state_getter(public_name: &str) -> ClassMember {
     }))];
     ClassMember::Method(Box::new(MethodDefinition {
         key: PropertyKey::Identifier(Identifier {
-            name: public_name.to_string(),
+            name: Cow::Owned(public_name.to_string()),
             span: Span::ZERO,
         }),
         value: FunctionExpression {
@@ -20633,7 +20632,7 @@ fn make_state_setter(public_name: &str) -> ClassMember {
     ))];
     ClassMember::Method(Box::new(MethodDefinition {
         key: PropertyKey::Identifier(Identifier {
-            name: public_name.to_string(),
+            name: Cow::Owned(public_name.to_string()),
             span: Span::ZERO,
         }),
         value: FunctionExpression {
@@ -20662,7 +20661,7 @@ fn make_derived_getter_client(public_name: &str) -> ClassMember {
     }))];
     ClassMember::Method(Box::new(MethodDefinition {
         key: PropertyKey::Identifier(Identifier {
-            name: public_name.to_string(),
+            name: Cow::Owned(public_name.to_string()),
             span: Span::ZERO,
         }),
         value: FunctionExpression {
@@ -20689,7 +20688,7 @@ fn make_derived_setter_client(public_name: &str) -> ClassMember {
     ))];
     ClassMember::Method(Box::new(MethodDefinition {
         key: PropertyKey::Identifier(Identifier {
-            name: public_name.to_string(),
+            name: Cow::Owned(public_name.to_string()),
             span: Span::ZERO,
         }),
         value: FunctionExpression {
@@ -20712,7 +20711,7 @@ fn this_private(name: &str) -> Expression {
     Expression::Member(Box::new(MemberExpression {
         object: Expression::This(Span::ZERO),
         property: MemberProperty::Private(PrivateIdentifier {
-            name: name.to_string(),
+            name: Cow::Owned(name.to_string()),
             span: Span::ZERO,
         }),
         computed: false,
@@ -20766,7 +20765,7 @@ fn rewrite_expr_for_class_state(e: &mut Expression, state_privates: &HashSet<Str
                 AssignmentTarget::Expression(E::Member(m)) => {
                     if matches!(&m.object, E::This(_)) {
                         if let MemberProperty::Private(pi) = &m.property {
-                            Some(pi.name.clone())
+                            Some(pi.name.to_string())
                         } else {
                             None
                         }
@@ -20777,7 +20776,7 @@ fn rewrite_expr_for_class_state(e: &mut Expression, state_privates: &HashSet<Str
                 AssignmentTarget::Pattern(Pattern::Member(m)) => {
                     if matches!(&m.object, E::This(_)) {
                         if let MemberProperty::Private(pi) = &m.property {
-                            Some(pi.name.clone())
+                            Some(pi.name.to_string())
                         } else {
                             None
                         }
@@ -20788,7 +20787,7 @@ fn rewrite_expr_for_class_state(e: &mut Expression, state_privates: &HashSet<Str
                 _ => None,
             };
             if let Some(name) = private_name {
-                if state_privates.contains(&name)
+                if state_privates.contains(name.as_str())
                     && matches!(a.operator, AssignmentOperator::Assign)
                 {
                     rewrite_expr_for_class_state(&mut a.right, state_privates);
@@ -20950,9 +20949,9 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
     use Expression as E;
     match e {
         E::Identifier(i) => {
-            if state.contains(&i.name) {
+            if state.contains(i.name.as_ref()) {
                 let name = i.name.clone();
-                *e = t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]);
+                *e = t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())]);
             }
         }
         E::Assignment(a) => {
@@ -20960,12 +20959,12 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
             // The LHS may be either Expression(Identifier) or Pattern(Identifier)
             // depending on the parser path.
             let lhs_name: Option<String> = match &a.left {
-                AssignmentTarget::Expression(E::Identifier(id)) => Some(id.name.clone()),
-                AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(id.name.clone()),
+                AssignmentTarget::Expression(E::Identifier(id)) => Some(id.name.to_string()),
+                AssignmentTarget::Pattern(Pattern::Identifier(id)) => Some(id.name.to_string()),
                 _ => None,
             };
             if let Some(name) = lhs_name {
-                if state.contains(&name) {
+                if state.contains(name.as_str()) {
                     {
                         // Recurse into RHS first (its own reads become $.get).
                         rewrite_expr_for_state(&mut a.right, state);
@@ -20977,34 +20976,34 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                             AssignmentOperator::Assign => rhs,
                             AssignmentOperator::AddAssign => binop(
                                 BinaryOperator::Plus,
-                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())]),
                                 rhs,
                             ),
                             AssignmentOperator::SubAssign => binop(
                                 BinaryOperator::Minus,
-                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())]),
                                 rhs,
                             ),
                             AssignmentOperator::MulAssign => binop(
                                 BinaryOperator::Mul,
-                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())]),
                                 rhs,
                             ),
                             AssignmentOperator::DivAssign => binop(
                                 BinaryOperator::Div,
-                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())]),
                                 rhs,
                             ),
                             AssignmentOperator::ModAssign => binop(
                                 BinaryOperator::Mod,
-                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)]),
+                                t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())]),
                                 rhs,
                             ),
                             _ => rhs,
                         };
                         *e = t::call(
                             t::member_id(t::id_dollar(), "set"),
-                            vec![t::id(&name), new_value],
+                            vec![t::id_owned(name.to_string()), new_value],
                         );
                         return;
                     }
@@ -21018,11 +21017,11 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
         }
         E::Update(u) => {
             if let E::Identifier(id) = &u.argument {
-                if state.contains(&id.name) {
+                if state.contains(id.name.as_ref()) {
                     let name = id.name.clone();
                     let increment_args = match u.operator {
-                        UpdateOperator::Increment => vec![t::id(&name)],
-                        UpdateOperator::Decrement => vec![t::id(&name), t::lit_number(-1.0)],
+                        UpdateOperator::Increment => vec![t::id_owned(name.to_string())],
+                        UpdateOperator::Decrement => vec![t::id_owned(name.to_string()), t::lit_number(-1.0)],
                     };
                     *e = t::call(t::member_id(t::id_dollar(), "update"), increment_args);
                     return;
@@ -21087,15 +21086,15 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                     if matches!(asgn.operator, AssignmentOperator::Assign) {
                         let lhs_name = match &asgn.left {
                             AssignmentTarget::Expression(E::Identifier(id)) => {
-                                Some(id.name.clone())
+                                Some(id.name.to_string())
                             }
                             AssignmentTarget::Pattern(Pattern::Identifier(id)) => {
-                                Some(id.name.clone())
+                                Some(id.name.to_string())
                             }
                             _ => None,
                         };
                         if let Some(name) = lhs_name {
-                            if state.contains(&name)
+                            if state.contains(name.as_str())
                                 && expr_contains_call(&asgn.right)
                             {
                                 rewrite_expr_for_state(&mut asgn.right, state);
@@ -21106,7 +21105,7 @@ pub(crate) fn rewrite_expr_for_state(e: &mut Expression, state: &HashSet<String>
                                 *body_expr = t::call(
                                     t::member_id(t::id_dollar(), "set"),
                                     vec![
-                                        t::id(&name),
+                                        t::id_owned(name.to_string()),
                                         rhs,
                                         Expression::Literal(Box::new(Literal::Boolean(
                                             BooleanLiteral {
@@ -21178,7 +21177,7 @@ fn try_strip_state(
     uses_runes: &mut bool,
 ) -> bool {
     let Some(name) = pattern_single_ident(id) else { return false };
-    if assigned.contains(&name) {
+    if assigned.contains(name.as_str()) {
         // Has assignments — would need full $.state lowering; mark and bail
         // at the caller level.
         if is_state_call(init) {
@@ -21196,7 +21195,7 @@ fn try_strip_state(
         _ => None,
     });
     *init = arg.unwrap_or_else(|| Expression::Identifier(Identifier {
-        name: "undefined".to_string(),
+        name: Cow::Borrowed("undefined"),
         span: Span::ZERO,
     }));
     true
@@ -21204,7 +21203,7 @@ fn try_strip_state(
 
 fn pattern_single_ident(p: &Pattern) -> Option<String> {
     match p {
-        Pattern::Identifier(i) => Some(i.name.clone()),
+        Pattern::Identifier(i) => Some(i.name.to_string()),
         _ => None,
     }
 }
@@ -21254,7 +21253,7 @@ fn expr_has_unsupported_rune(e: &Expression) -> bool {
 
 fn global_keypath(e: &Expression) -> Option<String> {
     match e {
-        Expression::Identifier(i) => Some(i.name.clone()),
+        Expression::Identifier(i) => Some(i.name.to_string()),
         Expression::Member(m) => {
             if m.computed || m.optional {
                 return None;
@@ -21409,7 +21408,7 @@ fn scan_nodes_for_assignments(nodes: &[FragmentChild], out: &mut HashSet<String>
                             // mutate `target`. Treat the target's root
                             // identifier as assigned so it gets state lowering.
                             if let Expression::Identifier(i) = &b.expression {
-                                out.insert(i.name.clone());
+                                out.insert(i.name.to_string());
                             }
                             scan_expr_for_assignments(&b.expression, out);
                         }
@@ -21442,7 +21441,7 @@ fn scan_nodes_for_assignments(nodes: &[FragmentChild], out: &mut HashSet<String>
                             // mutate `target`. Treat the target's root
                             // identifier as assigned so it gets state lowering.
                             if let Expression::Identifier(i) = &b.expression {
-                                out.insert(i.name.clone());
+                                out.insert(i.name.to_string());
                             }
                             scan_expr_for_assignments(&b.expression, out);
                         }
@@ -21495,7 +21494,7 @@ fn scan_expr_for_assignments(e: &Expression, out: &mut HashSet<String>) {
         }
         E::Update(u) => {
             if let E::Identifier(i) = &u.argument {
-                out.insert(i.name.clone());
+                out.insert(i.name.to_string());
             } else {
                 scan_expr_for_assignments(&u.argument, out);
             }
@@ -21586,7 +21585,7 @@ fn collect_assignment_target_idents(target: &AssignmentTarget, out: &mut HashSet
     match target {
         AssignmentTarget::Expression(e) => {
             if let Expression::Identifier(i) = e {
-                out.insert(i.name.clone());
+                out.insert(i.name.to_string());
             }
         }
         AssignmentTarget::Pattern(p) => collect_pattern_idents(p, out),
@@ -21596,7 +21595,7 @@ fn collect_assignment_target_idents(target: &AssignmentTarget, out: &mut HashSet
 fn collect_pattern_idents(p: &Pattern, out: &mut HashSet<String>) {
     match p {
         Pattern::Identifier(i) => {
-            out.insert(i.name.clone());
+            out.insert(i.name.to_string());
         }
         Pattern::Array(a) => {
             for el in &a.elements {
@@ -22066,7 +22065,7 @@ fn emit_nav(out: &mut Vec<Statement>, name: &str, prev: Option<&str>) {
     let init = if let Some(p) = prev {
         t::call(
             t::member_id(t::id_dollar(), "sibling"),
-            vec![t::id(p), t::lit_number(2.0)],
+            vec![t::id_owned(p.to_string()), t::lit_number(2.0)],
         )
     } else {
         t::call(t::member_id(t::id_dollar(), "first_child"), vec![t::id_fragment()])
@@ -22144,11 +22143,11 @@ fn emit_element_content_combined(
         let text_var = unique_var("text", var_counts);
         body_stmts.push(t::var(
             &text_var,
-            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(parent_var)]),
+            t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(parent_var.to_string())]),
         ));
         body_stmts.push(t::stmt(t::call(
             t::member_id(t::id_dollar(), "reset"),
-            vec![t::id(parent_var)],
+            vec![t::id_owned(parent_var.to_string())],
         )));
         let template_expr = build_inline_template(parts, state_bindings);
         text_effects.push((text_var, template_expr));
@@ -22206,7 +22205,7 @@ fn emit_element_content(
                 t::call(
                     t::member_id(t::id_dollar(), "child"),
                     vec![
-                        t::id(parent_var),
+                        t::id_owned(parent_var.to_string()),
                         Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                             value: true,
                             span: Span::ZERO,
@@ -22216,7 +22215,7 @@ fn emit_element_content(
             ));
             body_stmts.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
-                vec![t::id(parent_var)],
+                vec![t::id_owned(parent_var.to_string())],
             )));
             // For a single expression Reactive part: pass the expression
             // directly to set_text. For multiple parts: build a template
@@ -22301,9 +22300,9 @@ fn emit_element_content(
         ElementContent::NoContent | ElementContent::StaticOnly => {}
         ElementContent::FoldedText(s) => {
             let target = Expression::Member(Box::new(MemberExpression {
-                object: t::id(parent_var),
+                object: t::id_owned(parent_var.to_string()),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "textContent".to_string(),
+                    name: Cow::Borrowed("textContent"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -22315,7 +22314,7 @@ fn emit_element_content(
                     left: AssignmentTarget::Expression(target),
                     operator: AssignmentOperator::Assign,
                     right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: s.clone(),
+                        value: Cow::Owned(s.clone()),
                         raw: None,
                         span: Span::ZERO,
                     }))),
@@ -22325,9 +22324,9 @@ fn emit_element_content(
         }
         ElementContent::DirectText(expr) => {
             let target = Expression::Member(Box::new(MemberExpression {
-                object: t::id(parent_var),
+                object: t::id_owned(parent_var.to_string()),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "textContent".to_string(),
+                    name: Cow::Borrowed("textContent"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -22348,11 +22347,11 @@ fn emit_element_content(
             let text_var = format!("text"); // Could conflict — keep simple for now.
             body_stmts.push(t::var(
                 &text_var,
-                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id(parent_var)]),
+                t::call(t::member_id(t::id_dollar(), "child"), vec![t::id_owned(parent_var.to_string())]),
             ));
             body_stmts.push(t::stmt(t::call(
                 t::member_id(t::id_dollar(), "reset"),
-                vec![t::id(parent_var)],
+                vec![t::id_owned(parent_var.to_string())],
             )));
 
             let expr_count = parts
@@ -22366,7 +22365,7 @@ fn emit_element_content(
                 let template_expr = build_inline_template(parts, state_bindings);
                 let fn_body = t::call(
                     t::member_id(t::id_dollar(), "set_text"),
-                    vec![t::id(&text_var), template_expr],
+                    vec![t::id_owned(text_var.to_string()), template_expr],
                 );
                 fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params: Vec::new(),
@@ -22381,11 +22380,11 @@ fn emit_element_content(
                 let (template_expr, dep_fns) = build_template_effect(parts, state_bindings);
                 let mut params: Vec<Pattern> = Vec::new();
                 for i in 0..dep_fns.len() {
-                    params.push(t::pat_id(&format!("${i}")));
+                    params.push(t::pat_id_owned(format!("${i}")));
                 }
                 let fn_body = t::call(
                     t::member_id(t::id_dollar(), "set_text"),
-                    vec![t::id(&text_var), template_expr],
+                    vec![t::id_owned(text_var.to_string()), template_expr],
                 );
                 fn_arrow = Expression::Arrow(Box::new(ArrowFunctionExpression {
                     params,
@@ -22453,7 +22452,7 @@ fn build_inline_template(
                     left: sub,
                     operator: LogicalOperator::Coalesce,
                     right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: String::new(),
+                        value: Cow::Owned(String::new()),
                         raw: None,
                         span: Span::ZERO,
                     }))),
@@ -22484,10 +22483,10 @@ fn build_template_effect(
                 quasis.push(std::mem::take(&mut current));
                 // `${$N ?? ''}`
                 let placeholder = Expression::Logical(Box::new(LogicalExpression {
-                    left: t::id(&format!("${placeholder_idx}")),
+                    left: t::id_owned(format!("${placeholder_idx}")),
                     operator: LogicalOperator::Coalesce,
                     right: Expression::Literal(Box::new(Literal::String(StringLiteral {
-                        value: String::new(),
+                        value: Cow::Owned(String::new()),
                         raw: None,
                         span: Span::ZERO,
                     }))),
@@ -22519,7 +22518,7 @@ fn textcontent_value(e: Expression) -> Expression {
     if let Expression::Literal(lit) = &e {
         if let Literal::Number(n) = lit.as_ref() {
             return Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: format_num(n.value),
+                value: Cow::Owned(format_num(n.value)),
                 raw: None,
                 span: Span::ZERO,
             })));
@@ -22597,7 +22596,7 @@ fn extract_client_snippets(
                             t::member_id(t::id_dollar(), "text"),
                             vec![Expression::Literal(Box::new(Literal::String(
                                 StringLiteral {
-                                    value: t.data.trim().to_string(),
+                                    value: Cow::Owned(t.data.trim().to_string()),
                                     raw: None,
                                     span: Span::ZERO,
                                 },
@@ -22606,7 +22605,7 @@ fn extract_client_snippets(
                     ));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "append"),
-                        vec![t::id_anchor(), t::id(&text_var)],
+                        vec![t::id_anchor(), t::id_owned(text_var.to_string())],
                     )));
                     body
                 }
@@ -22631,11 +22630,11 @@ fn extract_client_snippets(
                     let mut body: Vec<Statement> = Vec::new();
                     body.push(t::var(
                         &el_var,
-                        t::call(t::id(&root_name), Vec::new()),
+                        t::call(t::id_owned(root_name.to_string()), Vec::new()),
                     ));
                     body.push(t::stmt(t::call(
                         t::member_id(t::id_dollar(), "append"),
-                        vec![t::id_anchor(), t::id(&el_var)],
+                        vec![t::id_anchor(), t::id_owned(el_var.to_string())],
                     )));
                     body
                 }
@@ -22692,14 +22691,14 @@ fn component_call_with(
                 // When target refers to a state binding, wrap with $.get / $.set.
                 let target_is_state = matches!(
                     &b.expression,
-                    Expression::Identifier(i) if state_bindings.contains(&i.name)
+                    Expression::Identifier(i) if state_bindings.contains(i.name.as_ref())
                 );
                 let getter_body = if target_is_state {
                     let name = match &b.expression {
                         Expression::Identifier(i) => i.name.clone(),
                         _ => return None,
                     };
-                    t::call(t::member_id(t::id_dollar(), "get"), vec![t::id(&name)])
+                    t::call(t::member_id(t::id_dollar(), "get"), vec![t::id_owned(name.to_string())])
                 } else {
                     b.expression.clone()
                 };
@@ -22711,7 +22710,7 @@ fn component_call_with(
                     t::call(
                         t::member_id(t::id_dollar(), "set"),
                         vec![
-                            t::id(&name),
+                            t::id_owned(name.to_string()),
                             t::id("$$value"),
                             Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
                                 value: true,
@@ -22730,7 +22729,7 @@ fn component_call_with(
                 // get NAME() { return GETTER_BODY; }
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: b.name.clone(),
+                        name: Cow::Owned(b.name.clone()),
                         span: Span::ZERO,
                     }),
                     value: Expression::Function(Box::new(FunctionExpression {
@@ -22757,7 +22756,7 @@ fn component_call_with(
                 // set NAME($$value) { SETTER_BODY; }
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: b.name.clone(),
+                        name: Cow::Owned(b.name.clone()),
                         span: Span::ZERO,
                     }),
                     value: Expression::Function(Box::new(FunctionExpression {
@@ -22783,9 +22782,9 @@ fn component_call_with(
         }
     }
     Some(t::stmt(Expression::Call(Box::new(CallExpression {
-        callee: t::id(&c.name),
+        callee: t::id_owned(c.name.to_string()),
         arguments: vec![
-            Argument::Expression(t::id(node_var)),
+            Argument::Expression(t::id_owned(node_var.to_string())),
             Argument::Expression(Expression::Object(Box::new(ObjectExpression {
                 properties: props,
                 span: Span::ZERO,
@@ -22808,7 +22807,7 @@ fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
                 match &parts[0] {
                     AttributeValuePart::Text(t) => {
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: t.data.clone(),
+                            value: Cow::Owned(t.data.clone()),
                             raw: None,
                             span: Span::ZERO,
                         })))
@@ -22822,7 +22821,7 @@ fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
     };
     Some(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: a.name.clone(),
+            name: Cow::Owned(a.name.clone()),
             span: Span::ZERO,
         }),
         value,
@@ -22905,7 +22904,7 @@ fn fold_expr_with_consts(e: &mut Expression, consts: &HashMap<String, Expression
 fn substitute_consts(e: &mut Expression, consts: &HashMap<String, Expression>) {
     match e {
         Expression::Identifier(i) => {
-            if let Some(lit) = consts.get(&i.name) {
+            if let Some(lit) = consts.get(i.name.as_ref()) {
                 *e = lit.clone();
             }
         }
@@ -23033,7 +23032,7 @@ fn is_non_nullish_literal(e: &Expression) -> Option<bool> {
 fn literal_to_template_string(e: &Expression) -> Option<String> {
     match e {
         Expression::Literal(lit) => match lit.as_ref() {
-            Literal::String(s) => Some(s.value.clone()),
+            Literal::String(s) => Some(s.value.to_string()),
             Literal::Number(n) => Some(format_num(n.value)),
             Literal::Boolean(b) => Some(b.value.to_string()),
             Literal::Null(_) => Some(String::new()),
@@ -23147,7 +23146,7 @@ fn try_fold_binary(b: &BinaryExpression) -> Option<Expression> {
     };
     let lit_str = |e: &Expression| match e {
         Expression::Literal(l) => match l.as_ref() {
-            Literal::String(s) => Some(s.value.clone()),
+            Literal::String(s) => Some(s.value.to_string()),
             _ => None,
         },
         _ => None,
@@ -23173,7 +23172,7 @@ fn try_fold_binary(b: &BinaryExpression) -> Option<Expression> {
     if matches!(b.operator, svelte_js_ast::BinaryOperator::Plus) {
         if let (Some(l), Some(r)) = (lit_str(&b.left), lit_str(&b.right)) {
             return Some(Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: format!("{l}{r}"),
+                value: Cow::Owned(format!("{l}{r}")),
                 raw: None,
                 span: Span::ZERO,
             }))));
@@ -23191,11 +23190,11 @@ fn try_fold_math_call(c: &CallExpression) -> Option<Expression> {
         return None;
     }
     let obj = match &m.object {
-        Expression::Identifier(i) => i.name.as_str(),
+        Expression::Identifier(i) => i.name.as_ref(),
         _ => return None,
     };
     let prop = match &m.property {
-        MemberProperty::Identifier(i) => i.name.as_str(),
+        MemberProperty::Identifier(i) => i.name.as_ref(),
         _ => return None,
     };
     if obj != "Math" {

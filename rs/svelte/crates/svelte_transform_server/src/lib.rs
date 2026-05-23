@@ -21,6 +21,7 @@ use svelte_ast::fragment::FragmentChild;
 use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
+use std::borrow::Cow;
 
 /// Backwards-compatible entry — defaults `experimental_async = false`.
 pub fn try_typed_server_component(root: &Root, component_name: &str) -> Option<Program> {
@@ -333,10 +334,10 @@ pub fn try_typed_server_component_full(
         for name in &legacy_export_props {
             props.push(ObjectMember::Property(Box::new(Property {
                 key: PropertyKey::Identifier(Identifier {
-                    name: name.clone(),
+                    name: Cow::Owned(name.clone()),
                     span: Span::ZERO,
                 }),
-                value: t::id(name),
+                value: t::id_owned(name.clone()),
                 kind: PropertyKind::Init,
                 computed: false,
                 shorthand: true,
@@ -385,7 +386,7 @@ pub fn try_typed_server_component_full(
                 kind: VariableKind::Var,
                 declarations: vec![VariableDeclarator {
                     id: Pattern::Identifier(Identifier {
-                        name: "$$store_subs".to_string(),
+                        name: Cow::Borrowed("$$store_subs"),
                         span: Span::ZERO,
                     }),
                     init: None,
@@ -463,7 +464,7 @@ pub fn try_typed_server_component_full(
             properties: vec![
                 ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: "hash".to_string(),
+                        name: Cow::Borrowed("hash"),
                         span: Span::ZERO,
                     }),
                     value: string_lit(&hash),
@@ -475,7 +476,7 @@ pub fn try_typed_server_component_full(
                 })),
                 ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: "code".to_string(),
+                        name: Cow::Borrowed("code"),
                         span: Span::ZERO,
                     }),
                     value: string_lit(&code),
@@ -736,9 +737,9 @@ fn collect_import_names(body: &[Statement]) -> std::collections::HashSet<String>
         if let Statement::Import(imp) = s {
             for spec in &imp.specifiers {
                 match spec {
-                    ImportSpecifierKind::Default(d) => { out.insert(d.local.name.clone()); }
-                    ImportSpecifierKind::Namespace(n) => { out.insert(n.local.name.clone()); }
-                    ImportSpecifierKind::Named(n) => { out.insert(n.local.name.clone()); }
+                    ImportSpecifierKind::Default(d) => { out.insert(d.local.name.to_string()); }
+                    ImportSpecifierKind::Namespace(n) => { out.insert(n.local.name.to_string()); }
+                    ImportSpecifierKind::Named(n) => { out.insert(n.local.name.to_string()); }
                 }
             }
         }
@@ -782,7 +783,7 @@ fn member_root_is_import(
     imports: &std::collections::HashSet<String>,
 ) -> bool {
     match e {
-        Expression::Identifier(id) => imports.contains(&id.name),
+        Expression::Identifier(id) => imports.contains(id.name.as_ref()),
         Expression::Member(m) => member_root_is_import(&m.object, imports),
         Expression::Paren(p) => member_root_is_import(&p.expression, imports),
         _ => false,
@@ -800,7 +801,7 @@ fn expr_calls_import(
         Expression::Call(c) => {
             // Callee is a plain Identifier that's imported → unsafe.
             if let Expression::Identifier(id) = &c.callee {
-                if imports.contains(&id.name) {
+                if imports.contains(id.name.as_ref()) {
                     return true;
                 }
             }
@@ -1038,7 +1039,7 @@ fn expr_root_member_in(
             loop {
                 match cur {
                     Expression::Member(inner) => cur = &inner.object,
-                    Expression::Identifier(id) => return names.contains(&id.name),
+                    Expression::Identifier(id) => return names.contains(id.name.as_ref()),
                     _ => return false,
                 }
             }
@@ -1253,7 +1254,7 @@ fn wrap_async_block(
             .iter()
             .map(|i| {
                 ArrayElement::Expression(Expression::Member(Box::new(MemberExpression {
-                    object: t::id(promises_var),
+                    object: t::id_owned(promises_var.to_string()),
                     property: MemberProperty::Expression(t::lit_number(*i as f64)),
                     computed: true,
                     optional: false,
@@ -1307,7 +1308,7 @@ fn collect_block_indices_in_expr(
 ) {
     match e {
         Expression::Identifier(id) => {
-            if let Some(idx) = blocker_bindings.get(&id.name) {
+            if let Some(idx) = blocker_bindings.get(id.name.as_ref()) {
                 out.insert(*idx);
             }
         }
@@ -1753,7 +1754,7 @@ fn lower_fragment_with_const_await_with(
         if let FragmentChild::ConstTag(ct) = n {
             for d in &ct.declaration.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
-                    const_names.push(id.name.clone());
+                    const_names.push(id.name.to_string());
 
                     // Collect blockers from init (eager identifier references
                     // to script bindings that have `$$promises[idx]`).
@@ -1807,7 +1808,7 @@ fn lower_fragment_with_const_await_with(
                         init.clone()
                     };
                     let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                        left: AssignmentTarget::Expression(t::id(&id.name)),
+                        left: AssignmentTarget::Expression(t::id_owned(id.name.to_string())),
                         operator: AssignmentOperator::Assign,
                         right: setter_init,
                         span: Span::ZERO,
@@ -1838,7 +1839,7 @@ fn lower_fragment_with_const_await_with(
         out.push(Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Let,
             declarations: vec![VariableDeclarator {
-                id: t::pat_id(name),
+                id: t::pat_id_owned(name.to_string()),
                 init: None,
                 type_annotation: None,
                 span: Span::ZERO,
@@ -1986,7 +1987,7 @@ fn expr_has_await_top(e: &Expression) -> bool {
 
 fn expr_refs_any(e: &Expression, names: &std::collections::HashSet<String>) -> bool {
     match e {
-        Expression::Identifier(i) => names.contains(&i.name),
+        Expression::Identifier(i) => names.contains(i.name.as_ref()),
         Expression::Member(m) => expr_refs_any(&m.object, names),
         Expression::Call(c) => {
             expr_refs_any(&c.callee, names)
@@ -2033,7 +2034,7 @@ fn expr_blocker_idx(
     }
     match e {
         Expression::Identifier(i) => {
-            return blockers.get(&i.name).copied();
+            return blockers.get(i.name.as_ref()).copied();
         }
         Expression::Member(m) => {
             merge(&mut out, expr_blocker_idx(&m.object, blockers));
@@ -2088,7 +2089,7 @@ fn emit_async_wrap_with_await(
     promises_var: &str,
 ) -> Statement {
     let promises_slot = Expression::Member(Box::new(MemberExpression {
-        object: t::id(promises_var),
+        object: t::id_owned(promises_var.to_string()),
         property: MemberProperty::Expression(t::lit_number(idx as f64)),
         computed: true,
         optional: false,
@@ -2126,7 +2127,7 @@ fn emit_async_wrap_with_await(
 
 fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str) -> Statement {
     let promises_slot = Expression::Member(Box::new(MemberExpression {
-        object: t::id(promises_var),
+        object: t::id_owned(promises_var.to_string()),
         property: MemberProperty::Expression(t::lit_number(group_idx as f64)),
         computed: true,
         optional: false,
@@ -2310,7 +2311,7 @@ fn lower_svelte_head_server_inner(
         t::member_id(t::id_dollar(), "head"),
         vec![
             Expression::Literal(Box::new(Literal::String(StringLiteral {
-                value: hash.clone(),
+                value: Cow::Owned(hash.clone()),
                 raw: Some(format!("'{hash}'")),
                 span: Span::ZERO,
             }))),
@@ -2371,7 +2372,7 @@ fn lower_svelte_boundary_server(
                 params.push(p.clone());
             }
             out.push(t::function_decl(&name, params, body_stmts));
-            snippet_names.push(name);
+            snippet_names.push(name.to_string());
             continue;
         }
         remaining.push(n);
@@ -2485,7 +2486,7 @@ fn lower_svelte_boundary_server(
         let shorthand = matches!(&expr, Expression::Identifier(i) if i.name == name);
         obj_props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: name.clone(),
+                name: Cow::Owned(name.clone()),
                 span: Span::ZERO,
             }),
             value: expr,
@@ -2502,10 +2503,10 @@ fn lower_svelte_boundary_server(
         }
         obj_props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: name.clone(),
+                name: Cow::Owned(name.clone()),
                 span: Span::ZERO,
             }),
-            value: t::id(name),
+            value: t::id_owned(name.clone()),
             kind: PropertyKind::Init,
             computed: false,
             shorthand: true,
@@ -2644,7 +2645,7 @@ fn lower_head_fragment(
                     // already includes the open/close `<!--[-->` /
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
-                        .with(|s| s.borrow().contains(&c.name));
+                        .with(|s| s.borrow().contains(c.name.as_str()));
                     let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
                     last_was_component = !is_state && !async_wrapped;
                 }
@@ -2790,9 +2791,9 @@ fn lower_fragment_with_marker(
         if let FragmentChild::RegularElement(el) = n {
             let bind_body: Option<(&str, Expression)> = el.attributes.iter().find_map(|a| match a {
                 ElementAttribute::BindDirective(b)
-                    if matches!(b.name.as_str(), "innerText" | "textContent" | "innerHTML") =>
+                    if matches!(b.name.as_ref(), "innerText" | "textContent" | "innerHTML") =>
                 {
-                    Some((b.name.as_str(), b.expression.clone()))
+                    Some((b.name.as_ref(), b.expression.clone()))
                 }
                 _ => None,
             });
@@ -2879,7 +2880,7 @@ fn lower_fragment_with_marker(
                     // already includes the open/close `<!--[-->` /
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
-                        .with(|s| s.borrow().contains(&c.name));
+                        .with(|s| s.borrow().contains(c.name.as_str()));
                     let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
                     last_was_component = !is_state && !async_wrapped;
                 }
@@ -3040,7 +3041,7 @@ fn lower_content_editable_bind_inline(
     buf.push_str(&el.name);
     for attr in &el.attributes {
         if let ElementAttribute::BindDirective(b) = attr {
-            if matches!(b.name.as_str(), "innerText" | "textContent" | "innerHTML") {
+            if matches!(b.name.as_ref(), "innerText" | "textContent" | "innerHTML") {
                 continue;
             }
         }
@@ -3092,13 +3093,13 @@ fn lower_content_editable_bind_inline(
         let body_var = if idx == 0 { "$$body".to_string() } else { format!("$$body_{idx}") };
         out.push(t::const_decl(&body_var, body_source));
         out.push(Statement::If(Box::new(IfStatement {
-            test: t::id(&body_var),
+            test: t::id_owned(body_var.to_string()),
             consequent: Statement::Block(Box::new(BlockStatement {
                 body: vec![t::stmt(t::call(
                     t::member_id(t::id_renderer(), "push"),
                     vec![t::template_raw(
                         vec![String::new(), String::new()],
-                        vec![t::id(&body_var)],
+                        vec![t::id_owned(body_var.to_string())],
                     )],
                 ))],
                 span: Span::ZERO,
@@ -3206,13 +3207,13 @@ fn lower_textarea_server_inline(
 
     out.push(t::const_decl(&body_var, escape_call));
     out.push(Statement::If(Box::new(IfStatement {
-        test: t::id(&body_var),
+        test: t::id_owned(body_var.to_string()),
         consequent: Statement::Block(Box::new(BlockStatement {
             body: vec![t::stmt(t::call(
                 t::member_id(t::id_renderer(), "push"),
                 vec![t::template_raw(
                     vec![String::new(), String::new()],
-                    vec![t::id(&body_var)],
+                    vec![t::id_owned(body_var.to_string())],
                 )],
             ))],
             span: Span::ZERO,
@@ -3330,11 +3331,11 @@ fn lower_textarea_server(
         t::member_id(t::id_renderer(), "push"),
         vec![t::template_raw(
             vec![String::new(), String::new()],
-            vec![t::id(&body_var)],
+            vec![t::id_owned(body_var.to_string())],
         )],
     ));
     out.push(Statement::If(Box::new(IfStatement {
-        test: t::id(&body_var),
+        test: t::id_owned(body_var.to_string()),
         consequent: Statement::Block(Box::new(BlockStatement {
             body: vec![push_body],
             span: Span::ZERO,
@@ -3363,7 +3364,7 @@ fn select_value_attr(
                     AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
                         AttributeValuePart::Text(t) => Some(Expression::Literal(Box::new(
                             Literal::String(StringLiteral {
-                                value: t.data.clone(),
+                                value: Cow::Owned(t.data.clone()),
                                 raw: Some(format!("'{}'", t.data.replace('\'', "\\'"))),
                                 span: Span::ZERO,
                             }),
@@ -3410,7 +3411,7 @@ fn lower_select_with_value(
             ElementAttribute::Attribute(attr) if attr.name == "value" => {
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: "value".to_string(),
+                        name: Cow::Borrowed("value"),
                         span: Span::ZERO,
                     }),
                     value: value_expr.clone(),
@@ -3425,7 +3426,7 @@ fn lower_select_with_value(
             ElementAttribute::BindDirective(b) if b.name == "value" => {
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: "value".to_string(),
+                        name: Cow::Borrowed("value"),
                         span: Span::ZERO,
                     }),
                     value: value_expr.clone(),
@@ -3450,7 +3451,7 @@ fn lower_select_with_value(
         // safeguard by pushing value at the end.
         props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: "value".to_string(),
+                name: Cow::Borrowed("value"),
                 span: Span::ZERO,
             }),
             value: value_expr,
@@ -3853,7 +3854,7 @@ fn lower_each_for_select(
         kind: VariableKind::Let,
         declarations: vec![
             VariableDeclarator {
-                id: t::pat_id(&index_name),
+                id: t::pat_id_owned(index_name.to_string()),
                 init: Some(t::lit_number(0.0)),
                 type_annotation: None,
                 span: Span::ZERO,
@@ -3861,9 +3862,9 @@ fn lower_each_for_select(
             VariableDeclarator {
                 id: t::pat_id("$$length"),
                 init: Some(Expression::Member(Box::new(MemberExpression {
-                    object: t::id(&arr_name),
+                    object: t::id_owned(arr_name.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "length".to_string(),
+                        name: Cow::Borrowed("length"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -3877,14 +3878,14 @@ fn lower_each_for_select(
         span: Span::ZERO,
     }));
     let test = Expression::Binary(Box::new(BinaryExpression {
-        left: t::id(&index_name),
+        left: t::id_owned(index_name.to_string()),
         operator: BinaryOperator::Lt,
         right: t::id("$$length"),
         span: Span::ZERO,
     }));
     let update = Expression::Update(Box::new(UpdateExpression {
         operator: UpdateOperator::Increment,
-        argument: t::id(&index_name),
+        argument: t::id_owned(index_name.to_string()),
         prefix: false,
         span: Span::ZERO,
     }));
@@ -3895,8 +3896,8 @@ fn lower_each_for_select(
             declarations: vec![VariableDeclarator {
                 id: ctx.clone(),
                 init: Some(Expression::Member(Box::new(MemberExpression {
-                    object: t::id(&arr_name),
-                    property: MemberProperty::Expression(t::id(&index_name)),
+                    object: t::id_owned(arr_name.to_string()),
+                    property: MemberProperty::Expression(t::id_owned(index_name.to_string())),
                     computed: true,
                     optional: false,
                     span: Span::ZERO,
@@ -4063,7 +4064,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         kind: VariableKind::Let,
         declarations: vec![
             VariableDeclarator {
-                id: t::pat_id(&index_name),
+                id: t::pat_id_owned(index_name.to_string()),
                 init: Some(t::lit_number(0.0)),
                 type_annotation: None,
                 span: Span::ZERO,
@@ -4071,9 +4072,9 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             VariableDeclarator {
                 id: t::pat_id("$$length"),
                 init: Some(Expression::Member(Box::new(MemberExpression {
-                    object: t::id(&each_array_name),
+                    object: t::id_owned(each_array_name.to_string()),
                     property: MemberProperty::Identifier(Identifier {
-                        name: "length".to_string(),
+                        name: Cow::Borrowed("length"),
                         span: Span::ZERO,
                     }),
                     computed: false,
@@ -4088,14 +4089,14 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
     }));
 
     let test = Expression::Binary(Box::new(BinaryExpression {
-        left: t::id(&index_name),
+        left: t::id_owned(index_name.to_string()),
         operator: BinaryOperator::Lt,
         right: t::id("$$length"),
         span: Span::ZERO,
     }));
     let update = Expression::Update(Box::new(UpdateExpression {
         operator: UpdateOperator::Increment,
-        argument: t::id(&index_name),
+        argument: t::id_owned(index_name.to_string()),
         prefix: false,
         span: Span::ZERO,
     }));
@@ -4108,8 +4109,8 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             declarations: vec![VariableDeclarator {
                 id: ctx.clone(),
                 init: Some(Expression::Member(Box::new(MemberExpression {
-                    object: t::id(&each_array_name),
-                    property: MemberProperty::Expression(t::id(&index_name)),
+                    object: t::id_owned(each_array_name.to_string()),
+                    property: MemberProperty::Expression(t::id_owned(index_name.to_string())),
                     computed: true,
                     optional: false,
                     span: Span::ZERO,
@@ -4165,7 +4166,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
     let each_array_decl = Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Const,
         declarations: vec![VariableDeclarator {
-            id: t::pat_id(&each_array_name),
+            id: t::pat_id_owned(each_array_name.to_string()),
             init: Some(Expression::Call(Box::new(CallExpression {
                 callee: t::member_id(t::id_dollar(), "ensure_array_like"),
                 arguments: vec![Argument::Expression(each_array_init)],
@@ -4201,7 +4202,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
             let length_member = Expression::Member(Box::new(MemberExpression {
                 object: t::id("each_array"),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "length".to_string(),
+                    name: Cow::Borrowed("length"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -4266,9 +4267,9 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
         // + for-loop in sequence.
         if let Some(fallback) = &eb.fallback {
             let length_member = Expression::Member(Box::new(MemberExpression {
-                object: t::id(&each_array_name),
+                object: t::id_owned(each_array_name.to_string()),
                 property: MemberProperty::Identifier(Identifier {
-                    name: "length".to_string(),
+                    name: Cow::Borrowed("length"),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -5162,7 +5163,7 @@ fn push_string(s: &str) -> Statement {
         callee: t::member_id(t::id_renderer(), "push"),
         arguments: vec![Argument::Expression(Expression::Literal(Box::new(
             Literal::String(StringLiteral {
-                value: s.to_string(),
+                value: Cow::Owned(s.to_string()),
                 raw: Some(format!("'{}'", s.replace('\'', "\\'"))),
                 span: Span::ZERO,
             }),
@@ -5234,7 +5235,7 @@ fn lower_element_with_async_directive(
         body.push(Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Const,
             declarations: vec![VariableDeclarator {
-                id: t::pat_id(&placeholder),
+                id: t::pat_id_owned(placeholder.to_string()),
                 init: Some(saved),
                 type_annotation: None,
                 span: Span::ZERO,
@@ -5344,7 +5345,7 @@ fn lower_element_with_non_inline_children(
                     // already includes the open/close `<!--[-->` /
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
-                        .with(|s| s.borrow().contains(&c.name));
+                        .with(|s| s.borrow().contains(c.name.as_str()));
                     let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
                     last_was_component = !is_state && !async_wrapped;
                 }
@@ -5531,7 +5532,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                                     match &parts[0] {
                                         AttributeValuePart::Text(t) => Some(Expression::Literal(
                                             Box::new(Literal::String(StringLiteral {
-                                                value: t.data.clone(),
+                                                value: Cow::Owned(t.data.clone()),
                                                 raw: Some(format!(
                                                     "'{}'",
                                                     t.data.replace('\'', "\\'")
@@ -5571,7 +5572,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                                         callee: Expression::Member(Box::new(MemberExpression {
                                             object: b.expression.clone(),
                                             property: MemberProperty::Identifier(Identifier {
-                                                name: "includes".to_string(),
+                                                name: Cow::Borrowed("includes"),
                                                 span: Span::ZERO,
                                             }),
                                             computed: false,
@@ -5759,7 +5760,7 @@ fn append_attributes_call_with_hoists(
             ElementAttribute::BindDirective(b) if b.name != "this" => {
                 members.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: b.name.clone(),
+                        name: Cow::Owned(b.name.clone()),
                         span: Span::ZERO,
                     }),
                     value: b.expression.clone(),
@@ -5790,12 +5791,12 @@ fn append_attributes_call_with_hoists(
                     let idx = hoists.len();
                     hoists.push(d.expression.clone());
                     let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
-                    t::id(&name)
+                    t::id_owned(name.to_string())
                 } else {
                     d.expression.clone()
                 };
                 class_props.push(ObjectMember::Property(Box::new(Property {
-                    key: PropertyKey::Identifier(Identifier { name: d.name.clone(), span: Span::ZERO }),
+                    key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.clone()), span: Span::ZERO }),
                     value,
                     kind: PropertyKind::Init,
                     computed: false,
@@ -5811,7 +5812,7 @@ fn append_attributes_call_with_hoists(
                             let idx = hoists.len();
                             hoists.push(tag.expression.clone());
                             let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
-                            t::id(&name)
+                            t::id_owned(name.to_string())
                         } else {
                             tag.expression.clone()
                         }
@@ -5824,7 +5825,7 @@ fn append_attributes_call_with_hoists(
                                     let idx = hoists.len();
                                     hoists.push(tag.expression.clone());
                                     let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
-                                    t::id(&name)
+                                    t::id_owned(name.to_string())
                                 } else {
                                     tag.expression.clone()
                                 }
@@ -5834,7 +5835,7 @@ fn append_attributes_call_with_hoists(
                     _ => continue,
                 };
                 style_props.push(ObjectMember::Property(Box::new(Property {
-                    key: PropertyKey::Identifier(Identifier { name: d.name.clone(), span: Span::ZERO }),
+                    key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.clone()), span: Span::ZERO }),
                     value,
                     kind: PropertyKind::Init,
                     computed: false,
@@ -6212,7 +6213,7 @@ fn append_class_attribute_with_hash(
 
 fn string_lit(s: &str) -> Expression {
     Expression::Literal(Box::new(Literal::String(StringLiteral {
-        value: s.to_string(),
+        value: Cow::Owned(s.to_string()),
         raw: Some(format!("'{s}'")),
         span: Span::ZERO,
     })))
@@ -6247,7 +6248,7 @@ fn escape_attribute_text(s: &str) -> String {
 fn literal_expr_to_string(e: &Expression) -> Option<String> {
     match e {
         Expression::Literal(lit) => match lit.as_ref() {
-            Literal::String(s) => Some(s.value.clone()),
+            Literal::String(s) => Some(s.value.to_string()),
             Literal::Number(n) => Some(format_number(n.value)),
             Literal::Boolean(b) => Some(b.value.to_string()),
             // `{null}` and `{undefined}` render as empty string in templates.
@@ -6478,10 +6479,10 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
                     };
                     props.push(ObjectMember::Property(Box::new(Property {
                         key: PropertyKey::Identifier(Identifier {
-                            name: a.name.clone(),
+                            name: Cow::Owned(a.name.clone()),
                             span: Span::ZERO,
                         }),
-                        value: t::id(&placeholder),
+                        value: t::id_owned(placeholder.to_string()),
                         kind: PropertyKind::Init,
                         computed: false,
                         shorthand: false,
@@ -6561,7 +6562,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         }));
         props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: "children".to_string(),
+                name: Cow::Borrowed("children"),
                 span: Span::ZERO,
             }),
             value: children_arrow,
@@ -6574,13 +6575,13 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         // $$slots: { default: true }
         props.push(ObjectMember::Property(Box::new(Property {
             key: PropertyKey::Identifier(Identifier {
-                name: "$$slots".to_string(),
+                name: Cow::Borrowed("$$slots"),
                 span: Span::ZERO,
             }),
             value: Expression::Object(Box::new(ObjectExpression {
                 properties: vec![ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: "default".to_string(),
+                        name: Cow::Borrowed("default"),
                         span: Span::ZERO,
                     }),
                     value: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -6611,14 +6612,14 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
         }))),
     ];
     let call = Expression::Call(Box::new(CallExpression {
-        callee: t::id(&c.name),
+        callee: t::id_owned(c.name.to_string()),
         arguments: args,
         optional: false,
         span: Span::ZERO,
     }));
     // State-bound Component (e.g. `let Component = $state()`) — the
     // binding can be nullish so wrap in `if (X) { ... } else { ... }`.
-    let nullish = STATE_BINDINGS.with(|s| s.borrow().contains(&c.name));
+    let nullish = STATE_BINDINGS.with(|s| s.borrow().contains(c.name.as_str()));
     let inner_stmt = if nullish {
         let then_branch = vec![
             push_string("<!--[-->"),
@@ -6630,7 +6631,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
             push_string("<!--]-->"),
         ];
         Statement::If(Box::new(IfStatement {
-            test: t::id(&c.name),
+            test: t::id_owned(c.name.to_string()),
             consequent: Statement::Block(Box::new(BlockStatement {
                 body: then_branch,
                 span: Span::ZERO,
@@ -6662,7 +6663,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
             body.push(Statement::Variable(Box::new(VariableDeclaration {
                 kind: VariableKind::Const,
                 declarations: vec![VariableDeclarator {
-                    id: t::pat_id(&placeholder),
+                    id: t::pat_id_owned(placeholder.to_string()),
                     init: Some(saved),
                     type_annotation: None,
                     span: Span::ZERO,
@@ -6698,7 +6699,7 @@ fn make_bind_getter(name: &str, target: &Expression) -> ObjectMember {
     }))];
     ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: name.to_string(),
+            name: Cow::Owned(name.to_string()),
             span: Span::ZERO,
         }),
         value: Expression::Function(Box::new(FunctionExpression {
@@ -6741,7 +6742,7 @@ fn make_bind_setter(name: &str, target: &Expression) -> ObjectMember {
     let body = vec![t::stmt(assign_target), t::stmt(assign_settled)];
     ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: name.to_string(),
+            name: Cow::Owned(name.to_string()),
             span: Span::ZERO,
         }),
         value: Expression::Function(Box::new(FunctionExpression {
@@ -6790,7 +6791,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
                             (t.data.clone(), format!("'{}'", t.raw.replace('\'', "\\'")))
                         };
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: val,
+                            value: Cow::Owned(val),
                             raw: Some(raw),
                             span: Span::ZERO,
                         })))
@@ -6833,7 +6834,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
     };
     Some(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: a.name.clone(),
+            name: Cow::Owned(a.name.clone()),
             span: Span::ZERO,
         }),
         value,

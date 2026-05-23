@@ -56,7 +56,7 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
     let inner_var = t::var(&root_var_name, t::call(t::id("root"), vec![]));
     let append_call = t::call(
         t::member_id(t::id("$"), "append"),
-        vec![t::id("$$anchor"), t::id(&root_var_name)],
+        vec![t::id("$$anchor"), t::id_owned(root_var_name.to_string())],
     );
     let mut func_body = vec![inner_var];
     // Multi-root templates need `$.next(2*(N-1))` to position the cursor

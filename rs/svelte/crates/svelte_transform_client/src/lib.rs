@@ -22,6 +22,7 @@ use svelte_ast::fragment::FragmentChild;
 use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
+use std::borrow::Cow;
 
 /// Compile options threaded through from `svelte_compiler::CompileOptions`.
 #[derive(Debug, Clone, Default)]
@@ -122,7 +123,7 @@ fn lower_single_component_client(
     // Non-runes mode adds `$$legacy: true` to the props.
     props.push(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: "$$legacy".to_string(),
+            name: Cow::Borrowed("$$legacy"),
             span: Span::ZERO,
         }),
         value: Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
@@ -138,7 +139,7 @@ fn lower_single_component_client(
 
     // Build the component-call expression.
     let component_call = Expression::Call(Box::new(CallExpression {
-        callee: t::id(&c.name),
+        callee: t::id_owned(c.name.to_string()),
         arguments: vec![
             Argument::Expression(t::id("$$anchor")),
             Argument::Expression(Expression::Object(Box::new(ObjectExpression {
@@ -235,7 +236,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
                 match &parts[0] {
                     AttributeValuePart::Text(t) => {
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: t.data.clone(),
+                            value: Cow::Owned(t.data.clone()),
                             raw: Some(format!("'{}'", t.raw.replace('\'', "\\'"))),
                             span: Span::ZERO,
                         })))
@@ -249,7 +250,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
     };
     Some(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: a.name.clone(),
+            name: Cow::Owned(a.name.clone()),
             span: Span::ZERO,
         }),
         value,

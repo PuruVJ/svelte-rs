@@ -13,6 +13,7 @@
 //! Walks every Expression/Statement and rewrites in place.
 
 use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
 
 use svelte_js_ast::*;
 
@@ -165,7 +166,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             Statement::Variable(v) => {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
-                        hoisted_names.push(id.name.clone());
+                        hoisted_names.push(id.name.to_string());
                         hoisted_spans.push(id.span);
                         let init = d.init.clone().unwrap_or_else(undefined_expr);
                         // `$.derived(() => await E)` pattern (post rune-erase
@@ -174,14 +175,14 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                         // arrow.
                         if let Some(rewritten) = rewrite_async_derived(&init) {
                             lowered.push(Lowered::AsyncSet {
-                                name: id.name.clone(),
+                                name: id.name.to_string(),
                                 init: rewritten,
                             });
                             continue;
                         }
                         if expr_has_top_level_await(&init) {
                             lowered.push(Lowered::AsyncSet {
-                                name: id.name.clone(),
+                                name: id.name.to_string(),
                                 init,
                             });
                         } else {
@@ -279,7 +280,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                 }
                 // `async () => X = INIT`
                 let assign = Expression::Assignment(Box::new(AssignmentExpression {
-                    left: AssignmentTarget::Expression(t::id(&name)),
+                    left: AssignmentTarget::Expression(t::id_owned(name.to_string())),
                     operator: AssignmentOperator::Assign,
                     right: init,
                     span: Span::ZERO,
@@ -332,7 +333,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             .enumerate()
             .map(|(i, n)| VariableDeclarator {
                 id: Pattern::Identifier(Identifier {
-                    name: n.clone(),
+                    name: Cow::Owned(n.clone()),
                     span: hoisted_spans.get(i).copied().unwrap_or(Span::ZERO),
                 }),
                 init: None,
@@ -366,7 +367,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
         if let Statement::Variable(v) = s {
             for d in &v.declarations {
                 if let Pattern::Identifier(id) = &d.id {
-                    script_let_bindings.insert(id.name.clone());
+                    script_let_bindings.insert(id.name.to_string());
                 }
             }
         }
@@ -400,7 +401,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                             }
                             let idx = groups_count;
                             blocker_bindings
-                                .entry(id.name.clone())
+                                .entry(id.name.to_string())
                                 .or_insert(idx);
                             if let Some(init) = init {
                                 let mut touched: HashSet<String> = HashSet::new();
@@ -419,7 +420,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                             // they'll be flushed into.
                             if awaited_seen {
                                 blocker_bindings
-                                    .entry(id.name.clone())
+                                    .entry(id.name.to_string())
                                     .or_insert(groups_count);
                             }
                             sync_pending = true;
@@ -538,7 +539,7 @@ fn collect_touched_in_expr(e: &Expression, out: &mut HashSet<String>) {
         Expression::Identifier(id) => {
             // Skip `undefined` etc. — these aren't real bindings.
             if id.name != "undefined" {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Expression::Call(c) => {
@@ -707,7 +708,7 @@ fn collect_touched_in_stmt(s: &Statement, out: &mut HashSet<String>) {
 
 fn assignment_stmt(name: &str, value: Expression) -> Statement {
     t::stmt(Expression::Assignment(Box::new(AssignmentExpression {
-        left: AssignmentTarget::Expression(t::id(name)),
+        left: AssignmentTarget::Expression(t::id_owned(name.to_string())),
         operator: AssignmentOperator::Assign,
         right: value,
         span: Span::ZERO,
@@ -764,7 +765,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
                         let v = *v;
                         for d in &v.declarations {
                             if let Pattern::Identifier(id) = &d.id {
-                                legacy_export_props.push(id.name.clone());
+                                legacy_export_props.push(id.name.to_string());
                             }
                         }
                         // Emit one `let X = $$props['X'][, $.fallback(...)]`
@@ -774,7 +775,7 @@ pub fn rewrite_program_for_server(p: &mut Program) -> RewriteInfo {
                                 let key = id.name.clone();
                                 let read = Expression::Member(Box::new(MemberExpression {
                                     object: t::id("$$props"),
-                                    property: MemberProperty::Expression(t::literal_str(&key)),
+                                    property: MemberProperty::Expression(t::literal_str_owned(key.to_string())),
                                     computed: true,
                                     optional: false,
                                     span: Span::ZERO,
@@ -875,7 +876,7 @@ fn collect_state_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
             for d in &v.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
                     if is_state_call(init) {
-                        out.insert(id.name.clone());
+                        out.insert(id.name.to_string());
                     }
                 }
             }
@@ -920,7 +921,7 @@ fn collect_derived_bindings_stmt(s: &Statement, out: &mut HashSet<String>) {
             for d in &v.declarations {
                 if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
                     if is_derived_call(init) {
-                        out.insert(id.name.clone());
+                        out.insert(id.name.to_string());
                     }
                 }
             }
@@ -958,10 +959,10 @@ pub fn call_derived_refs(e: &mut Expression, derived: &HashSet<String>) {
 fn call_derived_refs_inner(e: &mut Expression, derived: &HashSet<String>) {
     match e {
         Expression::Identifier(i) => {
-            if derived.contains(&i.name) {
+            if derived.contains(i.name.as_ref()) {
                 let id = std::mem::replace(
                     i,
-                    Identifier { name: String::new(), span: Span::ZERO },
+                    Identifier { name: Cow::Borrowed(""), span: Span::ZERO },
                 );
                 *e = Expression::Call(Box::new(CallExpression {
                     callee: Expression::Identifier(id),
@@ -1020,7 +1021,7 @@ fn check_single_id_props_stmt(s: &Statement, out: &mut Option<String>) {
         for d in &v.declarations {
             if let (Pattern::Identifier(id), Some(init)) = (&d.id, &d.init) {
                 if is_props_call(init) {
-                    *out = Some(id.name.clone());
+                    *out = Some(id.name.to_string());
                 }
             }
         }
@@ -1071,11 +1072,11 @@ pub fn rewrite_props_destructure(p: &mut Program, identifier: &str) {
                             properties: vec![
                                 ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
                                     key: PropertyKey::Identifier(Identifier {
-                                        name: "$$slots".to_string(),
+                                        name: Cow::Borrowed("$$slots"),
                                         span: Span::ZERO,
                                     }),
                                     value: Pattern::Identifier(Identifier {
-                                        name: "$$slots".to_string(),
+                                        name: Cow::Borrowed("$$slots"),
                                         span: Span::ZERO,
                                     }),
                                     computed: false,
@@ -1084,11 +1085,11 @@ pub fn rewrite_props_destructure(p: &mut Program, identifier: &str) {
                                 })),
                                 ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
                                     key: PropertyKey::Identifier(Identifier {
-                                        name: "$$events".to_string(),
+                                        name: Cow::Borrowed("$$events"),
                                         span: Span::ZERO,
                                     }),
                                     value: Pattern::Identifier(Identifier {
-                                        name: "$$events".to_string(),
+                                        name: Cow::Borrowed("$$events"),
                                         span: Span::ZERO,
                                     }),
                                     computed: false,
@@ -1097,7 +1098,7 @@ pub fn rewrite_props_destructure(p: &mut Program, identifier: &str) {
                                 })),
                                 ObjectPatternMember::Rest(Box::new(RestElement {
                                     argument: Pattern::Identifier(Identifier {
-                                        name: identifier.to_string(),
+                                        name: Cow::Owned(identifier.to_string()),
                                         span: Span::ZERO,
                                     }),
                                     span: Span::ZERO,
@@ -1159,7 +1160,7 @@ fn is_rune_call(e: &Expression) -> bool {
 fn collect_pattern_names(p: &Pattern, out: &mut HashSet<String>) {
     match p {
         Pattern::Identifier(i) => {
-            out.insert(i.name.clone());
+            out.insert(i.name.to_string());
         }
         Pattern::Array(a) => {
             for el in a.elements.iter().flatten() {
@@ -1209,12 +1210,12 @@ pub fn collect_script_constants(
             }
             for d in &v.declarations {
                 if let Pattern::Identifier(id) = &d.id {
-                    if skip.contains(&id.name) {
+                    if skip.contains(id.name.as_ref()) {
                         continue;
                     }
                     if let Some(init) = &d.init {
                         if is_inlineable_literal(init) {
-                            candidates.insert(id.name.clone(), init.clone());
+                            candidates.insert(id.name.to_string(), init.clone());
                         }
                     }
                 }
@@ -1303,13 +1304,13 @@ fn collect_mutations_expr(e: &Expression, out: &mut HashSet<String>) {
     match e {
         Expression::Assignment(a) => {
             if let AssignmentTarget::Pattern(Pattern::Identifier(i)) = &a.left {
-                out.insert(i.name.clone());
+                out.insert(i.name.to_string());
             }
             collect_mutations_expr(&a.right, out);
         }
         Expression::Update(u) => {
             if let Expression::Identifier(i) = &u.argument {
-                out.insert(i.name.clone());
+                out.insert(i.name.to_string());
             }
         }
         Expression::Call(c) => {
@@ -1369,7 +1370,7 @@ pub fn substitute_and_fold(e: &mut Expression, consts: &HashMap<String, Expressi
 fn substitute(e: &mut Expression, consts: &HashMap<String, Expression>) {
     match e {
         Expression::Identifier(i) => {
-            if let Some(lit) = consts.get(&i.name) {
+            if let Some(lit) = consts.get(i.name.as_ref()) {
                 *e = lit.clone();
             }
         }
@@ -1421,8 +1422,7 @@ fn fold(e: &mut Expression) {
                 if let Some(true) = is_non_nullish_literal(&l.left) {
                     let left = std::mem::replace(
                         &mut l.left,
-                        Expression::Identifier(Identifier {
-                            name: String::new(),
+                        Expression::Identifier(Identifier { name: Cow::Borrowed(""),
                             span: Span::ZERO,
                         }),
                     );
@@ -1464,8 +1464,7 @@ fn fold(e: &mut Expression) {
             if matches!(p.expression, Expression::Literal(_)) {
                 let inner = std::mem::replace(
                     &mut p.expression,
-                    Expression::Identifier(Identifier {
-                        name: String::new(),
+                    Expression::Identifier(Identifier { name: Cow::Borrowed(""),
                         span: Span::ZERO,
                     }),
                 );
@@ -1488,11 +1487,11 @@ fn try_fold_math_call(c: &CallExpression) -> Option<Expression> {
         return None;
     }
     let obj = match &m.object {
-        Expression::Identifier(i) => i.name.as_str(),
+        Expression::Identifier(i) => i.name.as_ref(),
         _ => return None,
     };
     let prop = match &m.property {
-        MemberProperty::Identifier(i) => i.name.as_str(),
+        MemberProperty::Identifier(i) => i.name.as_ref(),
         _ => return None,
     };
     if obj != "Math" {
@@ -1617,7 +1616,7 @@ fn rewrite_statement(s: &mut Statement, ctx: &mut Ctx) {
                         for (i, slot) in elems.iter().enumerate() {
                             if let Some(Pattern::Identifier(id)) = slot {
                                 new_decls.push(VariableDeclarator {
-                                    id: t::pat_id(&id.name),
+                                    id: t::pat_id_owned(id.name.to_string()),
                                     init: Some(Expression::Member(Box::new(MemberExpression {
                                         object: t::id("$$array"),
                                         property: MemberProperty::Expression(t::lit_number(i as f64)),
@@ -1864,7 +1863,7 @@ fn make_derived_getter(public_name: &str, private_name: &str) -> ClassMember {
             callee: Expression::Member(Box::new(MemberExpression {
                 object: Expression::This(Span::ZERO),
                 property: MemberProperty::Private(PrivateIdentifier {
-                    name: private_name.to_string(),
+                    name: Cow::Owned(private_name.to_string()),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -1879,7 +1878,7 @@ fn make_derived_getter(public_name: &str, private_name: &str) -> ClassMember {
     }))];
     ClassMember::Method(Box::new(MethodDefinition {
         key: PropertyKey::Identifier(Identifier {
-            name: public_name.to_string(),
+            name: Cow::Owned(public_name.to_string()),
             span: Span::ZERO,
         }),
         value: FunctionExpression {
@@ -1905,7 +1904,7 @@ fn make_derived_setter(public_name: &str, private_name: &str) -> ClassMember {
             callee: Expression::Member(Box::new(MemberExpression {
                 object: Expression::This(Span::ZERO),
                 property: MemberProperty::Private(PrivateIdentifier {
-                    name: private_name.to_string(),
+                    name: Cow::Owned(private_name.to_string()),
                     span: Span::ZERO,
                 }),
                 computed: false,
@@ -1913,7 +1912,7 @@ fn make_derived_setter(public_name: &str, private_name: &str) -> ClassMember {
                 span: Span::ZERO,
             })),
             arguments: vec![Argument::Expression(Expression::Identifier(Identifier {
-                name: "$$value".to_string(),
+                name: Cow::Borrowed("$$value"),
                 span: Span::ZERO,
             }))],
             optional: false,
@@ -1923,13 +1922,13 @@ fn make_derived_setter(public_name: &str, private_name: &str) -> ClassMember {
     }))];
     ClassMember::Method(Box::new(MethodDefinition {
         key: PropertyKey::Identifier(Identifier {
-            name: public_name.to_string(),
+            name: Cow::Owned(public_name.to_string()),
             span: Span::ZERO,
         }),
         value: FunctionExpression {
             id: None,
             params: vec![Pattern::Identifier(Identifier {
-                name: "$$value".to_string(),
+                name: Cow::Borrowed("$$value"),
                 span: Span::ZERO,
             })],
             param_type_annotations: Vec::new(),
@@ -2093,7 +2092,7 @@ fn try_rewrite_rune_call(e: &Expression, ctx: &mut Ctx) -> Option<Expression> {
         "$props" => {
             ctx.uses_props = true;
             Some(Expression::Identifier(Identifier {
-                name: "$$props".to_string(),
+                name: Cow::Borrowed("$$props"),
                 span: Span::ZERO,
             }))
         }
@@ -2125,11 +2124,11 @@ fn derived_call(arg: Expression) -> Expression {
     Expression::Call(Box::new(CallExpression {
         callee: Expression::Member(Box::new(MemberExpression {
             object: Expression::Identifier(Identifier {
-                name: "$".to_string(),
+                name: Cow::Borrowed("$"),
                 span: Span::ZERO,
             }),
             property: MemberProperty::Identifier(Identifier {
-                name: "derived".to_string(),
+                name: Cow::Borrowed("derived"),
                 span: Span::ZERO,
             }),
             computed: false,
@@ -2160,7 +2159,7 @@ fn first_arg_or_void(args: &[Argument]) -> Expression {
 
 fn undefined_expr() -> Expression {
     Expression::Identifier(Identifier {
-        name: "undefined".to_string(),
+        name: Cow::Borrowed("undefined"),
         span: Span::ZERO,
     })
 }
@@ -2321,7 +2320,7 @@ fn rewrite_store_refs_inner(
             let base = id.name[1..].to_string();
             if top_bindings.contains(&base) {
                 let store_name = id.name.clone();
-                refs.insert(store_name.clone());
+                refs.insert(store_name.to_string());
                 let coalesce = Expression::Assignment(Box::new(AssignmentExpression {
                     left: AssignmentTarget::Expression(t::id("$$store_subs")),
                     operator: AssignmentOperator::CoalesceAssign,
@@ -2333,7 +2332,7 @@ fn rewrite_store_refs_inner(
                 }));
                 *e = t::call(
                     t::member_id(t::id("$"), "store_get"),
-                    vec![coalesce, t::literal_str(&store_name), t::id(&base)],
+                    vec![coalesce, t::literal_str_owned(store_name.to_string()), t::id_owned(base.to_string())],
                 );
                 return;
             }
@@ -2439,25 +2438,25 @@ pub fn collect_bindings_from_stmt(s: &Statement, out: &mut HashSet<String>) {
         }
         Statement::Function(f) => {
             if let Some(id) = &f.id {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Statement::Class(c) => {
             if let Some(id) = &c.id {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Statement::Import(im) => {
             for sp in &im.specifiers {
                 match sp {
                     ImportSpecifierKind::Default(d) => {
-                        out.insert(d.local.name.clone());
+                        out.insert(d.local.name.to_string());
                     }
                     ImportSpecifierKind::Named(n) => {
-                        out.insert(n.local.name.clone());
+                        out.insert(n.local.name.to_string());
                     }
                     ImportSpecifierKind::Namespace(n) => {
-                        out.insert(n.local.name.clone());
+                        out.insert(n.local.name.to_string());
                     }
                 }
             }
@@ -2469,7 +2468,7 @@ pub fn collect_bindings_from_stmt(s: &Statement, out: &mut HashSet<String>) {
 fn collect_names_in_pattern(p: &Pattern, out: &mut HashSet<String>) {
     match p {
         Pattern::Identifier(id) => {
-            out.insert(id.name.clone());
+            out.insert(id.name.to_string());
         }
         Pattern::Array(a) => {
             for el in &a.elements {

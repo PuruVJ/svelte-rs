@@ -13,7 +13,6 @@
 use svelte_ast::css::*;
 use svelte_ast::{Comment, ElementAttribute};
 use svelte_diagnostics::{errors, CompileDiagnostic};
-
 /// Read a `<style>...</style>` block. Caller positions `content_start` at the
 /// first byte of the body (just after the opening `>`), and `start` at the
 /// position of the leading `<` of `<style>`. Caller already parsed the

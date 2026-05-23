@@ -42,7 +42,7 @@ fn hoist_typed(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
         S::Function(f) => {
             if let Some(id) = &f.id {
                 scope.borrow_mut().declare(
-                    id.name.clone(),
+                    id.name.to_string(),
                     BindingKind::Normal,
                     DeclarationKind::Function,
                     id.clone(),
@@ -58,7 +58,7 @@ fn hoist_typed(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
             if let svelte_js_ast::ExportDefault::Function(f) = &e.declaration {
                 if let Some(id) = &f.id {
                     scope.borrow_mut().declare(
-                        id.name.clone(),
+                    id.name.to_string(),
                         BindingKind::Normal,
                         DeclarationKind::Function,
                         id.clone(),
@@ -88,7 +88,7 @@ fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
                     svelte_js_ast::ImportSpecifierKind::Namespace(s) => &s.local,
                 };
                 scope.borrow_mut().declare(
-                    local.name.clone(),
+                        local.name.to_string(),
                     BindingKind::Normal,
                     DeclarationKind::Import,
                     local.clone(),
@@ -219,7 +219,7 @@ fn declare_pattern(
         P::Identifier(id) => {
             scope
                 .borrow_mut()
-                .declare(id.name.clone(), kind, decl_kind, id.clone());
+                .declare(id.name.to_string(), kind, decl_kind, id.clone());
         }
         P::Array(a) => {
             for el in a.elements.iter().flatten() {
@@ -270,7 +270,7 @@ fn visit_function_body(f: &svelte_js_ast::FunctionDeclaration, parent: &ScopePtr
 fn visit_class(c: &svelte_js_ast::ClassDeclaration, parent: &ScopePtr) {
     if let Some(id) = &c.id {
         parent.borrow_mut().declare(
-            id.name.clone(),
+            id.name.to_string(),
             BindingKind::Normal,
             DeclarationKind::Let,
             id.clone(),
@@ -509,7 +509,7 @@ fn expr_uses_runes(e: &svelte_js_ast::Expression) -> bool {
             // treats this as a runes-mode signal too, allowing the validator
             // to emit `rune_missing_parentheses`.
             matches!(
-                id.name.as_str(),
+                id.name.as_ref(),
                 "$state" | "$derived" | "$props" | "$effect" | "$host"
                     | "$bindable" | "$inspect"
             )

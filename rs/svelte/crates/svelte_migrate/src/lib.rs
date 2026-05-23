@@ -243,14 +243,14 @@ fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
             Statement::Function(f) => {
                 if let Some(id) = &f.id {
                     decl_start
-                        .entry(id.name.clone())
+                        .entry(id.name.to_string())
                         .or_insert(f.span.start as usize);
                 }
             }
             Statement::Class(c) => {
                 if let Some(id) = &c.id {
                     decl_start
-                        .entry(id.name.clone())
+                        .entry(id.name.to_string())
                         .or_insert(c.span.start as usize);
                 }
             }
@@ -270,7 +270,7 @@ fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
                         Statement::Function(f) => {
                             if let Some(id) = &f.id {
                                 decl_start
-                                    .entry(id.name.clone())
+                                    .entry(id.name.to_string())
                                     .or_insert(en.span.start as usize);
                             }
                         }
@@ -766,9 +766,9 @@ fn detect_before_after_update(root: &Root) -> Option<String> {
                             ModuleExportName::String(sl) => &sl.value,
                         };
                         if imported_name == "beforeUpdate" {
-                            imports.push((s.local.name.clone(), "beforeUpdate"));
+                            imports.push((s.local.name.to_string(), "beforeUpdate"));
                         } else if imported_name == "afterUpdate" {
-                            imports.push((s.local.name.clone(), "afterUpdate"));
+                            imports.push((s.local.name.to_string(), "afterUpdate"));
                         }
                     }
                 }
@@ -858,7 +858,7 @@ fn collect_identifiers_in_statement(stmt: &Statement, out: &mut std::collections
 fn collect_identifiers_in_expr(expr: &Expression, out: &mut std::collections::HashSet<String>) {
     match expr {
         Expression::Identifier(id) => {
-            out.insert(id.name.clone());
+            out.insert(id.name.to_string());
         }
         Expression::Call(c) => {
             collect_identifiers_in_expr(&c.callee, out);
@@ -1018,7 +1018,7 @@ fn detect_props_and_dollar_props(root: &Root, source: &str) -> Option<String> {
             for a in attrs {
                 if let ElementAttribute::BindDirective(b) = a {
                     if let Some(name) = bind_target_identifier(&b.expression) {
-                        updated.insert(name);
+                        updated.insert(name.to_string());
                     }
                 }
             }
@@ -1036,7 +1036,7 @@ fn detect_props_and_dollar_props(root: &Root, source: &str) -> Option<String> {
             if let Some(Statement::Variable(v)) = en.declaration.as_ref() {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
-                        if d.init.is_some() || updated.contains(&id.name) {
+                        if d.init.is_some() || updated.contains(id.name.as_ref()) {
                             bad_prop = true;
                         }
                     }
@@ -1098,7 +1098,7 @@ fn collect_assignment_targets_expr(
         Expression::Assignment(a) => {
             match &a.left {
                 svelte_js_ast::AssignmentTarget::Expression(Expression::Identifier(id)) => {
-                    out.insert(id.name.clone());
+                    out.insert(id.name.to_string());
                 }
                 svelte_js_ast::AssignmentTarget::Pattern(p) => {
                     collect_pattern_names(p, out);
@@ -1109,7 +1109,7 @@ fn collect_assignment_targets_expr(
         }
         Expression::Update(u) => {
             if let Expression::Identifier(id) = &u.argument {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Expression::Call(c) => {
@@ -1330,12 +1330,12 @@ fn collect_top_level_decl_names(stmt: &Statement, out: &mut std::collections::Ha
         }
         Statement::Function(f) => {
             if let Some(id) = &f.id {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Statement::Class(c) => {
             if let Some(id) = &c.id {
-                out.insert(id.name.clone());
+                out.insert(id.name.to_string());
             }
         }
         Statement::Import(imp) => {
@@ -1345,7 +1345,7 @@ fn collect_top_level_decl_names(stmt: &Statement, out: &mut std::collections::Ha
                     ImportSpecifierKind::Default(n) => n.local.name.clone(),
                     ImportSpecifierKind::Namespace(n) => n.local.name.clone(),
                 };
-                out.insert(name);
+                out.insert(name.to_string());
             }
         }
         Statement::ExportNamed(en) => {
@@ -1360,7 +1360,7 @@ fn collect_top_level_decl_names(stmt: &Statement, out: &mut std::collections::Ha
 fn collect_pattern_names(p: &Pattern, out: &mut std::collections::HashSet<String>) {
     match p {
         Pattern::Identifier(id) => {
-            out.insert(id.name.clone());
+            out.insert(id.name.to_string());
         }
         Pattern::Array(a) => {
             for e in &a.elements {
@@ -1432,7 +1432,7 @@ fn detect_rune_var_clash(root: &Root, source: &str) -> Option<String> {
                 if let Some(Statement::Variable(v)) = en.declaration.as_ref() {
                     for d in &v.declarations {
                         if let Pattern::Identifier(id) = &d.id {
-                            exported_props.insert(id.name.clone());
+                            exported_props.insert(id.name.to_string());
                         }
                     }
                 }
@@ -1440,7 +1440,7 @@ fn detect_rune_var_clash(root: &Root, source: &str) -> Option<String> {
             Statement::Variable(v) => {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
-                        non_prop_lets.push((id.name.clone(), d.init.is_some()));
+                        non_prop_lets.push((id.name.to_string(), d.init.is_some()));
                     }
                 }
             }
@@ -1454,7 +1454,7 @@ fn detect_rune_var_clash(root: &Root, source: &str) -> Option<String> {
                                 Expression::Identifier(target),
                             ) = &asn.left
                             {
-                                reactive_targets.push(target.name.clone());
+                                reactive_targets.push(target.name.to_string());
                                 continue;
                             }
                             // ({y} = …) — destructure assignment via Paren.
@@ -1505,7 +1505,7 @@ fn detect_rune_var_clash(root: &Root, source: &str) -> Option<String> {
             for a in attrs {
                 if let ElementAttribute::BindDirective(b) = a {
                     if let Some(name) = bind_target_identifier(&b.expression) {
-                        bind_targets.insert(name);
+                        bind_targets.insert(name.to_string());
                     }
                 }
             }
@@ -1662,7 +1662,7 @@ fn snippet_for_let(
 
 fn bind_target_identifier(expr: &Expression) -> Option<String> {
     match expr {
-        Expression::Identifier(id) => Some(id.name.clone()),
+        Expression::Identifier(id) => Some(id.name.to_string()),
         Expression::Member(m) => bind_target_identifier(&m.object),
         _ => None,
     }
@@ -4733,7 +4733,7 @@ fn migrate_simple_props(
             for a in attrs {
                 if let ElementAttribute::BindDirective(b) = a {
                     if let Some(name) = bind_target_identifier(&b.expression) {
-                        updated.insert(name);
+                        updated.insert(name.to_string());
                     }
                 }
             }
@@ -4902,14 +4902,14 @@ fn migrate_simple_props(
 
             let init_span = d.init.as_ref().map(|e| expr_span(e));
             props.push(Prop {
-                local: id.name.clone(),
+                local: id.name.to_string(),
                 init: init_span,
                 decl_start: d.span.start as usize,
                 decl_end: d.span.end as usize,
                 node_start: en.span.start as usize,
                 node_end: en.span.end as usize,
                 node_decl_count: v.declarations.len(),
-                bindable: updated.contains(&id.name),
+                bindable: updated.contains(id.name.as_ref()),
                 has_type_annotation: has_type,
                 jsdoc_type,
                 jsdoc_span,
@@ -5168,7 +5168,7 @@ fn migrate_simple_props(
             }
             count.saturating_sub(
                 props.iter().filter(|p| body.contains(&p.local)).count()
-                    + slots.props.iter().filter(|s| body.contains(&s.name)).count(),
+                    + slots.props.iter().filter(|s| body.contains(s.name.as_str())).count(),
             )
         })
         .unwrap_or(0);
@@ -5226,8 +5226,8 @@ fn migrate_simple_props(
                         found
                     };
                     if is_referenced {
-                        parts.push(sp.name.clone());
-                        emitted_slots.insert(sp.name.clone());
+                        parts.push(sp.name.to_string());
+                        emitted_slots.insert(sp.name.to_string());
                     }
                 }
             }
@@ -5247,7 +5247,7 @@ fn migrate_simple_props(
         // Emit remaining slots in their source-order.
         for sp in &slots.props {
             if !emitted_slots.contains(&sp.name) {
-                parts.push(sp.name.clone());
+                parts.push(sp.name.to_string());
             }
         }
         if uses_rest {
@@ -5978,9 +5978,9 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
         let svelte_js_ast::ModuleExportName::Identifier(id) = &sp.local else {
             continue;
         };
-        let local = id.name.clone();
+        let local = id.name.to_string();
         let exported = match &sp.exported {
-            svelte_js_ast::ModuleExportName::Identifier(eid) => eid.name.clone(),
+            svelte_js_ast::ModuleExportName::Identifier(eid) => eid.name.to_string(),
             _ => local.clone(),
         };
         exported_of.insert(local.clone(), exported);
@@ -6015,10 +6015,10 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
             let Pattern::Identifier(id) = &d.id else {
                 continue;
             };
-            if names.contains(&id.name) {
+            if names.iter().any(|n| n == id.name.as_ref()) {
                 let init = d.init.as_ref().map(|e| expr_span(e));
                 sites.push(Site {
-                    name: id.name.clone(),
+                    name: id.name.to_string(),
                     var_start: v.span.start as usize,
                     var_end: v.span.end as usize,
                     decl_idx: i,
@@ -6094,8 +6094,8 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
     let mut name_type: std::collections::HashMap<String, Option<String>> = Default::default();
     for s in &sites {
         let init_text = s.init.map(|(a, b)| source[a as usize..b as usize].to_string());
-        name_init.insert(s.name.clone(), init_text);
-        name_type.insert(s.name.clone(), extract_ts_type_annotation(source, s.id_end));
+        name_init.insert(s.name.to_string(), init_text);
+        name_type.insert(s.name.to_string(), extract_ts_type_annotation(source, s.id_end));
     }
 
     // Collect bindable info.
@@ -6112,7 +6112,7 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
             for a in attrs {
                 if let ElementAttribute::BindDirective(b) = a {
                     if let Some(name) = bind_target_identifier(&b.expression) {
-                        updated.insert(name);
+                        updated.insert(name.to_string());
                     }
                 }
             }
@@ -6629,7 +6629,7 @@ fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root:
                     ModuleExportName::String(sl) => &sl.value,
                 };
                 if (imported_name == "beforeUpdate" || imported_name == "afterUpdate")
-                    && !refs.contains(&n.local.name)
+                    && !refs.contains(n.local.name.as_ref())
                 {
                     removable.push(n);
                 }
@@ -6970,7 +6970,7 @@ fn migrate_simple_derivations(
                 if id.name.starts_with('$') {
                     continue;
                 }
-                (id.name.clone(), vec![id.name.clone()])
+                (id.name.to_string(), vec![id.name.to_string()])
             }
             svelte_js_ast::AssignmentTarget::Pattern(p) => {
                 // Use the source slice as-is for the destructure pattern.
@@ -7065,7 +7065,7 @@ fn migrate_simple_derivations(
                 let Pattern::Identifier(id) = &d.id else {
                     continue;
                 };
-                if !target_names.contains(&id.name) {
+                if !target_names.iter().any(|n| n == id.name.as_ref()) {
                     continue;
                 }
                 if d.init.is_some() {
@@ -7240,7 +7240,7 @@ fn migrate_simple_state(
             if let Some(Statement::Variable(v)) = en.declaration.as_ref() {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
-                        exported_props.insert(id.name.clone());
+                        exported_props.insert(id.name.to_string());
                     }
                 }
             }
@@ -7257,7 +7257,7 @@ fn migrate_simple_state(
             for d in &v.declarations {
                 if d.init.is_some() {
                     if let Pattern::Identifier(id) = &d.id {
-                        decl_with_init.insert(id.name.clone());
+                        decl_with_init.insert(id.name.to_string());
                     }
                 }
             }
@@ -7290,7 +7290,7 @@ fn migrate_simple_state(
                         Expression::Identifier(id),
                     ) = &asn.left
                     {
-                        local.insert(id.name.clone());
+                        local.insert(id.name.to_string());
                     }
                     if let svelte_js_ast::AssignmentTarget::Pattern(p) = &asn.left {
                         collect_pattern_names(p, &mut local);
@@ -7341,7 +7341,7 @@ fn migrate_simple_state(
                 match a {
                     ElementAttribute::BindDirective(b) => {
                         if let Some(name) = bind_target_identifier(&b.expression) {
-                            reassigned.insert(name);
+                            reassigned.insert(name.to_string());
                         }
                     }
                     ElementAttribute::OnDirective(od) => {
@@ -7388,16 +7388,16 @@ fn migrate_simple_state(
                 let Pattern::Identifier(id) = &d.id else {
                     continue;
                 };
-                if exported_props.contains(&id.name) {
+                if exported_props.contains(id.name.as_ref()) {
                     continue;
                 }
-                if derived_targets.contains(&id.name) {
+                if derived_targets.contains(id.name.as_ref()) {
                     continue;
                 }
-                if derived_consumed_names.contains(&id.name) {
+                if derived_consumed_names.iter().any(|n| n == id.name.as_ref()) {
                     continue;
                 }
-                if !reassigned.contains(&id.name) {
+                if !reassigned.contains(id.name.as_ref()) {
                     continue;
                 }
                 // Also skip if there's a `let state` conflict — that'd be the

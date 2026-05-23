@@ -410,7 +410,7 @@ fn read_pattern_with_advance(parser: &mut Parser<'_>) -> Result<svelte_js_ast::P
         }
         parser.index = pat_end;
         return Ok(svelte_js_ast::Pattern::Identifier(svelte_js_ast::Identifier {
-            name,
+            name: name.into(),
             span: svelte_js_ast::Span::new(pat_start as u32, pat_end as u32),
         }));
     }
@@ -506,7 +506,7 @@ fn read_snippet_block(
     let id_name: String = id_name_bytes.into();
     let id_end = parser.index;
     let expression = svelte_js_ast::Identifier {
-        name: id_name,
+        name: id_name.into(),
         span: svelte_js_ast::Span::new(id_start as u32, id_end as u32),
     };
 

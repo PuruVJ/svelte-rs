@@ -19,6 +19,7 @@
 
 use std::fmt::Write;
 use std::rc::Rc;
+use std::borrow::Cow;
 
 use svelte_js_ast::*;
 
@@ -2018,7 +2019,7 @@ mod tests {
 
     fn id(name: &str) -> Expression {
         Expression::Identifier(Identifier {
-            name: name.to_string(),
+            name: Cow::Owned(name.to_string()),
             span: Span::ZERO,
         })
     }
@@ -2065,7 +2066,7 @@ mod tests {
                 kind: VariableKind::Var,
                 declarations: vec![VariableDeclarator {
                     id: Pattern::Identifier(Identifier {
-                        name: "x".to_string(),
+                        name: Cow::Borrowed("x"),
                         span: Span::ZERO,
                     }),
                     init: Some(Expression::Literal(Box::new(Literal::Number(
@@ -2093,13 +2094,13 @@ mod tests {
             body: vec![Statement::Import(Box::new(ImportDeclaration {
                 specifiers: vec![ImportSpecifierKind::Namespace(ImportNamespaceSpecifier {
                     local: Identifier {
-                        name: "$".to_string(),
+                        name: Cow::Borrowed("$"),
                         span: Span::ZERO,
                     },
                     span: Span::ZERO,
                 })],
                 source: StringLiteral {
-                    value: "svelte/internal/client".to_string(),
+                    value: Cow::Borrowed("svelte/internal/client"),
                     raw: None,
                     span: Span::ZERO,
                 },

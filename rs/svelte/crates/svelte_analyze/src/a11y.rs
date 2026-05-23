@@ -45,7 +45,7 @@ pub fn check_duplicate_attributes(
             }
             _ => continue,
         };
-        if !seen.insert(name.clone()) {
+        if !seen.insert(name.to_string()) {
             out.push(svelte_diagnostics::errors::attribute_duplicate(Some((
                 start, end,
             ))));
@@ -91,7 +91,7 @@ pub fn check_regular_element_with_parent(
     let span = Some((el.start, el.end));
 
     // 1. a11y_distracting_elements — `<marquee>` / `<blink>`
-    if matches!(el.name.as_str(), "marquee" | "blink") {
+    if matches!(el.name.as_ref(), "marquee" | "blink") {
         diags.push(warnings::a11y_distracting_elements(span, &el.name));
     }
 
@@ -110,7 +110,7 @@ pub fn check_regular_element_with_parent(
         attrs.iter().find(|(n, _)| *n == key).map(|(_, v)| *v)
     };
     let has_attr = |k: &str| attr_get(k).is_some();
-    match el.name.as_str() {
+    match el.name.as_ref() {
         "img" => {
             if !has_attr("alt") && !is_aria_hidden(&attrs) {
                 diags.push(warnings::a11y_missing_attribute(
@@ -231,7 +231,7 @@ pub fn check_regular_element_with_parent(
             //    strips list semantics and the role brings them back.
             //  - `<a>` without `href` has no implicit role, so a role
             //    isn't redundant.
-            let is_list_carveout = matches!(el.name.as_str(), "ul" | "ol" | "li" | "menu");
+            let is_list_carveout = matches!(el.name.as_ref(), "ul" | "ol" | "li" | "menu");
             let is_a_no_href = el.name == "a" && !has_attr("href");
             if !is_list_carveout && !is_a_no_href {
                 diags.push(warnings::a11y_no_redundant_roles(span, &role));
@@ -365,7 +365,7 @@ pub fn check_regular_element_with_parent(
     }
 
     // 10. a11y_consider_explicit_label — `<button>` / `<a>` with no text/label.
-    if matches!(el.name.as_str(), "button" | "a")
+    if matches!(el.name.as_ref(), "button" | "a")
         && !has_attr("aria-label")
         && !has_attr("aria-labelledby")
         && !has_attr("title")
@@ -387,7 +387,7 @@ pub fn check_regular_element_with_parent(
     }
 
     // 12. a11y_missing_content — heading elements should have content.
-    if matches!(el.name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+    if matches!(el.name.as_ref(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
         if !fragment_has_text(&el.fragment)
             && !has_attr("aria-label")
             && !has_attr("aria-labelledby")
@@ -404,7 +404,7 @@ pub fn check_regular_element_with_parent(
     // 14. a11y_aria_attributes / a11y_misplaced_role — these elements can't
     // have role or aria-*. role gets its own diagnostic; aria-* gets the
     // aria_attributes warning.
-    if matches!(el.name.as_str(), "meta" | "html" | "script" | "style") {
+    if matches!(el.name.as_ref(), "meta" | "html" | "script" | "style") {
         for (n, _) in &attrs {
             if *n == "role" {
                 diags.push(warnings::a11y_misplaced_role(span, &el.name));
@@ -495,7 +495,7 @@ pub fn check_regular_element_with_parent(
     }
 
     // 23. a11y_hidden — heading element with `aria-hidden="true"`.
-    if matches!(el.name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+    if matches!(el.name.as_ref(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
         if attr_static_string(attr_get("aria-hidden")).as_deref() == Some("true") {
             diags.push(warnings::a11y_hidden(span, &el.name));
         }
@@ -561,7 +561,7 @@ pub fn check_regular_element_with_parent(
     //   case fires `a11y_no_redundant_roles` instead.
     if let Some(role_name) = role.as_deref() {
         let is_exception = matches!(
-            (el.name.as_str(), role_name),
+            (el.name.as_ref(), role_name),
             ("ul", "listbox")
                 | ("ul", "menu")
                 | ("ul", "menubar")
@@ -680,7 +680,7 @@ pub fn check_regular_element_with_parent(
             "slider" => &["aria-valuenow"],
             "switch" => &["aria-checked"],
             // heading: only required if not implicit (h1-h6 supplies level).
-            "heading" if !matches!(el.name.as_str(),
+            "heading" if !matches!(el.name.as_ref(),
                 "h1" | "h2" | "h3" | "h4" | "h5" | "h6") => &["aria-level"],
             _ => &[],
         };
@@ -763,7 +763,7 @@ pub fn check_regular_element_with_parent(
     // 28. a11y_consider_explicit_label (popover-label) — `<button popovertarget>`
     //     without aria-label etc. The existing rule (10) only fires when the
     //     element has NO text and no aria — adding popover variant.
-    if matches!(el.name.as_str(), "button" | "a")
+    if matches!(el.name.as_ref(), "button" | "a")
         && has_attr("popovertarget")
         && !has_attr("aria-label")
         && !has_attr("aria-labelledby")
@@ -1537,7 +1537,7 @@ fn fragment_has_form_control(f: &Fragment) -> bool {
         match n {
             FragmentChild::RegularElement(el) => {
                 if matches!(
-                    el.name.as_str(),
+                    el.name.as_ref(),
                     "input" | "select" | "textarea" | "meter" | "progress" | "button"
                 ) {
                     return true;
