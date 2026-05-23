@@ -48,13 +48,19 @@ Use **`end_to_end_*`** or **`bench_phases`** for client transform cost, not `tra
 
 ### skip-static-subtree
 
+Baseline (pre-optimizations, `bench_phases` 5000 iter):
+
 | Phase | server ms/iter | client ms/iter |
 |-------|----------------|----------------|
-| parse | 0.0153 | 0.0171 |
-| analyze | 0.0235 | 0.0278 |
-| transform | **0.0331** | **0.0304** |
-| codegen | 0.0083 | 0.0122 |
-| **sum** | **0.0802** | **0.0876** |
+| transform | **0.0317** | **0.0256** |
+| **sum** | **0.0744** | **0.0737** |
+
+Current (`scripts/bench_loop.sh 5000` on this branch):
+
+| Phase | server ms/iter | client ms/iter |
+|-------|----------------|----------------|
+| transform | **~0.0115** | **~0.0175** |
+| **sum** | **~0.048** | **~0.062** |
 
 ### async-in-derived
 
