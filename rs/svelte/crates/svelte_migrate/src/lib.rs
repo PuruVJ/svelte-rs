@@ -3765,13 +3765,14 @@ fn apply_migrate_slot_usage(
         }
         let _ = bytes;
 
-        // No slot attr — only wrap if there are let directives on the
-        // svelte:fragment (default-slot fragment with let props). For other
-        // tags without slot=, nothing to do.
-        if slot_attr_span.is_none() {
-            if !is_svelte_fragment || let_pairs.is_empty() {
-                continue;
-            }
+        // No slot attr — wrap if there are let directives (default-slot
+        // wrap-children path). Mirrors upstream's `migrate_slot_usage` at
+        // line 1505: when `snippet_name === 'children' && node.type !==
+        // 'SvelteFragment'`, return early ONLY when snippet_props is empty.
+        // Otherwise (let directives present), wrap the element's CHILDREN
+        // in `{#snippet children({ ... })}…{/snippet}`.
+        if slot_attr_span.is_none() && let_pairs.is_empty() {
+            continue;
         }
         if let Some((slot_s, slot_e)) = slot_attr_span {
             // Remove the `slot=` attribute (upstream removes just the
@@ -3802,9 +3803,16 @@ fn apply_migrate_slot_usage(
         // upstream's `migrate_slot_usage` line 1505 path.
         if snippet_name == "children" && !is_svelte_fragment && !let_pairs.is_empty() {
             if let Some(f) = c_frag {
-                if let Some(first) = f.nodes.first() {
+                // Find first non-empty-text node. Mirrors upstream's
+                // `is_empty_text` skip in migrate_slot_usage's iteration.
+                let first = f.nodes.iter().find(|n| {
+                    !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty())
+                });
+                let last = f.nodes.iter().rev().find(|n| {
+                    !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty())
+                });
+                if let (Some(first), Some(last)) = (first, last) {
                     let inner_start = node_start(first);
-                    let last = &f.nodes[f.nodes.len() - 1];
                     let inner_end = match last {
                         FragmentChild::Text(t) => t.end as usize,
                         FragmentChild::RegularElement(e) => e.end as usize,

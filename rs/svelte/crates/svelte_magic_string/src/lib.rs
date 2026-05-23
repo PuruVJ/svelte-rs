@@ -356,6 +356,86 @@ impl MagicString {
         self
     }
 
+    /// Insert `prefix` after every `\n` in the rendered output, except inside
+    /// excluded ORIGINAL-source ranges. Mirrors `MagicString.indent(prefix,
+    /// { exclude })`. Walks the chunk list in CURRENT order so inserted
+    /// content (intros / outros / chunks moved via `move_range`) is also
+    /// processed.
+    pub fn indent_with_exclude(&mut self, prefix: &str, exclude: &[(usize, usize)]) -> &mut Self {
+        if prefix.is_empty() {
+            return self;
+        }
+        // Translate exclude bounds into offset-shifted positions.
+        let exclude: Vec<(usize, usize)> = exclude
+            .iter()
+            .map(|(s, e)| (s + self.offset, e + self.offset))
+            .collect();
+        // Is the given original-source position inside an exclude range?
+        let in_excluded = |pos: usize| -> bool {
+            exclude.iter().any(|(s, e)| pos >= *s && pos < *e)
+        };
+        // Walk chunks; collect (chunk_id, field) → new_value updates.
+        let mut updates: Vec<(ChunkId, u8, String)> = Vec::new();
+        // Track whether the next character (in render order) is the start of
+        // a line (i.e., previous char was `\n`). The leading chunk's first
+        // line — controlled by MagicString — does NOT get an indent prefix
+        // (matches upstream's `shouldIndentNextCharacter`).
+        let mut should_indent_next = false;
+        let mut id = Some(self.first_chunk);
+        // intro of the magic-string itself (not a chunk) — never indented.
+        // Add prefix-after-newline to `self.intro` for completeness:
+        let new_self_intro = process_text(&self.intro, prefix, &mut should_indent_next);
+        if new_self_intro != self.intro {
+            self.intro = new_self_intro;
+        }
+        while let Some(cid) = id {
+            let chunk_start = self.chunks[cid].start;
+            let chunk_end = self.chunks[cid].end;
+            let excluded = in_excluded(chunk_start);
+            // intro (insertions before the chunk's content) — always processed
+            // (insertions don't carry original positions).
+            let intro_orig = self.chunks[cid].intro.clone();
+            let new_intro = process_text(&intro_orig, prefix, &mut should_indent_next);
+            if new_intro != intro_orig {
+                updates.push((cid, 0, new_intro));
+            }
+            // content — only indent when the chunk is not in an exclude range.
+            let content_orig = self.chunks[cid].content.clone();
+            let new_content = if excluded {
+                // Don't indent, but still update should_indent_next based on
+                // whether content ended with `\n`.
+                if content_orig.ends_with('\n') {
+                    should_indent_next = true;
+                } else if !content_orig.is_empty() {
+                    should_indent_next = false;
+                }
+                content_orig.clone()
+            } else {
+                process_text(&content_orig, prefix, &mut should_indent_next)
+            };
+            if new_content != content_orig {
+                updates.push((cid, 1, new_content));
+            }
+            // outro (insertions after the chunk's content) — always processed.
+            let outro_orig = self.chunks[cid].outro.clone();
+            let new_outro = process_text(&outro_orig, prefix, &mut should_indent_next);
+            if new_outro != outro_orig {
+                updates.push((cid, 2, new_outro));
+            }
+            let _ = chunk_end;
+            id = self.chunks[cid].next;
+        }
+        for (cid, field, val) in updates {
+            match field {
+                0 => self.chunks[cid].intro = val,
+                1 => self.chunks[cid].content = val,
+                2 => self.chunks[cid].outro = val,
+                _ => unreachable!(),
+            }
+        }
+        self
+    }
+
     /// Remove `start..end`. Intro / outro on affected chunks are cleared.
     /// Mirrors `MagicString.remove`.
     pub fn remove(&mut self, start: usize, end: usize) -> &mut Self {
@@ -910,6 +990,34 @@ impl MagicString {
         }
         new_id
     }
+}
+
+/// Insert `prefix` after each `\n` in `text`. Updates `should_indent_next` —
+/// when true on entry, the first character of the output also gets `prefix`
+/// prepended (mid-line state).
+fn process_text(text: &str, prefix: &str, should_indent_next: &mut bool) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(text.len());
+    if *should_indent_next {
+        out.push_str(prefix);
+        *should_indent_next = false;
+    }
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        out.push(b as char);
+        if b == b'\n' {
+            // If next char is non-newline, prepend prefix; if last char
+            // of text, set should_indent_next.
+            if i + 1 < bytes.len() {
+                out.push_str(prefix);
+            } else {
+                *should_indent_next = true;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
