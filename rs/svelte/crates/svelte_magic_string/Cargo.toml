@@ -8,3 +8,10 @@ description = "Port of the `magic-string` npm package: chunked string with sourc
 
 [dependencies]
 sourcemap = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "magic_string"
+harness = false
