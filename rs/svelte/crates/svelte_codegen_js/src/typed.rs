@@ -2038,6 +2038,7 @@ mod tests {
                             span: Span::ZERO,
                         },
                     )))),
+                    type_annotation: None,
                     span: Span::ZERO,
                 }],
                 span: Span::ZERO,

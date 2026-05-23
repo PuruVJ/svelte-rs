@@ -3804,13 +3804,18 @@ fn apply_migrate_slot_usage(
         if snippet_name == "children" && !is_svelte_fragment && !let_pairs.is_empty() {
             if let Some(f) = c_frag {
                 // Find first non-empty-text node. Mirrors upstream's
-                // `is_empty_text` skip in migrate_slot_usage's iteration.
+                // `is_empty_text` skip in migrate_slot_usage's iteration —
+                // empty-text nodes don't trigger `inner_start = inner.start`.
                 let first = f.nodes.iter().find(|n| {
                     !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty())
                 });
-                let last = f.nodes.iter().rev().find(|n| {
-                    !matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty())
-                });
+                // For inner_end, upstream uses `nodes[nodes.length - 1].end`
+                // when no slot= child sets inner_end during iteration — i.e.,
+                // the ACTUAL last node, including a trailing empty-text. This
+                // matters: when the last child is text like "\n\t", its `end`
+                // is the position of `</div>`'s `<`, which is where we want
+                // to insert `{/snippet}`.
+                let last = f.nodes.last();
                 if let (Some(first), Some(last)) = (first, last) {
                     let inner_start = node_start(first);
                     let inner_end = match last {
@@ -3891,11 +3896,16 @@ fn apply_migrate_slot_usage(
         }
 
         // Wrap in `{#snippet NAME(props)}` … `{/snippet}`.
-        // Compute the indent at the snippet wrap depth. Upstream: prepend is
-        // `\n${indent.repeat(path.length - 2)}`. Our depth at the point we're
-        // examining a child of `frag` is `path.length - 1` (path was
-        // [outer1, ..., outerN, frag]). So path.length - 2 = depth - 1.
-        let outer_indent = indent.repeat(depth.saturating_sub(1));
+        // Upstream uses `indent.repeat(path.length - 2)`. Our `depth` counts
+        // nested fragment levels (each adds 1) — upstream's path.length adds 2
+        // per nested fragment (Element + Fragment, or IfBlock + Fragment, …).
+        // So `path.length = 2*depth - 1` and `path.length - 2 = 2*depth - 3`.
+        // For depth=2 (single-level wrap, the common case), this evaluates to
+        // 1 — same as the prior `depth - 1` formula. For deeper nesting (e.g.
+        // shadowed-forwarded-slot at depth=4), `2*depth-3 = 5` matches
+        // upstream's indent stacking from re-running indent() on overlapping
+        // ranges.
+        let outer_indent = indent.repeat((2 * depth).saturating_sub(3));
         let inner_indent = indent.repeat(depth);
         if std::env::var("MIGRATE_DEBUG_SLOT_WRAP").is_ok() {
             eprintln!("wrap depth={} c_start={} c_end={} name={}", depth, c_start, c_end, snippet_name);
