@@ -88,16 +88,18 @@ fn bench_transform_server(c: &mut Criterion) {
     for (label, name) in &fixtures {
         let source = load_fixture(name);
         let root = svelte_parse::parse(&source, false).unwrap();
+        let has_script_or_css = root.instance.is_some()
+            || root.module.is_some()
+            || root.css.is_some();
         group.bench_with_input(BenchmarkId::new("transform", label), &source, |b, source| {
             b.iter(|| {
                 let root = svelte_parse::parse(source, false).unwrap();
-                black_box(
+                black_box(if has_script_or_css {
+                    svelte_transform_server::try_typed_server_component(root, "Index")
+                } else {
                     svelte_transform_server::try_typed_server(&root, "Index")
-                        .or_else(|| {
-                            let root = svelte_parse::parse(source, false).unwrap();
-                            svelte_transform_server::try_typed_server_component(root, "Index")
-                        })
-                )
+                        .or_else(|| svelte_transform_server::try_typed_server_component(root, "Index"))
+                })
             });
         });
     }

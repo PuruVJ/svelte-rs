@@ -1361,9 +1361,9 @@ fn collect_mutations_expr(e: &Expression, out: &mut HashSet<String>) {
 /// then apply simple constant-fold rules (nullish-coalesce of literals,
 /// member access of literals).
 pub fn substitute_and_fold(e: &mut Expression, consts: &HashMap<String, Expression>) {
-    // First substitute identifiers.
-    substitute(e, consts);
-    // Then fold.
+    if !consts.is_empty() {
+        substitute(e, consts);
+    }
     fold(e);
 }
 

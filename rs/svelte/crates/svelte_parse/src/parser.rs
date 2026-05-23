@@ -105,7 +105,7 @@ impl<'src> Parser<'src> {
 
     /// Parse the body of `{@const ...}` as a VariableDeclaration.
     pub fn parse_const_decl_at(
-        &self,
+        &mut self,
         start: usize,
         end: usize,
     ) -> Result<svelte_js_ast::VariableDeclaration, CompileDiagnostic> {

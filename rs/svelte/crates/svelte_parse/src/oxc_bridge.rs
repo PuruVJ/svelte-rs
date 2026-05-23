@@ -165,8 +165,8 @@ pub fn parse_program(
     let parser = OxcParser::new(alloc, slice, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
-        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
         return Err(js_diag(start, end, msg));
     }
     walker::set_slice(slice);
@@ -231,8 +231,8 @@ pub fn parse_const_decl_at(
     let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
-        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
         return Err(js_diag(start, end, msg));
     }
     let prefix_len = 6u32;
@@ -261,8 +261,8 @@ pub fn parse_pattern_at(
     let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
-        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
         return Err(js_diag(start, end, msg));
     }
     let prefix_len = 4u32;
@@ -299,8 +299,8 @@ pub fn parse_arrow_params_at(
     let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
     let ret = parser.parse();
     if !ret.errors.is_empty() {
-        alloc.reset();
         let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
         return Err(js_diag(start, end, msg));
     }
     let prefix_len = "let _f = ".len() as u32;

@@ -2712,7 +2712,17 @@ fn lower_fragment_with_marker(
     // and let two adjacent texts emit two spaces).
     let mut after_dropped_comment = false;
     let in_select_body = IN_SELECT_BODY.with(|c| c.get());
-    for n in nodes.iter() {
+    let mut skip_until = 0usize;
+    for i in 0..nodes.len() {
+        if i < skip_until {
+            continue;
+        }
+        if let Some(end) = try_append_static_run(&nodes, i, &mut buf) {
+            skip_until = end;
+            last_was_component = false;
+            continue;
+        }
+        let n = &nodes[i];
         // Inside a `<select>` callback body, whitespace-only Text between
         // siblings (Component/RenderTag/anything) is dropped — matches
         // upstream's clean_nodes for select bodies.
@@ -5459,6 +5469,40 @@ fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
     true
 }
 
+/// True when a fragment child can be merged into a single static HTML run.
+/// Whitespace-only text is excluded: batching it with neighbors runs
+/// `trim_boundary_whitespace` on a sub-slice and drops inter-element spaces.
+fn is_static_template_batchable(n: &FragmentChild) -> bool {
+    match n {
+        FragmentChild::RegularElement(el) => {
+            is_fully_static_element(el)
+                && !has_option_child(el)
+                && !element_has_async_directive(el)
+        }
+        _ => false,
+    }
+}
+
+/// Serialize two or more consecutive static text/element siblings in one pass.
+fn try_append_static_run(
+    nodes: &[FragmentChild],
+    start: usize,
+    buf: &mut TemplateBuf,
+) -> Option<usize> {
+    if !is_static_template_batchable(&nodes[start]) {
+        return None;
+    }
+    let mut end = start + 1;
+    while end < nodes.len() && is_static_template_batchable(&nodes[end]) {
+        end += 1;
+    }
+    if end - start < 2 {
+        return None;
+    }
+    serialize_static_fragment_to_template(&nodes[start..end], buf)?;
+    Some(end)
+}
+
 /// Serialize a fully-static fragment subtree directly into `buf`, skipping
 /// per-element AST construction. Boundary whitespace trim matches the
 /// incremental walker without cloning nodes.
@@ -7293,9 +7337,13 @@ fn substitute_consts_in_node(
     consts: &std::collections::HashMap<String, Expression>,
 ) {
     match n {
+        FragmentChild::Text(_) | FragmentChild::Comment(_) => {}
         FragmentChild::ExpressionTag(t) => script::substitute_and_fold(&mut t.expression, consts),
         FragmentChild::HtmlTag(t) => script::substitute_and_fold(&mut t.expression, consts),
         FragmentChild::RegularElement(el) => {
+            if consts.is_empty() && is_fully_static_element(el) {
+                return;
+            }
             for attr in &mut el.attributes {
                 substitute_consts_in_attr(attr, consts);
             }
