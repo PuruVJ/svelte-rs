@@ -194,7 +194,7 @@ fn read_each_block(
 
     consume_block_close(parser, "each")?;
 
-    Ok(FragmentChild::EachBlock(EachBlock {
+    Ok(FragmentChild::EachBlock(Box::new(EachBlock {
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -203,7 +203,7 @@ fn read_each_block(
         fallback,
         index: index_name,
         key: key_expr,
-    }))
+    })))
 }
 
 /// `{#await EXPR}...{:then [PAT]}...{:catch [PAT]}...{/await}`
@@ -344,7 +344,7 @@ fn read_await_block(
 
     consume_block_close(parser, "await")?;
 
-    Ok(FragmentChild::AwaitBlock(AwaitBlock {
+    Ok(FragmentChild::AwaitBlock(Box::new(AwaitBlock {
         start: start as u32,
         end: parser.index as u32,
         expression,
@@ -353,7 +353,7 @@ fn read_await_block(
         pending,
         then,
         catch_: catch,
-    }))
+    })))
 }
 
 /// Check whether the cursor sits on a bare keyword followed by whitespace
@@ -575,14 +575,14 @@ fn read_snippet_block(
     let body = parse_fragment_until_block_boundary(parser, &["/snippet"])?;
     consume_block_close(parser, "snippet")?;
 
-    Ok(FragmentChild::SnippetBlock(SnippetBlock {
+    Ok(FragmentChild::SnippetBlock(Box::new(SnippetBlock {
         start: start as u32,
         end: parser.index as u32,
         expression,
         parameters,
         type_params,
         body,
-    }))
+    })))
 }
 
 fn position_to_json(p: &Position) -> serde_json::Value {
@@ -775,14 +775,14 @@ fn read_if_block(
     };
 
     let _ = elseif; // kept for the field on the AST; no longer affects close-consumption.
-    Ok(FragmentChild::IfBlock(IfBlock {
+    Ok(FragmentChild::IfBlock(Box::new(IfBlock {
         start: start as u32,
         end: parser.index as u32,
         elseif,
         test,
         consequent,
         alternate,
-    }))
+    })))
 }
 
 /// `{#key expr}...{/key}`

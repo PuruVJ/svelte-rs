@@ -94,12 +94,12 @@ pub fn try_typed_server_component_full(
     let mut module_rest: Vec<Statement> = Vec::with_capacity(module_body_len);
     let mut module_bindings: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    if let Some(m) = root.module.as_ref() {
-        for s in m.content.body.iter() {
-            script::collect_bindings_from_stmt(s, &mut module_bindings);
+    if let Some(m) = root.module.as_mut() {
+        for s in std::mem::take(&mut m.content.body) {
+            script::collect_bindings_from_stmt(&s, &mut module_bindings);
             match s {
-                Statement::Import(_) => module_imports.push(s.clone()),
-                _ => module_rest.push(s.clone()),
+                Statement::Import(i) => module_imports.push(Statement::Import(i)),
+                other => module_rest.push(other),
             }
         }
     }
@@ -162,9 +162,7 @@ pub fn try_typed_server_component_full(
         // Module-script bindings count the same way: `<script module>`
         // values referenced from instance/template can't be inlined.
         let mut import_names = collect_import_names(&s.content.body);
-        for m in &module_bindings {
-            import_names.insert(m.clone());
-        }
+        import_names.extend(module_bindings.iter().cloned());
         if !import_names.is_empty() {
             if script_body_has_unsafe_with_imports(&s.content.body, &import_names) {
                 needs_component_wrap = true;
@@ -178,8 +176,8 @@ pub fn try_typed_server_component_full(
     let mut state_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut store_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut script_top_bindings: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(s) = root.instance.as_ref() {
-        let mut content = s.content.clone();
+    if let Some(s) = root.instance.as_mut() {
+        let mut content = std::mem::take(&mut s.content);
         let info = script::rewrite_program_for_server(&mut content);
         uses_props = info.uses_props;
         needs_component_wrap |= info.needs_component_wrap();
@@ -200,10 +198,10 @@ pub fn try_typed_server_component_full(
             &mut store_refs,
         );
         consts = script::collect_script_constants(&content, &info.rune_bindings);
-        let (imports, rest) = partition_imports(&content.body)?;
+        let (imports, rest) = partition_imports(std::mem::take(&mut content.body))?;
         script_imports = imports;
-        if let Some(ai) = script::transform_async_script_server(&rest) {
-            async_info = Some(ai);
+        if script::script_has_async_transform(&rest) {
+            async_info = script::transform_async_script_server(rest);
         } else {
             script_rest = rest;
         }
@@ -211,7 +209,7 @@ pub fn try_typed_server_component_full(
     // Stash state bindings for the lowering pass so Component callees can
     // be wrapped in `if (X) { X(...); } else { ... }` when potentially nullish.
     STATE_BINDINGS.with(|c| {
-        *c.borrow_mut() = state_bindings.clone();
+        *c.borrow_mut() = std::mem::take(&mut state_bindings);
     });
 
     // Upstream's MemberExpression analyzer sets `needs_context = true` for
@@ -228,8 +226,8 @@ pub fn try_typed_server_component_full(
     }
 
     // Build the function body: rune-rewritten script statements first, then template.
-    let mut func_body: Vec<Statement> = if let Some(ai) = &async_info {
-        ai.setup_stmts.clone()
+    let mut func_body: Vec<Statement> = if let Some(ai) = &mut async_info {
+        std::mem::take(&mut ai.setup_stmts)
     } else {
         script_rest
     };
@@ -1778,7 +1776,7 @@ fn lower_fragment_with_const_await_with(
                             })))
                             .collect();
                         let body = if elems.len() == 1 {
-                            elems[0].clone()
+                            elems.into_iter().next().unwrap()
                         } else {
                             t::call(
                                 t::member_id(t::id("Promise"), "all"),
@@ -1847,12 +1845,13 @@ fn lower_fragment_with_const_await_with(
         })));
     }
     // var <promises_var> = $$renderer.run([...]);
+    let last_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
     out.push(t::var(
         promises_var,
         t::call(
             t::member_id(t::id_renderer(), "run"),
             vec![Expression::Array(Box::new(ArrayExpression {
-                elements: groups.iter().cloned().map(ArrayElement::Expression).collect(),
+                elements: groups.into_iter().map(ArrayElement::Expression).collect(),
                 span: Span::ZERO,
             }))],
         ),
@@ -1860,7 +1859,6 @@ fn lower_fragment_with_const_await_with(
 
     // Lower the rest of the fragment with the const names treated as
     // async-tainted. `<promises_var>` is the local var name.
-    let last_idx = if groups.is_empty() { 0 } else { groups.len() - 1 };
     let async_set: std::collections::HashSet<String> = const_names.into_iter().collect();
     let stub_fragment = svelte_ast::fragment::Fragment { nodes: rest_nodes };
     let empty_blockers: std::collections::HashMap<String, usize> =
@@ -2419,8 +2417,8 @@ fn lower_svelte_boundary_server(
     //     boundary call entirely so the server can render synchronously.
     let pending_expr: Option<Expression> = attr_snippets
         .iter()
-        .find(|(n, _)| n == "pending")
-        .map(|(_, e)| e.clone())
+        .position(|(n, _)| n == "pending")
+        .map(|i| attr_snippets.remove(i).1)
         .or_else(|| {
             if snippet_names.iter().any(|n| n == "pending") {
                 Some(t::id("pending"))
@@ -2430,9 +2428,10 @@ fn lower_svelte_boundary_server(
         });
     if let Some(pending_expr) = pending_expr {
         // Snippet path: \`push(\`<!--[!-->\`); pending($$renderer); push(\`<!--]-->\`);\`
+        let pending_call = t::stmt(t::call(pending_expr.clone(), vec![t::id_renderer()]));
         let pending_branch = vec![
             push_template("<!--[!-->"),
-            t::stmt(t::call(pending_expr.clone(), vec![t::id_renderer()])),
+            pending_call,
             push_template("<!--]-->"),
         ];
         let body_branch = vec![
@@ -3390,12 +3389,13 @@ fn lower_select_with_value(
     el: &svelte_ast::elements::RegularElement,
     value_expr: Expression,
 ) -> Option<Statement> {
-    let value_expr_orig = value_expr.clone();
-    let value_has_await = expr_has_await_top(&value_expr_orig);
+    let value_has_await = expr_has_await_top(&value_expr);
     // When the value expression contains a top-level await, the inner
     // select uses a `$$0` placeholder filled by the outer `$$renderer.child`
     // wrap below. Otherwise the value flows in unchanged.
-    let value_expr = if value_has_await {
+    let mut value_expr_orig = None;
+    let value_for_props = if value_has_await {
+        value_expr_orig = Some(value_expr);
         t::id("$$0")
     } else {
         value_expr
@@ -3413,7 +3413,7 @@ fn lower_select_with_value(
                         name: Cow::Borrowed("value"),
                         span: Span::ZERO,
                     }),
-                    value: value_expr.clone(),
+                    value: value_for_props.clone(),
                     kind: PropertyKind::Init,
                     computed: false,
                     shorthand: false,
@@ -3428,7 +3428,7 @@ fn lower_select_with_value(
                         name: Cow::Borrowed("value"),
                         span: Span::ZERO,
                     }),
-                    value: value_expr.clone(),
+                    value: value_for_props.clone(),
                     kind: PropertyKind::Init,
                     computed: false,
                     shorthand: false,
@@ -3453,7 +3453,7 @@ fn lower_select_with_value(
                 name: Cow::Borrowed("value"),
                 span: Span::ZERO,
             }),
-            value: value_expr,
+            value: value_for_props,
             kind: PropertyKind::Init,
             computed: false,
             shorthand: false,
@@ -3542,7 +3542,7 @@ fn lower_select_with_value(
     // select call in `$$renderer.child(async ($$renderer) => { const $$0 =
     // (await $.save(VALUE_EXPR))(); $$renderer.select({ value: $$0 }, …); })`.
     if value_has_await {
-        let saved = wrap_async_test(&value_expr_orig);
+        let saved = wrap_async_test(value_expr_orig.as_ref().expect("await value"));
         let const_decl = Statement::Variable(Box::new(VariableDeclaration {
             kind: VariableKind::Const,
             declarations: vec![VariableDeclarator {
@@ -5734,6 +5734,26 @@ fn append_attributes_call(
     append_attributes_call_with_hoists(el, buf, &mut Vec::new());
 }
 
+
+fn hoist_await_expr(expr: &Expression, hoists: &mut Vec<Expression>) -> Expression {
+    let idx = hoists.len();
+    hoists.push(expr.clone());
+    let name = if idx == 0 {
+        "$$0".to_string()
+    } else {
+        format!("$${idx}")
+    };
+    t::id_owned(name)
+}
+
+fn expr_or_hoisted(expr: &Expression, hoists: &mut Vec<Expression>) -> Expression {
+    if expr_has_await_top(expr) {
+        hoist_await_expr(expr, hoists)
+    } else {
+        expr.clone()
+    }
+}
+
 fn append_attributes_call_with_hoists(
     el: &svelte_ast::elements::RegularElement,
     buf: &mut TemplateBuf,
@@ -5786,14 +5806,7 @@ fn append_attributes_call_with_hoists(
     for attr in &el.attributes {
         match attr {
             ElementAttribute::ClassDirective(d) => {
-                let value = if expr_has_await_top(&d.expression) {
-                    let idx = hoists.len();
-                    hoists.push(d.expression.clone());
-                    let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
-                    t::id_owned(name.to_string())
-                } else {
-                    d.expression.clone()
-                };
+                let value = expr_or_hoisted(&d.expression, hoists);
                 class_props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.clone()), span: Span::ZERO }),
                     value,
@@ -5807,27 +5820,13 @@ fn append_attributes_call_with_hoists(
             ElementAttribute::StyleDirective(d) => {
                 let value: Expression = match &d.value {
                     AttributeValue::Single(tag) => {
-                        if expr_has_await_top(&tag.expression) {
-                            let idx = hoists.len();
-                            hoists.push(tag.expression.clone());
-                            let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
-                            t::id_owned(name.to_string())
-                        } else {
-                            tag.expression.clone()
-                        }
+                        expr_or_hoisted(&tag.expression, hoists)
                     }
                     AttributeValue::Many(parts) if parts.len() == 1 => {
                         match &parts[0] {
                             AttributeValuePart::Text(t) => string_lit(&t.data),
                             AttributeValuePart::ExpressionTag(tag) => {
-                                if expr_has_await_top(&tag.expression) {
-                                    let idx = hoists.len();
-                                    hoists.push(tag.expression.clone());
-                                    let name = if idx == 0 { "$$0".to_string() } else { format!("$${idx}") };
-                                    t::id_owned(name.to_string())
-                                } else {
-                                    tag.expression.clone()
-                                }
+                                expr_or_hoisted(&tag.expression, hoists)
                             }
                         }
                     }
@@ -7220,7 +7219,7 @@ fn fragment_is_empty(f: &svelte_ast::fragment::Fragment) -> bool {
     })
 }
 
-fn partition_imports(body: &[Statement]) -> Option<(Vec<Statement>, Vec<Statement>)> {
+fn partition_imports(body: Vec<Statement>) -> Option<(Vec<Statement>, Vec<Statement>)> {
     // Hoist every ImportDeclaration to the top regardless of source order —
     // upstream's `<script>` parser preserves user ordering but the server
     // codegen always emits imports first (they're scoped at module level).
@@ -7228,8 +7227,8 @@ fn partition_imports(body: &[Statement]) -> Option<(Vec<Statement>, Vec<Statemen
     let mut rest = Vec::new();
     for s in body {
         match s {
-            Statement::Import(_) => imports.push(s.clone()),
-            _ => rest.push(s.clone()),
+            Statement::Import(i) => imports.push(Statement::Import(i)),
+            other => rest.push(other),
         }
     }
     Some((imports, rest))

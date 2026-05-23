@@ -71,6 +71,27 @@ pub fn has_top_level_await(p: &Program) -> bool {
     p.body.iter().any(stmt_has_top_level_await)
 }
 
+
+pub fn script_has_async_transform(body: &[Statement]) -> bool {
+    has_top_level_await_body(body) || has_async_derived_init_body(body)
+}
+
+fn has_top_level_await_body(body: &[Statement]) -> bool {
+    body.iter().any(stmt_has_top_level_await)
+}
+
+fn has_async_derived_init_body(body: &[Statement]) -> bool {
+    body.iter().any(|s| {
+        if let Statement::Variable(v) = s {
+            v.declarations.iter().any(|d| {
+                d.init.as_ref().map_or(false, |i| rewrite_async_derived(i).is_some())
+            })
+        } else {
+            false
+        }
+    })
+}
+
 fn stmt_has_top_level_await(s: &Statement) -> bool {
     match s {
         Statement::Variable(v) => v
@@ -122,13 +143,8 @@ fn expr_has_top_level_await(e: &Expression) -> bool {
 ///    runs of sync statements collapse into a single sync arrow.
 ///
 /// Returns None if no top-level await is present.
-pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
-    let p = Program {
-        source_type: SourceType::Module,
-        body: body.to_vec(),
-        span: Span::ZERO,
-    };
-    if !has_top_level_await(&p) && !has_async_derived_init(&p) {
+pub fn transform_async_script_server(mut body: Vec<Statement>) -> Option<AsyncInfo> {
+    if !has_top_level_await_body(&body) && !has_async_derived_init_body(&body) {
         return None;
     }
 
@@ -148,8 +164,8 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
             false
         }
     })?;
-    let pre_async: Vec<Statement> = body[..first_async_idx].to_vec();
-    let body = &body[first_async_idx..];
+    let async_body = body.split_off(first_async_idx);
+    let pre_async = body;
 
     // Gather all let/const bindings to hoist + classify each statement.
     let mut hoisted_names: Vec<String> = Vec::new();
@@ -161,14 +177,70 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     }
     let mut lowered: Vec<Lowered> = Vec::new();
 
-    for s in body {
-        match s {
-            Statement::Variable(v) => {
+    // Collect script let bindings + blocker indices before consuming async_body.
+    let mut script_let_bindings: HashSet<String> = HashSet::new();
+    for s in pre_async.iter().chain(async_body.iter()) {
+        if let Statement::Variable(v) = s {
+            for d in &v.declarations {
+                if let Pattern::Identifier(id) = &d.id {
+                    script_let_bindings.insert(id.name.to_string());
+                }
+            }
+        }
+    }
+    let mut blocker_bindings: HashMap<String, usize> = HashMap::new();
+    {
+        let mut groups_count: usize = 0;
+        let mut sync_pending: bool = false;
+        let mut awaited_seen: bool = false;
+        for s in async_body.iter() {
+            if let Statement::Variable(v) = s {
                 for d in &v.declarations {
                     if let Pattern::Identifier(id) = &d.id {
+                        let init = d.init.as_ref();
+                        let is_async = init.map_or(false, |i| {
+                            expr_has_top_level_await(i) || rewrite_async_derived(i).is_some()
+                        });
+                        if is_async {
+                            if sync_pending {
+                                groups_count += 1;
+                                sync_pending = false;
+                            }
+                            let idx = groups_count;
+                            blocker_bindings.entry(id.name.to_string()).or_insert(idx);
+                            if let Some(init) = init {
+                                let mut touched: HashSet<String> = HashSet::new();
+                                collect_touched_in_expr(init, &mut touched);
+                                for name in touched {
+                                    if script_let_bindings.contains(&name) {
+                                        blocker_bindings.entry(name).or_insert(idx);
+                                    }
+                                }
+                            }
+                            groups_count += 1;
+                            awaited_seen = true;
+                        } else if awaited_seen {
+                            blocker_bindings.entry(id.name.to_string()).or_insert(groups_count);
+                            sync_pending = true;
+                        } else {
+                            sync_pending = true;
+                        }
+                    }
+                }
+            } else if !matches!(s, Statement::Function(_)) {
+                sync_pending = true;
+            }
+        }
+    }
+
+    for s in async_body {
+        match s {
+            Statement::Variable(v) => {
+                for d in v.declarations {
+                    if let Pattern::Identifier(id) = d.id {
                         hoisted_names.push(id.name.to_string());
                         hoisted_spans.push(id.span);
-                        let init = d.init.clone().unwrap_or_else(undefined_expr);
+                        let init = d.init.unwrap_or_else(undefined_expr);
                         // `$.derived(() => await E)` pattern (post rune-erase
                         // form of `let X = $derived(await E)`) → convert to
                         // `await $.async_derived(() => E)` for the async-set
@@ -214,16 +286,16 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
                 // `await EXPR;` (top-level await expression statement) — each
                 // gets its own thunk in the run array (not merged with sibling
                 // sync stmts). The thunk body unwraps to just `EXPR`.
-                if let Expression::Await(a) = &e.expression {
-                    lowered.push(Lowered::AwaitExpr(a.argument.clone()));
+                if let Expression::Await(a) = e.expression {
+                    lowered.push(Lowered::AwaitExpr(a.argument));
                     continue;
                 }
-                lowered.push(Lowered::Sync(s.clone()));
+                lowered.push(Lowered::Sync(Statement::Expression(e)));
             }
             // Function declarations pass through untouched (they don't
             // participate in the async hoisting).
             Statement::Function(_) => {
-                lowered.push(Lowered::Sync(s.clone()));
+                lowered.push(Lowered::Sync(s));
             }
             _ => return None,
         }
@@ -326,7 +398,7 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     let mut setup_stmts: Vec<Statement> = Vec::new();
     // Pre-async statements (functions + plain sync bindings before the first
     // await) come first, untouched.
-    setup_stmts.extend(pre_async.clone());
+    setup_stmts.extend(pre_async);
     if !hoisted_names.is_empty() {
         let decls: Vec<VariableDeclarator> = hoisted_names
             .iter()
@@ -360,80 +432,8 @@ pub fn transform_async_script_server(body: &[Statement]) -> Option<AsyncInfo> {
     ));
 
     let async_bindings: HashSet<String> = hoisted_names.into_iter().collect();
-    // Collect all script let/const bindings (pre-async + hoisted), excluding
-    // function declarations.
-    let mut script_let_bindings: HashSet<String> = async_bindings.clone();
-    for s in pre_async.iter().chain(body.iter()) {
-        if let Statement::Variable(v) = s {
-            for d in &v.declarations {
-                if let Pattern::Identifier(id) = &d.id {
-                    script_let_bindings.insert(id.name.to_string());
-                }
-            }
-        }
-    }
-    // Compute blocker_bindings: simulate the group counting and assign
-    // `group_idx` per binding. Mirrors upstream's
-    // `2-analyze/index.js::calculate_blockers`:
-    //   - async declarators flush any pending sync group, then occupy their
-    //     own async group index. Touched identifiers (writes via the
-    //     CallExpression rule) ALSO get this index.
-    //   - sync declarators that come AFTER the first async one accumulate
-    //     into the upcoming sync group; their blocker is the index THAT sync
-    //     group will land on once flushed.
-    let mut blocker_bindings: HashMap<String, usize> = HashMap::new();
-    {
-        let mut groups_count: usize = 0;
-        let mut sync_pending: bool = false;
-        let mut awaited_seen: bool = false;
-        for s in body.iter() {
-            if let Statement::Variable(v) = s {
-                for d in &v.declarations {
-                    if let Pattern::Identifier(id) = &d.id {
-                        let init = d.init.as_ref();
-                        let is_async = init.map_or(false, |i| {
-                            expr_has_top_level_await(i) || rewrite_async_derived(i).is_some()
-                        });
-                        if is_async {
-                            if sync_pending {
-                                groups_count += 1;
-                                sync_pending = false;
-                            }
-                            let idx = groups_count;
-                            blocker_bindings
-                                .entry(id.name.to_string())
-                                .or_insert(idx);
-                            if let Some(init) = init {
-                                let mut touched: HashSet<String> = HashSet::new();
-                                collect_touched_in_expr(init, &mut touched);
-                                for name in touched {
-                                    if script_let_bindings.contains(&name) {
-                                        blocker_bindings.entry(name).or_insert(idx);
-                                    }
-                                }
-                            }
-                            groups_count += 1;
-                            awaited_seen = true;
-                        } else {
-                            // After any await, sync declarators also get a
-                            // blocker — the index of the pending sync group
-                            // they'll be flushed into.
-                            if awaited_seen {
-                                blocker_bindings
-                                    .entry(id.name.to_string())
-                                    .or_insert(groups_count);
-                            }
-                            sync_pending = true;
-                        }
-                    }
-                }
-            } else if matches!(s, Statement::Function(_)) {
-                // Function declarations are sync; they go to setup, not groups.
-                // Don't count them.
-            } else {
-                sync_pending = true;
-            }
-        }
+    for name in &async_bindings {
+        script_let_bindings.insert(name.clone());
     }
     Some(AsyncInfo {
         setup_stmts,

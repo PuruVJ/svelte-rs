@@ -463,7 +463,7 @@ impl<'a> Emitter<'a> {
                 self.write(") ");
                 self.emit_statement(&w.body);
             }
-            Statement::Raw(text) => self.write(text),
+            Statement::Raw(text) => self.write(text.as_str()),
         }
     }
 

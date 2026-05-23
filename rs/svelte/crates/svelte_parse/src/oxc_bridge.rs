@@ -14,6 +14,65 @@ use svelte_js_ast::{Expression, Pattern, Program};
 use crate::oxc_to_typed::{self as walker, Shift};
 use crate::utils::locator::LineMap;
 
+use std::borrow::Cow;
+
+fn is_identifier_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+fn is_identifier_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+fn is_js_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger"
+        | "default" | "delete" | "do" | "else" | "export" | "extends" | "false"
+        | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
+        | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
+        | "true" | "try" | "typeof" | "var" | "void" | "while" | "with" | "yield"
+        | "enum" | "implements" | "interface" | "package" | "private" | "protected"
+        | "public" | "static" | "let"
+    )
+}
+
+/// Fast path for `{title}`-style mustache expressions: a single identifier
+/// with no member access, calls, or operators.
+fn try_parse_simple_identifier(source: &str, start: usize) -> Option<(Expression, usize)> {
+    let tail = &source[start..];
+    let bytes = tail.as_bytes();
+    if bytes.is_empty() || !is_identifier_start(bytes[0]) {
+        return None;
+    }
+    let mut end = 1usize;
+    while end < bytes.len() && is_identifier_continue(bytes[end]) {
+        end += 1;
+    }
+    let name = &tail[..end];
+    if is_js_keyword(name) {
+        return None;
+    }
+    Some((
+        Expression::Identifier(svelte_js_ast::Identifier {
+            name: Cow::Owned(name.into()),
+            span: svelte_js_ast::Span::new(start as u32, (start + end) as u32),
+        }),
+        start + end,
+    ))
+}
+
+fn strip_comment_body(value: &str, line: bool) -> String {
+    if line {
+        return value.strip_prefix("//").map(|s| s.into()).unwrap_or_else(|| value.into());
+    }
+    let mut s: String = value.strip_prefix("/*").map(|rest| rest.into()).unwrap_or_else(|| value.into());
+    if s.ends_with("*/") {
+        s.truncate(s.len() - 2);
+    }
+    s
+}
+
 #[derive(Debug, Clone)]
 pub struct RawComment {
     pub line: bool,
@@ -41,20 +100,11 @@ fn collect_comments(
         .iter()
         .map(|c| {
             let span = c.span;
-            let mut value = slice[(span.start as usize)..(span.end as usize)].to_string();
-            // OXC includes the comment markers in the slice; strip them for
-            // downstream `TypedComment.value` which already wraps with `//`
-            // or `/* ... */` at codegen time.
-            if matches!(c.kind, oxc_ast::CommentKind::Line) && value.starts_with("//") {
-                value = value[2..].to_string();
-            } else {
-                if value.starts_with("/*") {
-                    value = value[2..].to_string();
-                }
-                if value.ends_with("*/") {
-                    value.truncate(value.len() - 2);
-                }
-            }
+            let line = matches!(c.kind, oxc_ast::CommentKind::Line);
+            let value = strip_comment_body(
+                &slice[(span.start as usize)..(span.end as usize)],
+                line,
+            );
             // OXC's Comment.span covers the comment's *body* (between the
             // `//` or `/*` markers and the terminator). Adjust to include
             // the markers when emitting a `RawComment` — acorn's onComment
@@ -71,7 +121,7 @@ fn collect_comments(
                 span.end + 2 + shift_offset // include `*/`
             };
             RawComment {
-                line: matches!(c.kind, oxc_ast::CommentKind::Line),
+                line,
                 start,
                 end,
                 value,
@@ -141,6 +191,9 @@ pub fn parse_expression_at_with_comments(
     ts: bool,
 ) -> Result<(Expression, usize, Vec<RawComment>), CompileDiagnostic> {
     let tail = &full_source[start..];
+    if let Some((expression, end)) = try_parse_simple_identifier(full_source, start) {
+        return Ok((expression, end, Vec::new()));
+    }
     let allocator = Allocator::default();
     let source_type = SourceType::default().with_typescript(ts);
     // Parse the WHOLE tail as a program — OXC reports the end span of the
@@ -227,7 +280,7 @@ pub fn parse_pattern_at(
             return Ok((walker::binding_pattern(&d.id, shift), end));
         }
     }
-    Err(js_diag(start, end, "expected pattern".to_string()))
+    Err(js_diag(start, end, "expected pattern".into()))
 }
 
 pub fn parse_arrow_params_at(
@@ -259,12 +312,16 @@ pub fn parse_arrow_params_at(
     if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
         if let Some(d) = decl.declarations.first() {
             if let Some(oxc_ast::ast::Expression::ArrowFunctionExpression(arrow)) = &d.init {
-                let mut out: Vec<Pattern> = arrow
-                    .params
-                    .items
-                    .iter()
-                    .map(|p| walker::binding_pattern(&p.pattern, shift))
-                    .collect();
+                let mut out: Vec<Pattern> = Vec::with_capacity(
+                    arrow.params.items.len() + usize::from(arrow.params.rest.is_some()),
+                );
+                out.extend(
+                    arrow
+                        .params
+                        .items
+                        .iter()
+                        .map(|p| walker::binding_pattern(&p.pattern, shift)),
+                );
                 if let Some(rest) = &arrow.params.rest {
                     out.push(Pattern::Rest(Box::new(svelte_js_ast::RestElement {
                         argument: walker::binding_pattern(&rest.rest.argument, shift),

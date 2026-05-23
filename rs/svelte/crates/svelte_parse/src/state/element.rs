@@ -470,37 +470,37 @@ fn build_element(
             let (mut attrs, this_value) = extract_this_attribute(attributes);
             let expression = build_svelte_this_expression(&this_value, &name);
             let _ = &mut attrs;
-            FragmentChild::SvelteComponent(svelte_ast::SvelteComponent {
+            FragmentChild::SvelteComponent(Box::new(svelte_ast::SvelteComponent {
                 start,
                 end,
                 name_loc,
                 attributes: attrs,
                 fragment,
                 expression,
-            })
+            }))
         }
         // `<svelte:element this={...}>` — extract `this` attribute as
         // `tag`. Mirrors element.js:283-326.
         "svelte:element" => {
             let (attrs, this_value) = extract_this_attribute(attributes);
             let tag = build_svelte_this_expression(&this_value, &name);
-            FragmentChild::SvelteElement(svelte_ast::SvelteElement {
+            FragmentChild::SvelteElement(Box::new(svelte_ast::SvelteElement {
                 start,
                 end,
                 name_loc,
                 attributes: attrs,
                 fragment,
                 tag,
-            })
+            }))
         }
-        n if is_component_name(n) => FragmentChild::Component(svelte_ast::Component {
+        n if is_component_name(n) => FragmentChild::Component(Box::new(svelte_ast::Component {
             start,
             end,
             name,
             name_loc,
             attributes,
             fragment,
-        }),
+        })),
         _ => FragmentChild::RegularElement(RegularElement {
             start,
             end,

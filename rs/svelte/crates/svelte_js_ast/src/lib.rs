@@ -83,7 +83,7 @@ pub enum Statement {
     /// transforms that have already produced source text and want to embed
     /// it without re-parsing. The string is inserted verbatim. NOT for new
     /// uses — exists during migration only.
-    Raw(String),
+    Raw(Box<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -933,4 +933,46 @@ pub struct AssignmentPattern {
     pub left: Pattern,
     pub right: Expression,
     pub span: Span,
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+    #[test]
+    fn print_sizes() {
+        println!("Expression: {} bytes", std::mem::size_of::<Expression>());
+        println!("Statement: {} bytes", std::mem::size_of::<Statement>());
+        println!("Identifier: {} bytes", std::mem::size_of::<Identifier>());
+        println!("Literal: {} bytes", std::mem::size_of::<Literal>());
+        println!("--- Expression variants ---");
+        println!("  Identifier: {}", std::mem::size_of::<Identifier>());
+        println!("  CallExpression: {}", std::mem::size_of::<CallExpression>());
+        println!("  MemberExpression: {}", std::mem::size_of::<MemberExpression>());
+        println!("  BinaryExpression: {}", std::mem::size_of::<BinaryExpression>());
+        println!("  ArrowFunctionExpression: {}", std::mem::size_of::<ArrowFunctionExpression>());
+        println!("  ObjectExpression: {}", std::mem::size_of::<ObjectExpression>());
+        println!("  ArrayExpression: {}", std::mem::size_of::<ArrayExpression>());
+        println!("  AssignmentExpression: {}", std::mem::size_of::<AssignmentExpression>());
+        println!("  ConditionalExpression: {}", std::mem::size_of::<ConditionalExpression>());
+        println!("  SequenceExpression: {}", std::mem::size_of::<SequenceExpression>());
+        println!("  TemplateLiteral: {}", std::mem::size_of::<TemplateLiteral>());
+        println!("  UnaryExpression: {}", std::mem::size_of::<UnaryExpression>());
+        println!("  UpdateExpression: {}", std::mem::size_of::<UpdateExpression>());
+        println!("  LogicalExpression: {}", std::mem::size_of::<LogicalExpression>());
+        println!("  SpreadElement: {}", std::mem::size_of::<SpreadElement>());
+        println!("  FunctionExpression: {}", std::mem::size_of::<FunctionExpression>());
+        println!("  NewExpression: {}", std::mem::size_of::<NewExpression>());
+        println!("--- Statement variants ---");
+        println!("  VariableDeclaration: {}", std::mem::size_of::<VariableDeclaration>());
+        println!("  FunctionDeclaration: {}", std::mem::size_of::<FunctionDeclaration>());
+        println!("  ImportDeclaration: {}", std::mem::size_of::<ImportDeclaration>());
+        println!("  ExportNamedDeclaration: {}", std::mem::size_of::<ExportNamedDeclaration>());
+        println!("  ExportDefaultDeclaration: {}", std::mem::size_of::<ExportDefaultDeclaration>());
+        println!("  ClassDeclaration: {}", std::mem::size_of::<ClassDeclaration>());
+        println!("  IfStatement: {}", std::mem::size_of::<IfStatement>());
+        println!("  ForStatement: {}", std::mem::size_of::<ForStatement>());
+        println!("  TryStatement: {}", std::mem::size_of::<TryStatement>());
+        println!("  SwitchStatement: {}", std::mem::size_of::<SwitchStatement>());
+        println!("  BlockStatement: {}", std::mem::size_of::<BlockStatement>());
+    }
 }

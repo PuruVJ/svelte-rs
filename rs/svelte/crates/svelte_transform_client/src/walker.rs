@@ -1114,7 +1114,7 @@ fn emit_rich_select_program(
     // is emitted via Statement::Raw so the codegen reproduces it byte-for-byte.
     let raw = RICH_SELECT_RAW_OUTPUT;
     let mut prog: Vec<Statement> = Vec::new();
-    prog.push(Statement::Raw(raw.to_string()));
+    prog.push(Statement::Raw(Box::new(raw.to_string())));
     Some(t::program(prog))
 }
 
@@ -1181,7 +1181,7 @@ fn emit_dynamic_attributes_casing_program(
     }
     let raw = DYNAMIC_ATTRIBUTES_CASING_RAW_OUTPUT;
     let mut prog: Vec<Statement> = Vec::new();
-    prog.push(Statement::Raw(raw.to_string()));
+    prog.push(Statement::Raw(Box::new(raw.to_string())));
     Some(t::program(prog))
 }
 
@@ -4542,7 +4542,7 @@ pub fn try_typed_client_walker_with(
             let if_blocks: Vec<&svelte_ast::blocks::IfBlock> = block_nodes
                 .iter()
                 .filter_map(|n| match n {
-                    FragmentChild::IfBlock(ib) => Some(ib),
+                    FragmentChild::IfBlock(ib) => Some(ib.as_ref()),
                     _ => None,
                 })
                 .collect();

@@ -26,6 +26,33 @@ pub struct Shift(pub u32);
 fn span_of(s: oxc_span::Span, shift: Shift) -> Span {
     Span::new(s.start + shift.0, s.end + shift.0)
 }
+#[inline]
+fn cow_owned(s: &str) -> Cow<'static, str> {
+    Cow::Owned(s.into())
+}
+
+#[inline]
+fn private_identifier(name: &str, sp: oxc_span::Span, shift: Shift) -> PrivateIdentifier {
+    PrivateIdentifier {
+        name: cow_owned(name),
+        span: span_of(sp, shift),
+    }
+}
+
+/// Pre-allocate a `Vec` when the source iterator exposes an exact length.
+#[inline]
+fn map_collect<T, U, I, F>(iter: I, f: F) -> Vec<U>
+where
+    I: IntoIterator<Item = T>,
+    I::IntoIter: ExactSizeIterator,
+    F: FnMut(T) -> U,
+{
+    let iter = iter.into_iter();
+    let mut out = Vec::with_capacity(iter.len());
+    out.extend(iter.map(f));
+    out
+}
+
 
 // Thread-local slice the OXC parser is operating on. Set by `set_slice`
 // (called from the parse bridge), read by helpers that need to capture
@@ -80,11 +107,11 @@ pub fn statement(s: &oxc::Statement<'_>, shift: Shift) -> Statement {
     match s {
         S::BlockStatement(b) => Statement::Block(Box::new(block_statement(b, shift))),
         S::BreakStatement(b) => Statement::Break(Box::new(BreakStatement {
-            label: b.label.as_ref().map(|l| ident_from_label(&l.name, l.span, shift)),
+            label: b.label.as_ref().map(|l| ident_from_name(&l.name, l.span, shift)),
             span: span_of(b.span, shift),
         })),
         S::ContinueStatement(c) => Statement::Continue(Box::new(ContinueStatement {
-            label: c.label.as_ref().map(|l| ident_from_label(&l.name, l.span, shift)),
+            label: c.label.as_ref().map(|l| ident_from_name(&l.name, l.span, shift)),
             span: span_of(c.span, shift),
         })),
         S::DebuggerStatement(d) => Statement::Debugger(span_of(d.span, shift)),
@@ -125,7 +152,7 @@ pub fn statement(s: &oxc::Statement<'_>, shift: Shift) -> Statement {
             span: span_of(i.span, shift),
         })),
         S::LabeledStatement(l) => Statement::Labeled(Box::new(LabeledStatement {
-            label: ident_from_label(&l.label.name, l.label.span, shift),
+            label: ident_from_name(&l.label.name, l.label.span, shift),
             body: statement(&l.body, shift),
             span: span_of(l.span, shift),
         })),
@@ -135,15 +162,11 @@ pub fn statement(s: &oxc::Statement<'_>, shift: Shift) -> Statement {
         })),
         S::SwitchStatement(s) => Statement::Switch(Box::new(SwitchStatement {
             discriminant: expression(&s.discriminant, shift),
-            cases: s
-                .cases
-                .iter()
-                .map(|c| SwitchCase {
-                    test: c.test.as_ref().map(|t| expression(t, shift)),
-                    consequent: c.consequent.iter().map(|s| statement(s, shift)).collect(),
-                    span: span_of(c.span, shift),
-                })
-                .collect(),
+            cases: map_collect(s.cases.iter(), |c| SwitchCase {
+                test: c.test.as_ref().map(|t| expression(t, shift)),
+                consequent: map_collect(c.consequent.iter(), |s| statement(s, shift)),
+                span: span_of(c.span, shift),
+            }),
             span: span_of(s.span, shift),
         })),
         S::ThrowStatement(t) => Statement::Throw(Box::new(ThrowStatement {
@@ -262,16 +285,12 @@ fn variable_declaration(
         K::Let | K::Using | K::AwaitUsing => VariableKind::Let,
         K::Const => VariableKind::Const,
     };
-    let declarations = v
-        .declarations
-        .iter()
-        .map(|d| VariableDeclarator {
-            id: binding_pattern(&d.id, shift),
-            init: d.init.as_ref().map(|e| expression(e, shift)),
-            type_annotation: d.type_annotation.as_ref().and_then(|t| slice_text(t.span)),
-            span: span_of(d.span, shift),
-        })
-        .collect();
+    let declarations = map_collect(v.declarations.iter(), |d| VariableDeclarator {
+        id: binding_pattern(&d.id, shift),
+        init: d.init.as_ref().map(|e| expression(e, shift)),
+        type_annotation: d.type_annotation.as_ref().and_then(|t| slice_text(t.span)),
+        span: span_of(d.span, shift),
+    });
     VariableDeclaration {
         kind,
         declarations,
@@ -348,7 +367,11 @@ fn class_decl(c: &oxc::Class<'_>, shift: Shift) -> ClassDeclaration {
         id: c.id.as_ref().map(|b| binding_identifier(b, shift)),
         super_class: c.super_class.as_ref().map(|e| expression(e, shift)),
         body: ClassBody {
-            body: c.body.body.iter().filter_map(|m| class_member(m, shift)).collect(),
+            body: {
+                let mut body = Vec::with_capacity(c.body.body.len());
+                body.extend(c.body.body.iter().filter_map(|m| class_member(m, shift)));
+                body
+            },
             span: span_of(c.body.span, shift),
         },
         span: span_of(c.span, shift),
@@ -360,7 +383,11 @@ fn class_expression(c: &oxc::Class<'_>, shift: Shift) -> ClassExpression {
         id: c.id.as_ref().map(|b| binding_identifier(b, shift)),
         super_class: c.super_class.as_ref().map(|e| expression(e, shift)),
         body: ClassBody {
-            body: c.body.body.iter().filter_map(|m| class_member(m, shift)).collect(),
+            body: {
+                let mut body = Vec::with_capacity(c.body.body.len());
+                body.extend(c.body.body.iter().filter_map(|m| class_member(m, shift)));
+                body
+            },
             span: span_of(c.body.span, shift),
         },
         span: span_of(c.span, shift),
@@ -395,7 +422,7 @@ fn class_member(m: &oxc::ClassElement<'_>, shift: Shift) -> Option<ClassMember> 
             span: span_of(pd.span, shift),
         }))),
         E::StaticBlock(sb) => Some(ClassMember::StaticBlock(Box::new(StaticBlock {
-            body: sb.body.iter().map(|s| statement(s, shift)).collect(),
+            body: map_collect(sb.body.iter(), |s| statement(s, shift)),
             span: span_of(sb.span, shift),
         }))),
         E::AccessorProperty(_) | E::TSIndexSignature(_) => None,
@@ -414,9 +441,7 @@ fn import_declaration(
         .specifiers
         .as_ref()
         .map(|specs| {
-            specs
-                .iter()
-                .map(|s| match s {
+            map_collect(specs.iter(), |s| match s {
                     oxc::ImportDeclarationSpecifier::ImportSpecifier(s) => {
                         ImportSpecifierKind::Named(ImportSpecifier {
                             imported: module_export_name(&s.imported, shift),
@@ -441,7 +466,6 @@ fn import_declaration(
                         })
                     }
                 })
-                .collect()
         })
         .unwrap_or_default();
     ImportDeclaration {
@@ -458,15 +482,11 @@ fn export_named_declaration(
 ) -> ExportNamedDeclaration {
     ExportNamedDeclaration {
         declaration: e.declaration.as_ref().map(|d| declaration_to_statement(d, shift)),
-        specifiers: e
-            .specifiers
-            .iter()
-            .map(|s| ExportSpecifier {
-                local: module_export_name(&s.local, shift),
-                exported: module_export_name(&s.exported, shift),
-                span: span_of(s.span, shift),
-            })
-            .collect(),
+        specifiers: map_collect(e.specifiers.iter(), |s| ExportSpecifier {
+            local: module_export_name(&s.local, shift),
+            exported: module_export_name(&s.exported, shift),
+            span: span_of(s.span, shift),
+        }),
         source: e.source.as_ref().map(|s| string_literal(s, shift)),
         span: span_of(e.span, shift),
     }
@@ -549,7 +569,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         }))),
         E::RegExpLiteral(r) => Expression::Literal(Box::new(Literal::Regex(RegexLiteral {
             pattern: r.regex.pattern.text.as_str().into(),
-            flags: format!("{}", r.regex.flags),
+            flags: r.regex.flags.to_string(),
             span: span_of(r.span, shift),
         }))),
         E::StringLiteral(s) => Expression::Literal(Box::new(Literal::String(string_literal(s, shift)))),
@@ -624,14 +644,14 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
-            arguments: c.arguments.iter().map(|a| argument(a, shift)).collect(),
+            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)),
             optional: c.optional,
             span: span_of(c.span, shift),
         })),
         E::ChainExpression(c) => match &c.expression {
             oxc::ChainElement::CallExpression(c2) => Expression::Call(Box::new(CallExpression {
                 callee: expression(&c2.callee, shift),
-                arguments: c2.arguments.iter().map(|a| argument(a, shift)).collect(),
+                arguments: map_collect(c2.arguments.iter(), |a| argument(a, shift)),
                 optional: c2.optional,
                 span: span_of(c2.span, shift),
             })),
@@ -660,10 +680,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
             oxc::ChainElement::PrivateFieldExpression(m) => {
                 Expression::Member(Box::new(MemberExpression {
                     object: expression(&m.object, shift),
-                    property: MemberProperty::Private(PrivateIdentifier {
-                        name: Cow::Owned(m.field.name.as_ref().to_string()),
-                        span: span_of(m.field.span, shift),
-                    }),
+                    property: MemberProperty::Private(private_identifier(m.field.name.as_ref(), m.field.span, shift)),
                     computed: false,
                     optional: m.optional,
                     span: span_of(m.span, shift),
@@ -687,9 +704,14 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                 name: "import".into(),
                 span: Span::ZERO,
             }),
-            arguments: std::iter::once(Argument::Expression(expression(&i.source, shift)))
-                .chain(i.options.as_ref().map(|o| Argument::Expression(expression(o, shift))))
-                .collect(),
+            arguments: {
+                let mut args = Vec::with_capacity(1 + usize::from(i.options.is_some()));
+                args.push(Argument::Expression(expression(&i.source, shift)));
+                if let Some(o) = &i.options {
+                    args.push(Argument::Expression(expression(o, shift)));
+                }
+                args
+            },
             optional: false,
             span: span_of(i.span, shift),
         })),
@@ -701,14 +723,11 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::NewExpression(n) => Expression::New(Box::new(NewExpression {
             callee: expression(&n.callee, shift),
-            arguments: n.arguments.iter().map(|a| argument(a, shift)).collect(),
+            arguments: map_collect(n.arguments.iter(), |a| argument(a, shift)),
             span: span_of(n.span, shift),
         })),
         E::ObjectExpression(o) => Expression::Object(Box::new(ObjectExpression {
-            properties: o
-                .properties
-                .iter()
-                .map(|p| match p {
+            properties: map_collect(o.properties.iter(), |p| match p {
                     oxc::ObjectPropertyKind::ObjectProperty(op) => {
                         ObjectMember::Property(Box::new(Property {
                             key: property_key(&op.key, shift),
@@ -730,8 +749,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
                             span: span_of(s.span, shift),
                         }))
                     }
-                })
-                .collect(),
+                }),
             span: span_of(o.span, shift),
         })),
         E::ParenthesizedExpression(p) => Expression::Paren(Box::new(ParenthesizedExpression {
@@ -739,7 +757,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
             span: span_of(p.span, shift),
         })),
         E::SequenceExpression(s) => Expression::Sequence(Box::new(SequenceExpression {
-            expressions: s.expressions.iter().map(|e| expression(e, shift)).collect(),
+            expressions: map_collect(s.expressions.iter(), |e| expression(e, shift)),
             span: span_of(s.span, shift),
         })),
         E::TaggedTemplateExpression(t) => Expression::Tagged(Box::new(TaggedTemplateExpression {
@@ -767,7 +785,13 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::PrivateInExpression(p) => Expression::Binary(Box::new(BinaryExpression {
             left: Expression::Identifier(Identifier {
-                name: Cow::Owned(format!("#{}", p.left.name.as_ref())),
+                name: {
+                    let name = p.left.name.as_ref();
+                    let mut s = String::with_capacity(name.len() + 1);
+                    s.push('#');
+                    s.push_str(name);
+                    Cow::Owned(s)
+                },
                 span: span_of(p.left.span, shift),
             }),
             operator: BinaryOperator::In,
@@ -795,10 +819,7 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         })),
         E::PrivateFieldExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
-            property: MemberProperty::Private(PrivateIdentifier {
-                name: Cow::Owned(m.field.name.as_ref().to_string()),
-                span: span_of(m.field.span, shift),
-            }),
+            property: MemberProperty::Private(private_identifier(m.field.name.as_ref(), m.field.span, shift)),
             computed: false,
             optional: m.optional,
             span: span_of(m.span, shift),
@@ -822,7 +843,13 @@ pub fn expression(e: &oxc::Expression<'_>, shift: Shift) -> Expression {
         E::TSInstantiationExpression(t) => expression(&t.expression, shift),
 
         E::V8IntrinsicExpression(v) => Expression::Identifier(Identifier {
-            name: Cow::Owned(format!("%{}", v.name.name.as_ref())),
+            name: {
+                let name = v.name.name.as_ref();
+                let mut s = String::with_capacity(name.len() + 1);
+                s.push('%');
+                s.push_str(name);
+                Cow::Owned(s)
+            },
             span: span_of(v.span, shift),
         }),
     }
@@ -847,7 +874,7 @@ fn expression_from_for_init(init: &oxc::ForStatementInit<'_>, shift: Shift) -> E
         F::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         F::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
-            arguments: c.arguments.iter().map(|a| argument(a, shift)).collect(),
+            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)),
             optional: c.optional,
             span: span_of(c.span, shift),
         })),
@@ -939,10 +966,7 @@ fn expression_from_default_kind(
             span: span_of(a.span, shift),
         })),
         K::ObjectExpression(o) => Expression::Object(Box::new(ObjectExpression {
-            properties: o
-                .properties
-                .iter()
-                .map(|p| match p {
+            properties: map_collect(o.properties.iter(), |p| match p {
                     oxc::ObjectPropertyKind::ObjectProperty(op) => {
                         ObjectMember::Property(Box::new(Property {
                             key: property_key(&op.key, shift),
@@ -960,8 +984,7 @@ fn expression_from_default_kind(
                             span: span_of(s.span, shift),
                         }))
                     }
-                })
-                .collect(),
+                }),
             span: span_of(o.span, shift),
         })),
         K::ArrowFunctionExpression(_) | K::FunctionExpression(_) | K::ClassExpression(_) => {
@@ -1012,10 +1035,7 @@ fn expression_from_simple_target(
         })),
         T::PrivateFieldExpression(m) => Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
-            property: MemberProperty::Private(PrivateIdentifier {
-                name: Cow::Owned(m.field.name.as_ref().to_string()),
-                span: span_of(m.field.span, shift),
-            }),
+            property: MemberProperty::Private(private_identifier(m.field.name.as_ref(), m.field.span, shift)),
             computed: false,
             optional: m.optional,
             span: span_of(m.span, shift),
@@ -1036,10 +1056,10 @@ pub fn binding_pattern(b: &oxc::BindingPattern<'_>, shift: Shift) -> Pattern {
     match b {
         K::BindingIdentifier(bi) => Pattern::Identifier(binding_identifier(bi, shift)),
         K::ObjectPattern(o) => Pattern::Object(Box::new(ObjectPattern {
-            properties: o
-                .properties
-                .iter()
-                .map(|p| {
+            properties: {
+                let mut properties =
+                    Vec::with_capacity(o.properties.len() + usize::from(o.rest.is_some()));
+                properties.extend(o.properties.iter().map(|p| {
                     ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
                         key: property_key(&p.key, shift),
                         value: binding_pattern(&p.value, shift),
@@ -1047,28 +1067,34 @@ pub fn binding_pattern(b: &oxc::BindingPattern<'_>, shift: Shift) -> Pattern {
                         shorthand: p.shorthand,
                         span: span_of(p.span, shift),
                     }))
-                })
-                .chain(o.rest.as_ref().map(|r| {
-                    ObjectPatternMember::Rest(Box::new(RestElement {
+                }));
+                if let Some(r) = &o.rest {
+                    properties.push(ObjectPatternMember::Rest(Box::new(RestElement {
                         argument: binding_pattern(&r.argument, shift),
                         span: span_of(r.span, shift),
-                    }))
-                }))
-                .collect(),
+                    })));
+                }
+                properties
+            },
             span: span_of(o.span, shift),
         })),
         K::ArrayPattern(a) => Pattern::Array(Box::new(ArrayPattern {
-            elements: a
-                .elements
-                .iter()
-                .map(|e| e.as_ref().map(|p| binding_pattern(p, shift)))
-                .chain(a.rest.as_ref().map(|r| {
-                    Some(Pattern::Rest(Box::new(RestElement {
+            elements: {
+                let mut elements =
+                    Vec::with_capacity(a.elements.len() + usize::from(a.rest.is_some()));
+                elements.extend(
+                    a.elements
+                        .iter()
+                        .map(|e| e.as_ref().map(|p| binding_pattern(p, shift))),
+                );
+                if let Some(r) = &a.rest {
+                    elements.push(Some(Pattern::Rest(Box::new(RestElement {
                         argument: binding_pattern(&r.argument, shift),
                         span: span_of(r.span, shift),
-                    })))
-                }))
-                .collect(),
+                    }))));
+                }
+                elements
+            },
             span: span_of(a.span, shift),
         })),
         K::AssignmentPattern(p) => Pattern::Assignment(Box::new(AssignmentPattern {
@@ -1096,27 +1122,20 @@ fn formal_param_pattern(p: &oxc::FormalParameter<'_>, shift: Shift) -> Pattern {
 
 fn binding_identifier(b: &oxc::BindingIdentifier<'_>, shift: Shift) -> Identifier {
     Identifier {
-        name: Cow::Owned(b.name.as_ref().to_string()),
+        name: cow_owned(b.name.as_ref()),
         span: span_of(b.span, shift),
     }
 }
 
 fn ident_from_name(name: &str, sp: oxc_span::Span, shift: Shift) -> Identifier {
-    Identifier { name: Cow::Owned(name.to_string()), span: span_of(sp, shift) }
-}
-
-fn ident_from_label(name: &str, sp: oxc_span::Span, shift: Shift) -> Identifier {
-    Identifier { name: Cow::Owned(name.to_string()), span: span_of(sp, shift) }
+    Identifier { name: cow_owned(name), span: span_of(sp, shift) }
 }
 
 fn property_key(k: &oxc::PropertyKey<'_>, shift: Shift) -> PropertyKey {
     use oxc::PropertyKey as K;
     match k {
         K::StaticIdentifier(n) => PropertyKey::Identifier(ident_from_name(n.name.as_ref(), n.span, shift)),
-        K::PrivateIdentifier(p) => PropertyKey::Private(PrivateIdentifier {
-            name: Cow::Owned(p.name.as_ref().to_string()),
-            span: span_of(p.span, shift),
-        }),
+        K::PrivateIdentifier(p) => PropertyKey::Private(private_identifier(p.name.as_ref(), p.span, shift)),
         // The Expression-inherited variants — convert via expression().
         _ => {
             // Reborrow as Expression. Most variants of PropertyKey beyond
@@ -1149,8 +1168,8 @@ fn property_key_as_expr(k: &oxc::PropertyKey<'_>, shift: Shift) -> Expression {
 
 fn string_literal(s: &oxc::StringLiteral<'_>, shift: Shift) -> StringLiteral {
     StringLiteral {
-        value: Cow::Owned(s.value.as_ref().to_string()),
-        raw: s.raw.as_ref().map(|r| r.as_str().to_string()),
+        value: cow_owned(s.value.as_ref()),
+        raw: s.raw.as_ref().map(|r| r.as_str().into()),
         span: span_of(s.span, shift),
     }
 }
@@ -1158,18 +1177,18 @@ fn string_literal(s: &oxc::StringLiteral<'_>, shift: Shift) -> StringLiteral {
 fn template_literal(t: &oxc::TemplateLiteral<'_>, shift: Shift) -> TemplateLiteral {
     let last = t.quasis.len().saturating_sub(1);
     TemplateLiteral {
-        quasis: t
-            .quasis
-            .iter()
-            .enumerate()
-            .map(|(i, q)| TemplateElement {
+        quasis: {
+            let quasis = t.quasis.iter();
+            let mut out = Vec::with_capacity(quasis.len());
+            out.extend(quasis.enumerate().map(|(i, q)| TemplateElement {
                 cooked: q.value.cooked.as_ref().map(|s| s.as_str().into()).unwrap_or_default(),
                 raw: q.value.raw.as_str().into(),
                 tail: q.tail || i == last,
                 span: span_of(q.span, shift),
-            })
-            .collect(),
-        expressions: t.expressions.iter().map(|e| expression(e, shift)).collect(),
+            }));
+            out
+        },
+        expressions: map_collect(t.expressions.iter(), |e| expression(e, shift)),
         span: span_of(t.span, shift),
     }
 }
@@ -1239,7 +1258,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
         A::Identifier(i) => Expression::Identifier(ident_from_name(i.name.as_ref(), i.span, shift)),
         A::CallExpression(c) => Expression::Call(Box::new(CallExpression {
             callee: expression(&c.callee, shift),
-            arguments: c.arguments.iter().map(|a| argument(a, shift)).collect(),
+            arguments: map_collect(c.arguments.iter(), |a| argument(a, shift)),
             optional: c.optional,
             span: span_of(c.span, shift),
         })),
@@ -1250,10 +1269,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
             span: span_of(b.span, shift),
         })),
         A::ObjectExpression(o) => Expression::Object(Box::new(ObjectExpression {
-            properties: o
-                .properties
-                .iter()
-                .map(|p| match p {
+            properties: map_collect(o.properties.iter(), |p| match p {
                     oxc::ObjectPropertyKind::ObjectProperty(op) => {
                         ObjectMember::Property(Box::new(Property {
                             key: property_key(&op.key, shift),
@@ -1271,8 +1287,7 @@ fn argument_as_expr(a: &oxc::Argument<'_>, shift: Shift) -> Expression {
                             span: span_of(s.span, shift),
                         }))
                     }
-                })
-                .collect(),
+                }),
             span: span_of(o.span, shift),
         })),
         _ => {
@@ -1311,19 +1326,16 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
         }))),
         T::PrivateFieldExpression(m) => AssignmentTarget::Expression(Expression::Member(Box::new(MemberExpression {
             object: expression(&m.object, shift),
-            property: MemberProperty::Private(PrivateIdentifier {
-                name: Cow::Owned(m.field.name.as_ref().to_string()),
-                span: span_of(m.field.span, shift),
-            }),
+            property: MemberProperty::Private(private_identifier(m.field.name.as_ref(), m.field.span, shift)),
             computed: false,
             optional: m.optional,
             span: span_of(m.span, shift),
         }))),
         T::ArrayAssignmentTarget(a) => AssignmentTarget::Pattern(Pattern::Array(Box::new(ArrayPattern {
-            elements: a
-                .elements
-                .iter()
-                .map(|e| {
+            elements: {
+                let mut elements =
+                    Vec::with_capacity(a.elements.len() + usize::from(a.rest.is_some()));
+                elements.extend(a.elements.iter().map(|e| {
                     e.as_ref().map(|el| match el {
                         oxc::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(w) => {
                             Pattern::Assignment(Box::new(AssignmentPattern {
@@ -1333,9 +1345,6 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
                             }))
                         }
                         other => {
-                            // The remaining variants are AssignmentTarget cases:
-                            // identifiers / member expressions / nested destructures.
-                            // We round-trip via assignment_target_to_pattern.
                             let s = other.span();
                             match other {
                                 oxc::AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(_) => unreachable!(),
@@ -1346,20 +1355,23 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
                             }
                         }
                     })
-                })
-                .chain(a.rest.as_ref().map(|r| Some(Pattern::Rest(Box::new(RestElement {
-                    argument: assignment_target_to_pattern(&r.target, shift),
-                    span: span_of(r.span, shift),
-                })))))
-                .collect(),
+                }));
+                if let Some(r) = &a.rest {
+                    elements.push(Some(Pattern::Rest(Box::new(RestElement {
+                        argument: assignment_target_to_pattern(&r.target, shift),
+                        span: span_of(r.span, shift),
+                    }))));
+                }
+                elements
+            },
             span: span_of(a.span, shift),
         }))),
         T::ObjectAssignmentTarget(o) => {
             AssignmentTarget::Pattern(Pattern::Object(Box::new(ObjectPattern {
-                properties: o
-                    .properties
-                    .iter()
-                    .map(|p| match p {
+                properties: {
+                    let mut properties =
+                        Vec::with_capacity(o.properties.len() + usize::from(o.rest.is_some()));
+                    properties.extend(o.properties.iter().map(|p| match p {
                         oxc::AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(id) => {
                             ObjectPatternMember::Property(Box::new(ObjectPatternProperty {
                                 key: PropertyKey::Identifier(ident_from_name(
@@ -1400,14 +1412,15 @@ fn assignment_target(t: &oxc::AssignmentTarget<'_>, shift: Shift) -> AssignmentT
                                 span: span_of(pp.span, shift),
                             }))
                         }
-                    })
-                    .chain(o.rest.as_ref().map(|r| {
-                        ObjectPatternMember::Rest(Box::new(RestElement {
+                    }));
+                    if let Some(r) = &o.rest {
+                        properties.push(ObjectPatternMember::Rest(Box::new(RestElement {
                             argument: assignment_target_to_pattern(&r.target, shift),
                             span: span_of(r.span, shift),
-                        }))
-                    }))
-                    .collect(),
+                        })));
+                    }
+                    properties
+                },
                 span: span_of(o.span, shift),
             })))
         }

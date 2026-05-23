@@ -41,7 +41,7 @@ pub fn hoist_scripts_and_styles(
                 _ => unreachable!(),
             };
             let is_module = is_module_script(&el.attributes);
-            let (script, comments) = build_script_with_comments(&el, source, line_map, ts)?;
+            let (script, comments) = build_script_with_comments(el, source, line_map, ts)?;
             // Append script comments to root.comments for downstream
             // codegen (inter-declarator preservation).
             for c in comments {
@@ -76,7 +76,7 @@ pub fn hoist_scripts_and_styles(
                 _ => unreachable!(),
             };
             if root.css.is_none() {
-                if let Some(sheet) = build_style(&el, source)? {
+                if let Some(sheet) = build_style(el, source)? {
                     root.css = Some(sheet);
                 }
             } else {
@@ -94,12 +94,12 @@ pub fn hoist_scripts_and_styles(
 }
 
 fn build_script_with_comments(
-    el: &RegularElement,
+    el: RegularElement,
     source: &str,
     line_map: &LineMap,
     ts_default: bool,
 ) -> Result<(Script, Vec<oxc_bridge::RawComment>), CompileDiagnostic> {
-    let (body_start, body_end) = body_bounds(el).unwrap_or((el.end as usize, el.end as usize));
+    let (body_start, body_end) = body_bounds(&el).unwrap_or((el.end as usize, el.end as usize));
     let ts = ts_default
         || attribute_string_value(&el.attributes, "lang")
             .map(|s| s == "ts" || s == "typescript")
@@ -111,12 +111,14 @@ fn build_script_with_comments(
     } else {
         ScriptContext::Default
     };
-    let mut attributes: Vec<Attribute> = Vec::with_capacity(el.attributes.len());
-    for a in &el.attributes {
-        if let ElementAttribute::Attribute(attr) = a {
-            attributes.push(attr.clone());
-        }
-    }
+    let attributes = el
+        .attributes
+        .into_iter()
+        .filter_map(|a| match a {
+            ElementAttribute::Attribute(attr) => Some(attr),
+            _ => None,
+        })
+        .collect();
     Ok((
         Script {
             start: el.start,
@@ -130,13 +132,13 @@ fn build_script_with_comments(
 }
 
 fn build_script(
-    el: &RegularElement,
+    el: RegularElement,
     source: &str,
     line_map: &LineMap,
     ts_default: bool,
 ) -> Result<Script, CompileDiagnostic> {
     // Body bounds: the Text child written by `read_raw_until_close_tag`.
-    let (body_start, body_end) = body_bounds(el).unwrap_or((el.end as usize, el.end as usize));
+    let (body_start, body_end) = body_bounds(&el).unwrap_or((el.end as usize, el.end as usize));
 
     // `lang="ts"` flips on TypeScript parsing for this block specifically.
     let ts = ts_default
@@ -157,12 +159,14 @@ fn build_script(
 
     // Collect attributes as svelte_ast `Attribute`s only (drop directives —
     // `<script>` elements never carry them in practice).
-    let mut attributes: Vec<Attribute> = Vec::with_capacity(el.attributes.len());
-    for a in &el.attributes {
-        if let ElementAttribute::Attribute(attr) = a {
-            attributes.push(attr.clone());
-        }
-    }
+    let attributes = el
+        .attributes
+        .into_iter()
+        .filter_map(|a| match a {
+            ElementAttribute::Attribute(attr) => Some(attr),
+            _ => None,
+        })
+        .collect();
 
     Ok(Script {
         start: el.start,
@@ -174,16 +178,17 @@ fn build_script(
 }
 
 fn build_style(
-    el: &RegularElement,
+    el: RegularElement,
     source: &str,
 ) -> Result<Option<svelte_ast::css::StyleSheet>, CompileDiagnostic> {
-    let (body_start, _body_end) = match body_bounds(el) {
+    let (body_start, _body_end) = match body_bounds(&el) {
         Some(b) => b,
         None => return Ok(None),
     };
-    let attributes = el.attributes.clone();
+    let start = el.start;
+    let attributes = el.attributes;
     let (sheet, _end) =
-        svelte_css_parser::read_style(source, el.start, body_start, attributes, None)?;
+        svelte_css_parser::read_style(source, start, body_start, attributes, None)?;
     Ok(Some(sheet))
 }
 
