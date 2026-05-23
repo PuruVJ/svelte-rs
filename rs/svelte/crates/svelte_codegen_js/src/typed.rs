@@ -17,6 +17,9 @@
 //! Sourcemap segment shape matches `print.rs::Segment`:
 //! `(generated_column, source_index_0, original_line_0_indexed, original_column)`.
 
+use std::fmt::Write;
+use std::rc::Rc;
+
 use svelte_js_ast::*;
 
 /// Start byte offset of a pattern (for comment-flushing alignment).
@@ -155,6 +158,27 @@ pub fn print_statements_str_with_comments(body: &[Statement], comments: &[TypedC
     emitter.code
 }
 
+const CODE_INIT_CAPACITY: usize = 4096;
+const MAPPINGS_INIT_CAPACITY: usize = 64;
+const INDENT_LEVELS: usize = 128;
+
+fn build_indent_table(indent_unit: &str) -> (Rc<str>, Rc<Vec<String>>, Rc<Vec<u32>>) {
+    let unit_cols = indent_unit.chars().count() as u32;
+    let mut levels = Vec::with_capacity(INDENT_LEVELS + 1);
+    let mut cols = Vec::with_capacity(INDENT_LEVELS + 1);
+    levels.push(String::new());
+    cols.push(0);
+    for _ in 1..=INDENT_LEVELS {
+        let prev = levels.last().unwrap();
+        let mut next = String::with_capacity(prev.len() + indent_unit.len());
+        next.push_str(prev);
+        next.push_str(indent_unit);
+        levels.push(next);
+        cols.push(cols.last().unwrap() + unit_cols);
+    }
+    (Rc::from(indent_unit), Rc::new(levels), Rc::new(cols))
+}
+
 // ----- Emitter ------------------------------------------------------------
 
 struct Emitter<'a> {
@@ -164,9 +188,11 @@ struct Emitter<'a> {
     /// Per-line mappings, finalized when emitter sees `\n`.
     mappings: Vec<Vec<Segment>>,
     current_line: Vec<Segment>,
-    /// Current indentation string (one tab per level by default).
-    indent: String,
-    indent_unit: String,
+    /// Current indentation depth (one level per `indent_in`).
+    indent_depth: usize,
+    indent_unit: Rc<str>,
+    indent_levels: Rc<Vec<String>>,
+    indent_cols: Rc<Vec<u32>>,
     line_map: Option<&'a LineMap>,
     /// True after a `newline()` call: the indent string should be emitted
     /// before the next visible content. Margin lines (multiple newlines in
@@ -186,14 +212,17 @@ impl<'a> Emitter<'a> {
         comments: &'a [TypedComment],
         comment_index: &'a std::cell::Cell<usize>,
     ) -> Self {
-        let indent_unit = opts.indent.clone().unwrap_or_else(|| "\t".to_string());
+        let indent_unit_str = opts.indent.clone().unwrap_or_else(|| "\t".to_string());
+        let (indent_unit, indent_levels, indent_cols) = build_indent_table(&indent_unit_str);
         Self {
-            code: String::with_capacity(1024),
+            code: String::with_capacity(CODE_INIT_CAPACITY),
             col: 0,
-            mappings: Vec::new(),
+            mappings: Vec::with_capacity(MAPPINGS_INIT_CAPACITY),
             current_line: Vec::new(),
-            indent: String::new(),
+            indent_depth: 0,
             indent_unit,
+            indent_levels,
+            indent_cols,
             line_map: opts.line_map.as_ref(),
             pending_indent: false,
             comments,
@@ -215,8 +244,9 @@ impl<'a> Emitter<'a> {
 
     fn flush_indent(&mut self) {
         if self.pending_indent {
-            self.code.push_str(&self.indent);
-            self.col = self.indent.chars().count() as u32;
+            let depth = self.indent_depth;
+            self.code.push_str(&self.indent_levels[depth.min(self.indent_levels.len() - 1)]);
+            self.col = self.indent_cols[depth.min(self.indent_cols.len() - 1)];
             self.pending_indent = false;
         }
     }
@@ -232,6 +262,13 @@ impl<'a> Emitter<'a> {
                 self.col += 1;
             }
         }
+    }
+
+    fn write_display(&mut self, value: impl std::fmt::Display) {
+        self.flush_indent();
+        let start = self.code.len();
+        let _ = write!(self.code, "{}", value);
+        self.col += (self.code.len() - start) as u32;
     }
 
     fn newline(&mut self) {
@@ -253,12 +290,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn indent_in(&mut self) {
-        self.indent.push_str(&self.indent_unit);
+        self.indent_depth += 1;
     }
 
     fn indent_out(&mut self) {
-        let len = self.indent.len().saturating_sub(self.indent_unit.len());
-        self.indent.truncate(len);
+        self.indent_depth = self.indent_depth.saturating_sub(1);
     }
 
     /// Record a sourcemap mapping for a span at the current output column.
@@ -291,18 +327,7 @@ impl<'a> Emitter<'a> {
             }
             // Render into a child Emitter so we know its multi-line state
             // before emitting the margin.
-            let mut child = Emitter {
-                code: String::new(),
-                col: self.col,
-                mappings: Vec::new(),
-                current_line: Vec::new(),
-                indent: self.indent.clone(),
-                indent_unit: self.indent_unit.clone(),
-                line_map: self.line_map,
-                pending_indent: false,
-                comments: self.comments,
-                comment_index: self.comment_index,
-            };
+            let mut child = self.child_at_col(self.col);
             // Flush any comments that appear before this statement's start.
             // Emitted into the child so the indentation/margin logic below
             // accounts for them as part of the same statement block.
@@ -453,7 +478,9 @@ impl<'a> Emitter<'a> {
                 self.code.pop();
             }
             self.indent_out();
-            self.code.push_str(&self.indent);
+            let depth = self.indent_depth;
+            self.code
+                .push_str(&self.indent_levels[depth.min(self.indent_levels.len() - 1)]);
             self.write("}");
             return;
         }
@@ -777,18 +804,7 @@ impl<'a> Emitter<'a> {
         let mut prev_tag: Option<u32> = None;
         let mut prev_multiline = false;
         for member in &b.body {
-            let mut child = Emitter {
-                code: String::new(),
-                col: self.col,
-                mappings: Vec::new(),
-                current_line: Vec::new(),
-                indent: self.indent.clone(),
-                indent_unit: self.indent_unit.clone(),
-                line_map: self.line_map,
-                pending_indent: false,
-                comments: self.comments,
-                comment_index: self.comment_index,
-            };
+            let mut child = self.child_at_col(self.col);
             child.emit_class_member(member);
             let child_multiline = !child.mappings.is_empty();
             let tag = class_member_tag(member);
@@ -909,15 +925,22 @@ impl<'a> Emitter<'a> {
             // Pre-compute display string per named for wrap-length check.
             let names_str: Vec<String> = named.iter().map(|n| {
                 let imported = match &n.imported {
-                    ModuleExportName::Identifier(id) => id.name.clone(),
-                    ModuleExportName::String(s) => s.value.clone(),
+                    ModuleExportName::Identifier(id) => &id.name,
+                    ModuleExportName::String(s) => &s.value,
                 };
                 let prefix = if n.type_only { "type " } else { "" };
-                if imported == n.local.name {
-                    format!("{}{}", prefix, n.local.name)
+                let mut s = String::with_capacity(
+                    prefix.len() + imported.len() + n.local.name.len() + 4,
+                );
+                s.push_str(prefix);
+                if imported == &n.local.name {
+                    s.push_str(&n.local.name);
                 } else {
-                    format!("{}{} as {}", prefix, imported, n.local.name)
+                    s.push_str(imported);
+                    s.push_str(" as ");
+                    s.push_str(&n.local.name);
                 }
+                s
             }).collect();
             // Conservative wrap: switch to multi-line when there are
             // many named imports (≥7) — long lists wrap, short ones stay.
@@ -1336,14 +1359,16 @@ impl<'a> Emitter<'a> {
 
     /// Spawn a sub-emitter sharing `self`'s indent/line_map context. Used
     /// for the look-ahead measure pass in `emit_sequence`-shaped helpers.
-    fn child(&self) -> Emitter<'a> {
+    fn child_at_col(&self, col: u32) -> Emitter<'a> {
         Emitter {
-            code: String::new(),
-            col: 0,
-            mappings: Vec::new(),
+            code: String::with_capacity(CODE_INIT_CAPACITY),
+            col,
+            mappings: Vec::with_capacity(MAPPINGS_INIT_CAPACITY),
             current_line: Vec::new(),
-            indent: self.indent.clone(),
-            indent_unit: self.indent_unit.clone(),
+            indent_depth: self.indent_depth,
+            indent_unit: Rc::clone(&self.indent_unit),
+            indent_levels: Rc::clone(&self.indent_levels),
+            indent_cols: Rc::clone(&self.indent_cols),
             line_map: self.line_map,
             pending_indent: false,
             comments: self.comments,
@@ -1351,12 +1376,16 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn child(&self) -> Emitter<'a> {
+        self.child_at_col(0)
+    }
+
     /// Like `child()` but pre-indents one level. Used when the helper that
     /// will splice the child's output is about to call `indent_in()` — the
     /// child's interior newlines need to land at the post-indent column.
     fn child_indented(&self) -> Emitter<'a> {
         let mut c = self.child();
-        c.indent.push_str(&self.indent_unit);
+        c.indent_depth += 1;
         c
     }
 
@@ -1494,7 +1523,7 @@ impl<'a> Emitter<'a> {
                 if let Some(raw) = &n.raw {
                     self.write(raw);
                 } else if n.value.fract() == 0.0 && n.value.is_finite() {
-                    self.write(&(n.value as i64).to_string());
+                    self.write_display(n.value as i64);
                 } else {
                     self.write(&n.value.to_string());
                 }
