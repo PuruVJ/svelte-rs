@@ -7,7 +7,8 @@ use svelte_compiler::ParseOptions;
 #[ignore]
 fn imports_in_modules_script_is_typed() {
     let svelte = "<script>\n\timport { random } from './module.svelte';\n</script>\n";
-    let root = svelte_compiler::parse(svelte, ParseOptions::default()).expect("parse");
+    let ast = svelte_compiler::parse(svelte, ParseOptions::default()).expect("parse");
+    let root = ast.root();
 
     let instance = root.instance.as_ref().expect("instance script present");
     assert_eq!(instance.context, svelte_ast::ScriptContext::Default);
@@ -31,7 +32,8 @@ fn imports_in_modules_script_is_typed() {
 #[ignore]
 fn module_script_lands_in_module() {
     let svelte = "<script context=\"module\">\n\texport const meta = 'x';\n</script>\n";
-    let root = svelte_compiler::parse(svelte, ParseOptions::default()).expect("parse");
+    let ast = svelte_compiler::parse(svelte, ParseOptions::default()).expect("parse");
+    let root = ast.root();
     assert!(root.module.is_some(), "module script should populate Root.module");
     assert!(root.instance.is_none(), "no instance script");
 }
@@ -40,6 +42,7 @@ fn module_script_lands_in_module() {
 #[ignore]
 fn style_block_populates_root_css() {
     let svelte = "<p>hi</p>\n<style>\n\tp { color: red; }\n</style>\n";
-    let root = svelte_compiler::parse(svelte, ParseOptions::default()).expect("parse");
+    let ast = svelte_compiler::parse(svelte, ParseOptions::default()).expect("parse");
+    let root = ast.root();
     assert!(root.css.is_some(), "<style> should populate Root.css");
 }

@@ -17,9 +17,9 @@ use crate::scope::{ScopePtr, ScopeRootPtr};
 /// Output of `analyze_component` / `analyze_module`. Consumed by the
 /// transform phases (client / server).
 #[derive(Debug)]
-pub struct Analysis {
+pub struct Analysis<'a> {
     /// The parsed template (same as the input).
-    pub root: Root,
+    pub root: &'a Root<'a>,
     /// Scope of the instance script (or root scope if no `<script>`).
     pub instance: ScopePtr,
     /// Scope of the module script (or root scope if no `<script module>`).
@@ -55,7 +55,7 @@ pub struct Analysis {
     pub exports: Vec<String>,
 }
 
-impl Analysis {
+impl<'a> Analysis<'a> {
     /// True if the component's CSS contains any unscoped (`:global`)
     /// rules or `-global-` keyframes.
     pub fn has_global_css(&self) -> bool {

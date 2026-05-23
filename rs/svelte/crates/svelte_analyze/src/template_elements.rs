@@ -510,7 +510,7 @@ pub(crate) fn collect_child(
         FragmentChild::RegularElement(el) => {
             let idx = push_element(
                 NodeKind::RegularElement,
-                Some(el.name.clone()),
+                Some(el.name.to_string()),
                 &el.attributes,
                 parent,
                 existence,
@@ -530,7 +530,7 @@ pub(crate) fn collect_child(
             let own_existence = Existence::min(existence, Existence::Probable);
             let idx = push_element(
                 NodeKind::Component,
-                Some(c.name.clone()),
+                Some(c.name.to_string()),
                 &c.attributes,
                 parent,
                 own_existence,
@@ -968,7 +968,7 @@ fn describe_element(
                         }
                     }
                 }
-                info.attr_values.insert(attr.name.clone(), values);
+                info.attr_values.insert(attr.name.to_string(), values);
             }
             ElementAttribute::SpreadAttribute(_) => {
                 info.has_spread_attribute = true;
@@ -978,7 +978,7 @@ fn describe_element(
             }
             ElementAttribute::ClassDirective(c) => {
                 info.class_directives.insert(c.name.to_string());
-                info.classes.add_known(c.name.clone());
+                info.classes.add_known(c.name.to_string());
             }
             ElementAttribute::StyleDirective(_) => {
                 info.has_style_directive = true;

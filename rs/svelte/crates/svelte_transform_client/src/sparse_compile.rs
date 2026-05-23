@@ -12,7 +12,7 @@ use crate::walker::{analyze_script, fold_fragment_with_consts, scan_fragment_ass
 
 /// Full client compile for sparse-island shapes: direct JS when possible (no Program / print_typed).
 pub fn try_emit_sparse_islands_client_js(
-    root: &mut Root,
+    root: &mut Root<'_>,
     component_name: &str,
     bump: &CompileBump,
 ) -> Option<String> {

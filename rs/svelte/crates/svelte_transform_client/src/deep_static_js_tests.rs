@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use svelte_parse::parse;
+    use svelte_parse::parse_in_arena;
     use svelte_transform_shared::compile_bump::CompileBump;
 
     use crate::deep_static_js::try_emit_deep_static_walker_js;
@@ -11,13 +11,13 @@ mod tests {
     fn skip_static_subtree_direct_js() {
         let path = "/workspace/packages/svelte/tests/snapshot/samples/skip-static-subtree/index.svelte";
         let source = std::fs::read_to_string(path).unwrap();
-        let mut root = parse(&source, false).unwrap();
+        let bump = CompileBump::new();
+        let mut root = parse_in_arena(&bump.template, &source, false).unwrap();
         svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
         crate::static_html_cache::precompute_static_html_cache(&mut root);
 
         let assigned = scan_fragment_assignments(&root.fragment);
         let script = analyze_script_props_only(root.instance.as_ref(), &assigned).unwrap();
-        let bump = CompileBump::new();
         let js = try_emit_deep_static_walker_js(&root.fragment, "Skip_static_subtree", &script, &bump)
             .expect("deep static direct emit");
 

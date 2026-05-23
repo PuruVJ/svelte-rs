@@ -1660,6 +1660,7 @@ dependencies = [
 name = "svelte_ast"
 version = "0.0.0"
 dependencies = [
+ "bumpalo",
  "svelte_diagnostics",
  "svelte_js_ast",
 ]
@@ -1760,12 +1761,14 @@ dependencies = [
 name = "svelte_parse"
 version = "0.0.0"
 dependencies = [
+ "bumpalo",
  "oxc_allocator",
  "oxc_ast",
  "oxc_estree",
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",
+ "self_cell",
  "serde",
  "serde_json",
  "svelte_analyze",
@@ -1810,6 +1813,7 @@ dependencies = [
 name = "svelte_transform_client"
 version = "0.0.0"
 dependencies = [
+ "bumpalo",
  "svelte_ast",
  "svelte_codegen_js",
  "svelte_js_ast",
@@ -1821,6 +1825,7 @@ dependencies = [
 name = "svelte_transform_server"
 version = "0.0.0"
 dependencies = [
+ "bumpalo",
  "svelte_ast",
  "svelte_js_ast",
  "svelte_parse",

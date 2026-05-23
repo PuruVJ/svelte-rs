@@ -27,7 +27,7 @@ use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
-pub fn try_typed_client_walker(root: Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_client_walker(root: Root<'_>, component_name: &str) -> Option<Program> {
     try_typed_client_walker_with(root, component_name, false)
 }
 
@@ -61,7 +61,7 @@ fn current_walker_filename() -> Option<String> {
 /// simple body (single static element). Mirrors `head-missing`.
 fn emit_svelte_head_program(
     head: &svelte_ast::elements::SvelteHead,
-    others: &[&FragmentChild],
+    others: &[&FragmentChild<'_>],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -80,8 +80,8 @@ fn emit_svelte_head_program(
         return None;
     }
     enum HeadBody<'a> {
-        Static(&'a svelte_ast::elements::RegularElement),
-        Component(&'a svelte_ast::elements::Component),
+        Static(&'a svelte_ast::elements::RegularElement<'a>),
+        Component(&'a svelte_ast::elements::Component<'a>),
     }
     let head_body = match others[0] {
         FragmentChild::RegularElement(el) if is_element_fully_static(el) => HeadBody::Static(el),
@@ -324,7 +324,7 @@ fn emit_svelte_head_program(
 ///  <Component />` (top-level bare Component).
 fn emit_head_if_block_program(
     head: &svelte_ast::elements::SvelteHead,
-    body_component: &svelte_ast::elements::Component,
+    body_component: &svelte_ast::elements::Component<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -614,7 +614,7 @@ fn emit_head_if_block_program(
 /// ExpressionTag. Both interpolations become text anchors merged into a
 /// single template_effect block.
 fn emit_single_element_with_inner_and_trailing_expr_program(
-    outer: &svelte_ast::elements::RegularElement,
+    outer: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -663,7 +663,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
     let mut inner_parts: Vec<TextPart> = Vec::new();
     for c in &inner_el.fragment.nodes {
         match c {
-            FragmentChild::Text(t) => inner_parts.push(TextPart::Static(t.data.clone())),
+            FragmentChild::Text(t) => inner_parts.push(TextPart::Static(t.data.to_string())),
             FragmentChild::ExpressionTag(et) => {
                 inner_parts.push(TextPart::Expr(&et.expression))
             }
@@ -788,7 +788,7 @@ fn emit_single_element_with_inner_and_trailing_expr_program(
 /// `$.customizable_select(option_N, () => { ... append fragment ... })`.
 /// All options receive `option_N.value = option_N.__value = 'X'`.
 fn emit_select_with_rich_options_static(
-    select_el: &svelte_ast::elements::RegularElement,
+    select_el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -823,7 +823,7 @@ fn emit_select_with_rich_options_static(
     struct OptionInfo<'a> {
         value: Option<String>,
         rich_html: Option<String>,
-        children: &'a [FragmentChild],
+        children: &'a [FragmentChild<'a>],
     }
     let mut infos: Vec<OptionInfo> = Vec::new();
     for opt in &option_els {
@@ -1078,7 +1078,7 @@ fn emit_select_with_rich_options_static(
 /// duplicating that entire classifier subsystem here, we detect the
 /// fixture's exact shape and emit the upstream output verbatim.
 fn emit_rich_select_program(
-    root_fragment: &svelte_ast::fragment::Fragment,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
     _component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -1125,7 +1125,7 @@ fn emit_rich_select_program(
 ///   div fooBar={y()}, svg viewBox={y()}, custom-element fooBar={y()}.
 /// Emits the canonical output via Statement::Raw.
 fn emit_dynamic_attributes_casing_program(
-    root_fragment: &svelte_ast::fragment::Fragment,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     _script: &ScriptInfo,
 ) -> Option<Program> {
@@ -1185,7 +1185,7 @@ fn emit_dynamic_attributes_casing_program(
     Some(t::program(prog))
 }
 
-fn attr_single_expr(a: &svelte_ast::attributes::ElementAttribute) -> Option<Expression> {
+fn attr_single_expr(a: &svelte_ast::attributes::ElementAttribute<'_>) -> Option<Expression> {
     use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
     let attr = match a {
         ElementAttribute::Attribute(a) => a,
@@ -1714,7 +1714,7 @@ export default function Main($$anchor) {
 }"#;
 
 fn emit_boundary_pending_attribute_program(
-    snippet: &svelte_ast::blocks::SnippetBlock,
+    snippet: &svelte_ast::blocks::SnippetBlock<'_>,
     boundary: &svelte_ast::elements::SvelteBoundary,
     component_name: &str,
     script: &ScriptInfo,
@@ -2065,7 +2065,7 @@ fn emit_boundary_pending_attribute_program(
 /// upstream output where rich-optgroup wraps in `\$.customizable_select`
 /// + nests another `\$.customizable_select` for any rich `<option>` inside.
 fn emit_select_with_optgroup_rich(
-    root_fragment: &svelte_ast::fragment::Fragment,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -2132,7 +2132,7 @@ fn emit_select_with_optgroup_rich(
     // calls + text anchors + template_effect.
     // Returns (callback_body, template_html, has_set_text_calls).
     fn build_rich_callback<'a>(
-        children: &'a [FragmentChild],
+        children: &'a [FragmentChild<'a>],
         parent_var: &str,
         fragment_var: &str,
         anchor_var: &str,
@@ -2175,7 +2175,7 @@ fn emit_select_with_optgroup_rich(
     struct OgInfo<'a> {
         label: Option<String>,
         is_rich: bool,
-        children: &'a [FragmentChild],
+        children: &'a [FragmentChild<'a>],
     }
     let mut og_infos: Vec<OgInfo> = Vec::new();
     for og in &optgroup_els {
@@ -2404,10 +2404,10 @@ fn emit_select_with_optgroup_rich(
                                             // counter so a nested span
                                             // continues the naming.
                                             let elem_count = og_elem_used_names
-                                                .entry(child_el.name.clone())
+                                                .entry(child_el.name.to_string())
                                                 .or_insert(0);
                                             let elem_name = if *elem_count == 0 {
-                                                child_el.name.clone()
+                                                child_el.name.to_string()
                                             } else {
                                                 format!("{}_{}", child_el.name, elem_count)
                                             };
@@ -2457,7 +2457,7 @@ fn emit_select_with_optgroup_rich(
                                             let mut parts: Vec<TextPart> = Vec::new();
                                             for cc in &child_el.fragment.nodes {
                                                 match cc {
-                                                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                                                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                                                     FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
                                                     _ => return None,
                                                 }
@@ -2699,9 +2699,9 @@ fn emit_select_with_optgroup_rich(
                             tpl.push_str(&el.name);
                             tpl.push('>');
 
-                            let span_count = og_elem_used_names.entry(el.name.clone()).or_insert(0);
+                            let span_count = og_elem_used_names.entry(el.name.to_string()).or_insert(0);
                             let span_var_name = if *span_count == 0 {
-                                el.name.clone()
+                                el.name.to_string()
                             } else {
                                 format!("{}_{}", el.name, span_count)
                             };
@@ -2751,7 +2751,7 @@ fn emit_select_with_optgroup_rich(
                             let mut parts: Vec<TextPart> = Vec::new();
                             for cc in &el.fragment.nodes {
                                 match cc {
-                                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                                     FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
                                     _ => return None,
                                 }
@@ -3049,7 +3049,7 @@ fn emit_select_with_optgroup_rich(
                         );
                         delegated_events.push((
                             stripped.to_string(),
-                            tel_var.clone(),
+                            tel_var.to_string(),
                             handler,
                         ));
                     }
@@ -3157,7 +3157,7 @@ fn select_optgroup_var(idx: usize) -> String {
 ///   - trailing button gets `\$.delegated('click', button, handler)` +
 ///     module-level `\$.delegate(['click'])`
 fn emit_select_with_rich_reactive_and_trailing(
-    root_fragment: &svelte_ast::fragment::Fragment,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -3205,7 +3205,7 @@ fn emit_select_with_rich_reactive_and_trailing(
     struct OptInfo<'a> {
         value: Option<String>,
         is_rich: bool,
-        children: &'a [FragmentChild],
+        children: &'a [FragmentChild<'a>],
     }
     let mut infos: Vec<OptInfo> = Vec::new();
     for opt in &option_els {
@@ -3450,7 +3450,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         tpl.push_str(&child_el.name);
                         tpl.push('>');
                         let elem_name = if elem_var_local == 0 {
-                            child_el.name.clone()
+                            child_el.name.to_string()
                         } else {
                             format!("{}_{}", child_el.name, elem_var_local)
                         };
@@ -3501,7 +3501,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         let mut parts: Vec<TextPart> = Vec::new();
                         for cc in &child_el.fragment.nodes {
                             match cc {
-                                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                                 FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
                                 _ => return None,
                             }
@@ -3667,7 +3667,7 @@ fn emit_select_with_rich_reactive_and_trailing(
                         );
                         delegated_events.push((
                             stripped.to_string(),
-                            tel_var.clone(),
+                            tel_var.to_string(),
                             handler,
                         ));
                     }
@@ -3799,7 +3799,7 @@ fn rewrite_expr_for_state_helper(e: &Expression, state: &HashSet<String>) -> Exp
 /// component in legacy `$.push($$props, false) ... $.pop()` so that
 /// runtime hydration recognizes it as a Svelte 4-shape custom element.
 fn emit_single_static_custom_element_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     module_stmts: &[Statement],
 ) -> Option<Program> {
@@ -5144,10 +5144,10 @@ fn emit_tree_program(
 }
 
 /// Build `[tagname, attrs_or_null, ...children]` for a static element.
-fn element_to_tree(el: &RegularElement) -> Option<Expression> {
+fn element_to_tree(el: &RegularElement<'_>) -> Option<Expression> {
     let mut parts: Vec<Expression> = Vec::new();
     parts.push(Expression::Literal(Box::new(Literal::String(StringLiteral {
-        value: Cow::Owned(el.name.clone()),
+        value: Cow::Owned(el.name.to_string()),
         raw: None,
         span: Span::ZERO,
     }))));
@@ -5183,7 +5183,7 @@ fn element_to_tree(el: &RegularElement) -> Option<Expression> {
                 };
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: Cow::Owned(a.name.clone()),
+                        name: Cow::Owned(a.name.to_string()),
                         span: Span::ZERO,
                     }),
                     value,
@@ -5294,7 +5294,7 @@ fn emit_class_only_program(component_name: &str, script: &ScriptInfo) -> Option<
 // ---------------------------------------------------------------------------
 
 fn emit_single_component_program(
-    c: &Component,
+    c: &Component<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -5319,7 +5319,7 @@ fn emit_single_component_program(
                             match &parts[0] {
                                 AttributeValuePart::Text(t) => {
                                     Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                        value: Cow::Owned(t.data.clone()),
+                                        value: Cow::Owned(t.data.to_string()),
                                         raw: None,
                                         span: Span::ZERO,
                                     })))
@@ -5341,7 +5341,7 @@ fn emit_single_component_program(
                 let shorthand = matches!(&value, Expression::Identifier(i) if i.name == a.name);
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: Cow::Owned(a.name.clone()),
+                        name: Cow::Owned(a.name.to_string()),
                         span: Span::ZERO,
                     }),
                     value,
@@ -5388,7 +5388,7 @@ fn emit_single_component_program(
                                 if let AttributeValue::Many(parts) = &attr.value {
                                     if parts.len() == 1 {
                                         if let AttributeValuePart::Text(t) = &parts[0] {
-                                            return Some(t.data.clone());
+                                            return Some(t.data.to_string());
                                         }
                                     }
                                 }
@@ -5683,7 +5683,7 @@ fn emit_single_component_program(
         let mut parts: Vec<TextPart> = Vec::new();
         for child in &c.fragment.nodes {
             match child {
-                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                 FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
                 _ => return None,
             }
@@ -5916,11 +5916,11 @@ fn strip_outer_await(e: &Expression) -> Expression {
 ///   $.template_effect(($0) => $.set_text(TEXT, $0), void 0, [() => INNER_EXPR]);
 ///   $.append($$anchor, TEXT);
 fn emit_async_branch_body(
-    fragment: &svelte_ast::fragment::Fragment,
+    fragment: &svelte_ast::fragment::Fragment<'_>,
     text_name: &str,
 ) -> Option<Vec<Statement>> {
     // Find the first non-whitespace child.
-    let non_ws: Vec<&FragmentChild> = fragment
+    let non_ws: Vec<&FragmentChild<'_>> = fragment
         .nodes
         .iter()
         .filter(|c| match c {
@@ -5989,7 +5989,7 @@ fn emit_async_branch_body(
 /// element must be either fully static or have only dyn attributes
 /// (no events, binds, slots, blocks).
 fn emit_multi_element_branch_body(
-    non_ws: &[&FragmentChild],
+    non_ws: &[&FragmentChild<'_>],
     roots: &mut Vec<Statement>,
     root_idx: &mut usize,
     elem_var_idx: &mut usize,
@@ -6005,7 +6005,7 @@ fn emit_multi_element_branch_body(
 }
 
 fn emit_multi_element_branch_body_with_context(
-    non_ws: &[&FragmentChild],
+    non_ws: &[&FragmentChild<'_>],
     roots: &mut Vec<Statement>,
     root_idx: &mut usize,
     elem_var_idx: &mut usize,
@@ -6141,7 +6141,7 @@ fn emit_multi_element_branch_body_with_context(
                     vec![
                         t::id_owned(var.to_string()),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: Cow::Owned(attr.name.clone()),
+                            value: Cow::Owned(attr.name.to_string()),
                             raw: None,
                             span: Span::ZERO,
                         }))),
@@ -6190,7 +6190,7 @@ fn emit_multi_element_branch_body_with_context(
 /// text-anchor var per element, and combines all set_text calls into a
 /// single $.template_effect block.
 fn emit_multi_element_each_body(
-    non_ws: &[&FragmentChild],
+    non_ws: &[&FragmentChild<'_>],
     roots: &mut Vec<Statement>,
     root_idx: &mut usize,
     elem_var_idx: &mut usize,
@@ -6277,7 +6277,7 @@ fn emit_multi_element_each_body(
         let mut parts: Vec<TextPart> = Vec::new();
         for c in &el.fragment.nodes {
             match c {
-                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                 FragmentChild::ExpressionTag(et) => {
                     parts.push(TextPart::Expr(&et.expression))
                 }
@@ -6361,7 +6361,7 @@ fn emit_multi_element_each_body(
 }
 
 fn emit_vanilla_branch_body(
-    fragment: &svelte_ast::fragment::Fragment,
+    fragment: &svelte_ast::fragment::Fragment<'_>,
     text_name: &str,
     roots: &mut Vec<Statement>,
     root_idx: &mut usize,
@@ -6374,7 +6374,7 @@ fn emit_vanilla_branch_body(
 }
 
 fn emit_vanilla_branch_body_with_context(
-    fragment: &svelte_ast::fragment::Fragment,
+    fragment: &svelte_ast::fragment::Fragment<'_>,
     text_name: &str,
     roots: &mut Vec<Statement>,
     root_idx: &mut usize,
@@ -6382,7 +6382,7 @@ fn emit_vanilla_branch_body_with_context(
     props_destructured: &HashSet<String>,
     legacy_prop_names: &HashSet<String>,
 ) -> Option<Vec<Statement>> {
-    let non_ws: Vec<&FragmentChild> = fragment
+    let non_ws: Vec<&FragmentChild<'_>> = fragment
         .nodes
         .iter()
         .filter(|c| match c {
@@ -6488,7 +6488,7 @@ fn emit_vanilla_branch_body_with_context(
                 let mut parts: Vec<TextPart> = Vec::new();
                 for c in &el.fragment.nodes {
                     match c {
-                        FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                        FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                         FragmentChild::ExpressionTag(et) => {
                             parts.push(TextPart::Expr(&et.expression))
                         }
@@ -6599,7 +6599,7 @@ fn emit_vanilla_branch_body_with_context(
                         if let AttributeValue::Many(parts) = &attr.value {
                             if parts.len() == 1 {
                                 if let AttributeValuePart::Text(t) = &parts[0] {
-                                    slot_name = t.data.clone();
+                                    slot_name = t.data.to_string();
                                 }
                             }
                         }
@@ -6676,7 +6676,7 @@ fn emit_vanilla_branch_body_with_context(
 /// - optional text-only alternate,
 /// - no script reactivity beyond plain `let X = INIT` (preserved as-is).
 fn emit_single_vanilla_if_program(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -7112,7 +7112,7 @@ fn emit_top_level_render_tag_program(
 /// wrapper (so the runtime fills the element rather than placing nodes
 /// before an anchor comment). Mirrors `raw-empty`.
 fn emit_single_element_wrapping_html_tag_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -7516,7 +7516,7 @@ fn emit_top_level_single_expression_program(
 /// no Component props/children, only whitespace text/comments around
 /// the inner Component.
 fn emit_single_element_with_component_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -7670,7 +7670,7 @@ fn emit_single_element_with_component_program(
 /// The static rest stays in the template. Mirrors `no-reset-snippet` and
 /// `no-reset-debug`.
 fn emit_single_element_with_inner_snippet_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -7689,34 +7689,24 @@ fn emit_single_element_with_inner_snippet_program(
     // (must be fully static after removal).
     let mut snippets: Vec<&svelte_ast::blocks::SnippetBlock> = Vec::new();
     let mut debug_tags: Vec<&svelte_ast::tags::DebugTag> = Vec::new();
-    let mut rest_nodes: Vec<FragmentChild> = Vec::new();
     for n in &el.fragment.nodes {
         match n {
             FragmentChild::SnippetBlock(sb) => snippets.push(sb),
             FragmentChild::DebugTag(dt) => debug_tags.push(dt),
-            other => rest_nodes.push(other.clone()),
+            _ => {}
         }
     }
     if snippets.is_empty() && debug_tags.is_empty() {
         return None;
     }
-    // After snippet removal, the rest must form a fully-static body.
-    // Build a temporary element with only rest nodes to reuse static-check.
-    let rest_el = svelte_ast::elements::RegularElement {
-        fragment: svelte_ast::fragment::Fragment {
-            nodes: rest_nodes,
-            ..el.fragment.clone()
-        },
-        ..el.clone()
-    };
-    if !is_element_fully_static(&rest_el) {
+    if !fragment_excluding_snippets_debug_is_static(&el.fragment) {
         return None;
     }
 
     // Build template HTML (snippet-free).
     let mut html = String::new();
     let mut needs = false;
-    serialize_element_to_html(&rest_el, &mut html, &mut needs)?;
+    serialize_element_to_html_omit_snippets_debug(el, &mut html, &mut needs)?;
 
     // Snippet declarations as a block.
     let mut snippet_block: Vec<Statement> = Vec::new();
@@ -7916,7 +7906,7 @@ fn collapse_template_inter_element_ws(s: &str) -> String {
 
 /// True iff the element has only static attributes (no spread, no
 /// directives, no dynamic values).
-fn is_element_static_attrs(el: &svelte_ast::elements::RegularElement) -> bool {
+fn is_element_static_attrs(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     for a in &el.attributes {
         match a {
@@ -7943,7 +7933,7 @@ fn is_element_static_attrs(el: &svelte_ast::elements::RegularElement) -> bool {
 /// whitespace, each with a fully-static single-element consequent. Mirrors
 /// `if-block-anchor`.
 fn emit_single_element_wrapping_ifs_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -7976,9 +7966,9 @@ fn emit_single_element_wrapping_ifs_program(
     // Body slots: mixture of StaticEl, StaticText, If — same gap-aware
     // approach as `emit_top_level_multi_if_program`.
     enum Slot<'a> {
-        StaticEl(&'a svelte_ast::elements::RegularElement),
+        StaticEl(&'a svelte_ast::elements::RegularElement<'a>),
         StaticText(String),
-        If(&'a svelte_ast::blocks::IfBlock),
+        If(&'a svelte_ast::blocks::IfBlock<'a>),
     }
     let mut slots: Vec<Slot> = Vec::new();
     let mut gap_after: Vec<bool> = Vec::new();
@@ -8354,7 +8344,7 @@ pub(crate) struct TopLevelMultiIfEmit {
 }
 
 pub(crate) fn emit_top_level_multi_if_program(
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -8363,7 +8353,7 @@ pub(crate) fn emit_top_level_multi_if_program(
 }
 
 pub(crate) fn emit_top_level_multi_if_parts(
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     _component_name: &str,
     script: &ScriptInfo,
 ) -> Option<TopLevelMultiIfEmit> {
@@ -8377,10 +8367,10 @@ pub(crate) fn emit_top_level_multi_if_parts(
     // Allow nodes that are either IfBlock (with constraints) or fully-static
     // RegularElement. Track per-slot kind via an enum.
     enum Slot<'a> {
-        StaticEl(&'a svelte_ast::elements::RegularElement),
+        StaticEl(&'a svelte_ast::elements::RegularElement<'a>),
         StaticText(String),
-        If(&'a svelte_ast::blocks::IfBlock),
-        Each(&'a svelte_ast::blocks::EachBlock),
+        If(&'a svelte_ast::blocks::IfBlock<'a>),
+        Each(&'a svelte_ast::blocks::EachBlock<'a>),
         /// `{LITERAL}` ExpressionTag with literal-foldable value. Becomes a
         /// text anchor whose `nodeValue` is set in the body.
         LiteralAnchor(String),
@@ -8388,36 +8378,36 @@ pub(crate) fn emit_top_level_multi_if_parts(
         Html(&'a svelte_ast::tags::HtmlTag),
         /// Bare `<Component {...attrs} />`. Becomes a `<!>` anchor +
         /// `Component(node, {...props})` body.
-        Component(&'a svelte_ast::elements::Component),
+        Component(&'a svelte_ast::elements::Component<'a>),
         /// `<TAG ATTRS>{@html EXPR}</TAG>` — static element wrapping a
         /// single HtmlTag. Emits empty `<TAG></TAG>` template + body
         /// `var X = ...; $.html(X, () => EXPR, true); $.reset(X);`.
-        ElementWithHtml(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::tags::HtmlTag),
+        ElementWithHtml(&'a svelte_ast::elements::RegularElement<'a>, &'a svelte_ast::tags::HtmlTag),
         /// Static-body element with one or more event directives (`on:click`
         /// etc). Emits `<TAG>body</TAG>` template + `var X = ...; $.event(...);`.
-        ElementWithEvents(&'a svelte_ast::elements::RegularElement),
+        ElementWithEvents(&'a svelte_ast::elements::RegularElement<'a>),
         /// Element with one or more dynamic attributes (`<div id={x}>`) and
         /// static body. Emits `<TAG STATIC_ATTRS>body</TAG>` template +
         /// `var X = ...; $.template_effect(() => $.set_attribute(...))`.
-        DynamicEl(&'a svelte_ast::elements::RegularElement),
+        DynamicEl(&'a svelte_ast::elements::RegularElement<'a>),
         /// Element with one or more spread attributes + static body. Emits
         /// `var X = ...; $.attribute_effect(X, () => ({ ...spread }));`.
-        ElementWithSpread(&'a svelte_ast::elements::RegularElement),
+        ElementWithSpread(&'a svelte_ast::elements::RegularElement<'a>),
         /// `<TAG ATTRS><slot/></TAG>` — static element wrapping a single
         /// SlotElement. Emits `<TAG><!></TAG>` template + body with
         /// `var X = ...; var node = $.child(X); $.slot(node, $$props,
         /// 'NAME', {}, null); $.reset(X);`.
-        ElementWithSlot(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::elements::SlotElement),
+        ElementWithSlot(&'a svelte_ast::elements::RegularElement<'a>, &'a svelte_ast::elements::SlotElement<'a>),
         /// `<TAG ATTRS>Hello {name}!</TAG>` — element with text-only body
         /// (Text + ExpressionTag, at least one non-literal). Emits
         /// `<TAG> </TAG>` template + body `var X = ...; var text = $.child(X);
         /// $.reset(X);` and a template_effect for set_text.
-        TextAnchorEl(&'a svelte_ast::elements::RegularElement),
+        TextAnchorEl(&'a svelte_ast::elements::RegularElement<'a>),
         /// `<TAG ATTRS>{#each ...}{/each}</TAG>` — element wrapping a single
         /// each-block ("controlled" — runtime manages the children, no
         /// `<!>` anchor inside). Emits `<TAG></TAG>` template + body
         /// `var X = ...; $.each(X, FLAG | IS_CONTROLLED, ...); $.reset(X);`.
-        ElementWithEach(&'a svelte_ast::elements::RegularElement, &'a svelte_ast::blocks::EachBlock),
+        ElementWithEach(&'a svelte_ast::elements::RegularElement<'a>, &'a svelte_ast::blocks::EachBlock<'a>),
     }
     let mut slots: Vec<Slot> = Vec::new();
     // `gap_after[i]` is true iff there was whitespace text (or any
@@ -9351,7 +9341,7 @@ pub(crate) fn emit_top_level_multi_if_parts(
                         t::member_id(t::id_dollar(), "event"),
                         vec![
                             Expression::Literal(Box::new(Literal::String(StringLiteral {
-                                value: Cow::Owned(od.name.clone()),
+                                value: Cow::Owned(od.name.to_string()),
                                 raw: None,
                                 span: Span::ZERO,
                             }))),
@@ -9573,7 +9563,7 @@ pub(crate) fn emit_top_level_multi_if_parts(
                 let mut parts: Vec<TextPart> = Vec::new();
                 for child in &el.fragment.nodes {
                     match child {
-                        FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                        FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                         FragmentChild::ExpressionTag(et) => {
                             parts.push(TextPart::Expr(&et.expression))
                         }
@@ -9598,7 +9588,7 @@ pub(crate) fn emit_top_level_multi_if_parts(
                             if let AttributeValue::Many(parts) = &attr.value {
                                 if parts.len() == 1 {
                                     if let AttributeValuePart::Text(t) = &parts[0] {
-                                        slot_name = t.data.clone();
+                                        slot_name = t.data.to_string();
                                     }
                                 }
                             }
@@ -9697,7 +9687,7 @@ pub(crate) fn emit_top_level_multi_if_parts(
                                         match &parts[0] {
                                             AttributeValuePart::Text(t) => Expression::Literal(
                                                 Box::new(Literal::String(StringLiteral {
-                                                    value: Cow::Owned(t.data.clone()),
+                                                    value: Cow::Owned(t.data.to_string()),
                                                     raw: None,
                                                     span: Span::ZERO,
                                                 })),
@@ -9719,7 +9709,7 @@ pub(crate) fn emit_top_level_multi_if_parts(
                                 matches!(&value, Expression::Identifier(id) if id.name == attr.name);
                             props.push(ObjectMember::Property(Box::new(Property {
                                 key: PropertyKey::Identifier(Identifier {
-                                    name: Cow::Owned(attr.name.clone()),
+                                    name: Cow::Owned(attr.name.to_string()),
                                     span: Span::ZERO,
                                 }),
                                 value,
@@ -10394,7 +10384,7 @@ fn program_from_top_level_multi_if(
 /// Constrained to: no key, no `:else`, single-element fully-static inner
 /// with text-only body (text or `{VAR}`). Mirrors the `each-block` fixture.
 fn emit_single_element_wrapping_each_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -10936,7 +10926,7 @@ fn expression_has_any_binding(
 /// Many with ExpressionTag part) + static body. Other attrs may be
 /// static. No directives (events, binds) allowed in this slot type —
 /// those route to ElementWithEvents / bind:this paths.
-fn element_static_body_with_dyn_attrs(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_static_body_with_dyn_attrs(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     let mut has_dyn = false;
     for a in &el.attributes {
@@ -10970,7 +10960,7 @@ fn element_static_body_with_dyn_attrs(el: &svelte_ast::elements::RegularElement)
 
 /// True iff the element has at least one SpreadAttribute + (optional)
 /// static attrs and a fully-static body. Used by `Slot::ElementWithSpread`.
-fn element_static_body_with_spread(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_static_body_with_spread(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     let mut has_spread = false;
     for a in &el.attributes {
@@ -11003,7 +10993,7 @@ fn element_static_body_with_spread(el: &svelte_ast::elements::RegularElement) ->
 /// True iff the element has only static attributes plus at least one
 /// `OnDirective` (or `on*` Attribute), and a fully-static body. Used
 /// by `Slot::ElementWithEvents`.
-fn element_static_body_with_events(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_static_body_with_events(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     let mut has_event = false;
     for a in &el.attributes {
@@ -11110,7 +11100,7 @@ fn rewrite_stmt_prop_writes(s: &Statement, legacy_props: &HashSet<String>) -> St
 }
 
 /// Walk a fragment looking for any reference to a given identifier name.
-fn fragment_uses_identifier(f: &svelte_ast::fragment::Fragment, name: &str) -> bool {
+fn fragment_uses_identifier(f: &svelte_ast::fragment::Fragment<'_>, name: &str) -> bool {
     f.nodes.iter().any(|n| node_uses_identifier(n, name))
 }
 
@@ -11118,8 +11108,8 @@ fn fragment_uses_identifier(f: &svelte_ast::fragment::Fragment, name: &str) -> b
 /// variable for this fragment. Returns true for:
 /// - top-level Text or ExpressionTag (always extracted)
 /// - text-only RegularElement with at least one non-literal ExpressionTag
-fn fragment_emits_text_var(f: &svelte_ast::fragment::Fragment) -> bool {
-    let non_ws: Vec<&FragmentChild> = f
+fn fragment_emits_text_var(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
+    let non_ws: Vec<&FragmentChild<'_>> = f
         .nodes
         .iter()
         .filter(|c| match c {
@@ -11146,9 +11136,9 @@ fn fragment_emits_text_var(f: &svelte_ast::fragment::Fragment) -> bool {
 /// RegularElement contributes one text var. Returns None if the fragment
 /// can't be handled as a multi-element each body.
 fn multi_element_each_text_count(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
 ) -> Option<usize> {
-    let non_ws: Vec<&FragmentChild> = f
+    let non_ws: Vec<&FragmentChild<'_>> = f
         .nodes
         .iter()
         .filter(|c| match c {
@@ -11181,8 +11171,8 @@ fn multi_element_each_text_count(
 /// `root_N` template for this fragment. Returns true when the body is a
 /// single RegularElement (which always materializes a `var root_N =
 /// \$.from_html(...)`).
-fn fragment_emits_root_template(f: &svelte_ast::fragment::Fragment) -> bool {
-    let non_ws: Vec<&FragmentChild> = f
+fn fragment_emits_root_template(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
+    let non_ws: Vec<&FragmentChild<'_>> = f
         .nodes
         .iter()
         .filter(|c| match c {
@@ -11197,7 +11187,7 @@ fn fragment_emits_root_template(f: &svelte_ast::fragment::Fragment) -> bool {
     matches!(non_ws[0], FragmentChild::RegularElement(_))
 }
 
-fn node_uses_identifier(n: &FragmentChild, name: &str) -> bool {
+fn node_uses_identifier(n: &FragmentChild<'_>, name: &str) -> bool {
     match n {
         FragmentChild::ExpressionTag(et) => expr_uses_identifier(&et.expression, name),
         FragmentChild::HtmlTag(ht) => expr_uses_identifier(&ht.expression, name),
@@ -11343,7 +11333,7 @@ fn rewrite_get_for_each_var(e: &Expression, var_name: &str) -> Expression {
 /// — single element with one or more spread attributes (and optional
 /// static attrs), static body. Mirrors `removes-undefined-attributes`.
 fn emit_single_element_with_spread_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -11503,7 +11493,7 @@ fn emit_single_element_with_spread_program(
 /// — single element with a `bind:this` directive and fully-static body.
 /// Other attributes must be static. Mirrors `element-ref`.
 fn emit_single_element_with_bind_this_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -11735,7 +11725,7 @@ fn emit_single_element_with_bind_this_program(
 /// `nodeValue` of a text-anchor at the head of the body. Mirrors
 /// `expression-sibling`, `safari-borking`.
 fn emit_single_element_with_folded_prefix_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -11942,7 +11932,7 @@ fn emit_single_element_with_folded_prefix_program(
 }
 
 fn emit_single_dynamic_element_program(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -12079,7 +12069,7 @@ fn emit_single_dynamic_element_program(
             // surrounding static text.
             for n in &el.fragment.nodes {
                 let s = match n {
-                    FragmentChild::Text(t) => Some(t.data.clone()),
+                    FragmentChild::Text(t) => Some(t.data.to_string()),
                     FragmentChild::ExpressionTag(et) => literal_to_template_string(&et.expression),
                     _ => None,
                 };
@@ -12119,7 +12109,7 @@ fn emit_single_dynamic_element_program(
         let mut parts: Vec<TextPart<'static>> = Vec::new();
         for n in &el.fragment.nodes {
             match n {
-                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                 FragmentChild::ExpressionTag(et) => {
                     let rewritten = rewrite_expr(&et.expression);
                     // Leak the expression to extend its lifetime to 'static
@@ -12314,7 +12304,7 @@ fn emit_single_dynamic_element_program(
 ///         else \$\$render(alternate, -1); });
 /// });`
 fn emit_single_async_if_program(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -12461,7 +12451,7 @@ fn emit_single_async_if_program(
 
 /// True iff the fragment contains a `{@const X = ...}` whose initializer has
 /// a top-level `await`.
-fn fragment_has_const_await_client(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_has_const_await_client(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(|n| {
         if let FragmentChild::ConstTag(ct) = n {
             ct.declaration
@@ -12493,7 +12483,7 @@ fn fragment_has_const_await_client(f: &svelte_ast::fragment::Fragment) -> bool {
 /// When any const init has an IIFE pattern (call of arrow-function), wraps
 /// the function body in `$.push($$props, true); ... $.pop();`.
 fn emit_async_const_chain_program(
-    if_blocks: &[&svelte_ast::blocks::IfBlock],
+    if_blocks: &[&svelte_ast::blocks::IfBlock<'_>],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -12695,7 +12685,7 @@ fn strip_paren(e: &Expression) -> &Expression {
 }
 
 fn build_async_const_consequent(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     ai: &AsyncInfo,
     derived_bindings: &HashSet<String>,
     promises_idx: &mut usize,
@@ -12930,7 +12920,7 @@ fn rewrite_const_chain_init(
 }
 
 fn emit_const_async_if_program(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -13294,7 +13284,7 @@ impl ChainCounters {
 /// shape). Each IfBlock either gets a `$.async(...)` wrap (when it has
 /// blockers and/or async-test) or stays as a plain `{}` block.
 fn emit_async_if_chain_program(
-    if_blocks: &[&svelte_ast::blocks::IfBlock],
+    if_blocks: &[&svelte_ast::blocks::IfBlock<'_>],
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -13392,7 +13382,7 @@ fn emit_async_if_chain_program(
 /// `nested` = true when this if-block is itself the result of an elseif
 /// break-out (different node-variable naming from a top-level $.async).
 fn emit_async_if_block(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     node_name: &str,
     ai: &AsyncInfo,
     derived_bindings: &HashSet<String>,
@@ -13638,7 +13628,7 @@ fn is_only_blocker_derived(
 /// fully-static body (no expression tags, blocks, components, directives,
 /// or nested reactive content). Used by emitters that pass the element
 /// verbatim into the template HTML.
-fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
+fn is_element_fully_static(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     if el.metadata.is_static_element {
         return true;
     }
@@ -13682,8 +13672,8 @@ fn is_element_fully_static(el: &svelte_ast::elements::RegularElement) -> bool {
 }
 
 /// Skip leading/trailing whitespace-only text and comments (no allocation).
-fn trim_boundary_whitespace_children(nodes: &[FragmentChild]) -> &[FragmentChild] {
-    let is_boundary_skip = |n: &FragmentChild| match n {
+fn trim_boundary_whitespace_children<'a>(nodes: &'a [FragmentChild<'a>]) -> &'a [FragmentChild<'a>] {
+    let is_boundary_skip = |n: &FragmentChild<'_>| match n {
         FragmentChild::Text(t) => t.data.trim().is_empty(),
         FragmentChild::Comment(_) => true,
         _ => false,
@@ -13700,7 +13690,7 @@ fn trim_boundary_whitespace_children(nodes: &[FragmentChild]) -> &[FragmentChild
 }
 
 /// True when the element subtree contains `{expr}` or `{@html ...}` (any depth).
-fn element_tree_has_expr_or_html(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_tree_has_expr_or_html(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     for n in trim_boundary_whitespace_children(&el.fragment.nodes) {
         match n {
             FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => return true,
@@ -13715,7 +13705,7 @@ fn element_tree_has_expr_or_html(el: &svelte_ast::elements::RegularElement) -> b
     false
 }
 
-pub(crate) fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement) -> bool {
+pub(crate) fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     if element_has_reactive_attr(child_el) {
         return true;
     }
@@ -13725,11 +13715,11 @@ pub(crate) fn element_child_is_deep_reactive(child_el: &svelte_ast::elements::Re
     fragment_has_deep_reactive(&child_el.fragment)
 }
 
-pub(crate) fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment) -> bool {
+pub(crate) fn fragment_has_deep_reactive(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(node_has_deep_reactive)
 }
 
-fn node_has_deep_reactive(n: &FragmentChild) -> bool {
+fn node_has_deep_reactive(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => true,
         FragmentChild::RegularElement(el) => {
@@ -13742,7 +13732,7 @@ fn node_has_deep_reactive(n: &FragmentChild) -> bool {
     }
 }
 
-fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     let is_custom = el.name.contains('-');
     for a in &el.attributes {
         match a {
@@ -13789,7 +13779,7 @@ fn element_has_reactive_attr(el: &svelte_ast::elements::RegularElement) -> bool 
 /// Returns None for cases we don't handle — the caller will fall through
 /// to the regular walker.
 fn emit_select_rich_content_program(
-    root_fragment: &svelte_ast::fragment::Fragment,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -13981,10 +13971,10 @@ impl SelectCtx {
 /// Builds the snippet body assuming it's a single `<option>...</option>`.
 /// Allocates a root_N template + emits the arrow body for the snippet.
 fn build_snippet_body(
-    fragment: &svelte_ast::fragment::Fragment,
+    fragment: &svelte_ast::fragment::Fragment<'_>,
     ctx: &mut SelectCtx,
 ) -> Option<Vec<Statement>> {
-    let non_ws: Vec<&FragmentChild> = fragment
+    let non_ws: Vec<&FragmentChild<'_>> = fragment
         .nodes
         .iter()
         .filter(|n| match n {
@@ -14027,7 +14017,7 @@ fn build_snippet_body(
 
 /// Returns the simple text content of an `<option>...</option>` when its
 /// only child is a single Text node. Returns None for any other shape.
-fn option_text_content(el: &svelte_ast::elements::RegularElement) -> Option<String> {
+fn option_text_content(el: &svelte_ast::elements::RegularElement<'_>) -> Option<String> {
     let mut text = String::new();
     for n in &el.fragment.nodes {
         if let FragmentChild::Text(t) = n {
@@ -14042,7 +14032,7 @@ fn option_text_content(el: &svelte_ast::elements::RegularElement) -> Option<Stri
 /// Returns true iff a top-level snippet block precedes the i-th select
 /// (i is 0-based among `<select>` elements).
 fn top_selects_had_snippet_before(
-    root: &svelte_ast::fragment::Fragment,
+    root: &svelte_ast::fragment::Fragment<'_>,
     i: usize,
 ) -> bool {
     let mut seen_selects = 0usize;
@@ -14069,7 +14059,7 @@ fn top_selects_had_snippet_before(
 /// body_statements) where the body uses `select_var` as the binding name
 /// for this select.
 fn lower_top_select(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
 ) -> Option<(String, Vec<Statement>)> {
@@ -14127,7 +14117,7 @@ fn lower_top_select(
     None
 }
 
-fn build_static_attrs(el: &svelte_ast::elements::RegularElement) -> String {
+fn build_static_attrs(el: &svelte_ast::elements::RegularElement<'_>) -> String {
     let mut out = String::new();
     for a in &el.attributes {
         if let ElementAttribute::Attribute(attr) = a {
@@ -14154,10 +14144,10 @@ enum OptionShape<'a> {
     /// `<option>{var}</option>` — single ExpressionTag.
     SingleExpr(&'a Expression),
     /// `<option><span>...</span></option>` etc. — rich content.
-    RichContent(&'a [FragmentChild]),
+    RichContent(&'a [FragmentChild<'a>]),
 }
 
-fn classify_option_body<'a>(opt: &'a svelte_ast::elements::RegularElement) -> Option<OptionShape<'a>> {
+fn classify_option_body<'a>(opt: &'a svelte_ast::elements::RegularElement<'a>) -> Option<OptionShape<'a>> {
     let non_ws: Vec<&FragmentChild> = opt
         .fragment
         .nodes
@@ -14196,7 +14186,7 @@ fn classify_option_body<'a>(opt: &'a svelte_ast::elements::RegularElement) -> Op
 
 /// `<select><option>BODY</option></select>` → single-option select.
 fn lower_select_with_option(
-    opt: &svelte_ast::elements::RegularElement,
+    opt: &svelte_ast::elements::RegularElement<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
     attrs: &str,
@@ -14252,7 +14242,7 @@ fn lower_select_with_option(
 }
 
 fn build_static_attrs_excluding(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     exclude: &[&str],
 ) -> String {
     let mut out = String::new();
@@ -14277,7 +14267,7 @@ fn build_static_attrs_excluding(
     out
 }
 
-fn option_has_html_only(nodes: &[FragmentChild]) -> bool {
+fn option_has_html_only(nodes: &[FragmentChild<'_>]) -> bool {
     let non_ws: Vec<&FragmentChild> = nodes
         .iter()
         .filter(|n| match n {
@@ -14289,7 +14279,7 @@ fn option_has_html_only(nodes: &[FragmentChild]) -> bool {
     non_ws.len() == 1 && matches!(non_ws[0], FragmentChild::HtmlTag(_))
 }
 
-fn option_has_value_attr_and_text_anchor(opt: &svelte_ast::elements::RegularElement) -> bool {
+fn option_has_value_attr_and_text_anchor(opt: &svelte_ast::elements::RegularElement<'_>) -> bool {
     // Option has `value=` AND its content ends with a non-whitespace text
     // node after the rich opener — e.g. `<em>Italic</em> text`.
     if find_option_value_attr(opt).is_none() {
@@ -14310,7 +14300,7 @@ fn option_has_value_attr_and_text_anchor(opt: &svelte_ast::elements::RegularElem
 
 fn build_customizable_select_body_with_html(
     target_var: &str,
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     ctx: &mut SelectCtx,
 ) -> Option<Statement> {
     // For `<option>{@html '<strong>Bold HTML</strong>'}</option>`-style:
@@ -14387,7 +14377,7 @@ fn build_customizable_select_body_with_html(
 
 fn build_customizable_select_body_with_next(
     target_var: &str,
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     ctx: &mut SelectCtx,
 ) -> Option<Statement> {
     // `<option value="a"><em>Italic</em> text</option>` shape: rich body
@@ -14440,14 +14430,14 @@ fn build_customizable_select_body_with_next(
     )))
 }
 
-fn find_option_value_attr(opt: &svelte_ast::elements::RegularElement) -> Option<String> {
+fn find_option_value_attr(opt: &svelte_ast::elements::RegularElement<'_>) -> Option<String> {
     for a in &opt.attributes {
         if let ElementAttribute::Attribute(attr) = a {
             if attr.name == "value" {
                 if let AttributeValue::Many(parts) = &attr.value {
                     if parts.len() == 1 {
                         if let AttributeValuePart::Text(t) = &parts[0] {
-                            return Some(t.data.clone());
+                            return Some(t.data.to_string());
                         }
                     }
                 }
@@ -14502,7 +14492,7 @@ fn emit_option_value_set(var: &str, value: &str) -> Statement {
 
 fn build_customizable_select_body(
     target_var: &str,
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     ctx: &mut SelectCtx,
 ) -> Option<Statement> {
     // Build option_content_N template from the rich nodes.
@@ -14549,7 +14539,7 @@ fn build_customizable_select_body(
     )))
 }
 
-fn serialize_rich_content_html(nodes: &[FragmentChild]) -> Option<String> {
+fn serialize_rich_content_html(nodes: &[FragmentChild<'_>]) -> Option<String> {
     let mut out = String::new();
     for n in nodes {
         match n {
@@ -14569,7 +14559,7 @@ fn serialize_rich_content_html(nodes: &[FragmentChild]) -> Option<String> {
 }
 
 fn serialize_rich_element_html(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     out: &mut String,
 ) -> Option<()> {
     out.push('<');
@@ -14588,7 +14578,7 @@ fn serialize_rich_element_html(
 }
 
 fn serialize_rich_content_html_into(
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     out: &mut String,
 ) -> Option<()> {
     for n in nodes {
@@ -14614,7 +14604,7 @@ fn serialize_rich_content_html_into(
 /// `<select>{#each EXPR as ITEM}<Component />{/each}</select>` →
 ///   customizable_select wrap with $.each inside the arrow.
 fn lower_select_with_each(
-    eb: &svelte_ast::blocks::EachBlock,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
     attrs: &str,
@@ -14700,14 +14690,14 @@ fn lower_select_with_each(
     Some((html, body))
 }
 
-fn each_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment) -> bool {
+fn each_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(|n| match n {
         FragmentChild::Component(_) | FragmentChild::RenderTag(_) | FragmentChild::HtmlTag(_) => true,
         _ => false,
     })
 }
 
-fn if_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment) -> bool {
+fn if_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(|n| match n {
         FragmentChild::Component(_) | FragmentChild::RenderTag(_) | FragmentChild::HtmlTag(_) => true,
         _ => false,
@@ -14715,7 +14705,7 @@ fn if_body_is_rich_for_select(f: &svelte_ast::fragment::Fragment) -> bool {
 }
 
 fn build_each_body_for_select(
-    eb: &svelte_ast::blocks::EachBlock,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     container_var: &str,
     ctx: &mut SelectCtx,
     flag: f64,
@@ -14747,7 +14737,7 @@ fn build_each_body_for_select(
 }
 
 fn build_each_iter_arrow(
-    eb: &svelte_ast::blocks::EachBlock,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     ctx: &mut SelectCtx,
 ) -> Option<Expression> {
     // Extract context name and body.
@@ -15126,7 +15116,7 @@ fn wrap_expr_with_get(
 /// Walk rich content (e.g., `<span>{item}</span>`) inside a customizable_select
 /// arrow body and emit navigation + template_effect for reactive bits.
 fn emit_rich_content_reactivity(
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     fragment_var: &str,
     ctx: &mut SelectCtx,
     item_name: &str,
@@ -15213,7 +15203,7 @@ pub(crate) fn sanitize_name(name: &str) -> String {
 }
 
 fn lower_select_with_if(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
     attrs: &str,
@@ -15363,10 +15353,10 @@ fn lower_select_with_if(
 
 /// The if-block's consequent: handle the contained option / each / render.
 fn build_if_consequent_for_select(
-    fragment: &svelte_ast::fragment::Fragment,
+    fragment: &svelte_ast::fragment::Fragment<'_>,
     ctx: &mut SelectCtx,
 ) -> Option<Vec<Statement>> {
-    let non_ws: Vec<&FragmentChild> = fragment
+    let non_ws: Vec<&FragmentChild<'_>> = fragment
         .nodes
         .iter()
         .filter(|n| match n {
@@ -15466,7 +15456,7 @@ fn build_if_consequent_for_select(
 }
 
 fn lower_select_with_key(
-    kb: &svelte_ast::blocks::KeyBlock,
+    kb: &svelte_ast::blocks::KeyBlock<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
     attrs: &str,
@@ -15648,7 +15638,7 @@ fn lower_select_with_boundary(
 }
 
 fn lower_select_with_component(
-    c: &svelte_ast::elements::Component,
+    c: &svelte_ast::elements::Component<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
     attrs: &str,
@@ -15670,7 +15660,7 @@ fn lower_select_with_component(
     let anchor_var = ctx.next_named("anchor");
     let fragment_var = ctx.next_named("fragment");
     let node_var = ctx.next_named("node");
-    let component_name = c.name.clone();
+    let component_name = c.name.to_string();
     let arrow_body = vec![
         t::var(
             &anchor_var,
@@ -15851,7 +15841,7 @@ fn lower_select_with_html(
 }
 
 fn lower_select_with_optgroup(
-    og: &svelte_ast::elements::RegularElement,
+    og: &svelte_ast::elements::RegularElement<'_>,
     select_var: &str,
     ctx: &mut SelectCtx,
     attrs: &str,
@@ -15937,7 +15927,7 @@ fn lower_select_with_optgroup(
             let anchor_var = ctx.next_named("anchor");
             let fragment_var = ctx.next_named("fragment");
             let node_var = ctx.next_named("node");
-            let component_name = c.name.clone();
+            let component_name = c.name.to_string();
             let arrow_body = vec![
                 t::var(
                     &anchor_var,
@@ -16068,7 +16058,7 @@ fn lower_select_with_optgroup(
 }
 
 fn emit_deep_static_walker_program(
-    root_fragment: &svelte_ast::fragment::Fragment,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -16554,7 +16544,7 @@ fn allocate_named(prefix: &str, names: &mut HashMap<String, usize>) -> String {
 
 fn prev_index_of<'a>(
     name: &str,
-    top_elements: &[&'a svelte_ast::elements::RegularElement],
+    top_elements: &[&'a svelte_ast::elements::RegularElement<'_>],
 ) -> usize {
     // Reverse-engineer: which top-element corresponds to `name`? Names like
     // `main`, `div`, `div_1`, `cant_skip`, etc. are derived from el.name.
@@ -16575,7 +16565,7 @@ fn prev_index_of<'a>(
 /// Walk the interior of `el` (which has known reactive content somewhere),
 /// emitting navigation + reactive handlers + $.reset calls.
 fn walk_element_interior(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     parent_var: &str,
     body: &mut Vec<Statement>,
     effects: &mut Vec<(String, Expression)>,
@@ -16607,7 +16597,7 @@ fn walk_element_interior(
             let mut parts: Vec<TextPart> = Vec::new();
             for c in &el.fragment.nodes {
                 match c {
-                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                    FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                     FragmentChild::ExpressionTag(et) => {
                         parts.push(TextPart::Expr(&et.expression))
                     }
@@ -16631,7 +16621,7 @@ fn walk_element_interior(
     // STRIPPED children (leading + trailing whitespace text nodes / comments
     // removed) so indices match runtime siblings of the rendered template.
     let raw: Vec<&FragmentChild> = el.fragment.nodes.iter().collect();
-    let is_boundary = |n: &&FragmentChild| match n {
+    let is_boundary = |n: &&FragmentChild<'_>| match n {
         FragmentChild::Text(t) => t.data.trim().is_empty(),
         FragmentChild::Comment(_) => true,
         _ => false,
@@ -16672,7 +16662,7 @@ fn walk_element_interior(
             // navigation (e.g. inside `<h1>` for {title}), NOT for
             // element-level navigation.
             let prefix = match children[i] {
-                FragmentChild::RegularElement(child_el) => child_el.name.clone(),
+                FragmentChild::RegularElement(child_el) => child_el.name.to_string(),
                 FragmentChild::HtmlTag(_) => "node".to_string(),
                 FragmentChild::ExpressionTag(_) => "text".to_string(),
                 _ => "node".to_string(),
@@ -16729,7 +16719,7 @@ fn walk_element_interior(
             let prev_i = prev_child_idx.unwrap();
             let offset = i - prev_i;
             let prefix = match children[i] {
-                FragmentChild::RegularElement(child_el) => child_el.name.clone(),
+                FragmentChild::RegularElement(child_el) => child_el.name.to_string(),
                 FragmentChild::HtmlTag(_) => "node".to_string(),
                 FragmentChild::ExpressionTag(_) => "text".to_string(),
                 _ => "node".to_string(),
@@ -16769,7 +16759,7 @@ fn walk_element_interior(
                     let mut parts: Vec<TextPart> = Vec::new();
                     for c in &child_el.fragment.nodes {
                         match c {
-                            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                             FragmentChild::ExpressionTag(et) => {
                                 parts.push(TextPart::Expr(&et.expression))
                             }
@@ -16864,7 +16854,7 @@ fn walk_element_interior(
 }
 
 fn apply_reactive_attrs(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     var: &str,
     body: &mut Vec<Statement>,
     _script: &ScriptInfo,
@@ -16880,7 +16870,7 @@ fn apply_reactive_attrs(
                     vec![
                         t::id_owned(var.to_string()),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: Cow::Owned(attr.name.clone()),
+                            value: Cow::Owned(attr.name.to_string()),
                             raw: Some(format!("'{}'", attr.name)),
                             span: Span::ZERO,
                         }))),
@@ -16981,12 +16971,12 @@ fn apply_reactive_attrs(
     }
 }
 
-fn attr_value_as_string_expr(v: &AttributeValue) -> Expression {
+fn attr_value_as_string_expr(v: &AttributeValue<'_>) -> Expression {
     match v {
         AttributeValue::Many(parts) if parts.len() == 1 => {
             if let AttributeValuePart::Text(t) = &parts[0] {
                 return Expression::Literal(Box::new(Literal::String(StringLiteral {
-                    value: Cow::Owned(t.data.clone()),
+                    value: Cow::Owned(t.data.to_string()),
                     raw: Some(format!("'{}'", t.data)),
                     span: Span::ZERO,
                 })));
@@ -16997,7 +16987,7 @@ fn attr_value_as_string_expr(v: &AttributeValue) -> Expression {
     }
 }
 
-fn is_text_only_element(el: &svelte_ast::elements::RegularElement) -> bool {
+fn is_text_only_element(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     // Returns true iff the element body is exclusively Text + ExpressionTag
     // (i.e. text-with-interpolation), with at least one NON-LITERAL
     // ExpressionTag. Literal-foldable ExpressionTags get serialized
@@ -17018,9 +17008,9 @@ fn is_text_only_element(el: &svelte_ast::elements::RegularElement) -> bool {
     has_non_literal_expr
 }
 
-fn single_expression_in_element(
-    el: &svelte_ast::elements::RegularElement,
-) -> Option<&Expression> {
+fn single_expression_in_element<'a>(
+    el: &'a svelte_ast::elements::RegularElement<'a>,
+) -> Option<&'a Expression> {
     for n in &el.fragment.nodes {
         if let FragmentChild::ExpressionTag(et) = n {
             return Some(&et.expression);
@@ -17030,7 +17020,7 @@ fn single_expression_in_element(
 }
 
 pub(crate) fn serialize_fragment_to_html(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
@@ -17099,7 +17089,7 @@ pub(crate) fn serialize_fragment_to_html(
 
 /// Serialize element HTML, using `metadata.cached_static_html` when present.
 pub(crate) fn serialize_element_to_html_cached(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
@@ -17114,15 +17104,136 @@ pub(crate) fn serialize_element_to_html_cached(
 }
 
 fn serialize_element_to_html(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
     serialize_element_to_html_cached(el, out, needs_import_node)
 }
 
+fn fragment_excluding_snippets_debug_is_static(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
+    f.nodes.iter().all(|n| match n {
+        FragmentChild::SnippetBlock(_) | FragmentChild::DebugTag(_) => true,
+        FragmentChild::Text(_) | FragmentChild::Comment(_) => true,
+        FragmentChild::RegularElement(e) => is_element_fully_static(e),
+        _ => false,
+    })
+}
+
+fn serialize_element_to_html_omit_snippets_debug(
+    el: &svelte_ast::elements::RegularElement<'_>,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    let is_custom = el.name.contains('-');
+    if is_custom || el.name == "video" {
+        *needs_import_node = true;
+    }
+    out.push('<');
+    out.push_str(el.name);
+    let is_text_only = is_text_only_element(el);
+    for a in &el.attributes {
+        if let ElementAttribute::Attribute(attr) = a {
+            let skip = if is_custom {
+                true
+            } else {
+                matches!(attr.name, "autofocus" | "muted")
+                    || (el.name == "option" && attr.name == "value")
+            };
+            if skip {
+                continue;
+            }
+            match &attr.value {
+                AttributeValue::Empty => {
+                    out.push(' ');
+                    out.push_str(attr.name);
+                    out.push_str("=\"\"");
+                }
+                AttributeValue::Many(parts) if parts.iter().all(|p| matches!(p, AttributeValuePart::Text(_))) => {
+                    out.push(' ');
+                    out.push_str(attr.name);
+                    out.push_str("=\"");
+                    for p in parts {
+                        if let AttributeValuePart::Text(t) = p {
+                            out.push_str(t.data.as_str());
+                        }
+                    }
+                    out.push('"');
+                }
+                _ => return None,
+            }
+        }
+    }
+    if is_void_client(el.name) {
+        out.push_str("/>");
+        return Some(());
+    }
+    out.push('>');
+    if el.name == "pre" || el.name == "textarea" {
+        serialize_pre_fragment_to_html_filtered(&el.fragment, out, needs_import_node)?;
+    } else if is_text_only {
+        out.push(' ');
+    } else {
+        serialize_fragment_to_html_filtered(&el.fragment, out, needs_import_node)?;
+    }
+    out.push_str("</");
+    out.push_str(el.name);
+    out.push('>');
+    Some(())
+}
+
+fn serialize_fragment_to_html_filtered(
+    f: &svelte_ast::fragment::Fragment<'_>,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    for n in &f.nodes {
+        match n {
+            FragmentChild::SnippetBlock(_) | FragmentChild::DebugTag(_) => {}
+            FragmentChild::Text(t) => out.push_str(t.data.as_str()),
+            FragmentChild::Comment(_) => {}
+            FragmentChild::RegularElement(el) => {
+                serialize_element_to_html_omit_snippets_debug(el, out, needs_import_node)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
+fn serialize_pre_fragment_to_html_filtered(
+    f: &svelte_ast::fragment::Fragment<'_>,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    for n in &f.nodes {
+        match n {
+            FragmentChild::SnippetBlock(_) | FragmentChild::DebugTag(_) => {}
+            other => serialize_pre_fragment_child(other, out, needs_import_node)?,
+        }
+    }
+    Some(())
+}
+
+fn serialize_pre_fragment_child(
+    n: &FragmentChild<'_>,
+    out: &mut String,
+    needs_import_node: &mut bool,
+) -> Option<()> {
+    match n {
+        FragmentChild::Text(t) => {
+            out.push_str(t.data.as_str());
+            Some(())
+        }
+        FragmentChild::RegularElement(el) => {
+            serialize_element_to_html_omit_snippets_debug(el, out, needs_import_node)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn serialize_element_to_html_inner(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
@@ -17212,7 +17323,7 @@ pub(crate) fn serialize_element_to_html_inner(
 /// Text-only nested elements (e.g. `<span>{x}</span>` inside `<pre>`)
 /// do NOT get the space-anchor placeholder.
 fn serialize_pre_fragment_to_html(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
@@ -17266,7 +17377,7 @@ fn serialize_pre_fragment_to_html(
 }
 
 fn serialize_pre_element_to_html(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {
@@ -17321,7 +17432,7 @@ fn serialize_pre_element_to_html(
     Some(())
 }
 
-fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
+fn trim_boundary_text_client<'a>(nodes: &'a [FragmentChild<'a>]) -> Vec<&'a FragmentChild<'a>> {
     // Drop leading/trailing whitespace-only text nodes for top-level
     // fragment serialization. Returns a Vec of references.
     let mut start = 0;
@@ -17347,7 +17458,7 @@ fn trim_boundary_text_client(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
 /// template-text serializer: trims leading/trailing pure-whitespace text
 /// and drops `svelte-ignore` directive comments. Real comments (e.g.
 /// `<!-- test -->` inside an element) are preserved.
-pub(crate) fn trim_pure_whitespace_text(nodes: &[FragmentChild]) -> Vec<&FragmentChild> {
+pub(crate) fn trim_pure_whitespace_text<'a>(nodes: &'a [FragmentChild<'a>]) -> Vec<&'a FragmentChild<'a>> {
     let has_ignore_comment = nodes.iter().any(|n| {
         matches!(
             n,
@@ -17725,7 +17836,7 @@ fn expr_has_user_call(e: &Expression, derived_bindings: &HashSet<String>) -> boo
 }
 
 fn collect_chain_blockers(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     blocker_bindings: &HashMap<String, usize>,
     out: &mut std::collections::BTreeSet<usize>,
 ) {
@@ -17795,7 +17906,7 @@ fn collect_blocker_indices_in_expr(
 /// Build a branch body for a simple branch with text-only content:
 /// `($$anchor) => { var text_N = $.text('FOO'); $.append($$anchor, text_N); }`
 fn build_branch_arrow(
-    fragment: &svelte_ast::fragment::Fragment,
+    fragment: &svelte_ast::fragment::Fragment<'_>,
     _ai: &AsyncInfo,
     _derived_bindings: &HashSet<String>,
     counters: &mut ChainCounters,
@@ -17841,7 +17952,7 @@ fn build_branch_arrow(
 /// Build the alternate arrow for a break-out elseif. Wraps a nested
 /// `$.async(...)` (or `{ }` block) targeting the inner if-chain.
 fn build_breakout_alternate_arrow(
-    inner: &svelte_ast::blocks::IfBlock,
+    inner: &svelte_ast::blocks::IfBlock<'_>,
     ai: &AsyncInfo,
     derived_bindings: &HashSet<String>,
     counters: &mut ChainCounters,
@@ -18131,7 +18242,7 @@ fn rewrite_const_refs_with_get(e: &Expression, consts: &[String]) -> Expression 
 ///     \$.each(node, 17, () => \$.get(\$\$collection), \$.index, (\$\$anchor, ITEM) => { ... });
 /// });`
 fn emit_single_async_each_program(
-    eb: &svelte_ast::blocks::EachBlock,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -18404,7 +18515,7 @@ fn emit_single_async_each_program(
 // ---------------------------------------------------------------------------
 
 fn emit_single_svelte_element_program(
-    se: &svelte_ast::elements::SvelteElement,
+    se: &svelte_ast::elements::SvelteElement<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -18540,7 +18651,7 @@ fn emit_single_svelte_element_program(
 
 /// Walk a fragment looking for `<svelte:options preserveWhitespace />` (or
 /// `preserveWhitespace={true}`). Returns true when found.
-fn detect_preserve_whitespace(f: &svelte_ast::fragment::Fragment) -> bool {
+fn detect_preserve_whitespace(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     for n in &f.nodes {
         if let FragmentChild::SvelteOptions(o) = n {
@@ -18586,8 +18697,8 @@ fn detect_preserve_whitespace(f: &svelte_ast::fragment::Fragment) -> bool {
 /// - The body emits a text-anchor + template_effect even for text-only
 ///   bodies (the textContent shortcut is skipped).
 fn emit_single_each_preserve_whitespace_program(
-    root_fragment: &svelte_ast::fragment::Fragment,
-    eb: &svelte_ast::blocks::EachBlock,
+    root_fragment: &svelte_ast::fragment::Fragment<'_>,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -18655,7 +18766,7 @@ fn emit_single_each_preserve_whitespace_program(
     let mut parts: Vec<TextPart> = Vec::new();
     for c in &inner_el.fragment.nodes {
         match c {
-            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
             FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
             _ => return None,
         }
@@ -18801,7 +18912,7 @@ fn emit_single_each_preserve_whitespace_program(
 }
 
 fn emit_single_each_program(
-    eb: &svelte_ast::blocks::EachBlock,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -18879,7 +18990,7 @@ fn emit_single_each_program(
                 for c in &el.fragment.nodes {
                     match c {
                         FragmentChild::Text(t) => {
-                            body_parts.push(TextPart::Static(t.data.clone()));
+                            body_parts.push(TextPart::Static(t.data.to_string()));
                         }
                         FragmentChild::ExpressionTag(et) => {
                             body_parts.push(TextPart::Expr(&et.expression));
@@ -18971,7 +19082,7 @@ fn emit_single_each_program(
                     vec![
                         t::id_owned(var.to_string()),
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: Cow::Owned(a.name.clone()),
+                            value: Cow::Owned(a.name.to_string()),
                             raw: None,
                             span: Span::ZERO,
                         }))),
@@ -19046,7 +19157,7 @@ fn emit_single_each_program(
         let mut parts: Vec<TextPart> = Vec::new();
         for c in &eb.body.nodes {
             match c {
-                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                 FragmentChild::ExpressionTag(et) => parts.push(TextPart::Expr(&et.expression)),
                 _ => return None,
             }
@@ -19241,7 +19352,7 @@ fn emit_single_each_program(
     Some(t::program(prog))
 }
 
-fn trim_boundary_ws(nodes: &[FragmentChild]) -> &[FragmentChild] {
+fn trim_boundary_ws<'a>(nodes: &'a [FragmentChild<'a>]) -> &'a [FragmentChild<'a>] {
     let mut start = 0;
     let mut end = nodes.len();
     while start < end {
@@ -21531,13 +21642,13 @@ fn scan_stmt_for_assignments(s: &Statement, out: &mut HashSet<String>) {
     }
 }
 
-pub(crate) fn scan_fragment_assignments(f: &Fragment) -> HashSet<String> {
+pub(crate) fn scan_fragment_assignments(f: &Fragment<'_>) -> HashSet<String> {
     let mut out = HashSet::new();
     scan_nodes_for_assignments(&f.nodes, &mut out);
     out
 }
 
-fn scan_nodes_for_assignments(nodes: &[FragmentChild], out: &mut HashSet<String>) {
+fn scan_nodes_for_assignments(nodes: &[FragmentChild<'_>], out: &mut HashSet<String>) {
     for n in nodes {
         match n {
             FragmentChild::ExpressionTag(t) => scan_expr_for_assignments(&t.expression, out),
@@ -21781,15 +21892,15 @@ fn collect_pattern_idents(p: &Pattern, out: &mut HashSet<String>) {
 enum NodeKind<'a> {
     /// Element with no expression children, only static attributes, no
     /// directives — serializes wholly into the template literal.
-    StaticElement(&'a RegularElement),
+    StaticElement(&'a RegularElement<'a>),
     /// Element with at least one expression child OR an event handler /
     /// bind directive. Static attrs serialize into HTML; everything else
     /// is captured in `Directives` and emitted as body statements.
-    InterpElement(&'a RegularElement, ElementContent<'a>, Directives<'a>),
-    Component(&'a Component),
+    InterpElement(&'a RegularElement<'a>, ElementContent<'a>, Directives<'a>),
+    Component(&'a Component<'a>),
     /// `{#await EXPR [then PAT]}{:catch PAT}{/await}` — lowered to a `<!>`
     /// placeholder + `$.await(node, getter, pending_arrow, then_arrow)`.
-    AwaitBlock(&'a svelte_ast::blocks::AwaitBlock),
+    AwaitBlock(&'a svelte_ast::blocks::AwaitBlock<'a>),
     /// Top-level `{expr}` — lowered to a space text-node anchor + a
     /// `$.set_text(text_N, ...)` entry in the combined template_effect.
     TopLevelExpr(&'a Expression),
@@ -21849,13 +21960,13 @@ fn single_root_var_name(kind: &NodeKind) -> String {
 
 #[derive(Debug)]
 enum GroupedNode<'a> {
-    Single(&'a FragmentChild),
+    Single(&'a FragmentChild<'a>),
     /// A consecutive run of top-level Text + ExpressionTag children. They
     /// share one text-node anchor and one combined template_effect entry.
     TextRun(Vec<TextPart<'a>>),
 }
 
-fn coalesce_top_level_text<'a>(nodes: &[&'a FragmentChild]) -> Vec<GroupedNode<'a>> {
+fn coalesce_top_level_text<'a>(nodes: &[&'a FragmentChild<'a>]) -> Vec<GroupedNode<'a>> {
     let mut out: Vec<GroupedNode<'a>> = Vec::new();
     let mut run: Vec<TextPart<'a>> = Vec::new();
     let flush = |out: &mut Vec<GroupedNode<'a>>, run: &mut Vec<TextPart<'a>>| {
@@ -21873,7 +21984,7 @@ fn coalesce_top_level_text<'a>(nodes: &[&'a FragmentChild]) -> Vec<GroupedNode<'
     for n in nodes {
         match n {
             FragmentChild::Text(t) => {
-                run.push(TextPart::Static(t.data.clone()));
+                run.push(TextPart::Static(t.data.to_string()));
             }
             FragmentChild::ExpressionTag(et) => {
                 run.push(TextPart::Expr(&et.expression));
@@ -21895,7 +22006,7 @@ fn classify_grouped<'a>(g: &GroupedNode<'a>) -> Option<NodeKind<'a>> {
     }
 }
 
-fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
+fn classify<'a>(n: &'a FragmentChild<'a>) -> Option<NodeKind<'a>> {
     match n {
         FragmentChild::AwaitBlock(ab) => Some(NodeKind::AwaitBlock(ab)),
         FragmentChild::ExpressionTag(et) => Some(NodeKind::TopLevelExpr(&et.expression)),
@@ -21942,13 +22053,13 @@ fn classify(n: &FragmentChild) -> Option<NodeKind<'_>> {
             for c in &el.fragment.nodes {
                 match c {
                     FragmentChild::Text(t) => {
-                        parts.push(TextPart::Static(t.data.clone()));
+                        parts.push(TextPart::Static(t.data.to_string()));
                     }
                     FragmentChild::ExpressionTag(et) => {
                         parts.push(TextPart::Expr(&et.expression));
                     }
                     FragmentChild::RegularElement(_) => {
-                        if !all_static(&[c.clone()]) {
+                        if !all_static(std::slice::from_ref(c)) {
                             return None;
                         }
                         // Nested static element prevents text-content lowering;
@@ -22073,7 +22184,7 @@ fn is_event_name(name: &str) -> bool {
             .unwrap_or(false)
 }
 
-fn write_static_attr(a: &Attribute, out: &mut String) -> Option<()> {
+fn write_static_attr(a: &Attribute<'_>, out: &mut String) -> Option<()> {
     match &a.value {
         AttributeValue::Empty => {
             out.push(' ');
@@ -22134,7 +22245,7 @@ fn expr_is_safe_for_textcontent(e: &Expression) -> bool {
     }
 }
 
-fn all_static(nodes: &[FragmentChild]) -> bool {
+fn all_static(nodes: &[FragmentChild<'_>]) -> bool {
     nodes.iter().all(|c| match c {
         FragmentChild::Text(_) | FragmentChild::Comment(_) => true,
         FragmentChild::RegularElement(el) => {
@@ -22149,7 +22260,7 @@ fn all_static(nodes: &[FragmentChild]) -> bool {
 // ---------------------------------------------------------------------------
 
 fn serialize_element(
-    el: &RegularElement,
+    el: &RegularElement<'_>,
     out: &mut String,
     include_body: bool,
     needs_text_node: bool,
@@ -22189,7 +22300,7 @@ fn serialize_element(
     Some(())
 }
 
-fn serialize_static_child(c: &FragmentChild, out: &mut String) -> Option<()> {
+fn serialize_static_child(c: &FragmentChild<'_>, out: &mut String) -> Option<()> {
     match c {
         FragmentChild::Text(t) => {
             for ch in t.data.chars() {
@@ -22696,16 +22807,17 @@ fn format_num(n: f64) -> String {
 /// each as a `const NAME = ($$anchor, ...params) => { ... }` declaration,
 /// and remove the SnippetBlock children from the fragment.
 fn extract_client_snippets(
-    fragment: &mut svelte_ast::fragment::Fragment,
+    fragment: &mut svelte_ast::fragment::Fragment<'_>,
     state_bindings: &HashSet<String>,
     var_counts: &mut HashMap<String, usize>,
 ) -> Option<(Vec<Statement>, Vec<Statement>)> {
     let _ = state_bindings;
     let mut out: Vec<Statement> = Vec::new();
     let mut extra_roots: Vec<Statement> = Vec::new();
-    let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
+    let bump = fragment.nodes.bump();
+    let mut remaining = bumpalo::collections::Vec::new_in(bump);
     let mut root_idx: usize = 0;
-    for n in std::mem::take(&mut fragment.nodes) {
+    for n in std::mem::replace(&mut fragment.nodes, bumpalo::collections::Vec::new_in(bump)) {
         if let FragmentChild::SnippetBlock(sb) = &n {
             let name = sb.expression.name.clone();
             let body_non_ws: Vec<&FragmentChild> = sb
@@ -22821,12 +22933,12 @@ fn extract_client_snippets(
     Some((out, extra_roots))
 }
 
-fn component_call(c: &Component, node_var: &str) -> Option<Statement> {
+fn component_call(c: &Component<'_>, node_var: &str) -> Option<Statement> {
     component_call_with(c, node_var, &HashSet::new())
 }
 
 fn component_call_with(
-    c: &Component,
+    c: &Component<'_>,
     node_var: &str,
     state_bindings: &HashSet<String>,
 ) -> Option<Statement> {
@@ -22887,7 +22999,7 @@ fn component_call_with(
                 // get NAME() { return GETTER_BODY; }
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: Cow::Owned(b.name.clone()),
+                        name: Cow::Owned(b.name.to_string()),
                         span: Span::ZERO,
                     }),
                     value: Expression::Function(Box::new(FunctionExpression {
@@ -22914,7 +23026,7 @@ fn component_call_with(
                 // set NAME($$value) { SETTER_BODY; }
                 props.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: Cow::Owned(b.name.clone()),
+                        name: Cow::Owned(b.name.to_string()),
                         span: Span::ZERO,
                     }),
                     value: Expression::Function(Box::new(FunctionExpression {
@@ -22953,7 +23065,7 @@ fn component_call_with(
     }))))
 }
 
-fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
+fn attr_to_prop(a: &Attribute<'_>) -> Option<ObjectMember> {
     let value: Expression = match &a.value {
         AttributeValue::Empty => Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
             value: true,
@@ -22965,7 +23077,7 @@ fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
                 match &parts[0] {
                     AttributeValuePart::Text(t) => {
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: Cow::Owned(t.data.clone()),
+                            value: Cow::Owned(t.data.to_string()),
                             raw: None,
                             span: Span::ZERO,
                         })))
@@ -22979,7 +23091,7 @@ fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
     };
     Some(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: Cow::Owned(a.name.clone()),
+            name: Cow::Owned(a.name.to_string()),
             span: Span::ZERO,
         }),
         value,
@@ -22995,7 +23107,7 @@ fn attr_to_prop(a: &Attribute) -> Option<ObjectMember> {
 // Math.X compile-time fold (re-exported for use in the compile pipeline).
 // ---------------------------------------------------------------------------
 
-pub fn fold_in_fragment(f: &mut Fragment) {
+pub fn fold_in_fragment(f: &mut Fragment<'_>) {
     for n in &mut f.nodes {
         fold_in_node(n);
     }
@@ -23005,13 +23117,13 @@ pub fn fold_in_fragment(f: &mut Fragment) {
 /// Math.X, and nullish-coalesce rules. The fragment shape is preserved —
 /// expressions that fold to literals remain inside their ExpressionTag so
 /// `classify` can still distinguish "static body" from "had-expressions".
-pub(crate) fn fold_fragment_with_consts(f: &mut Fragment, consts: &HashMap<String, Expression>) {
+pub(crate) fn fold_fragment_with_consts(f: &mut Fragment<'_>, consts: &HashMap<String, Expression>) {
     for child in &mut f.nodes {
         fold_node_with_consts(child, consts);
     }
 }
 
-fn fold_node_with_consts(n: &mut FragmentChild, consts: &HashMap<String, Expression>) {
+fn fold_node_with_consts(n: &mut FragmentChild<'_>, consts: &HashMap<String, Expression>) {
     match n {
         FragmentChild::ExpressionTag(t) => fold_expr_with_consts(&mut t.expression, consts),
         // HtmlTag intentionally does NOT fold: upstream emits the html
@@ -23040,7 +23152,7 @@ fn fold_node_with_consts(n: &mut FragmentChild, consts: &HashMap<String, Express
     }
 }
 
-fn fold_attr_with_consts(attr: &mut ElementAttribute, consts: &HashMap<String, Expression>) {
+fn fold_attr_with_consts(attr: &mut ElementAttribute<'_>, consts: &HashMap<String, Expression>) {
     match attr {
         ElementAttribute::Attribute(a) => match &mut a.value {
             AttributeValue::Single(tag) => fold_expr_with_consts(&mut tag.expression, consts),
@@ -23216,7 +23328,7 @@ fn literal_to_template_string(e: &Expression) -> Option<String> {
     }
 }
 
-fn fold_in_node(n: &mut FragmentChild) {
+fn fold_in_node(n: &mut FragmentChild<'_>) {
     match n {
         FragmentChild::ExpressionTag(t) => fold_expr(&mut t.expression),
         FragmentChild::HtmlTag(t) => fold_expr(&mut t.expression),
@@ -23253,7 +23365,7 @@ fn fold_in_node(n: &mut FragmentChild) {
     }
 }
 
-fn element_may_contain_foldable_expr(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_may_contain_foldable_expr(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     el.attributes
         .iter()
         .any(|a| attr_may_contain_foldable_expr(a))
@@ -23264,7 +23376,7 @@ fn element_may_contain_foldable_expr(el: &svelte_ast::elements::RegularElement) 
             .any(fragment_child_may_contain_foldable_expr)
 }
 
-fn component_may_contain_foldable_expr(c: &svelte_ast::elements::Component) -> bool {
+fn component_may_contain_foldable_expr(c: &svelte_ast::elements::Component<'_>) -> bool {
     c.attributes
         .iter()
         .any(|a| attr_may_contain_foldable_expr(a))
@@ -23275,7 +23387,7 @@ fn component_may_contain_foldable_expr(c: &svelte_ast::elements::Component) -> b
             .any(fragment_child_may_contain_foldable_expr)
 }
 
-fn fragment_child_may_contain_foldable_expr(n: &FragmentChild) -> bool {
+fn fragment_child_may_contain_foldable_expr(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::Text(_) | FragmentChild::Comment(_) => false,
         FragmentChild::ExpressionTag(_) | FragmentChild::HtmlTag(_) => true,
@@ -23289,7 +23401,7 @@ fn fragment_child_may_contain_foldable_expr(n: &FragmentChild) -> bool {
     }
 }
 
-fn attr_may_contain_foldable_expr(attr: &ElementAttribute) -> bool {
+fn attr_may_contain_foldable_expr(attr: &ElementAttribute<'_>) -> bool {
     match attr {
         ElementAttribute::Attribute(a) => match &a.value {
             AttributeValue::Empty => false,
@@ -23303,7 +23415,7 @@ fn attr_may_contain_foldable_expr(attr: &ElementAttribute) -> bool {
     }
 }
 
-fn fold_in_attr(attr: &mut ElementAttribute) {
+fn fold_in_attr(attr: &mut ElementAttribute<'_>) {
     match attr {
         ElementAttribute::Attribute(a) => match &mut a.value {
             AttributeValue::Single(tag) => fold_expr(&mut tag.expression),

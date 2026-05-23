@@ -63,7 +63,7 @@ pub enum FragmentsMode {
 /// Second-tier typed entry point. Currently handles:
 /// - "instance script with imports only + empty template"
 /// - "no script + single <Component bind:this={x}>" (bind-this client)
-pub fn try_typed_client_component(root: &Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_client_component(root: &Root<'_>, component_name: &str) -> Option<Program> {
     if root.css.is_some() || root.module.is_some() {
         return None;
     }
@@ -90,7 +90,7 @@ pub fn try_typed_client_component(root: &Root, component_name: &str) -> Option<P
 
     // Build function body from template.
     let func_body = if let Some(c) = single_component {
-        lower_single_component_client(c)?
+        lower_single_component_client(&c)?
     } else {
         Vec::new()
     };
@@ -116,7 +116,7 @@ pub fn try_typed_client_component(root: &Root, component_name: &str) -> Option<P
 /// either `Foo($$anchor, {...props})` (no bind:this) or
 /// `$.bind_this(Foo($$anchor, {...props}), ($$value) => x = $$value, () => x)`.
 fn lower_single_component_client(
-    c: &svelte_ast::elements::Component,
+    c: &svelte_ast::elements::Component<'_>,
 ) -> Option<Vec<Statement>> {
     let mut props: Vec<ObjectMember> = Vec::new();
     let mut bind_this: Option<Expression> = None;
@@ -218,17 +218,17 @@ fn expr_to_pattern(e: &Expression) -> Option<Pattern> {
     }
 }
 
-fn fragment_is_empty(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_is_empty(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().all(|n| match n {
         FragmentChild::Text(t) => t.data.trim().is_empty(),
         _ => false,
     })
 }
 
-fn single_non_ws_node(
-    f: &svelte_ast::fragment::Fragment,
-) -> Option<&FragmentChild> {
-    let non_ws: Vec<&FragmentChild> = f
+fn single_non_ws_node<'a>(
+    f: &'a svelte_ast::fragment::Fragment<'a>,
+) -> Option<&'a FragmentChild<'a>> {
+    let non_ws: Vec<&FragmentChild<'_>> = f
         .nodes
         .iter()
         .filter(|n| match n {
@@ -243,7 +243,7 @@ fn single_non_ws_node(
     }
 }
 
-fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
+fn attribute_to_object_member(a: &Attribute<'_>) -> Option<ObjectMember> {
     let value: Expression = match &a.value {
         AttributeValue::Empty => Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
             value: true,
@@ -255,7 +255,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
                 match &parts[0] {
                     AttributeValuePart::Text(t) => {
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
-                            value: Cow::Owned(t.data.clone()),
+                            value: Cow::Owned(t.data.to_string()),
                             raw: Some(format!("'{}'", t.raw.replace('\'', "\\'"))),
                             span: Span::ZERO,
                         })))
@@ -269,7 +269,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
     };
     Some(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: Cow::Owned(a.name.clone()),
+            name: Cow::Owned(a.name.to_string()),
             span: Span::ZERO,
         }),
         value,

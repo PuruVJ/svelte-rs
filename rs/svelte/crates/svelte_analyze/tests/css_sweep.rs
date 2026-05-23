@@ -16,12 +16,33 @@ fn fixture_dev_flag(config: &str) -> bool {
 
 const HASH: &str = "svelte-xyz";
 
+fn render_css_fixture(
+    source: &str,
+    hash: &str,
+    dev: bool,
+) -> Result<String, svelte_diagnostics::CompileDiagnostic> {
+    let ast = parse(source, false)?;
+    let mut analysis = analyze_component(ast.root(), None)?;
+    analysis.css_hash = hash.to_string();
+    let stylesheet = match analysis.root.css.as_ref() {
+        Some(s) => s,
+        None => return Ok(String::new()),
+    };
+    Ok(render_stylesheet_with_opts(
+        source,
+        stylesheet,
+        &analysis.css_meta,
+        hash,
+        dev,
+    ))
+}
+
 #[test]
 #[ignore]
 fn debug_basic() {
     let src = fs::read_to_string("../../../../packages/svelte/tests/css/samples/basic/input.svelte").unwrap();
-    let root = parse(&src, false).unwrap();
-    let mut analysis = analyze_component(&root, None).unwrap();
+    let ast = parse(&src, false).unwrap();
+    let mut analysis = analyze_component(ast.root(), None).unwrap();
     analysis.css_hash = "svelte-xyz".to_string();
     let sheet = analysis.root.css.as_ref().unwrap();
     eprintln!("content range: {}..{}", sheet.content.start, sheet.content.end);
@@ -77,17 +98,7 @@ fn sweep_css_fixtures() {
             HASH.to_string()
         };
         let hash_str = hash_for_fixture.clone();
-        let result = std::panic::catch_unwind(move || {
-            let root = parse(&source, false)?;
-            let mut analysis = analyze_component(&root, None)?;
-            analysis.css_hash = hash_str.clone();
-            let stylesheet = match analysis.root.css.as_ref() {
-                Some(s) => s,
-                None => return Ok::<_, svelte_diagnostics::CompileDiagnostic>(String::new()),
-            };
-            let rendered = render_stylesheet_with_opts(&source, stylesheet, &analysis.css_meta, &hash_str, dev);
-            Ok(rendered)
-        });
+        let result = std::panic::catch_unwind(move || render_css_fixture(&source, &hash_str, dev));
         match result {
             Ok(Ok(got)) if got.trim() == expected.trim() => {
                 println!("[MATCH] {name}");

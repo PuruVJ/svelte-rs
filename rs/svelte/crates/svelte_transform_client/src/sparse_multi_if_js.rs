@@ -9,7 +9,7 @@ use crate::walker::{emit_top_level_multi_if_parts, ScriptInfo};
 
 /// Emit client JS for sparse-island shapes classified by `emit_top_level_multi_if_parts`.
 pub(crate) fn try_emit_sparse_multi_if_js(
-    fragment: &Fragment,
+    fragment: &Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
     bump: &CompileBump,

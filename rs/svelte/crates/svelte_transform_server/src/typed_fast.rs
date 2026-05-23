@@ -21,12 +21,12 @@ use std::borrow::Cow;
 /// Try to lower `root` end-to-end via the typed path. Returns `None` for
 /// shapes that need the legacy/Value path (any script, dynamic content,
 /// CSS scoping hooks, etc).
-pub fn try_typed_server(root: &Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_server(root: &Root<'_>, component_name: &str) -> Option<Program> {
     try_typed_server_with(root, component_name, false)
 }
 
 pub fn try_typed_server_with(
-    root: &Root,
+    root: &Root<'_>,
     component_name: &str,
     experimental_async: bool,
 ) -> Option<Program> {
@@ -81,7 +81,7 @@ pub fn try_typed_server_with(
 /// dynamic attributes. Returns `None` on the first dynamic node OR on any
 /// `<option>` (which upstream lowers to a `$$renderer.option(...)` call even
 /// in static contexts — falls through to the dynamic path).
-fn static_html(fragment: &Fragment) -> Option<String> {
+fn static_html(fragment: &Fragment<'_>) -> Option<String> {
     if fragment_contains_option_element(fragment) {
         return None;
     }
@@ -125,11 +125,11 @@ fn static_html(fragment: &Fragment) -> Option<String> {
 
 /// True if any descendant of `fragment` is a `<select>` or `<option>` element —
 /// those need the customizable-select-element call shape, not static HTML.
-fn fragment_contains_option_element(fragment: &Fragment) -> bool {
+fn fragment_contains_option_element(fragment: &Fragment<'_>) -> bool {
     fragment.nodes.iter().any(node_contains_option_element)
 }
 
-fn node_contains_option_element(n: &FragmentChild) -> bool {
+fn node_contains_option_element(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::RegularElement(el) => {
             el.name == "option"
@@ -140,7 +140,7 @@ fn node_contains_option_element(n: &FragmentChild) -> bool {
     }
 }
 
-fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {
+fn append_static(child: &FragmentChild<'_>, out: &mut String) -> Option<()> {
     match child {
         FragmentChild::Text(t) => {
             // Collapse whitespace runs to a single space (matching upstream's

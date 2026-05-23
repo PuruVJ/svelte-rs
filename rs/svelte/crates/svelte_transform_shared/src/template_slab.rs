@@ -56,7 +56,7 @@ fn push_static_element_html(
         }
     }
     if matches!(
-        el.name.as_str(),
+        el.name,
         "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta"
             | "param" | "source" | "track" | "wbr"
     ) {

@@ -10,7 +10,7 @@ use crate::walker::{analyze_script, emit_top_level_multi_if_program, ScriptInfo}
 
 /// Try the slot-based sparse-islands emitter used by `skip-static-subtree` and similar fixtures.
 pub fn try_sparse_islands_program(
-    fragment: &Fragment,
+    fragment: &Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
 ) -> Option<Program> {
@@ -72,7 +72,7 @@ pub fn try_sparse_islands_program(
 
 /// Classify + emit in one step when the root fragment qualifies.
 pub fn try_sparse_islands_root(
-    root: &svelte_ast::root::Root,
+    root: &svelte_ast::root::Root<'_>,
     component_name: &str,
     template_assigned: &std::collections::HashSet<String>,
 ) -> Option<Program> {

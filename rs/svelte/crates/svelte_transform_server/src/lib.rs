@@ -17,14 +17,14 @@ pub use typed_fast::{try_typed_server, try_typed_server_with};
 pub use self::try_typed_server_component_with_filename as try_typed_server_component_with_filename_pub;
 
 use svelte_ast::attributes::{Attribute, AttributeValue, AttributeValuePart, ElementAttribute};
-use svelte_ast::fragment::FragmentChild;
+use svelte_ast::fragment::{Fragment, FragmentChild};
 use svelte_ast::root::Root;
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 use std::borrow::Cow;
 
 /// Backwards-compatible entry — defaults `experimental_async = false`.
-pub fn try_typed_server_component(root: Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_server_component(root: Root<'_>, component_name: &str) -> Option<Program> {
     try_typed_server_component_with_filename(root, component_name, false, None)
 }
 
@@ -76,7 +76,7 @@ pub fn svelte_filename_hash_pub(s: &str) -> String {
 /// - "single <Component bind:this={x}/>"
 /// - "<svelte:element this={tag}>"
 pub fn try_typed_server_component_full(
-    mut root: Root,
+    mut root: Root<'_>,
     component_name: &str,
     experimental_async: bool,
     filename: Option<&str>,
@@ -125,6 +125,7 @@ pub fn try_typed_server_component_full(
     // Reset the per-component each-array counter for `<select>` lowering.
     SELECT_EACH_COUNTER.with(|c| c.set(0));
     EACH_ARRAY_COUNTER.with(|c| c.set(0));
+    trim_boundary_text_recursive(&mut root.fragment);
     // Thread filename into the lowering pass for `$.head(HASH, ...)`.
     HEAD_FILENAME.with(|c| {
         *c.borrow_mut() = filename.map(|s| s.to_string());
@@ -496,7 +497,7 @@ pub fn try_typed_server_component_full(
 /// each as a `function NAME($$renderer) { body }` declaration, and remove
 /// the SnippetBlock children from the fragment.
 fn extract_and_lower_snippets(
-    fragment: &mut svelte_ast::fragment::Fragment,
+    fragment: &mut svelte_ast::fragment::Fragment<'_>,
 ) -> Option<Vec<Statement>> {
     if !fragment
         .nodes
@@ -506,9 +507,10 @@ fn extract_and_lower_snippets(
         return Some(Vec::new());
     }
     let mut out: Vec<Statement> = Vec::with_capacity(fragment.nodes.len());
-    let mut remaining: Vec<FragmentChild> = Vec::with_capacity(fragment.nodes.len());
-    for n in std::mem::take(&mut fragment.nodes) {
-        if let FragmentChild::SnippetBlock(sb) = &n {
+    let bump = fragment.nodes.bump();
+    let mut remaining = bumpalo::collections::Vec::new_in(bump);
+    for n in std::mem::replace(&mut fragment.nodes, bumpalo::collections::Vec::new_in(bump)) {
+        if let FragmentChild::SnippetBlock(sb) = n {
             let name = sb.expression.name.clone();
             // Snippet body needs a leading `<!---->` anchor UNLESS the first
             // non-whitespace child is an `<option>` (which emits a self-anchored
@@ -565,7 +567,7 @@ fn extract_and_lower_snippets(
 /// Does the fragment contain a top-level `<Component bind:X={...} />` where
 /// X is not `this`? (bind:this just captures the component instance and
 /// doesn't need the $$settled re-render dance.)
-fn fragment_has_component_bind(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_has_component_bind(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(|n| {
         if let FragmentChild::Component(c) = n {
             c.attributes.iter().any(|a| {
@@ -666,7 +668,7 @@ fn wrap_for_bind_settled(inner: Vec<Statement>) -> Vec<Statement> {
 /// () => $.escape(EXPR)));`. Surrounding text/static-elements split into
 /// their own push statements.
 fn lower_fragment_server_async(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     async_bindings: &std::collections::HashSet<String>,
     last_group_idx: usize,
     blocker_bindings: &std::collections::HashMap<String, usize>,
@@ -677,6 +679,7 @@ fn lower_fragment_server_async(
         last_group_idx,
         "$$promises",
         blocker_bindings,
+        false,
     )
 }
 
@@ -687,7 +690,7 @@ struct FragmentEntryFlags {
     has_component_bind: bool,
 }
 
-fn scan_fragment_entry_flags(f: &svelte_ast::fragment::Fragment) -> FragmentEntryFlags {
+fn scan_fragment_entry_flags(f: &svelte_ast::fragment::Fragment<'_>) -> FragmentEntryFlags {
     let mut flags = FragmentEntryFlags::default();
     for n in &f.nodes {
         scan_fragment_entry_node(n, &mut flags);
@@ -698,7 +701,7 @@ fn scan_fragment_entry_flags(f: &svelte_ast::fragment::Fragment) -> FragmentEntr
     flags
 }
 
-fn scan_fragment_entry_node(n: &FragmentChild, flags: &mut FragmentEntryFlags) {
+fn scan_fragment_entry_node(n: &FragmentChild<'_>, flags: &mut FragmentEntryFlags) {
     if flags.has_unsafe_call && flags.has_component_bind {
         return;
     }
@@ -719,18 +722,18 @@ fn scan_fragment_entry_node(n: &FragmentChild, flags: &mut FragmentEntryFlags) {
 /// Returns true if any CallExpression in the fragment has a non-safe-identifier
 /// callee (an arrow/function IIFE, a complex MemberExpression base, etc).
 /// Mirrors upstream's `is_safe_identifier` check inside CallExpression visitor.
-fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_has_unsafe_call(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(node_has_unsafe_call)
 }
 
 /// Returns true if any spread attribute in the fragment references
 /// `$$restProps`. Used to trigger the sanitize_props / rest_props
 /// declarations.
-fn fragment_uses_rest_props(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_uses_rest_props(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(node_uses_rest_props)
 }
 
-fn node_uses_rest_props(n: &FragmentChild) -> bool {
+fn node_uses_rest_props(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::RegularElement(el) => {
             el.attributes.iter().any(|a| match a {
@@ -872,14 +875,14 @@ fn expr_calls_import(
 /// Walk a fragment looking for any template-position CallExpression whose
 /// callee is an imported identifier.
 fn fragment_has_unsafe_callee(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     imports: &std::collections::HashSet<String>,
 ) -> bool {
     f.nodes.iter().any(|n| node_has_unsafe_callee(n, imports))
 }
 
 fn node_has_unsafe_callee(
-    n: &FragmentChild,
+    n: &FragmentChild<'_>,
     imports: &std::collections::HashSet<String>,
 ) -> bool {
     match n {
@@ -911,7 +914,7 @@ fn node_has_unsafe_callee(
 }
 
 fn attr_has_unsafe_callee(
-    a: &ElementAttribute,
+    a: &ElementAttribute<'_>,
     imports: &std::collections::HashSet<String>,
 ) -> bool {
     match a {
@@ -981,14 +984,14 @@ fn stmt_has_unsafe(s: &Statement) -> bool {
 /// Identifier matches one of the given names (which we treat as
 /// prop-kind bindings).
 fn fragment_has_unsafe_prop_member(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     props: &std::collections::HashSet<String>,
 ) -> bool {
     f.nodes.iter().any(|n| node_has_unsafe_prop_member(n, props))
 }
 
 fn node_has_unsafe_prop_member(
-    n: &FragmentChild,
+    n: &FragmentChild<'_>,
     props: &std::collections::HashSet<String>,
 ) -> bool {
     match n {
@@ -1037,7 +1040,7 @@ fn node_has_unsafe_prop_member(
 }
 
 fn attr_has_unsafe_prop_member(
-    a: &ElementAttribute,
+    a: &ElementAttribute<'_>,
     props: &std::collections::HashSet<String>,
 ) -> bool {
     match a {
@@ -1121,7 +1124,7 @@ fn expr_root_member_in(
     }
 }
 
-fn node_has_unsafe_call(n: &FragmentChild) -> bool {
+fn node_has_unsafe_call(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::ExpressionTag(t) => expr_has_unsafe_call(&t.expression),
         FragmentChild::HtmlTag(t) => expr_has_unsafe_call(&t.expression),
@@ -1166,7 +1169,7 @@ fn node_has_unsafe_call(n: &FragmentChild) -> bool {
     }
 }
 
-fn attr_has_unsafe_call(a: &ElementAttribute) -> bool {
+fn attr_has_unsafe_call(a: &ElementAttribute<'_>) -> bool {
     match a {
         ElementAttribute::Attribute(attr) => match &attr.value {
             AttributeValue::Many(parts) => parts.iter().any(|p| match p {
@@ -1436,7 +1439,7 @@ fn collect_block_indices_in_expr(
 /// Collects all blocker indices from an IfBlock test plus any nested
 /// flattened elseif tests (those without their own await/break-out).
 fn collect_if_block_indices(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     blocker_bindings: &std::collections::HashMap<String, usize>,
     out: &mut std::collections::BTreeSet<usize>,
 ) {
@@ -1462,16 +1465,16 @@ fn collect_if_block_indices(
 }
 
 fn lower_fragment_server_async_with(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     async_bindings: &std::collections::HashSet<String>,
     last_group_idx: usize,
     promises_var: &str,
     blocker_bindings: &std::collections::HashMap<String, usize>,
+    skip_const_tags: bool,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     let nodes = trim_boundary_whitespace(&f.nodes);
-    let nodes = trim_boundary_text(nodes);
     // Sibling-shared counter for `promises`/`promises_1`/... names when
     // sibling if-blocks each emit their own `lower_fragment_with_const_await`
     // local. Initial value 0 → first allocation gets `promises`, next
@@ -1498,6 +1501,12 @@ fn lower_fragment_server_async_with(
     // Track Comment-before-Text collapse, same rule as `lower_fragment_with_marker`.
     let mut after_dropped_comment = false;
     for n in nodes.iter() {
+        if skip_const_tags && matches!(n, FragmentChild::ConstTag(_)) {
+            continue;
+        }
+        if SKIP_SNIPPET_BLOCKS.with(|c| c.get()) && matches!(n, FragmentChild::SnippetBlock(_)) {
+            continue;
+        }
         if after_dropped_comment {
             if let FragmentChild::Text(t) = n {
                 buf.push_escaped_text_after_comment(&collapse_ws(&t.data));
@@ -1623,7 +1632,7 @@ fn lower_fragment_server_async_with(
                 let test_is_async = expr_has_await_top(&ib.test);
                 let mut indices: std::collections::BTreeSet<usize> =
                     std::collections::BTreeSet::new();
-                collect_if_block_indices(ib, blocker_bindings, &mut indices);
+                collect_if_block_indices(&*ib, blocker_bindings, &mut indices);
                 let indices_vec: Vec<usize> = indices.into_iter().collect();
                 let parent_blockers: std::collections::BTreeSet<usize> =
                     indices_vec.iter().copied().collect();
@@ -1638,7 +1647,7 @@ fn lower_fragment_server_async_with(
                     // ourselves with async_block(blockers, ...). Markers always
                     // use string literals (not template literals) inside an
                     // async_block / child_block body.
-                    let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
+                    let if_stmt = build_if_chain_server_ex(&*ib, 0, true, Some(&ctx))?;
                     out.push(wrap_async_block(
                         vec![if_stmt],
                         promises_var,
@@ -1647,12 +1656,12 @@ fn lower_fragment_server_async_with(
                     ));
                 } else if test_is_async {
                     // No blockers but await in test → child_block wrap.
-                    let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
+                    let if_stmt = build_if_chain_server_ex(&*ib, 0, true, Some(&ctx))?;
                     out.push(wrap_child_block(vec![if_stmt]));
                 } else {
                     // No blockers, no await — plain if-statement, but in
                     // async-mode markers are still single-quoted strings.
-                    let if_stmt = build_if_chain_server_ex(ib, 0, true, Some(&ctx))?;
+                    let if_stmt = build_if_chain_server_ex(&*ib, 0, true, Some(&ctx))?;
                     out.push(if_stmt);
                 }
                 const_await_counter = ctx.const_await_counter.get();
@@ -1662,14 +1671,14 @@ fn lower_fragment_server_async_with(
                 if let Some(stmt) = buf.flush() {
                     out.push(stmt);
                 }
-                out.extend(lower_each_block_server(eb)?);
+                out.extend(lower_each_block_server(&*eb)?);
                 buf.push_str("<!--]-->");
             }
             FragmentChild::AwaitBlock(ab) => {
                 if let Some(stmt) = buf.flush() {
                     out.push(stmt);
                 }
-                out.extend(lower_await_block_server(ab)?);
+                out.extend(lower_await_block_server(&*ab)?);
                 buf.push_str("<!--]-->");
             }
             FragmentChild::Text(_) | FragmentChild::Comment(_) => {
@@ -1720,7 +1729,7 @@ fn lower_fragment_server_async_with(
 /// references a script binding that has its own `$$promises[idx]` blocker
 /// (mirrors upstream's `2-analyze/visitors/ConstTag.js` decision).
 fn fragment_has_const_with_await_or_blocker(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     blocker_bindings: &std::collections::HashMap<String, usize>,
 ) -> bool {
     f.nodes.iter().any(|n| {
@@ -1744,7 +1753,7 @@ fn fragment_has_const_with_await_or_blocker(
 /// Legacy await-only check kept for callers that don't have access to
 /// `blocker_bindings`. Returns true ONLY when at least one const has top-level
 /// await.
-fn fragment_has_const_with_await(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_has_const_with_await(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(|n| {
         if let FragmentChild::ConstTag(ct) = n {
             ct.declaration.declarations.iter().any(|d| {
@@ -1764,7 +1773,7 @@ fn fragment_has_const_with_await(f: &svelte_ast::fragment::Fragment) -> bool {
 ///   var promises = $$renderer.run([async () => a = (await $.save(...))(), () => b = a + 1]);
 ///   ...rest of fragment lowered with $$renderer.async([promises[N]], ...)...
 fn lower_fragment_with_const_await(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
 ) -> Option<Vec<Statement>> {
     let empty: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     lower_fragment_with_const_await_with(f, &empty, "promises")
@@ -1779,14 +1788,13 @@ fn lower_fragment_with_const_await(
 /// `promises_var` controls the local var name (default `promises`, but
 /// caller may pass `promises_1` etc to dedupe across sibling fragments).
 fn lower_fragment_with_const_await_with(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     blocker_bindings: &std::collections::HashMap<String, usize>,
     promises_var: &str,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut const_names: Vec<String> = Vec::new();
     let mut groups: Vec<Expression> = Vec::new();
-    let mut rest_nodes: Vec<FragmentChild> = Vec::new();
     let mut last_was_async = false;
 
     for n in &f.nodes {
@@ -1864,8 +1872,6 @@ fn lower_fragment_with_const_await_with(
                     return None;
                 }
             }
-        } else {
-            rest_nodes.push(n.clone());
         }
     }
 
@@ -1902,10 +1908,6 @@ fn lower_fragment_with_const_await_with(
     // Lower the rest of the fragment with the const names treated as
     // async-tainted. `<promises_var>` is the local var name.
     let async_set: std::collections::HashSet<String> = const_names.into_iter().collect();
-    let stub_fragment = svelte_ast::fragment::Fragment {
-        nodes: rest_nodes,
-        metadata: Default::default(),
-    };
     let empty_blockers: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     // When called inside an if-block branch, the caller already pushed
@@ -1913,20 +1915,21 @@ fn lower_fragment_with_const_await_with(
     // inner lowerer's leading `<!---->` anchor in that case. We signal
     // this via a thread-local since the call site is deep.
     out.extend(lower_fragment_server_async_with(
-        &stub_fragment,
+        f,
         &async_set,
         last_idx,
         promises_var,
         &empty_blockers,
+        true,
     )?);
     Some(out)
 }
 
-fn fragment_has_async(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_has_async(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(node_has_async)
 }
 
-fn node_has_async(n: &FragmentChild) -> bool {
+fn node_has_async(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::ExpressionTag(t) => expr_has_await_top(&t.expression),
         FragmentChild::HtmlTag(t) => expr_has_await_top(&t.expression),
@@ -1969,7 +1972,7 @@ fn node_has_async(n: &FragmentChild) -> bool {
     }
 }
 
-fn attr_has_async(a: &svelte_ast::attributes::ElementAttribute) -> bool {
+fn attr_has_async(a: &svelte_ast::attributes::ElementAttribute<'_>) -> bool {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     match a {
         ElementAttribute::Attribute(a) => match &a.value {
@@ -2208,11 +2211,11 @@ fn emit_async_wrap_with(expr: &Expression, group_idx: usize, promises_var: &str)
 /// The leading `<!---->` anchor mirrors upstream's `is_text_first` rule:
 /// if the first non-WS child is Text or ExpressionTag (or @html), insert
 /// a marker so the text node doesn't get fused with surrounding fragments.
-fn lower_fragment_server(f: &svelte_ast::fragment::Fragment) -> Option<Vec<Statement>> {
+fn lower_fragment_server(f: &svelte_ast::fragment::Fragment<'_>) -> Option<Vec<Statement>> {
     lower_fragment_with_marker(f, is_text_first(f))
 }
 
-fn is_text_first(f: &svelte_ast::fragment::Fragment) -> bool {
+fn is_text_first(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     let first = f.nodes.iter().find(|n| match n {
         FragmentChild::Text(t) => !t.data.trim().is_empty(),
         FragmentChild::Comment(_) => false,
@@ -2242,6 +2245,8 @@ thread_local! {
     /// inner fragment processor strips whitespace between adjacent
     /// Components (matches upstream's `<select>`-body clean_nodes).
     static IN_SELECT_BODY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    /// Skip `{#snippet}` blocks while lowering a boundary body (already hoisted).
+    static SKIP_SNIPPET_BLOCKS: std::cell::Cell<bool> = std::cell::Cell::new(false);
     /// Set by `lower_component_server` when the returned statement is a
     /// `$$renderer.child_block(async …)` wrap — upstream skips the
     /// trailing `<!---->` anchor for async-wrapped components (component.js
@@ -2374,7 +2379,7 @@ fn lower_svelte_head_server_inner(
 ///   - `<svelte:boundary failed={ref} pending={ref}>` attributes → already
 ///     bound to a snippet; emit as shorthand or key:value pairs.
 fn lower_svelte_boundary_server(
-    sb: &svelte_ast::elements::SvelteBoundary,
+    sb: &svelte_ast::elements::SvelteBoundary<'_>,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(sb.fragment.nodes.len() + 16);
 
@@ -2394,7 +2399,7 @@ fn lower_svelte_boundary_server(
                     _ => None,
                 };
                 if let Some(e) = expr {
-                    attr_snippets.push((attr.name.clone(), e));
+                    attr_snippets.push((attr.name.to_string(), e));
                 }
             }
         }
@@ -2402,10 +2407,8 @@ fn lower_svelte_boundary_server(
 
     // 2. Snippet blocks inside the boundary → hoisted function decls.
     let mut snippet_names: Vec<String> = Vec::new();
-    let mut body_fragment = sb.fragment.clone();
-    let mut remaining: Vec<FragmentChild> = Vec::with_capacity(body_fragment.nodes.len());
-    for n in std::mem::take(&mut body_fragment.nodes) {
-        if let FragmentChild::SnippetBlock(snip) = &n {
+    for n in &sb.fragment.nodes {
+        if let FragmentChild::SnippetBlock(snip) = n {
             let name = snip.expression.name.clone();
             let needs_marker = body_needs_marker(&snip.body);
             let body_stmts = lower_fragment_with_marker(&snip.body, needs_marker)?;
@@ -2415,11 +2418,8 @@ fn lower_svelte_boundary_server(
             }
             out.push(t::function_decl(&name, params, body_stmts));
             snippet_names.push(name.to_string());
-            continue;
         }
-        remaining.push(n);
     }
-    body_fragment.nodes = remaining;
 
     // 3. Build the body statements once (used by both wrap and no-wrap paths).
     // Detect const-with-await in boundary body → route to const-await lowerer.
@@ -2427,8 +2427,9 @@ fn lower_svelte_boundary_server(
     // which splits adjacent text + the async expression into separate pushes.
     let empty_blockers: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    SKIP_SNIPPET_BLOCKS.with(|skip| skip.set(true));
     let body_stmts = if fragment_has_const_with_await_or_blocker(
-        &body_fragment, &empty_blockers,
+        &sb.fragment, &empty_blockers,
     ) {
         let idx = SIBLING_PROMISES_COUNTER.with(|cc| {
             let i = cc.get();
@@ -2441,20 +2442,19 @@ fn lower_svelte_boundary_server(
             format!("promises_{idx}")
         };
         lower_fragment_with_const_await_with(
-            &body_fragment, &empty_blockers, &promises_var,
+            &sb.fragment, &empty_blockers, &promises_var,
         )?
-    } else if fragment_has_async(&body_fragment) {
-        // Boundary body needs a leading `<!---->` anchor (the boundary's
-        // open marker counts as its sibling) — same rule as snippets/each.
+    } else if fragment_has_async(&sb.fragment) {
         let mut stmts = Vec::new();
-        if body_needs_marker(&body_fragment) {
+        if body_needs_marker(&sb.fragment) {
             stmts.push(push_template("<!---->"));
         }
-        stmts.extend(lower_fragment_for_async_block(&body_fragment)?);
+        stmts.extend(lower_fragment_for_async_block(&sb.fragment)?);
         stmts
     } else {
-        lower_fragment_server(&body_fragment)?
+        lower_fragment_server(&sb.fragment)?
     };
+    SKIP_SNIPPET_BLOCKS.with(|skip| skip.set(false));
 
     // 3a. When `pending` is present (snippet or attribute), the boundary
     //     lowers to an `if (pending) { snippet path } else { body path }`
@@ -2588,12 +2588,11 @@ fn lower_svelte_boundary_server(
 }
 
 fn lower_head_fragment(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     let nodes = trim_boundary_whitespace(&f.nodes);
-    let nodes = trim_boundary_text(nodes);
     let mut last_was_component = false;
     let mut after_dropped_comment = false;
     // Tracks whether the previous emitted node was a `$$renderer.title(...)`
@@ -2642,7 +2641,6 @@ fn lower_head_fragment(
             let mut inner_buf = TemplateBuf::new();
             inner_buf.push_str("<title>");
             let kids = trim_boundary_whitespace(&el.fragment.nodes);
-            let kids = trim_boundary_text(kids);
             for k in kids.iter() {
                 append_node_to_template(k, &mut inner_buf)?;
             }
@@ -2686,7 +2684,7 @@ fn lower_head_fragment(
                     // already includes the open/close `<!--[-->` /
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
-                        .with(|s| s.borrow().contains(c.name.as_str()));
+                        .with(|s| s.borrow().contains(c.name));
                     let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
                     last_was_component = !is_state && !async_wrapped;
                 }
@@ -2694,7 +2692,7 @@ fn lower_head_fragment(
                     out.push(lower_svelte_element_server(el)?);
                 }
                 FragmentChild::EachBlock(eb) => {
-                    out.extend(lower_each_block_server(eb)?);
+                    out.extend(lower_each_block_server(&*eb)?);
                     buf.push_str("<!--]-->");
                 }
                 FragmentChild::IfBlock(ib) => {
@@ -2735,7 +2733,7 @@ fn lower_head_fragment(
 /// Lower a fragment with an optional leading `<!---->` marker (prepended
 /// to the first push if the first non-whitespace child needs it).
 fn lower_fragment_with_marker(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
     needs_marker: bool,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
@@ -2744,7 +2742,6 @@ fn lower_fragment_with_marker(
         buf.push_str("<!---->");
     }
     let nodes = trim_boundary_whitespace(&f.nodes);
-    let nodes = trim_boundary_text(nodes);
     let mut emitted_static_push = false;
     // Set to true after emitting a non-template side-statement
     // (`$.head(...)`, `$$renderer.title(...)`, etc.) so the next Text's
@@ -2761,6 +2758,9 @@ fn lower_fragment_with_marker(
     let mut skip_until = 0usize;
     for i in 0..nodes.len() {
         if i < skip_until {
+            continue;
+        }
+        if SKIP_SNIPPET_BLOCKS.with(|c| c.get()) && matches!(nodes[i], FragmentChild::SnippetBlock(_)) {
             continue;
         }
         if let Some(end) = try_append_static_run(&nodes, i, &mut buf) {
@@ -2929,7 +2929,7 @@ fn lower_fragment_with_marker(
                     // already includes the open/close `<!--[-->` /
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
-                        .with(|s| s.borrow().contains(c.name.as_str()));
+                        .with(|s| s.borrow().contains(c.name));
                     let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
                     last_was_component = !is_state && !async_wrapped;
                 }
@@ -2938,13 +2938,13 @@ fn lower_fragment_with_marker(
                     last_was_component = false;
                 }
                 FragmentChild::EachBlock(eb) => {
-                    out.extend(lower_each_block_server(eb)?);
+                    out.extend(lower_each_block_server(&*eb)?);
                     // BLOCK_CLOSE `<!--]-->` fuses with the next text push.
                     buf.push_str("<!--]-->");
                     last_was_component = false;
                 }
                 FragmentChild::AwaitBlock(ab) => {
-                    out.extend(lower_await_block_server(ab)?);
+                    out.extend(lower_await_block_server(&*ab)?);
                     // BLOCK_CLOSE `<!--]-->` fuses with the next text push.
                     buf.push_str("<!--]-->");
                     last_was_component = false;
@@ -3079,7 +3079,7 @@ fn lower_fragment_with_marker(
 /// stmts go to `out`, then close tag is pushed back to `buf` so adjacent
 /// content can fuse with it on the next push.
 fn lower_content_editable_bind_inline(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     bind_name: &str,
     bind_expr: Expression,
     buf: &mut TemplateBuf,
@@ -3166,7 +3166,7 @@ fn lower_content_editable_bind_inline(
 /// to `buf`/`out`, emits the body extraction stmts to `out`, then pushes
 /// `</textarea>` back into `buf` so adjacent content can fuse with it.
 fn lower_textarea_server_inline(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
 ) -> Option<()> {
@@ -3277,7 +3277,7 @@ fn lower_textarea_server_inline(
 /// The `$$body` source comes from the `value=` (or `bind:value=`) attr
 /// when present; otherwise it's a template literal of the body children.
 fn lower_textarea_server(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
 ) -> Option<Vec<Statement>> {
     // Open tag + non-value attributes.
     let mut open_buf = TemplateBuf::new();
@@ -3388,7 +3388,7 @@ fn lower_textarea_server(
 /// shapes: static text, `{expr}`, `bind:value={x}`) or None when the
 /// select has no value attribute.
 fn select_value_attr(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
 ) -> Option<Expression> {
     for a in &el.attributes {
         match a {
@@ -3398,7 +3398,7 @@ fn select_value_attr(
                     AttributeValue::Many(parts) if parts.len() == 1 => match &parts[0] {
                         AttributeValuePart::Text(t) => Some(Expression::Literal(Box::new(
                             Literal::String(StringLiteral {
-                                value: Cow::Owned(t.data.clone()),
+                                value: Cow::Owned(t.data.to_string()),
                                 raw: Some(format!("'{}'", t.data.replace('\'', "\\'"))),
                                 span: Span::ZERO,
                             }),
@@ -3422,7 +3422,7 @@ fn select_value_attr(
 /// Other (non-value, non-bind) attributes on the `<select>` flow into the
 /// first-arg object too as additional properties.
 fn lower_select_with_value(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     value_expr: Expression,
 ) -> Option<Statement> {
     let value_has_await = expr_has_await_top(&value_expr);
@@ -3612,7 +3612,7 @@ fn lower_select_with_value(
 /// into `buf`, interleaves option calls into `out` (flushing buf each
 /// time), and finishes by writing the close tag into `buf`.
 fn emit_select_inline(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
 ) -> Option<()> {
@@ -3620,7 +3620,7 @@ fn emit_select_inline(
 }
 
 fn emit_select_inline_with(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
     each_counter: &std::cell::Cell<usize>,
@@ -3647,7 +3647,7 @@ fn emit_select_inline_with(
 /// "inside select context", Components / snippets / @html / @render get
 /// their out-of-band emission with anchor markers.
 fn lower_select_child(
-    c: &FragmentChild,
+    c: &FragmentChild<'_>,
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
     each_counter: &std::cell::Cell<usize>,
@@ -3796,7 +3796,7 @@ fn lower_select_child(
 /// RenderTags don't emit per-iteration anchors — those go on the trailing
 /// `<!--]-->`/`<!>` push after the loop instead.
 fn lower_select_child_loop_body(
-    c: &FragmentChild,
+    c: &FragmentChild<'_>,
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
     each_counter: &std::cell::Cell<usize>,
@@ -3827,7 +3827,7 @@ fn lower_select_child_loop_body(
 
 /// True if any descendant of the fragment is a Component, RenderTag, or
 /// HtmlTag — meaning the each/if-block's close marker needs a trailing `<!>`.
-fn each_body_has_rich_content(f: &svelte_ast::fragment::Fragment) -> bool {
+fn each_body_has_rich_content(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().any(|n| match n {
         FragmentChild::Component(_)
         | FragmentChild::RenderTag(_)
@@ -3868,7 +3868,7 @@ fn lower_render_tag_for_select(rt: &svelte_ast::tags::RenderTag) -> Option<State
 /// `idx == 0` uses plain names (`each_array`, `$$index`, `$$length`); higher
 /// indices append `_N` to dedupe across sibling each-blocks.
 fn lower_each_for_select(
-    eb: &svelte_ast::blocks::EachBlock,
+    eb: &svelte_ast::blocks::EachBlock<'_>,
     idx: usize,
     each_counter: &std::cell::Cell<usize>,
 ) -> Option<Vec<Statement>> {
@@ -3877,13 +3877,16 @@ fn lower_each_for_select(
     } else {
         format!("each_array_{idx}")
     };
-    let index_name = eb.index.clone().unwrap_or_else(|| {
-        if idx == 0 {
-            "$$index".to_string()
-        } else {
-            format!("$$index_{idx}")
-        }
-    });
+    let index_name = eb
+        .index
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if idx == 0 {
+                "$$index".to_string()
+            } else {
+                format!("$$index_{idx}")
+            }
+        });
 
     let init = Statement::Variable(Box::new(VariableDeclaration {
         kind: VariableKind::Let,
@@ -3998,7 +4001,7 @@ fn lower_each_for_select(
 /// If-block whose branches lower via `lower_select_child` for the `<select>`
 /// context. Simpler than the async version — no blockers, no async wrap.
 fn build_if_chain_for_select(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     each_counter: &std::cell::Cell<usize>,
 ) -> Option<Statement> {
     let consequent_marker = "<!--[0-->";
@@ -4006,7 +4009,6 @@ fn build_if_chain_for_select(
     {
         let mut inner_buf = TemplateBuf::new();
         let children = trim_boundary_whitespace(&ib.consequent.nodes);
-        let children = trim_boundary_text(children);
         for c in children.iter() {
             lower_select_child_loop_body(c, &mut inner_buf, &mut consequent_body, each_counter)?;
         }
@@ -4018,7 +4020,6 @@ fn build_if_chain_for_select(
     if let Some(alt) = &ib.alternate {
         let mut inner_buf = TemplateBuf::new();
         let children = trim_boundary_whitespace(&alt.nodes);
-        let children = trim_boundary_text(children);
         for c in children.iter() {
             lower_select_child_loop_body(c, &mut inner_buf, &mut alternate_body, each_counter)?;
         }
@@ -4043,7 +4044,7 @@ fn build_if_chain_for_select(
 /// Returns true unless the first non-trivial child of the fragment is a
 /// RegularElement (which provides its own anchor). Used to decide whether
 /// to prepend `<!---->` to a body push.
-fn body_needs_marker(f: &svelte_ast::fragment::Fragment) -> bool {
+fn body_needs_marker(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     let first = f
         .nodes
         .iter()
@@ -4068,7 +4069,7 @@ fn body_needs_marker(f: &svelte_ast::fragment::Fragment) -> bool {
 /// }
 /// $$renderer.push(`<!--]-->`);
 /// ```
-fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Statement>> {
+fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock<'_>) -> Option<Vec<Statement>> {
     // Per-component each-array counter — first block uses `each_array`,
     // subsequent blocks get `each_array_1`, `each_array_2`, ... Same index
     // suffix applies to the per-iteration `$$index` (`$$index_1`, ...).
@@ -4086,13 +4087,16 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
     // Index name — explicit when given, `$$index` otherwise. No-context form
     // (no `as`) still uses the explicit index if present. The index counter
     // also picks up the suffix when the each-block is the second-or-later.
-    let index_name = eb.index.clone().unwrap_or_else(|| {
-        if array_idx == 0 {
-            "$$index".to_string()
-        } else {
-            format!("$$index_{array_idx}")
-        }
-    });
+    let index_name = eb
+        .index
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            if array_idx == 0 {
+                "$$index".to_string()
+            } else {
+                format!("$$index_{array_idx}")
+            }
+        });
 
     // for-loop init: `let INDEX = 0, $$length = each_array.length`
     let init = Statement::Variable(Box::new(VariableDeclaration {
@@ -4386,7 +4390,7 @@ fn lower_each_block_server(eb: &svelte_ast::blocks::EachBlock) -> Option<Vec<Sta
 /// Caller appends a trailing `<!--]-->` marker that fuses with following content.
 /// Ports `packages/svelte/src/compiler/phases/3-transform/server/visitors/IfBlock.js`.
 fn lower_if_block_server(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
 ) -> Option<Vec<Statement>> {
     let test_is_async = expr_has_await_top(&ib.test);
     let if_stmt = build_if_chain_server(ib, 0, test_is_async)?;
@@ -4420,15 +4424,15 @@ fn lower_if_block_server(
 /// wrapping a fresh if-chain starting at the broken-out elseif. Mirrors
 /// upstream's IfBlock.js + analyze visitor's flattened/non-flattened split.
 fn build_if_chain_server(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     branch_idx: i32,
     use_async_marker: bool,
 ) -> Option<Statement> {
-    build_if_chain_server_ex(ib, branch_idx, use_async_marker, None)
+    build_if_chain_server_ex(&*ib, branch_idx, use_async_marker, None)
 }
 
 fn build_if_chain_server_ex(
-    ib: &svelte_ast::blocks::IfBlock,
+    ib: &svelte_ast::blocks::IfBlock<'_>,
     branch_idx: i32,
     use_async_marker: bool,
     async_ctx: Option<&AsyncCtx>,
@@ -4752,13 +4756,12 @@ fn wrap_async_test(test: &Expression) -> Expression {
 /// in their expression become separate `$$renderer.push(async () =>
 /// $.escape(await EXPR))` statements; other content uses normal lowering.
 fn lower_fragment_for_async_block(
-    f: &svelte_ast::fragment::Fragment,
+    f: &svelte_ast::fragment::Fragment<'_>,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(f.nodes.len() + 16);
     let mut buf = TemplateBuf::new();
     let in_head = IN_SVELTE_HEAD.with(|c| c.get());
     let nodes = trim_boundary_whitespace(&f.nodes);
-    let nodes = trim_boundary_text(nodes);
     for n in nodes.iter() {
         // `<title>` inside `<svelte:head>` becomes `$$renderer.title(…)`
         // even when the surrounding context is async.
@@ -4770,7 +4773,6 @@ fn lower_fragment_for_async_block(
                 let mut inner_buf = TemplateBuf::new();
                 inner_buf.push_str("<title>");
                 let kids = trim_boundary_whitespace(&el.fragment.nodes);
-                let kids = trim_boundary_text(kids);
                 for k in kids.iter() {
                     append_node_to_template(k, &mut inner_buf)?;
                 }
@@ -4834,7 +4836,7 @@ fn lower_fragment_for_async_block(
 /// `$.await($$renderer, EXPR, pending_arrow, then_arrow, catch_arrow?);`
 /// Returns the call statement; caller appends a trailing `<!--]-->` marker.
 fn lower_await_block_server(
-    ab: &svelte_ast::blocks::AwaitBlock,
+    ab: &svelte_ast::blocks::AwaitBlock<'_>,
 ) -> Option<Vec<Statement>> {
     // pending arrow: `() => { ...pending body... }`
     let pending = build_block_arrow(None, ab.pending.as_ref())?;
@@ -4890,14 +4892,14 @@ fn build_block_arrow(
 /// true for any `<select>` element (matching upstream's
 /// `is_option_special`-style decision applied per-`<option>`, but routed at
 /// the `<select>` level so the recursive lowering reaches every option).
-fn has_option_child(el: &svelte_ast::elements::RegularElement) -> bool {
+fn has_option_child(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     el.name == "select"
 }
 
 /// `<select>` with `<option>` children: emit the open tag, each option as a
 /// `$$renderer.option(props, body_fn)` call, then the close tag.
 fn lower_select_element_server(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
 ) -> Option<Vec<Statement>> {
     let mut out: Vec<Statement> = Vec::with_capacity(el.fragment.nodes.len() + el.attributes.len() + 8);
     // Open tag — serialize into a small TemplateBuf, flush.
@@ -4934,7 +4936,7 @@ fn lower_select_element_server(
 }
 
 /// `<option value="X">content</option>` → `$$renderer.option({ value: 'X' }, ($$renderer) => { ...body... });`.
-fn lower_option_server(el: &svelte_ast::elements::RegularElement) -> Option<Statement> {
+fn lower_option_server(el: &svelte_ast::elements::RegularElement<'_>) -> Option<Statement> {
     let mut props: Vec<ObjectMember> = Vec::new();
     for attr in &el.attributes {
         if let ElementAttribute::Attribute(a) = attr {
@@ -5106,8 +5108,8 @@ fn void_zero_expr() -> Expression {
 /// Mirrors upstream's `is_customizable_select_element` for the `<select>` case:
 /// returns true if any descendant beyond `<option>`/`<optgroup>` children
 /// is found — including direct Text content, Components, RenderTags, etc.
-fn is_customizable_select(el: &svelte_ast::elements::RegularElement) -> bool {
-    fn check(n: &FragmentChild) -> bool {
+fn is_customizable_select(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
+    fn check(n: &FragmentChild<'_>) -> bool {
         match n {
             // Allowed inside <select>: option, optgroup, expressions, etc.
             FragmentChild::Comment(_)
@@ -5145,8 +5147,8 @@ fn is_customizable_select(el: &svelte_ast::elements::RegularElement) -> bool {
 /// returns true if any descendant of the option's fragment is a RegularElement
 /// (rich content like `<span>`/`<em>`), an HtmlTag (`{@html ...}`), a
 /// Component, a RenderTag (`{@render ...}`), etc.
-fn is_customizable_option(el: &svelte_ast::elements::RegularElement) -> bool {
-    fn check(n: &FragmentChild) -> bool {
+fn is_customizable_option(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
+    fn check(n: &FragmentChild<'_>) -> bool {
         match n {
             // Stop at: snippet/const/comment/expression/text/debug.
             FragmentChild::Text(_)
@@ -5220,7 +5222,7 @@ fn push_string(s: &str) -> Statement {
 ///     $$renderer.push(`<TAG${$.attributes({...}, void 0, { … })}>...</TAG>`);
 ///   });`
 fn lower_element_with_async_directive(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
 ) -> Option<Statement> {
     let mut buf = TemplateBuf::new();
     let mut hoists: Vec<Expression> = Vec::new();
@@ -5252,7 +5254,6 @@ fn lower_element_with_async_directive(
     } else {
         buf.push_str(">");
         let children = trim_boundary_whitespace(&el.fragment.nodes);
-        let children = trim_boundary_text(children);
         for c in children.iter() {
             append_node_to_template(c, &mut buf)?;
         }
@@ -5298,7 +5299,7 @@ fn lower_element_with_async_directive(
 /// True if this element has any class:/style: directive whose expression
 /// contains a top-level `await` — triggers the `$$renderer.child(async ...)`
 /// wrap with const-hoisting (mirrors upstream's PromiseOptimiser path).
-fn element_has_async_directive(el: &svelte_ast::elements::RegularElement) -> bool {
+fn element_has_async_directive(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     el.attributes.iter().any(|a| match a {
         ElementAttribute::ClassDirective(c) => expr_has_await_top(&c.expression),
         ElementAttribute::StyleDirective(s) => match &s.value {
@@ -5312,8 +5313,8 @@ fn element_has_async_directive(el: &svelte_ast::elements::RegularElement) -> boo
     })
 }
 
-fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement) -> bool {
-    fn node_is_non_inline(n: &FragmentChild) -> bool {
+fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
+    fn node_is_non_inline(n: &FragmentChild<'_>) -> bool {
         match n {
             FragmentChild::Component(_)
             | FragmentChild::SvelteElement(_)
@@ -5343,7 +5344,7 @@ fn element_contains_non_inline(el: &svelte_ast::elements::RegularElement) -> boo
 /// and emit their own statement (the same dispatch as the top-level loop).
 /// Finishes by writing the close tag.
 fn lower_element_with_non_inline_children(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
     out: &mut Vec<Statement>,
 ) -> Option<()> {
@@ -5360,7 +5361,7 @@ fn lower_element_with_non_inline_children(
     buf.push_str(">");
 
     let children = trim_boundary_whitespace(&el.fragment.nodes);
-    let children = trim_boundary_text(&children);
+    let children = trim_boundary_whitespace(&el.fragment.nodes);
     let mut last_was_component = false;
     for n in children.iter() {
         if last_was_component {
@@ -5380,7 +5381,7 @@ fn lower_element_with_non_inline_children(
                     // already includes the open/close `<!--[-->` /
                     // `<!--]-->` markers; no trailing anchor needed.
                     let is_state = STATE_BINDINGS
-                        .with(|s| s.borrow().contains(c.name.as_str()));
+                        .with(|s| s.borrow().contains(c.name));
                     let async_wrapped = LAST_COMPONENT_WAS_ASYNC.with(|c| c.get());
                     last_was_component = !is_state && !async_wrapped;
                 }
@@ -5388,11 +5389,11 @@ fn lower_element_with_non_inline_children(
                     out.push(lower_svelte_element_server(child)?);
                 }
                 FragmentChild::EachBlock(eb) => {
-                    out.extend(lower_each_block_server(eb)?);
+                    out.extend(lower_each_block_server(&*eb)?);
                     buf.push_str("<!--]-->");
                 }
                 FragmentChild::AwaitBlock(ab) => {
-                    out.extend(lower_await_block_server(ab)?);
+                    out.extend(lower_await_block_server(&*ab)?);
                     buf.push_str("<!--]-->");
                 }
                 FragmentChild::IfBlock(ib) => {
@@ -5463,8 +5464,8 @@ fn lower_element_with_non_inline_children(
 }
 
 /// Plain static leaf (`<p>text</p>`) — cheap check before `is_fully_static_element`.
-fn is_trivial_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
-    !matches!(el.name.as_str(), "option" | "select" | "textarea")
+fn is_trivial_static_element(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
+    !matches!(el.name, "option" | "select" | "textarea")
         && el.attributes.is_empty()
         && el
             .fragment
@@ -5476,14 +5477,14 @@ fn is_trivial_static_element(el: &svelte_ast::elements::RegularElement) -> bool 
 /// True when `el` and its entire subtree can be serialized to HTML without
 /// building per-element AST nodes — no dynamic attrs, blocks, components,
 /// or special-case elements (`<option>`, `<select>`, `<textarea>`).
-fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
+fn is_fully_static_element(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     if el.metadata.is_static_element {
         return true;
     }
     if el.metadata.dynamic {
         return false;
     }
-    if matches!(el.name.as_str(), "option" | "select" | "textarea") {
+    if matches!(el.name, "option" | "select" | "textarea") {
         return false;
     }
     if el.name == "select" || element_has_async_directive(el) {
@@ -5536,7 +5537,7 @@ fn is_fully_static_element(el: &svelte_ast::elements::RegularElement) -> bool {
 /// True when a fragment child can be merged into a single static HTML run.
 /// Whitespace-only text is excluded: batching it with neighbors runs
 /// `trim_boundary_whitespace` on a sub-slice and drops inter-element spaces.
-fn is_static_template_batchable(n: &FragmentChild) -> bool {
+fn is_static_template_batchable(n: &FragmentChild<'_>) -> bool {
     match n {
         FragmentChild::RegularElement(el) => {
             is_trivial_static_element(el) || is_fully_static_element(el)
@@ -5547,7 +5548,7 @@ fn is_static_template_batchable(n: &FragmentChild) -> bool {
 
 /// Serialize two or more consecutive static text/element siblings in one pass.
 fn try_append_static_run(
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     start: usize,
     buf: &mut TemplateBuf,
 ) -> Option<usize> {
@@ -5569,7 +5570,7 @@ fn try_append_static_run(
 /// per-element AST construction. Boundary whitespace trim matches the
 /// incremental walker without cloning nodes.
 fn serialize_static_fragment_to_template(
-    nodes: &[FragmentChild],
+    nodes: &[FragmentChild<'_>],
     buf: &mut TemplateBuf,
 ) -> Option<()> {
     let nodes = trim_boundary_whitespace(nodes);
@@ -5616,7 +5617,7 @@ fn serialize_static_fragment_to_template(
 
 /// Serialize one fully-static element (open tag, body, close tag) in bulk.
 fn serialize_static_element_to_template(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
 ) -> Option<()> {
     debug_assert!(is_fully_static_element(el));
@@ -5637,7 +5638,7 @@ fn serialize_static_element_to_template(
     Some(())
 }
 
-fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<()> {
+fn append_node_to_template(n: &FragmentChild<'_>, buf: &mut TemplateBuf) -> Option<()> {
     match n {
         FragmentChild::Text(t) => {
             buf.push_escaped_text(&collapse_ws(&t.data));
@@ -5740,7 +5741,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
                                     match &parts[0] {
                                         AttributeValuePart::Text(t) => Some(Expression::Literal(
                                             Box::new(Literal::String(StringLiteral {
-                                                value: Cow::Owned(t.data.clone()),
+                                                value: Cow::Owned(t.data.to_string()),
                                                 raw: Some(format!(
                                                     "'{}'",
                                                     t.data.replace('\'', "\\'")
@@ -5827,7 +5828,6 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             } else {
                 buf.push_str(">");
                 let children = trim_boundary_whitespace(&el.fragment.nodes);
-                let children = trim_boundary_text(children);
                 for c in children.iter() {
                     append_node_to_template(c, buf)?;
                 }
@@ -5852,7 +5852,6 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
             // (Inside head, `lower_head_fragment` handles it specially.)
             buf.push_str("<title>");
             let kids = trim_boundary_whitespace(&el.fragment.nodes);
-            let kids = trim_boundary_text(kids);
             for k in kids.iter() {
                 append_node_to_template(k, buf)?;
             }
@@ -5863,41 +5862,7 @@ fn append_node_to_template(n: &FragmentChild, buf: &mut TemplateBuf) -> Option<(
     }
 }
 
-/// After `trim_boundary_whitespace`, trim leading whitespace inside the
-/// FIRST surviving Text node and trailing whitespace inside the LAST.
-fn trim_boundary_text(nodes: &[FragmentChild]) -> Cow<'_, [FragmentChild]> {
-    let needs_first = matches!(
-        nodes.first(),
-        Some(FragmentChild::Text(t)) if t.data.len() != t.data.trim_start().len()
-    );
-    let needs_last = matches!(
-        nodes.last(),
-        Some(FragmentChild::Text(t)) if t.data.len() != t.data.trim_end().len()
-    );
-    if !needs_first && !needs_last {
-        return Cow::Borrowed(nodes);
-    }
-    let mut out = nodes.to_vec();
-    if needs_first {
-        if let Some(FragmentChild::Text(t)) = out.first_mut() {
-            let trimmed = t.data.trim_start().to_string();
-            t.data = trimmed.clone();
-            t.raw = trimmed;
-        }
-    }
-    if needs_last {
-        if let Some(FragmentChild::Text(t)) = out.last_mut() {
-            let trimmed = t.data.trim_end().to_string();
-            t.data = trimmed.clone();
-            t.raw = trimmed;
-        }
-    }
-    Cow::Owned(out)
-}
-
-/// Skip leading + trailing whitespace-only Text nodes (and Comments,
-/// which are dropped server-side anyway) from a slice of fragment children.
-fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
+fn boundary_whitespace_range(nodes: &[FragmentChild]) -> (usize, usize) {
     let is_boundary_skip = |n: &FragmentChild| match n {
         FragmentChild::Text(t) => t.data.trim().is_empty(),
         FragmentChild::Comment(_) => true,
@@ -5911,6 +5876,101 @@ fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
     while end > start && is_boundary_skip(&nodes[end - 1]) {
         end -= 1;
     }
+    (start, end)
+}
+
+/// Trim leading/trailing whitespace inside boundary Text nodes in place
+/// (avoids cloning `FragmentChild` slices). Does not update `Text::raw`; callers
+/// should use `Text::data` when serializing.
+fn trim_boundary_text_in(nodes: &mut [FragmentChild<'_>], start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    let len = end - start;
+    if len == 1 {
+        if let FragmentChild::Text(t) = &mut nodes[start] {
+            let trimmed = t.data.trim().to_string();
+            t.data.clear();
+            t.data.push_str(&trimmed);
+        }
+        return;
+    }
+    let sub = &mut nodes[start..end];
+    let (head, tail) = sub.split_at_mut(1);
+    if let FragmentChild::Text(t) = &mut head[0] {
+        if t.data.len() != t.data.trim_start().len() {
+            let trimmed = t.data.trim_start().to_string();
+            t.data.clear();
+            t.data.push_str(&trimmed);
+        }
+    }
+    if let FragmentChild::Text(t) = &mut tail[tail.len() - 1] {
+        if t.data.len() != t.data.trim_end().len() {
+            let trimmed = t.data.trim_end().to_string();
+            t.data.clear();
+            t.data.push_str(&trimmed);
+        }
+    }
+}
+
+fn trim_boundary_text_on_fragment(fragment: &mut Fragment<'_>) {
+    let slice = fragment.nodes.as_slice();
+    let (start, end) = boundary_whitespace_range(slice);
+    trim_boundary_text_in(fragment.nodes.as_mut_slice(), start, end);
+}
+
+fn trim_boundary_text_recursive(fragment: &mut Fragment<'_>) {
+    trim_boundary_text_on_fragment(fragment);
+    for child in fragment.nodes.iter_mut() {
+        match child {
+            FragmentChild::RegularElement(el) => trim_boundary_text_recursive(&mut el.fragment),
+            FragmentChild::Component(c) => trim_boundary_text_recursive(&mut c.fragment),
+            FragmentChild::SlotElement(el) => trim_boundary_text_recursive(&mut el.fragment),
+            FragmentChild::TitleElement(el) => trim_boundary_text_recursive(&mut el.fragment),
+            FragmentChild::SvelteBody(el)
+            | FragmentChild::SvelteBoundary(el)
+            | FragmentChild::SvelteDocument(el)
+            | FragmentChild::SvelteFragment(el)
+            | FragmentChild::SvelteHead(el)
+            | FragmentChild::SvelteWindow(el)
+            | FragmentChild::SvelteSelf(el)
+            | FragmentChild::SvelteOptions(el) => trim_boundary_text_recursive(&mut el.fragment),
+            FragmentChild::SvelteComponent(c) => trim_boundary_text_recursive(&mut c.fragment),
+            FragmentChild::SvelteElement(el) => trim_boundary_text_recursive(&mut el.fragment),
+            FragmentChild::EachBlock(b) => {
+                trim_boundary_text_recursive(&mut b.body);
+                if let Some(fallback) = b.fallback.as_mut() {
+                    trim_boundary_text_recursive(fallback);
+                }
+            }
+            FragmentChild::IfBlock(b) => {
+                trim_boundary_text_recursive(&mut b.consequent);
+                if let Some(alt) = b.alternate.as_mut() {
+                    trim_boundary_text_recursive(alt);
+                }
+            }
+            FragmentChild::AwaitBlock(b) => {
+                if let Some(p) = b.pending.as_mut() {
+                    trim_boundary_text_recursive(p);
+                }
+                if let Some(t) = b.then.as_mut() {
+                    trim_boundary_text_recursive(t);
+                }
+                if let Some(c) = b.catch_.as_mut() {
+                    trim_boundary_text_recursive(c);
+                }
+            }
+            FragmentChild::KeyBlock(b) => trim_boundary_text_recursive(&mut b.fragment),
+            FragmentChild::SnippetBlock(b) => trim_boundary_text_recursive(&mut b.body),
+            _ => {}
+        }
+    }
+}
+
+/// Skip leading + trailing whitespace-only Text nodes (and Comments,
+/// which are dropped server-side anyway) from a slice of fragment children.
+fn trim_boundary_whitespace<'a>(nodes: &'a [FragmentChild<'a>]) -> &'a [FragmentChild<'a>] {
+    let (start, end) = boundary_whitespace_range(nodes);
     &nodes[start..end]
 }
 
@@ -5954,7 +6014,7 @@ fn collapse_ws(s: &str) -> Cow<'_, str> {
 /// are hoisted to `const $$N` placeholders and the caller emits the
 /// outer `$$renderer.child(async ...)` wrap.
 fn append_attributes_call(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
 ) {
     append_attributes_call_with_hoists(el, buf, &mut Vec::new());
@@ -5981,7 +6041,7 @@ fn expr_or_hoisted(expr: &Expression, hoists: &mut Vec<Expression>) -> Expressio
 }
 
 fn append_attributes_call_with_hoists(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     buf: &mut TemplateBuf,
     hoists: &mut Vec<Expression>,
 ) {
@@ -6005,7 +6065,7 @@ fn append_attributes_call_with_hoists(
             ElementAttribute::BindDirective(b) if b.name != "this" => {
                 members.push(ObjectMember::Property(Box::new(Property {
                     key: PropertyKey::Identifier(Identifier {
-                        name: Cow::Owned(b.name.clone()),
+                        name: Cow::Owned(b.name.to_string()),
                         span: Span::ZERO,
                     }),
                     value: b.expression.clone(),
@@ -6034,7 +6094,7 @@ fn append_attributes_call_with_hoists(
             ElementAttribute::ClassDirective(d) => {
                 let value = expr_or_hoisted(&d.expression, hoists);
                 class_props.push(ObjectMember::Property(Box::new(Property {
-                    key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.clone()), span: Span::ZERO }),
+                    key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.to_string()), span: Span::ZERO }),
                     value,
                     kind: PropertyKind::Init,
                     computed: false,
@@ -6059,7 +6119,7 @@ fn append_attributes_call_with_hoists(
                     _ => continue,
                 };
                 style_props.push(ObjectMember::Property(Box::new(Property {
-                    key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.clone()), span: Span::ZERO }),
+                    key: PropertyKey::Identifier(Identifier { name: Cow::Owned(d.name.to_string()), span: Span::ZERO }),
                     value,
                     kind: PropertyKind::Init,
                     computed: false,
@@ -6143,7 +6203,7 @@ fn append_attributes_call_with_hoists(
 /// `phases/bindings.js`. Returns true for bindings whose underlying
 /// property is readonly/browser-only and therefore has no SSR attribute.
 /// True if the attribute value is a single static Text part matching `expected`.
-fn attr_value_is_text(value: &AttributeValue, expected: &str) -> bool {
+fn attr_value_is_text(value: &AttributeValue<'_>, expected: &str) -> bool {
     match value {
         AttributeValue::Many(parts) if parts.len() == 1 => {
             matches!(&parts[0], AttributeValuePart::Text(t) if t.data == expected)
@@ -6181,7 +6241,7 @@ fn bind_omit_in_ssr(name: &str) -> bool {
 }
 
 fn append_element_attribute_server(
-    attr: &ElementAttribute,
+    attr: &ElementAttribute<'_>,
     buf: &mut TemplateBuf,
 ) -> Option<()> {
     match attr {
@@ -6229,7 +6289,7 @@ fn append_element_attribute_server(
 /// dynamic → `${$.attr('name', expr)}` interpolation.
 fn append_value_attribute(
     name: &str,
-    value: &AttributeValue,
+    value: &AttributeValue<'_>,
     buf: &mut TemplateBuf,
 ) -> Option<()> {
     match value {
@@ -6353,7 +6413,7 @@ fn append_value_attribute(
 ///   - Many parts (Text/ExpressionTag mix): static if all text, otherwise
 ///     template-literal wrapped in `$.attr_class`.
 fn append_class_attribute_with_hash(
-    value: &AttributeValue,
+    value: &AttributeValue<'_>,
     hash: &str,
     buf: &mut TemplateBuf,
 ) -> Option<()> {
@@ -6663,7 +6723,7 @@ impl TemplateBuf {
 /// `attrs` is `void 0` when there are no attributes; the body arrow is
 /// omitted when the body is empty.
 fn lower_svelte_element_server(
-    el: &svelte_ast::elements::SvelteElement,
+    el: &svelte_ast::elements::SvelteElement<'_>,
 ) -> Option<Statement> {
     let mut args = vec![
         Argument::Expression(t::id_renderer()),
@@ -6737,7 +6797,7 @@ fn lower_svelte_element_server(
 
 /// `<Foo a={x} b="y" {...rest}>BODY</Foo>` → `Foo($$renderer, { a: x, b: 'y', ...rest, children: ..., $$slots: { default: true } });`.
 /// Directives (`bind:this`, `on:click`, etc.) are dropped server-side.
-fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Statement> {
+fn lower_component_server(c: &svelte_ast::elements::Component<'_>) -> Option<Statement> {
     // Detect attributes whose value contains a top-level await. Each such
     // expression gets hoisted to `const $$N = (await $.save(EXPR))()` inside
     // a `$$renderer.child_block(async ...)` wrap, and the attribute uses
@@ -6772,7 +6832,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
                     };
                     props.push(ObjectMember::Property(Box::new(Property {
                         key: PropertyKey::Identifier(Identifier {
-                            name: Cow::Owned(a.name.clone()),
+                            name: Cow::Owned(a.name.to_string()),
                             span: Span::ZERO,
                         }),
                         value: t::id_owned(placeholder.to_string()),
@@ -6912,7 +6972,7 @@ fn lower_component_server(c: &svelte_ast::elements::Component) -> Option<Stateme
     }));
     // State-bound Component (e.g. `let Component = $state()`) — the
     // binding can be nullish so wrap in `if (X) { ... } else { ... }`.
-    let nullish = STATE_BINDINGS.with(|s| s.borrow().contains(c.name.as_str()));
+    let nullish = STATE_BINDINGS.with(|s| s.borrow().contains(c.name));
     let inner_stmt = if nullish {
         let then_branch = vec![
             push_string("<!--[-->"),
@@ -7059,7 +7119,7 @@ fn make_bind_setter(name: &str, target: &Expression) -> ObjectMember {
 }
 
 /// `name={expr}` → `{ name: expr }`. `name="literal"` → `{ name: 'literal' }`.
-fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
+fn attribute_to_object_member(a: &Attribute<'_>) -> Option<ObjectMember> {
     let value: Expression = match &a.value {
         AttributeValue::Empty => Expression::Literal(Box::new(Literal::Boolean(BooleanLiteral {
             value: true,
@@ -7081,7 +7141,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
                                 .join(" ");
                             (collapsed.clone(), format!("'{}'", collapsed.replace('\'', "\\'")))
                         } else {
-                            (t.data.clone(), format!("'{}'", t.raw.replace('\'', "\\'")))
+                            (t.data.to_string(), format!("'{}'", t.data.replace('\'', "\\'")))
                         };
                         Expression::Literal(Box::new(Literal::String(StringLiteral {
                             value: Cow::Owned(val),
@@ -7127,7 +7187,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
     };
     Some(ObjectMember::Property(Box::new(Property {
         key: PropertyKey::Identifier(Identifier {
-            name: Cow::Owned(a.name.clone()),
+            name: Cow::Owned(a.name.to_string()),
             span: Span::ZERO,
         }),
         value,
@@ -7140,7 +7200,7 @@ fn attribute_to_object_member(a: &Attribute) -> Option<ObjectMember> {
 }
 
 #[allow(dead_code)]
-fn single_non_ws_node(f: &svelte_ast::fragment::Fragment) -> Option<&FragmentChild> {
+fn single_non_ws_node<'a>(f: &'a svelte_ast::fragment::Fragment<'a>) -> Option<&'a FragmentChild<'a>> {
     let non_ws: Vec<&FragmentChild> = f
         .nodes
         .iter()
@@ -7156,8 +7216,8 @@ fn single_non_ws_node(f: &svelte_ast::fragment::Fragment) -> Option<&FragmentChi
     }
 }
 
-fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment) -> bool {
-    fn is_static(n: &FragmentChild) -> bool {
+fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
+    fn is_static(n: &FragmentChild<'_>) -> bool {
         match n {
             FragmentChild::Text(_) => true,
             // Comments are dropped server-side but require whitespace
@@ -7182,7 +7242,7 @@ fn is_pure_static_fragment(f: &svelte_ast::fragment::Fragment) -> bool {
 /// Walk every Expression in a fragment and call-wrap Identifier refs to
 /// derived bindings.
 fn call_derived_in_fragment(
-    f: &mut svelte_ast::fragment::Fragment,
+    f: &mut svelte_ast::fragment::Fragment<'_>,
     derived: &std::collections::HashSet<String>,
 ) {
     for n in &mut f.nodes {
@@ -7191,7 +7251,7 @@ fn call_derived_in_fragment(
 }
 
 fn rewrite_store_refs_in_fragment(
-    f: &mut svelte_ast::fragment::Fragment,
+    f: &mut svelte_ast::fragment::Fragment<'_>,
     top_bindings: &std::collections::HashSet<String>,
     refs: &mut std::collections::HashSet<String>,
 ) {
@@ -7204,7 +7264,7 @@ fn rewrite_store_refs_in_fragment(
 }
 
 fn rewrite_store_refs_in_node(
-    n: &mut FragmentChild,
+    n: &mut FragmentChild<'_>,
     top_bindings: &std::collections::HashSet<String>,
     refs: &mut std::collections::HashSet<String>,
 ) {
@@ -7279,7 +7339,7 @@ fn rewrite_store_refs_in_node(
 }
 
 fn rewrite_store_refs_in_attr(
-    attr: &mut ElementAttribute,
+    attr: &mut ElementAttribute<'_>,
     top_bindings: &std::collections::HashSet<String>,
     refs: &mut std::collections::HashSet<String>,
 ) {
@@ -7308,7 +7368,7 @@ fn rewrite_store_refs_in_attr(
 }
 
 fn call_derived_in_node(
-    n: &mut FragmentChild,
+    n: &mut FragmentChild<'_>,
     derived: &std::collections::HashSet<String>,
 ) {
     match n {
@@ -7378,7 +7438,7 @@ fn call_derived_in_node(
 }
 
 fn call_derived_in_attr(
-    attr: &mut ElementAttribute,
+    attr: &mut ElementAttribute<'_>,
     derived: &std::collections::HashSet<String>,
 ) {
     match attr {
@@ -7407,7 +7467,7 @@ fn call_derived_in_attr(
 
 /// Walk every Expression in a fragment and apply substitute_and_fold.
 fn substitute_consts_in_fragment(
-    f: &mut svelte_ast::fragment::Fragment,
+    f: &mut svelte_ast::fragment::Fragment<'_>,
     consts: &std::collections::HashMap<String, Expression>,
 ) {
     if consts.is_empty() && fragment_is_const_substitution_inert(f) {
@@ -7418,7 +7478,7 @@ fn substitute_consts_in_fragment(
     }
 }
 
-fn fragment_is_const_substitution_inert(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_is_const_substitution_inert(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().all(|n| match n {
         FragmentChild::Text(_) | FragmentChild::Comment(_) => true,
         FragmentChild::RegularElement(el) => {
@@ -7429,7 +7489,7 @@ fn fragment_is_const_substitution_inert(f: &svelte_ast::fragment::Fragment) -> b
 }
 
 fn substitute_consts_in_node(
-    n: &mut FragmentChild,
+    n: &mut FragmentChild<'_>,
     consts: &std::collections::HashMap<String, Expression>,
 ) {
     match n {
@@ -7498,7 +7558,7 @@ fn substitute_consts_in_node(
 }
 
 fn substitute_consts_in_attr(
-    attr: &mut ElementAttribute,
+    attr: &mut ElementAttribute<'_>,
     consts: &std::collections::HashMap<String, Expression>,
 ) {
     match attr {
@@ -7526,7 +7586,7 @@ fn substitute_consts_in_attr(
 }
 
 #[allow(dead_code)]
-fn fragment_is_empty(f: &svelte_ast::fragment::Fragment) -> bool {
+fn fragment_is_empty(f: &svelte_ast::fragment::Fragment<'_>) -> bool {
     f.nodes.iter().all(|n| match n {
         FragmentChild::Text(t) => t.data.trim().is_empty(),
         _ => false,

@@ -11,7 +11,8 @@ mod tests {
     #[test]
     fn fully_static_direct_matches_program_shape() {
         let src = "<h1>hello world</h1>";
-        let root = parse(src, false).unwrap();
+        let ast = parse(src, false).unwrap();
+        let root = ast.root();
         let bump = CompileBump::new();
         let direct = try_emit_fully_static_client_js(&root, "Hello_world", &bump).unwrap();
         assert!(direct.contains("$.from_html(`<h1>hello world</h1>`)"));
@@ -23,7 +24,8 @@ mod tests {
     #[test]
     fn program_direct_for_static_program() {
         let src = "<h1>x</h1>";
-        let root = parse(src, false).unwrap();
+        let ast = parse(src, false).unwrap();
+        let root = ast.root();
         let program = try_typed_client(&root, "X").unwrap();
         let js = try_emit_client_program_direct(&program).unwrap();
         assert!(js.contains("var root = $.from_html"));

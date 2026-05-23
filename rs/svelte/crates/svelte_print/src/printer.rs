@@ -37,7 +37,7 @@ pub struct PrintResult {
 }
 
 /// Print a `Root` AST node back to a `.svelte` source string.
-pub fn print(root: &Root, opts: PrintOptions) -> PrintResult {
+pub fn print(root: &Root<'_>, opts: PrintOptions) -> PrintResult {
     let mut p = Printer::new(opts);
     p.root_comments = root_comments_to_typed(root);
     p.emit_root(root);
@@ -48,7 +48,7 @@ pub fn print(root: &Root, opts: PrintOptions) -> PrintResult {
     PrintResult { code: p.out }
 }
 
-fn root_comments_to_typed(root: &Root) -> Vec<TypedComment> {
+fn root_comments_to_typed(root: &Root<'_>) -> Vec<TypedComment> {
     root.comments
         .iter()
         .map(|c| TypedComment {
@@ -164,7 +164,7 @@ impl Printer {
 
     // ---- root ---------------------------------------------------------
 
-    fn emit_root(&mut self, root: &Root) {
+    fn emit_root(&mut self, root: &Root<'_>) {
         // Top-level fragment order: module script first, then instance
         // script, then template fragment, then style. Upstream `print()`
         // walks `root.fragment.nodes` in source order, but module/instance/
@@ -426,7 +426,7 @@ impl Printer {
     /// run into its own sequence so they get newline-separated. Inline runs
     /// are emitted on a single line. If any sub-emission was multiline OR
     /// total width exceeds 50, sequences become newline-separated.
-    fn emit_fragment(&mut self, f: &Fragment, _inline: bool) {
+    fn emit_fragment(&mut self, f: &Fragment<'_>, _inline: bool) {
         let sequences = clean_and_sequence(&f.nodes);
 
         // Render each sequence into a probe so we can measure multiline
@@ -463,7 +463,7 @@ impl Printer {
         }
     }
 
-    fn render_sequence(&self, seq: &[FragmentChild]) -> (String, bool) {
+    fn render_sequence(&self, seq: &[SeqItem<'_>]) -> (String, bool) {
         // Render the sequence in a sub-printer that inherits current indent.
         let mut sub = Printer {
             out: String::with_capacity(64),
@@ -472,8 +472,11 @@ impl Printer {
             multiline: false,
             root_comments: self.root_comments.clone(),
         };
-        for n in seq {
-            sub.emit_node(n);
+        for item in seq {
+            match item {
+                SeqItem::Node(n) => sub.emit_node(n),
+                SeqItem::Text(s) => sub.write(s),
+            }
         }
         (sub.out, sub.multiline)
     }
@@ -597,29 +600,20 @@ impl Printer {
         self.emit_element_open("title", &el.attributes, &el.fragment, false);
     }
 
-    fn emit_svelte_element(&mut self, el: &SvelteElement) {
+    fn emit_svelte_element(&mut self, el: &SvelteElement<'_>) {
         // SvelteElement: self-close when empty body; otherwise always use
         // block-style body (upstream calls `block(context, fragment)`
         // without the `allow_inline` flag — see print/index.js:858).
-        let mut attrs: Vec<ElementAttribute> = Vec::with_capacity(el.attributes.len() + 1);
-        attrs.push(ElementAttribute::Attribute(Attribute {
-            start: 0,
-            end: 0,
-            name: "this".to_string(),
-            name_loc: None,
-            value: AttributeValue::Single(ExpressionTag {
-                start: 0,
-                end: 0,
-                expression: el.tag.clone(),
-            }),
-        }));
-        attrs.extend(el.attributes.iter().cloned());
+        let mut attr_strs: Vec<String> = Vec::with_capacity(el.attributes.len() + 1);
+        attr_strs.push(format!("this={{{}}}", print_expression_str(&el.tag)));
+        for a in &el.attributes {
+            attr_strs.push(self.attribute_to_string(a));
+        }
         if el.fragment.nodes.is_empty() {
-            self.emit_element_open("svelte:element", &attrs, &el.fragment, true);
+            self.emit_element_open_with_attr_strs("svelte:element", &attr_strs, &el.fragment, true);
             return;
         }
         // Open tag (attrs may wrap).
-        let attr_strs: Vec<String> = attrs.iter().map(|a| self.attribute_to_string(a)).collect();
         let inline_len = "svelte:element".len() + 2
             + attr_strs.iter().map(|s| s.len() + 1).sum::<usize>();
         let wrap_attrs = inline_len > LINE_BREAK_THRESHOLD && !attr_strs.is_empty();
@@ -643,22 +637,22 @@ impl Printer {
         self.write("</svelte:element>");
     }
 
-    fn emit_svelte_component(&mut self, el: &SvelteComponent) {
-        let mut attrs: Vec<ElementAttribute> = Vec::with_capacity(el.attributes.len() + 1);
-        attrs.push(ElementAttribute::Attribute(Attribute {
-            start: 0,
-            end: 0,
-            name: "this".to_string(),
-            name_loc: None,
-            value: AttributeValue::Single(ExpressionTag {
-                start: 0,
-                end: 0,
-                expression: el.expression.clone(),
-            }),
-        }));
-        attrs.extend(el.attributes.iter().cloned());
+    fn emit_svelte_component(&mut self, el: &SvelteComponent<'_>) {
+        let mut attr_strs: Vec<String> = Vec::with_capacity(el.attributes.len() + 1);
+        attr_strs.push(format!(
+            "this={{{}}}",
+            print_expression_str(&el.expression)
+        ));
+        for a in &el.attributes {
+            attr_strs.push(self.attribute_to_string(a));
+        }
         let has_body = !el.fragment.nodes.is_empty();
-        self.emit_element_open("svelte:component", &attrs, &el.fragment, !has_body);
+        self.emit_element_open_with_attr_strs(
+            "svelte:component",
+            &attr_strs,
+            &el.fragment,
+            !has_body,
+        );
     }
 
     fn emit_special(&mut self, el: &SpecialElement, name: &str) {
@@ -672,12 +666,21 @@ impl Printer {
     fn emit_element_open(
         &mut self,
         name: &str,
-        attrs: &[ElementAttribute],
-        fragment: &Fragment,
+        attrs: &[ElementAttribute<'_>],
+        fragment: &Fragment<'_>,
         is_void: bool,
     ) {
-        // Render attribute strings up-front to measure line length.
         let attr_strs: Vec<String> = attrs.iter().map(|a| self.attribute_to_string(a)).collect();
+        self.emit_element_open_with_attr_strs(name, &attr_strs, fragment, is_void);
+    }
+
+    fn emit_element_open_with_attr_strs(
+        &mut self,
+        name: &str,
+        attr_strs: &[String],
+        fragment: &Fragment<'_>,
+        is_void: bool,
+    ) {
         let inline_len = name.len() + 2 // < + >
             + attr_strs.iter().map(|s| s.len() + 1).sum::<usize>();
         // svelte:options always stays inline — upstream's Root visitor
@@ -691,14 +694,14 @@ impl Printer {
         self.write(name);
         if wrap_attrs {
             self.indent_in();
-            for s in &attr_strs {
+            for s in attr_strs {
                 self.newline();
                 self.write(s);
             }
             self.indent_out();
             self.newline();
         } else {
-            for s in &attr_strs {
+            for s in attr_strs {
                 self.write(" ");
                 self.write(s);
             }
@@ -738,7 +741,7 @@ impl Printer {
 
     /// Emit a block body (consequent, each-body, snippet-body, etc.) —
     /// always indented + newline-separated using clean_and_sequence.
-    fn emit_block_body(&mut self, f: &Fragment) {
+    fn emit_block_body(&mut self, f: &Fragment<'_>) {
         let sequences = clean_and_sequence(&f.nodes);
         if sequences.is_empty() {
             return;
@@ -767,7 +770,7 @@ impl Printer {
 
     /// Emit the body of an element, deciding inline vs block based on the
     /// same clean-and-sequence rules as the top-level Fragment visitor.
-    fn emit_element_body(&mut self, f: &Fragment) {
+    fn emit_element_body(&mut self, f: &Fragment<'_>) {
         let sequences = clean_and_sequence(&f.nodes);
         if sequences.is_empty() {
             return;
@@ -837,7 +840,7 @@ impl Printer {
 
     // ---- blocks -------------------------------------------------------
 
-    fn emit_if_block(&mut self, b: &IfBlock, is_else_if: bool) {
+    fn emit_if_block(&mut self, b: &IfBlock<'_>, is_else_if: bool) {
         if !is_else_if {
             self.write("{#if ");
         } else {
@@ -851,7 +854,7 @@ impl Printer {
             // Detect `{:else if}` chain: alternate is a single IfBlock.
             let alt_nodes = clean_and_sequence(&alt.nodes);
             if alt_nodes.len() == 1 && alt_nodes[0].len() == 1 {
-                if let FragmentChild::IfBlock(else_if) = &alt_nodes[0][0] {
+                if let SeqItem::Node(FragmentChild::IfBlock(else_if)) = &alt_nodes[0][0] {
                     self.emit_if_block(else_if, true);
                     if !is_else_if {
                         self.write("{/if}");
@@ -860,10 +863,7 @@ impl Printer {
                 }
             }
             self.write("{:else}");
-            // Wrap nodes back into a Fragment for emit_block_body.
-            let mut alt_frag = Fragment::default();
-            alt_frag.nodes = alt.nodes.clone();
-            self.emit_block_body(&alt_frag);
+            self.emit_block_body(alt);
         }
 
         if !is_else_if {
@@ -970,15 +970,20 @@ impl Printer {
 
 // ---- helpers ------------------------------------------------------------
 
+enum SeqItem<'a> {
+    Node(&'a FragmentChild<'a>),
+    Text(String),
+}
+
 /// Split a fragment's children into "sequences" — runs of inline-shaped
 /// nodes that should render on one line. Block-shaped nodes flush both
 /// before and after, so each block sits on its own line.
 ///
 /// Mirrors upstream's Fragment visitor (print/index.js:367-474).
-fn clean_and_sequence(nodes: &[FragmentChild]) -> Vec<Vec<FragmentChild>> {
-    let mut items: Vec<Vec<FragmentChild>> = Vec::new();
-    let mut seq: Vec<FragmentChild> = Vec::new();
-    let flush = |items: &mut Vec<Vec<FragmentChild>>, seq: &mut Vec<FragmentChild>| {
+fn clean_and_sequence<'a>(nodes: &'a [FragmentChild<'a>]) -> Vec<Vec<SeqItem<'a>>> {
+    let mut items: Vec<Vec<SeqItem<'a>>> = Vec::new();
+    let mut seq: Vec<SeqItem<'a>> = Vec::new();
+    let flush = |items: &mut Vec<Vec<SeqItem<'a>>>, seq: &mut Vec<SeqItem<'a>>| {
         if !seq.is_empty() {
             items.push(std::mem::take(seq));
         }
@@ -989,7 +994,7 @@ fn clean_and_sequence(nodes: &[FragmentChild]) -> Vec<Vec<FragmentChild>> {
         match node {
             FragmentChild::Text(t) => {
                 // Replace whitespace-runs with single space.
-                let mut data: String = collapse_internal_ws(&t.data);
+                let mut data: String = collapse_internal_ws(t.data.as_str());
                 if i == 0 {
                     data = data.trim_start().to_string();
                 }
@@ -1000,18 +1005,15 @@ fn clean_and_sequence(nodes: &[FragmentChild]) -> Vec<Vec<FragmentChild>> {
                     continue;
                 }
                 if data.starts_with(' ')
-                    && prev.map_or(false, |p| !matches!(p, FragmentChild::ExpressionTag(_)))
+                    && prev.is_some_and(|p| !matches!(p, FragmentChild::ExpressionTag(_)))
                 {
                     flush(&mut items, &mut seq);
                     data = data.trim_start().to_string();
                 }
                 if !data.is_empty() {
-                    let mut t2 = t.clone();
-                    t2.data = data.clone();
-                    t2.raw = data.clone();
-                    seq.push(FragmentChild::Text(t2));
+                    seq.push(SeqItem::Text(data.clone()));
                     if data.ends_with(' ')
-                        && next.map_or(false, |n| !matches!(n, FragmentChild::ExpressionTag(_)))
+                        && next.is_some_and(|n| !matches!(n, FragmentChild::ExpressionTag(_)))
                     {
                         flush(&mut items, &mut seq);
                     }
@@ -1020,10 +1022,10 @@ fn clean_and_sequence(nodes: &[FragmentChild]) -> Vec<Vec<FragmentChild>> {
             _ => {
                 if is_block_element(node) {
                     flush(&mut items, &mut seq);
-                    seq.push(node.clone());
+                    seq.push(SeqItem::Node(node));
                     flush(&mut items, &mut seq);
                 } else {
-                    seq.push(node.clone());
+                    seq.push(SeqItem::Node(node));
                 }
             }
         }
@@ -1032,7 +1034,7 @@ fn clean_and_sequence(nodes: &[FragmentChild]) -> Vec<Vec<FragmentChild>> {
     items
 }
 
-fn is_block_element(n: &FragmentChild) -> bool {
+fn is_block_element(n: &FragmentChild<'_>) -> bool {
     matches!(
         n,
         FragmentChild::RegularElement(_)
@@ -1077,8 +1079,9 @@ fn measure_width(s: &str) -> usize {
     s.lines().map(|l| l.chars().count()).max().unwrap_or(0)
 }
 
-fn trim_boundary_ws(nodes: &[FragmentChild]) -> Vec<FragmentChild> {
-    let is_ws = |n: &FragmentChild| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty());
+fn trim_boundary_ws<'a>(nodes: &'a [FragmentChild<'a>]) -> &'a [FragmentChild<'a>] {
+    let is_ws =
+        |n: &FragmentChild<'_>| matches!(n, FragmentChild::Text(t) if t.data.trim().is_empty());
     let mut start = 0;
     let mut end = nodes.len();
     while start < end && is_ws(&nodes[start]) {
@@ -1087,35 +1090,14 @@ fn trim_boundary_ws(nodes: &[FragmentChild]) -> Vec<FragmentChild> {
     while end > start && is_ws(&nodes[end - 1]) {
         end -= 1;
     }
-    let mut out: Vec<FragmentChild> = nodes[start..end].to_vec();
-    // Trim leading whitespace on first Text + trailing whitespace on last Text.
-    if let Some(FragmentChild::Text(t)) = out.first_mut() {
-        let trimmed = t.data.trim_start().to_string();
-        t.raw = if t.raw.len() > t.data.len() {
-            // raw may include source quoting; safely re-derive
-            t.raw[t.raw.len() - t.data.len()..].trim_start().to_string()
-        } else {
-            trimmed.clone()
-        };
-        t.data = trimmed;
-    }
-    if let Some(FragmentChild::Text(t)) = out.last_mut() {
-        let trimmed = t.data.trim_end().to_string();
-        t.raw = if t.raw.len() > t.data.len() {
-            t.raw[..t.raw.len() - (t.data.len() - trimmed.len())].trim_end().to_string()
-        } else {
-            trimmed.clone()
-        };
-        t.data = trimmed;
-    }
-    out
+    &nodes[start..end]
 }
 
 // ---- attribute serialization ------------------------------------------
 
-fn attribute_str(a: &Attribute) -> String {
+fn attribute_str(a: &Attribute<'_>) -> String {
     match &a.value {
-        AttributeValue::Empty => a.name.clone(),
+        AttributeValue::Empty => a.name.to_string(),
         AttributeValue::Single(tag) => {
             // Shorthand: `<X {name}>` when expression is `Identifier(name)`.
             if let svelte_js_ast::Expression::Identifier(id) = &tag.expression {

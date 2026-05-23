@@ -17,6 +17,7 @@ pub use options::{
 pub use svelte_ast::Root;
 pub use svelte_diagnostics::CompileDiagnostic;
 pub use svelte_migrate::{migrate, MigrateOptions, MigrateResult};
+pub use svelte_parse::AstBundle;
 pub use svelte_print::{print as print_root, PrintOptions, PrintResult};
 
 /// `parse(source, options)` — delegates to `svelte_parse::parse`.
@@ -26,7 +27,7 @@ pub use svelte_print::{print as print_root, PrintOptions, PrintResult};
 ///
 /// Errors from the lower-level parser are propagated as `CompileDiagnostic`s,
 /// matching upstream's `InternalCompileError` shape.
-pub fn parse(source: &str, options: ParseOptions) -> Result<Root, CompileDiagnostic> {
+pub fn parse(source: &str, options: ParseOptions) -> Result<AstBundle, CompileDiagnostic> {
     svelte_parse::parse(source, options.loose)
 }
 
@@ -49,8 +50,8 @@ pub fn compile(
     component_name: &str,
     options: CompileOptions,
 ) -> Result<CompileResult, CompileDiagnostic> {
-    let mut root = svelte_parse::parse(source, false)?;
     let compile_bump = svelte_transform_shared::compile_bump::CompileBump::new();
+    let mut root = svelte_parse::parse_in_arena(&compile_bump.template, source, false)?;
     svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
     if matches!(
         options.module.generate,
@@ -340,7 +341,7 @@ fn minify_css(src: &str) -> String {
 /// Detect `<svelte:options css="injected" />` at the root level.
 /// Returns Some(true) when present and set to "injected", Some(false) when
 /// present but set to "external", None when no svelte:options css attr.
-fn svelte_options_css_is_injected(root: &Root) -> Option<bool> {
+fn svelte_options_css_is_injected(root: &Root<'_>) -> Option<bool> {
     use svelte_ast::fragment::FragmentChild;
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart, ElementAttribute};
     for n in &root.fragment.nodes {

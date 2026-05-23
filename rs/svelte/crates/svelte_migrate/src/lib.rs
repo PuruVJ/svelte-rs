@@ -56,7 +56,7 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
 
     // 1. Parse the (blanked) source. On hard failure → prepend the
     //    @migration-task comment + return the original source unchanged.
-    let parsed = match svelte_parse::parse(&source_blanked, false) {
+    let ast = match svelte_parse::parse(&source_blanked, false) {
         Ok(r) => r,
         Err(diag) => {
             return MigrateResult {
@@ -67,12 +67,13 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
             };
         }
     };
+    let parsed = ast.root();
     let source = source_blanked.as_str();
 
     // 2. Detect "impossible to migrate" patterns. If any are found,
     //    prepend the migration-task comment and bail. Use the original
     //    (un-blanked) source for the returned body.
-    if let Some(err_msg) = detect_impossible(&parsed, source) {
+    if let Some(err_msg) = detect_impossible(parsed, source) {
         return MigrateResult {
             code: format!(
                 "<!-- @migration-task Error while migrating Svelte code: {} -->\n{}",
@@ -87,25 +88,25 @@ pub fn migrate(source: &str, opts: MigrateOptions) -> MigrateResult {
     //      Svelte 4 implicit topological reordering). We do this by
     //      textually rewriting the source and re-parsing, so the rest
     //      of the pipeline operates on the reordered source.
-    if let Some(new_source) = reorder_reactive_statements(source, &parsed) {
-        let new_parsed = match svelte_parse::parse(&new_source, false) {
+    if let Some(new_source) = reorder_reactive_statements(source, parsed) {
+        let new_ast = match svelte_parse::parse(&new_source, false) {
             Ok(r) => r,
             Err(_) => {
                 // If reordering breaks parsing, just continue with original.
-                return run_pipeline(source, og_source, &parsed, &style_contents, &opts);
+                return run_pipeline(source, og_source, parsed, &style_contents, &opts);
             }
         };
         let leaked: &'static str = Box::leak(new_source.into_boxed_str());
-        return run_pipeline(leaked, og_source, &new_parsed, &style_contents, &opts);
+        return run_pipeline(leaked, og_source, new_ast.root(), &style_contents, &opts);
     }
 
-    run_pipeline(source, og_source, &parsed, &style_contents, &opts)
+    run_pipeline(source, og_source, parsed, &style_contents, &opts)
 }
 
 fn run_pipeline(
     source: &str,
     og_source: &str,
-    parsed: &Root,
+    parsed: &Root<'_>,
     style_contents: &[(usize, String)],
     opts: &MigrateOptions,
 ) -> MigrateResult {
@@ -187,7 +188,7 @@ const STYLE_PLACEHOLDER: &str = "/*$$__STYLE_CONTENT__$$*/";
 // source so the rest of the pipeline can reparse and operate on it.
 // ---------------------------------------------------------------------------
 
-fn reorder_reactive_statements(source: &str, root: &Root) -> Option<String> {
+fn reorder_reactive_statements(source: &str, root: &Root<'_>) -> Option<String> {
     let instance = root.instance.as_ref()?;
     let body = &instance.content.body;
     // Collect `$:` labeled statements with their dependency identifiers.
@@ -715,7 +716,7 @@ fn find_matching_paren(s: &str, start: usize) -> Option<usize> {
 
 /// Run each detection rule in priority order. Returns the first error message
 /// (without the wrapping HTML comment) — empty `None` means we can migrate.
-fn detect_impossible(root: &Root, source: &str) -> Option<String> {
+fn detect_impossible(root: &Root<'_>, source: &str) -> Option<String> {
     // beforeUpdate / afterUpdate import + call detection.
     if let Some(msg) = detect_before_after_update(root) {
         return Some(msg);
@@ -749,7 +750,7 @@ fn detect_impossible(root: &Root, source: &str) -> Option<String> {
 /// Detect `import { beforeUpdate, afterUpdate } from "svelte"` accompanied
 /// by an *actual* call to either. Upstream removes unused imports silently,
 /// so we only error when the identifier is referenced.
-fn detect_before_after_update(root: &Root) -> Option<String> {
+fn detect_before_after_update(root: &Root<'_>) -> Option<String> {
     let instance = root.instance.as_ref()?;
 
     let mut illegal: Vec<&'static str> = Vec::new();
@@ -967,7 +968,7 @@ fn collect_identifiers_in_expr(expr: &Expression, out: &mut std::collections::Ha
 
 /// `export let X = …` + `$$props` referenced anywhere. Upstream only errors
 /// when at least one named prop has an init OR is `updated` (bind:/assignment).
-fn is_custom_element(root: &Root) -> bool {
+fn is_custom_element(root: &Root<'_>) -> bool {
     let mut found = false;
     walk_fragment(&root.fragment, &mut |child| {
         if found {
@@ -987,7 +988,7 @@ fn is_custom_element(root: &Root) -> bool {
     found
 }
 
-fn detect_props_and_dollar_props(root: &Root, source: &str) -> Option<String> {
+fn detect_props_and_dollar_props(root: &Root<'_>, source: &str) -> Option<String> {
     let instance = root.instance.as_ref()?;
 
     // First check `$$props` is used at all.
@@ -1162,7 +1163,7 @@ fn source_uses_dollar_dollar(source: &str, needle: &str) -> bool {
 }
 
 /// `export let { x } = …` — non-Identifier destructure.
-fn detect_export_non_identifier(root: &Root) -> Option<String> {
+fn detect_export_non_identifier(root: &Root<'_>) -> Option<String> {
     let instance = root.instance.as_ref()?;
     for stmt in &instance.content.body {
         if let Statement::ExportNamed(en) = stmt {
@@ -1188,7 +1189,7 @@ fn detect_export_non_identifier(root: &Root) -> Option<String> {
 ///
 /// Skipped entirely when `<svelte:options customElement="...">` is set —
 /// custom elements keep their `<slot>`s intact.
-fn detect_slot_rename(root: &Root) -> Option<String> {
+fn detect_slot_rename(root: &Root<'_>) -> Option<String> {
     // Skip if this is a customElement.
     if is_custom_element(root) {
         return None;
@@ -1240,7 +1241,7 @@ fn detect_slot_rename(root: &Root) -> Option<String> {
     })
 }
 
-fn attribute_static_string(value: &AttributeValue) -> Option<String> {
+fn attribute_static_string(value: &AttributeValue<'_>) -> Option<String> {
     match value {
         AttributeValue::Empty => None,
         AttributeValue::Single(_) => None,
@@ -1272,7 +1273,7 @@ fn is_valid_identifier(s: &str) -> bool {
 
 /// Walk the fragment + every child fragment recursively, calling `visit`
 /// on each `FragmentChild`.
-fn walk_fragment<F: FnMut(&FragmentChild)>(frag: &Fragment, visit: &mut F) {
+fn walk_fragment<F: FnMut(&FragmentChild<'_>)>(frag: &Fragment<'_>, visit: &mut F) {
     for child in &frag.nodes {
         visit(child);
         // Recurse into nested fragments.
@@ -1395,7 +1396,7 @@ fn collect_pattern_names(p: &Pattern, out: &mut std::collections::HashSet<String
 ///   - `derived` — we'd need `$derived(…)` because of a `$: x = expr`.
 ///   - `props` — there's an `export let X` so we'd need `$props()`.
 ///   - `bindable` — there's an `export let X` AND that prop is bind:'d.
-fn detect_rune_var_clash(root: &Root, source: &str) -> Option<String> {
+fn detect_rune_var_clash(root: &Root<'_>, source: &str) -> Option<String> {
     let instance = root.instance.as_ref()?;
 
     // Top-level binding names in the script.
@@ -1725,7 +1726,7 @@ fn find_word(span: &str, word: &str) -> Option<usize> {
 // `<script context="module">` → `<script module>`
 // ---------------------------------------------------------------------------
 
-fn migrate_script_module_context(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_script_module_context(source: &str, str: &mut MagicString, root: &Root<'_>) {
     let Some(module) = &root.module else {
         return;
     };
@@ -1742,7 +1743,7 @@ fn migrate_script_module_context(source: &str, str: &mut MagicString, root: &Roo
 // Self-closing element: `<div />` → `<div></div>` (non-void, non-svg)
 // ---------------------------------------------------------------------------
 
-fn migrate_self_closing_elements(source: &str, str: &mut MagicString, frag: &Fragment) {
+fn migrate_self_closing_elements(source: &str, str: &mut MagicString, frag: &Fragment<'_>) {
     walk_fragment(frag, &mut |child| {
         if let FragmentChild::RegularElement(el) = child {
             let bytes = source.as_bytes();
@@ -1903,7 +1904,7 @@ fn is_svg(name: &str) -> bool {
 fn migrate_svelte_self_no_filename(
     source: &str,
     str: &mut MagicString,
-    frag: &Fragment,
+    frag: &Fragment<'_>,
     filename: Option<&str>,
 ) {
     if filename.is_some() {
@@ -1975,7 +1976,7 @@ fn analysis_name_from_filename(filename: &str) -> String {
 fn migrate_svelte_self_with_filename(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     filename: Option<&str>,
 ) -> bool {
     let Some(filename) = filename else {
@@ -2148,7 +2149,7 @@ struct SvCompPath {
 fn migrate_svelte_component(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     scope_names: &std::collections::HashSet<String>,
 ) -> (Vec<(String, String)>, Vec<(usize, usize)>) {
     let mut counter: usize = 0;
@@ -2176,8 +2177,8 @@ fn migrate_svelte_component(
     };
 
     // Path-aware walk of the fragment tree. We track only relevant ancestors.
-    fn visit<F: FnMut(&svelte_ast::SvelteComponent, &[SvCompPath])>(
-        frag: &Fragment,
+    fn visit<F: FnMut(&svelte_ast::SvelteComponent<'_>, &[SvCompPath])>(
+        frag: &Fragment<'_>,
         path: &mut Vec<SvCompPath>,
         callback: &mut F,
     ) {
@@ -2505,7 +2506,7 @@ fn is_valid_component_name(s: &str) -> bool {
 fn emit_svelte_component_derived(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     derived: &[(String, String)],
 ) {
     if derived.is_empty() {
@@ -2551,7 +2552,7 @@ fn emit_svelte_component_derived(
     str.append_left(insertion, buf);
 }
 
-fn migrate_svelte_element_static_this(source: &str, str: &mut MagicString, frag: &Fragment) {
+fn migrate_svelte_element_static_this(source: &str, str: &mut MagicString, frag: &Fragment<'_>) {
     walk_fragment(frag, &mut |child| {
         if let FragmentChild::SvelteElement(el) = child {
             if let Expression::Literal(lit) = &el.tag {
@@ -2607,7 +2608,7 @@ fn migrate_svelte_element_static_this(source: &str, str: &mut MagicString, frag:
 // pointing out the issue. For reserved words (e.g. `new`) too.
 // ---------------------------------------------------------------------------
 
-fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragment) {
+fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragment<'_>) {
     // Visit the fragment with the parent context. The slot-name check only
     // applies when the parent is a Component (or SvelteComponent).
     walk_with_parent(frag, None, &mut |child, parent| {
@@ -2678,8 +2679,8 @@ fn migrate_invalid_named_slots(source: &str, str: &mut MagicString, frag: &Fragm
     });
 }
 
-fn walk_with_parent<'a, F: FnMut(&'a FragmentChild, Option<&'a FragmentChild>)>(
-    frag: &'a Fragment,
+fn walk_with_parent<'a, F: FnMut(&'a FragmentChild<'_>, Option<&'a FragmentChild<'_>>)>(
+    frag: &'a Fragment<'_>,
     parent: Option<&'a FragmentChild>,
     visit: &mut F,
 ) {
@@ -2799,7 +2800,7 @@ fn is_reserved_word(s: &str) -> bool {
 // import insertion + handlers() merging and are deferred.
 // ---------------------------------------------------------------------------
 
-fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment) {
+fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment<'_>) {
     // Pre-compute aliases by scanning the instance script for top-level
     // bindings that clash with our legacy import names.
     let aliases = compute_legacy_aliases(source);
@@ -2827,8 +2828,8 @@ fn migrate_simple_on_events(source: &str, str: &mut MagicString, frag: &Fragment
 /// no clash).
 fn compute_legacy_aliases(source: &str) -> std::collections::HashMap<String, String> {
     let mut taken: std::collections::HashSet<String> = Default::default();
-    if let Ok(parsed) = svelte_parse::parse(source, false) {
-        if let Some(instance) = &parsed.instance {
+    if let Ok(ast) = svelte_parse::parse(source, false) {
+        if let Some(instance) = &ast.root().instance {
             for stmt in &instance.content.body {
                 collect_top_level_decl_names(stmt, &mut taken);
             }
@@ -2898,10 +2899,10 @@ fn apply_legacy_event_script(
     state: &LegacyEventState,
     aliases: &std::collections::HashMap<String, String>,
 ) {
-    let Ok(parsed) = svelte_parse::parse(source, false) else {
+    let Ok(ast) = svelte_parse::parse(source, false) else {
         return;
     };
-    let root = parsed;
+    let root = ast.root();
 
     // Build the import line: `import { foo, bar as bar_1, … } from 'svelte/legacy';`
     let mut parts: Vec<String> = Vec::new();
@@ -2944,7 +2945,7 @@ fn apply_legacy_event_script(
 fn handle_events_on_element(
     source: &str,
     str: &mut MagicString,
-    attrs: &[ElementAttribute],
+    attrs: &[ElementAttribute<'_>],
     state: &mut LegacyEventState,
     aliases: &std::collections::HashMap<String, String>,
 ) {
@@ -2958,7 +2959,7 @@ fn handle_events_on_element(
             continue;
         };
         let mut name = format!("on{}", od.name);
-        if od.modifiers.iter().any(|m| m == "capture") {
+        if od.modifiers.iter().any(|m| *m == "capture") {
             name = format!("{}capture", name);
         }
         if let Some(&i) = idx_of.get(&name) {
@@ -2984,8 +2985,8 @@ fn handle_events_on_element(
                 format!("{}('{}')", a("bubble"), node.name)
             };
 
-            let has_passive = node.modifiers.iter().any(|m| m == "passive");
-            let has_nonpassive = node.modifiers.iter().any(|m| m == "nonpassive");
+            let has_passive = node.modifiers.iter().any(|m| *m == "passive");
+            let has_nonpassive = node.modifiers.iter().any(|m| *m == "nonpassive");
 
             // Apply modifiers in canonical order.
             const ORDER: &[&str] = &[
@@ -3078,7 +3079,7 @@ pub(crate) struct SlotInfo {
     pub aliased_slot_starts: std::collections::HashMap<usize, String>,
 }
 
-fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
+fn gather_slot_info(source: &str, root: &Root<'_>) -> SlotInfo {
     let mut info = SlotInfo::default();
     // Bail entirely if it's a custom element — slots stay as-is.
     if is_custom_element(root) {
@@ -3254,10 +3255,10 @@ fn gather_slot_info(source: &str, root: &Root) -> SlotInfo {
 /// element, check if any ancestor (or self) has `slot="X"` matching the
 /// slot's `name`, OR if the slot is default and an ancestor has a `let:`
 /// directive. If so, add `X_render → X` to `derived_conflicting_slots`.
-fn detect_conflicting_slots(frag: &Fragment, info: &mut SlotInfo) {
-    fn ancestor_info(node: &FragmentChild) -> (Option<String>, bool) {
+fn detect_conflicting_slots(frag: &Fragment<'_>, info: &mut SlotInfo) {
+    fn ancestor_info(node: &FragmentChild<'_>) -> (Option<String>, bool) {
         // Returns (slot_attr_value, has_let_directive) for the node.
-        let attrs: &Vec<ElementAttribute> = match node {
+        let attrs: &[ElementAttribute<'_>] = match node {
             FragmentChild::RegularElement(e) => &e.attributes,
             FragmentChild::SvelteElement(e) => &e.attributes,
             FragmentChild::Component(c) => &c.attributes,
@@ -3283,7 +3284,7 @@ fn detect_conflicting_slots(frag: &Fragment, info: &mut SlotInfo) {
     }
 
     fn visit(
-        frag: &Fragment,
+        frag: &Fragment<'_>,
         path_slot_attrs: &mut Vec<String>,
         path_has_let: &mut Vec<bool>,
         info: &mut SlotInfo,
@@ -3339,7 +3340,7 @@ fn detect_conflicting_slots(frag: &Fragment, info: &mut SlotInfo) {
                 }
             }
             // Recurse into children fragments.
-            let inner: Option<&Fragment> = match child {
+            let inner: Option<&Fragment<'_>> = match child {
                 FragmentChild::RegularElement(e) => Some(&e.fragment),
                 FragmentChild::SvelteElement(e) => Some(&e.fragment),
                 FragmentChild::Component(c) => Some(&c.fragment),
@@ -3404,12 +3405,12 @@ fn detect_conflicting_slots(frag: &Fragment, info: &mut SlotInfo) {
 fn apply_component_let_directive_wrap(
     source: &str,
     str: &mut MagicString,
-    child: &FragmentChild,
+    child: &FragmentChild<'_>,
     depth: usize,
 ) {
     let bytes = source.as_bytes();
     let indent = guess_indent_from_source(source);
-    let (attrs, c_frag): (&Vec<ElementAttribute>, &Fragment) = match child {
+    let (attrs, c_frag): (&[ElementAttribute<'_>], &Fragment<'_>) = match child {
         FragmentChild::Component(c) => (&c.attributes, &c.fragment),
         FragmentChild::SvelteComponent(c) => (&c.attributes, &c.fragment),
         _ => return,
@@ -3423,7 +3424,7 @@ fn apply_component_let_directive_wrap(
                 let (s, e) = expr_span(expr);
                 format!("{}: {}", ld.name, &source[s as usize..e as usize])
             } else {
-                ld.name.clone()
+                ld.name.to_string()
             };
             let_pairs.push(pair);
             let_attrs.push((ld.start as usize, ld.end as usize));
@@ -3551,8 +3552,8 @@ fn apply_component_let_directive_wrap(
     }
 }
 
-fn node_has_slot_attribute(n: &FragmentChild) -> bool {
-    let attrs: &Vec<ElementAttribute> = match n {
+fn node_has_slot_attribute(n: &FragmentChild<'_>) -> bool {
+    let attrs: &[ElementAttribute<'_>] = match n {
         FragmentChild::RegularElement(e) => &e.attributes,
         FragmentChild::SvelteElement(e) => &e.attributes,
         FragmentChild::SvelteFragment(e) => &e.attributes,
@@ -3567,7 +3568,7 @@ fn node_has_slot_attribute(n: &FragmentChild) -> bool {
     })
 }
 
-fn node_start(n: &FragmentChild) -> usize {
+fn node_start(n: &FragmentChild<'_>) -> usize {
     match n {
         FragmentChild::Text(t) => t.start as usize,
         FragmentChild::RegularElement(e) => e.start as usize,
@@ -3599,7 +3600,7 @@ fn node_start(n: &FragmentChild) -> usize {
     }
 }
 
-fn node_end(n: &FragmentChild) -> usize {
+fn node_end(n: &FragmentChild<'_>) -> usize {
     match n {
         FragmentChild::Text(t) => t.end as usize,
         FragmentChild::RegularElement(e) => e.end as usize,
@@ -3638,7 +3639,7 @@ fn node_end(n: &FragmentChild) -> usize {
 fn apply_migrate_slot_usage(
     source: &str,
     str: &mut MagicString,
-    frag: &Fragment,
+    frag: &Fragment<'_>,
     parent: Option<&FragmentChild>,
     depth: usize,
 ) {
@@ -3650,7 +3651,7 @@ fn apply_migrate_slot_usage(
     );
     for child in &frag.nodes {
         // Recurse first into children so we don't miss nested cases.
-        let child_frag: Option<&Fragment> = match child {
+        let child_frag: Option<&Fragment<'_>> = match child {
             FragmentChild::Component(c) => Some(&c.fragment),
             FragmentChild::SvelteComponent(c) => Some(&c.fragment),
             FragmentChild::RegularElement(e) => Some(&e.fragment),
@@ -3677,10 +3678,10 @@ fn apply_migrate_slot_usage(
         }
         // Get attrs, start, end, and fragment.
         let (attrs, c_start, c_end, c_frag, is_svelte_fragment): (
-            &Vec<ElementAttribute>,
+            &[ElementAttribute<'_>],
             usize,
             usize,
-            Option<&Fragment>,
+            Option<&Fragment<'_>>,
             bool,
         ) = match child {
             FragmentChild::RegularElement(e) => {
@@ -3723,7 +3724,7 @@ fn apply_migrate_slot_usage(
                             invalid_id = Some(name.clone());
                         } else {
                             // Check parent's attributes — shadow detection.
-                            let parent_attrs: Option<&Vec<ElementAttribute>> = match parent {
+                            let parent_attrs: Option<&[ElementAttribute<'_>]> = match parent {
                                 Some(FragmentChild::Component(c)) => Some(&c.attributes),
                                 Some(FragmentChild::SvelteComponent(c)) => Some(&c.attributes),
                                 _ => None,
@@ -3748,7 +3749,7 @@ fn apply_migrate_slot_usage(
                         let (s, e) = expr_span(expr);
                         format!("{}: {}", ld.name, &source[s as usize..e as usize])
                     } else {
-                        ld.name.clone()
+                        ld.name.to_string()
                     };
                     let_pairs.push(pair);
                     let_attrs.push((ld.start as usize, ld.end as usize));
@@ -3981,7 +3982,7 @@ fn apply_migrate_slot_usage(
 }
 
 /// Replace `<slot>` markup and `$$slots.X` references in the template.
-fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, slots: &SlotInfo) {
+fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root<'_>, slots: &SlotInfo) {
     if is_custom_element(root) {
         return;
     }
@@ -4234,7 +4235,7 @@ fn apply_slot_template_edits(source: &str, str: &mut MagicString, root: &Root, s
 fn emit_props_script_no_instance(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     slots: &SlotInfo,
     opt_use_ts: bool,
     filename: Option<&str>,
@@ -4556,7 +4557,7 @@ fn guess_indent_for_text(text: &str) -> String {
 fn migrate_simple_props(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     slots: &SlotInfo,
     opt_use_ts: bool,
     filename: Option<&str>,
@@ -5940,7 +5941,7 @@ fn p_decl_unused() {
 //     within instance script
 // ---------------------------------------------------------------------------
 
-fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Root<'_>) {
     let Some(instance) = &root.instance else {
         return;
     };
@@ -6372,7 +6373,7 @@ fn migrate_export_specifier_props(source: &str, str: &mut MagicString, root: &Ro
 fn migrate_effects(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     derived_labeled_starts: &std::collections::HashSet<usize>,
 ) {
     let Some(instance) = &root.instance else {
@@ -6516,7 +6517,7 @@ fn migrate_effects(
 /// Find a unique name for a legacy import. If `base` doesn't clash with any
 /// top-level binding in the instance script, returns `base` unchanged.
 /// Otherwise returns `base_1`, `base_2`, etc.
-fn unique_legacy_name(source: &str, root: &Root, base: &str) -> String {
+fn unique_legacy_name(source: &str, root: &Root<'_>, base: &str) -> String {
     let mut taken: std::collections::HashSet<String> = Default::default();
     if let Some(instance) = &root.instance {
         for stmt in &instance.content.body {
@@ -6558,7 +6559,7 @@ fn reindent_inside(s: &str, indent: &str) -> String {
 // are removed, drop the entire import statement.
 // ---------------------------------------------------------------------------
 
-fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_unused_beforeafter_imports(source: &str, str: &mut MagicString, root: &Root<'_>) {
     let Some(instance) = &root.instance else {
         return;
     };
@@ -6808,7 +6809,7 @@ fn rewrite_dollar_dollar_refs_ctx(s: &str, uses_props: bool) -> String {
 fn migrate_simple_derivations(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
 ) -> (
     std::collections::HashSet<usize>,
     std::collections::HashSet<String>,
@@ -7226,7 +7227,7 @@ fn extract_comments_from_chunk(chunk: &str) -> Vec<String> {
 fn migrate_simple_state(
     source: &str,
     str: &mut MagicString,
-    root: &Root,
+    root: &Root<'_>,
     derived_consumed_names: &std::collections::HashSet<String>,
 ) {
     let Some(instance) = &root.instance else {
@@ -7452,7 +7453,7 @@ fn migrate_simple_state(
 // HTML `<!-- svelte-ignore ... -->` migration.
 // ---------------------------------------------------------------------------
 
-fn migrate_comments(source: &str, str: &mut MagicString, root: &Root) {
+fn migrate_comments(source: &str, str: &mut MagicString, root: &Root<'_>) {
     walk_fragment(&root.fragment, &mut |child| {
         if let FragmentChild::Comment(c) = child {
             let migrated = migrate_svelte_ignore_text(&c.data);
@@ -7644,7 +7645,7 @@ fn has_hyphenated_word(s: &str) -> bool {
 // Mirrors upstream's `trim_block(state, start, end)`.
 // ---------------------------------------------------------------------------
 
-fn migrate_block_whitespace(source: &str, str: &mut MagicString, frag: &Fragment) {
+fn migrate_block_whitespace(source: &str, str: &mut MagicString, frag: &Fragment<'_>) {
     walk_fragment(frag, &mut |child| {
         match child {
             FragmentChild::HtmlTag(t) => {
@@ -7857,8 +7858,8 @@ mod tests {
 	let count = 0;
 	$: $count = 1;
 </script>"#;
-        let r = svelte_parse::parse(src, false).unwrap();
-        let inst = r.instance.as_ref().unwrap();
+        let ast = svelte_parse::parse(src, false).unwrap();
+        let inst = ast.root().instance.as_ref().unwrap();
         for s in &inst.content.body {
             if let svelte_js_ast::Statement::Labeled(l) = s {
                 eprintln!("labeled body: {:?}", l.body);

@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Client typed transform: Svelte Root → svelte_js_ast::Program."
 
 [dependencies]
+bumpalo = { workspace = true }
 svelte_ast = { workspace = true }
 svelte_js_ast = { workspace = true }
 svelte_codegen_js = { workspace = true }

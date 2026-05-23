@@ -26,7 +26,7 @@ use crate::template_elements::{self, CollectResult, ElementTree};
 /// State threaded through every visitor. `path` is the chain of
 /// ancestors (oldest first). `is_runes` mirrors `analysis.runes`.
 pub struct ValidateState<'a> {
-    pub path: Vec<&'a FragmentChild>,
+    pub path: Vec<&'a FragmentChild<'a>>,
     pub warnings: Vec<CompileDiagnostic>,
     pub errors: Vec<CompileDiagnostic>,
     pub is_runes: bool,
@@ -58,7 +58,7 @@ pub struct ValidateState<'a> {
 }
 
 impl<'a> ValidateState<'a> {
-    pub fn new(analysis: &Analysis) -> Self {
+    pub fn new(analysis: &Analysis<'a>) -> Self {
         Self {
             path: Vec::new(),
             warnings: Vec::new(),
@@ -86,7 +86,7 @@ impl<'a> ValidateState<'a> {
 /// content (Program JSON) for JS-side validators (ImportDeclaration,
 /// LabeledStatement, etc.).
 pub fn validate(
-    root: &Root,
+    root: &Root<'_>,
     analysis: &Analysis,
     collect_elements: bool,
 ) -> (ElementTree, Vec<CompileDiagnostic>, Vec<CompileDiagnostic>) {
@@ -673,7 +673,7 @@ fn collect_template_reads(
             ElementAttribute::StyleDirective(d) => {
                 // Bare `style:height` desugars to `style:height={height}`,
                 // so the directive name itself is an identifier read.
-                if matches!(d.value, svelte_ast::AttributeValue::Empty) && cands.contains(&d.name) {
+                if matches!(d.value, svelte_ast::AttributeValue::Empty) && cands.contains(d.name) {
                     refs.insert(d.name.to_string());
                 }
                 match &d.value {
@@ -1277,6 +1277,9 @@ fn validate_slot_attributes(
         nearest_owner: Option<OwnerKind>,
         state: &mut ValidateState,
     ) {
+        if matches!(n, FragmentChild::SvelteFragment(_)) {
+            return;
+        }
         let attrs = match n {
             FragmentChild::RegularElement(el) => &el.attributes,
             FragmentChild::Component(c) => &c.attributes,
@@ -1320,7 +1323,7 @@ fn validate_slot_attributes(
             }
         }
     }
-    fn slot_attr_of(n: &FragmentChild) -> Option<(&svelte_ast::Attribute, Option<String>)> {
+    fn slot_attr_of<'a>(n: &'a FragmentChild<'a>) -> Option<(&'a svelte_ast::Attribute<'a>, Option<String>)> {
         let attrs = match n {
             FragmentChild::RegularElement(el) => &el.attributes,
             FragmentChild::SvelteElement(el) => &el.attributes,
@@ -1478,7 +1481,7 @@ fn attr_static_string_attr(attr: &svelte_ast::Attribute) -> Option<String> {
     match &attr.value {
         AttributeValue::Many(parts) if parts.len() == 1 => {
             if let AttributeValuePart::Text(t) = &parts[0] {
-                Some(t.data.clone())
+                Some(t.data.to_string())
             } else {
                 None
             }
@@ -3655,7 +3658,7 @@ fn validate_const_assignments(
         let mut refs = Vec::new();
         collect_idents(init, &mut refs);
         graph.insert(
-            name.clone(),
+            name.to_string(),
             refs.into_iter().filter(|r| names.contains(r) && r != name).collect(),
         );
     }
@@ -4509,7 +4512,7 @@ fn is_proxy_able(e: &svelte_js_ast::Expression) -> bool {
 /// Returns true when `<svelte:options customElement=...>` is present in
 /// the source. This sets `analysis.custom_element` upstream and gates
 /// `custom_element_props_identifier`.
-fn svelte_options_has_custom_element(root: &Root) -> bool {
+fn svelte_options_has_custom_element(root: &Root<'_>) -> bool {
     for n in &root.fragment.nodes {
         if let FragmentChild::SvelteOptions(opts) = n {
             for a in &opts.attributes {
@@ -4527,7 +4530,7 @@ fn svelte_options_has_custom_element(root: &Root) -> bool {
 /// Look for `<svelte:options customElement={{ ..., props: ... }}>`. When
 /// an explicit `props` option is configured, `custom_element_props_identifier`
 /// is suppressed because Svelte already knows what to expose.
-fn svelte_options_customelement_has_props(root: &Root) -> bool {
+fn svelte_options_customelement_has_props(root: &Root<'_>) -> bool {
     use svelte_js_ast::*;
     for n in &root.fragment.nodes {
         let FragmentChild::SvelteOptions(opts) = n else { continue };
@@ -4643,7 +4646,7 @@ fn validate_script_attributes(
 /// script — `let`, `const`, `var`, `function`, `class`, and `import`
 /// declarations. Used by `attribute_global_event_reference` to know
 /// whether `onclick` refers to a user variable.
-fn collect_instance_declared(root: &Root) -> std::collections::HashSet<String> {
+fn collect_instance_declared(root: &Root<'_>) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let Some(s) = &root.instance else { return out };
     for stmt in &s.content.body {
@@ -4855,7 +4858,7 @@ fn collect_pattern_names(
 /// Collect identifier names imported via `import X from ...` /
 /// `import { Y } from ...` / `import * as Z from ...` in instance + module
 /// scripts. Used by `component_name_lowercase` detection.
-fn collect_imported_names(root: &Root) -> std::collections::HashSet<String> {
+fn collect_imported_names(root: &Root<'_>) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     fn walk_program(program: &svelte_js_ast::Program, out: &mut std::collections::HashSet<String>) {
         for stmt in &program.body {
@@ -5646,7 +5649,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             }
             // component_name_lowercase: `<thisShouldWarnMe>` where the name
             // matches a script-level import → warn.
-            if state.imported_names.contains(&el.name) {
+            if state.imported_names.contains(el.name) {
                 state
                     .warnings
                     .push(warnings::component_name_lowercase(
@@ -5686,7 +5689,7 @@ fn visit_node<'a>(node: &'a FragmentChild, state: &mut ValidateState<'a>) {
             // SvelteElement also gets a11y checks if the tag is statically known.
             // For now we only check `autofocus` here since the tag is dynamic;
             // most other a11y rules need a concrete tag name.
-            if el.attributes.iter().any(|a| matches!(a, ElementAttribute::Attribute(svelte_ast::Attribute { name, .. }) if name == "autofocus")) {
+            if el.attributes.iter().any(|a| matches!(a, ElementAttribute::Attribute(svelte_ast::Attribute { name, .. }) if *name == "autofocus")) {
                 state
                     .warnings
                     .push(warnings::a11y_autofocus(Some((el.start, el.end))));
@@ -5961,7 +5964,7 @@ fn validate_custom_element_value(attr: &svelte_ast::Attribute) -> CustomElementC
         AttributeValue::Many(parts) => {
             if parts.len() == 1 {
                 if let AttributeValuePart::Text(t) = &parts[0] {
-                    Some(t.data.clone())
+                    Some(t.data.to_string())
                 } else if let AttributeValuePart::ExpressionTag(et) = &parts[0] {
                     return match &et.expression {
                         svelte_js_ast::Expression::Object(_) => CustomElementCheck::ObjectExpr,
@@ -6426,7 +6429,7 @@ fn visit_svelte_self<'a>(el: &'a svelte_ast::SvelteSelf, state: &mut ValidateSta
                     .and_then(|s| s.to_str())
                     .unwrap_or("Self.svelte")
                     .to_string();
-                (state.component_name.clone(), basename)
+                (state.component_name.to_string(), basename)
             }
         };
         state.warnings.push(warnings::svelte_self_deprecated(
@@ -6728,7 +6731,7 @@ fn visit_attribute(attr: &svelte_ast::Attribute, state: &mut ValidateState) {
         // `name={name}` form where the identifier is the same as the
         // attribute name. Skip when the binding exists in scope.
         if shorthand_or_self_reference(&attr.value, &attr.name)
-            && !state.instance_declared.contains(&attr.name)
+            && !state.instance_declared.contains(attr.name)
         {
             state
                 .warnings
@@ -6842,7 +6845,7 @@ fn visit_bind_directive(
     let Some(parent_name) = parent_name else { return };
 
     let props = crate::bindings::binding_properties();
-    let Some(prop) = props.get(d.name.as_str()) else {
+    let Some(prop) = props.get(d.name) else {
         // Unknown binding name — upstream surfaces `bind_invalid_name` /
         // `bind_invalid_target` via fuzzy match. We skip the fuzzy match
         // path for now (would require also porting `fuzzymatch.js`).
@@ -6923,7 +6926,7 @@ fn visit_on_directive(
     let mut has_passive = false;
     let mut conflicting_passive: Option<String> = None;
     for m in &d.modifiers {
-        if !EVENT_MODIFIERS.contains(&m.as_str()) {
+        if !EVENT_MODIFIERS.contains(&m) {
             let list = format!(
                 "{} or {}",
                 EVENT_MODIFIERS[..EVENT_MODIFIERS.len() - 1].join(", "),
@@ -6936,10 +6939,10 @@ fn visit_on_directive(
                     &list,
                 ));
         }
-        if m == "passive" {
+        if *m == "passive" {
             has_passive = true;
-        } else if m == "nonpassive" || m == "preventDefault" {
-            conflicting_passive = Some(m.clone());
+        } else if *m == "nonpassive" || *m == "preventDefault" {
+            conflicting_passive = Some(m.to_string());
         }
         if has_passive {
             if let Some(other) = conflicting_passive.clone() {
@@ -6963,7 +6966,7 @@ fn visit_on_directive(
     if on_element {
         // Track for `mixed_event_handler_syntaxes` detection at end-of-validate.
         if state.event_directive_node.is_none() {
-            state.event_directive_node = Some((d.start, d.end, d.name.clone()));
+            state.event_directive_node = Some((d.start, d.end, d.name.to_string()));
         }
         state.warnings.push(warnings::event_directive_deprecated(
             Some((d.start, d.end)),

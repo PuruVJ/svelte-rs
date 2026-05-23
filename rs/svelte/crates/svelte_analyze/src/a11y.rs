@@ -34,7 +34,7 @@ pub fn check_duplicate_attributes(
         let (name, start, end) = match a {
             ElementAttribute::Attribute(svelte_ast::Attribute {
                 name, start, end, ..
-            }) => (name.clone(), *start, *end),
+            }) => (name.to_string(), *start, *end),
             ElementAttribute::ClassDirective(d) => (format!("class:{}", d.name), d.start, d.end),
             ElementAttribute::StyleDirective(d) => (format!("style:{}", d.name), d.start, d.end),
             ElementAttribute::BindDirective(d) => (format!("bind:{}", d.name), d.start, d.end),
@@ -67,7 +67,7 @@ pub fn check_regular_element_with_parent(
         .attributes
         .iter()
         .filter_map(|a| match a {
-            ElementAttribute::Attribute(Attribute { name, value, .. }) => Some((name.as_str(), value)),
+            ElementAttribute::Attribute(Attribute { name, value, .. }) => Some((*name, value)),
             _ => None,
         })
         .collect();
@@ -1394,7 +1394,7 @@ fn fragment_has_caption_track(f: &Fragment) -> bool {
             if el.name == "track" {
                 let kind = el.attributes.iter().find_map(|a| match a {
                     ElementAttribute::Attribute(Attribute { name, value, .. })
-                        if name == "kind" =>
+                        if *name == "kind" =>
                     {
                         Some(value)
                     }

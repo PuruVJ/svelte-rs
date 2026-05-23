@@ -7,17 +7,17 @@ use svelte_ast::root::Root;
 use crate::walker::serialize_element_to_html_inner;
 
 /// Fill `element.metadata.cached_static_html` for every static element in the tree.
-pub fn precompute_static_html_cache(root: &mut Root) {
+pub fn precompute_static_html_cache(root: &mut Root<'_>) {
     precompute_fragment(&mut root.fragment);
 }
 
-fn precompute_fragment(fragment: &mut Fragment) {
+fn precompute_fragment(fragment: &mut Fragment<'_>) {
     for node in &mut fragment.nodes {
         precompute_node(node);
     }
 }
 
-fn precompute_node(node: &mut FragmentChild) {
+fn precompute_node(node: &mut FragmentChild<'_>) {
     match node {
         FragmentChild::RegularElement(el) => {
             if el.metadata.is_static_element && el.metadata.cached_static_html.is_none() {
@@ -74,7 +74,7 @@ fn precompute_node(node: &mut FragmentChild) {
 
 /// Push cached or freshly serialized element HTML.
 pub fn push_element_html(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     out: &mut String,
     needs_import_node: &mut bool,
 ) -> Option<()> {

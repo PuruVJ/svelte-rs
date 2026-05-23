@@ -1,6 +1,7 @@
 fn main() {
     let src = std::fs::read_to_string("/Users/puruvijay/Projects/svelte-rs/packages/svelte/tests/snapshot/samples/async-top-level-group-sync-run/index.svelte").unwrap();
-    let root = svelte_parse::parse(&src, false).unwrap();
+    let ast = svelte_parse::parse(&src, false).unwrap();
+    let root = ast.root();
     eprintln!("Root.comments: {}", root.comments.len());
     for c in &root.comments {
         eprintln!("  [{}..{}] {:?} {:?}", c.start, c.end, c.kind, c.value);

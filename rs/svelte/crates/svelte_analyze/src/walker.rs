@@ -20,7 +20,7 @@
 
 use svelte_ast::Root;
 
-use crate::scope::{BindingKind, DeclarationKind, Scope, ScopePtr};
+use crate::scope::{BindingKind, DeclarationKind, Reference, Scope, ScopePtr};
 
 /// Walk a Program node (the `content` field of a `Script`) and populate
 /// `root_scope` and its descendants.
@@ -117,6 +117,7 @@ fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
             }
         }
         S::If(i) => {
+            visit_expr_refs(&i.test, scope);
             visit_stmt(&i.consequent, scope);
             if let Some(a) = &i.alternate {
                 visit_stmt(a, scope);
@@ -130,6 +131,14 @@ fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
                 } else {
                     declare_var_declaration(d, &child);
                 }
+            } else if let Some(svelte_js_ast::ForInit::Expression(e)) = &f.init {
+                visit_expr_refs(e, &child);
+            }
+            if let Some(test) = &f.test {
+                visit_expr_refs(test, &child);
+            }
+            if let Some(update) = &f.update {
+                visit_expr_refs(update, &child);
             }
             visit_stmt(&f.body, &child);
         }
@@ -141,7 +150,10 @@ fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
                 } else {
                     declare_var_declaration(d, &child);
                 }
+            } else if let svelte_js_ast::ForInit::Expression(e) = &f.left {
+                visit_expr_refs(e, &child);
             }
+            visit_expr_refs(&f.right, &child);
             visit_stmt(&f.body, &child);
         }
         S::ForOf(f) => {
@@ -152,11 +164,20 @@ fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
                 } else {
                     declare_var_declaration(d, &child);
                 }
+            } else if let svelte_js_ast::ForInit::Expression(e) = &f.left {
+                visit_expr_refs(e, &child);
             }
+            visit_expr_refs(&f.right, &child);
             visit_stmt(&f.body, &child);
         }
-        S::While(w) => visit_stmt(&w.body, scope),
-        S::DoWhile(w) => visit_stmt(&w.body, scope),
+        S::While(w) => {
+            visit_expr_refs(&w.test, scope);
+            visit_stmt(&w.body, scope);
+        }
+        S::DoWhile(w) => {
+            visit_stmt(&w.body, scope);
+            visit_expr_refs(&w.test, scope);
+        }
         S::Try(t) => {
             for s in &t.block.body {
                 visit_stmt(s, scope);
@@ -177,13 +198,24 @@ fn visit_stmt(s: &svelte_js_ast::Statement, scope: &ScopePtr) {
             }
         }
         S::Switch(sw) => {
+            visit_expr_refs(&sw.discriminant, scope);
             let switch_scope = Scope::child(scope, true);
             for c in &sw.cases {
+                if let Some(test) = &c.test {
+                    visit_expr_refs(test, &switch_scope);
+                }
                 for s in &c.consequent {
                     visit_stmt(s, &switch_scope);
                 }
             }
         }
+        S::Return(r) => {
+            if let Some(arg) = &r.argument {
+                visit_expr_refs(arg, scope);
+            }
+        }
+        S::Throw(t) => visit_expr_refs(&t.argument, scope),
+        S::Expression(e) => visit_expr_refs(&e.expression, scope),
         S::Labeled(l) => visit_stmt(&l.body, scope),
         S::With(w) => visit_stmt(&w.body, scope),
         _ => {}
@@ -197,49 +229,60 @@ fn declare_var_declaration(v: &svelte_js_ast::VariableDeclaration, scope: &Scope
         svelte_js_ast::VariableKind::Const => DeclarationKind::Const,
     };
     for d in &v.declarations {
-        // Classify by the initializer's rune call, if any.
-        let kind = d
-            .init
-            .as_ref()
-            .and_then(get_rune_keypath_typed)
-            .as_deref()
-            .map(rune_to_binding_kind)
-            .filter(|k| !matches!(k, BindingKind::Normal))
-            .unwrap_or(BindingKind::Normal);
-        declare_pattern(&d.id, scope, kind, decl_kind);
+        let init_rune = d.init.as_ref().and_then(get_rune_keypath_typed);
+        let pattern_kind = match init_rune.as_deref() {
+            Some("$props") => BindingKind::Prop,
+            Some(other) => rune_to_binding_kind(other),
+            None => BindingKind::Normal,
+        };
+        declare_pattern(&d.id, scope, pattern_kind, decl_kind);
+    }
+}
+
+fn detect_bindable_pattern(p: &svelte_js_ast::Pattern) -> Option<BindingKind> {
+    let svelte_js_ast::Pattern::Assignment(a) = p else {
+        return None;
+    };
+    match get_rune_keypath_typed(&a.right).as_deref() {
+        Some("$bindable") => Some(BindingKind::BindableProp),
+        _ => None,
     }
 }
 
 fn declare_pattern(
     p: &svelte_js_ast::Pattern,
     scope: &ScopePtr,
-    kind: BindingKind,
+    default_kind: BindingKind,
     decl_kind: DeclarationKind,
 ) {
     use svelte_js_ast::Pattern as P;
     match p {
         P::Identifier(id) => {
-            scope
-                .borrow_mut()
-                .declare(id.name.to_string(), kind, decl_kind, id.clone());
+            scope.borrow_mut().declare(
+                id.name.to_string(),
+                default_kind,
+                decl_kind,
+                id.clone(),
+            );
         }
         P::Array(a) => {
             for el in a.elements.iter().flatten() {
-                declare_pattern(el, scope, kind, decl_kind);
+                declare_pattern(el, scope, default_kind, decl_kind);
             }
         }
         P::Object(o) => {
             for m in &o.properties {
                 match m {
                     svelte_js_ast::ObjectPatternMember::Property(p) => {
-                        declare_pattern(&p.value, scope, kind, decl_kind);
+                        let elem_kind =
+                            detect_bindable_pattern(&p.value).unwrap_or(default_kind);
+                        declare_pattern(&p.value, scope, elem_kind, decl_kind);
                     }
                     svelte_js_ast::ObjectPatternMember::Rest(r) => {
-                        // `let { ...rest } = $props()` — rest of props.
-                        let rest_kind = if matches!(kind, BindingKind::Prop) {
+                        let rest_kind = if matches!(default_kind, BindingKind::Prop) {
                             BindingKind::RestProp
                         } else {
-                            kind
+                            default_kind
                         };
                         declare_pattern(&r.argument, scope, rest_kind, decl_kind);
                     }
@@ -247,12 +290,199 @@ fn declare_pattern(
             }
         }
         P::Rest(r) => {
-            declare_pattern(&r.argument, scope, kind, DeclarationKind::RestParam);
+            declare_pattern(&r.argument, scope, default_kind, DeclarationKind::RestParam);
         }
         P::Assignment(a) => {
-            declare_pattern(&a.left, scope, kind, decl_kind);
+            let elem_kind = detect_bindable_pattern(p).unwrap_or(default_kind);
+            declare_pattern(&a.left, scope, elem_kind, decl_kind);
         }
         P::Member(_) => {}
+    }
+}
+
+fn visit_expr_refs(e: &svelte_js_ast::Expression, scope: &ScopePtr) {
+    use svelte_js_ast::Expression as E;
+    match e {
+        E::Identifier(id) => {
+            Scope::reference_chain(
+                scope,
+                id.name.to_string(),
+                Reference { node: id.clone() },
+            );
+        }
+        E::Update(u) => visit_expr_refs(&u.argument, scope),
+        E::Unary(u) => visit_expr_refs(&u.argument, scope),
+        E::Binary(b) => {
+            visit_expr_refs(&b.left, scope);
+            visit_expr_refs(&b.right, scope);
+        }
+        E::Logical(l) => {
+            visit_expr_refs(&l.left, scope);
+            visit_expr_refs(&l.right, scope);
+        }
+        E::Assignment(a) => {
+            visit_assignment_target_refs(&a.left, scope);
+            visit_expr_refs(&a.right, scope);
+        }
+        E::Conditional(c) => {
+            visit_expr_refs(&c.test, scope);
+            visit_expr_refs(&c.consequent, scope);
+            visit_expr_refs(&c.alternate, scope);
+        }
+        E::Call(c) => {
+            visit_expr_refs(&c.callee, scope);
+            for a in &c.arguments {
+                match a {
+                    svelte_js_ast::Argument::Expression(e) => visit_expr_refs(e, scope),
+                    svelte_js_ast::Argument::Spread(s) => visit_expr_refs(&s.argument, scope),
+                }
+            }
+        }
+        E::Member(m) => {
+            visit_expr_refs(&m.object, scope);
+            if m.computed {
+                if let svelte_js_ast::MemberProperty::Expression(e) = &m.property {
+                    visit_expr_refs(e, scope);
+                }
+            }
+        }
+        E::Sequence(s) => {
+            for e in &s.expressions {
+                visit_expr_refs(e, scope);
+            }
+        }
+        E::Array(a) => {
+            for el in &a.elements {
+                match el {
+                    svelte_js_ast::ArrayElement::Expression(e) => visit_expr_refs(e, scope),
+                    svelte_js_ast::ArrayElement::Spread(s) => visit_expr_refs(&s.argument, scope),
+                    svelte_js_ast::ArrayElement::Elision => {}
+                }
+            }
+        }
+        E::Object(o) => {
+            for p in &o.properties {
+                match p {
+                    svelte_js_ast::ObjectMember::Property(prop) => {
+                        if prop.computed {
+                            visit_property_key_refs(&prop.key, scope);
+                        }
+                        visit_expr_refs(&prop.value, scope);
+                    }
+                    svelte_js_ast::ObjectMember::Spread(s) => visit_expr_refs(&s.argument, scope),
+                }
+            }
+        }
+        E::Template(t) => {
+            for e in &t.expressions {
+                visit_expr_refs(e, scope);
+            }
+        }
+        E::Tagged(t) => {
+            visit_expr_refs(&t.tag, scope);
+            for e in &t.quasi.expressions {
+                visit_expr_refs(e, scope);
+            }
+        }
+        E::Arrow(a) => visit_arrow_refs(a, scope),
+        E::Function(f) => visit_function_expr_refs(f, scope),
+        E::Await(a) => visit_expr_refs(&a.argument, scope),
+        E::Yield(y) => {
+            if let Some(arg) = &y.argument {
+                visit_expr_refs(arg, scope);
+            }
+        }
+        E::Spread(s) => visit_expr_refs(&s.argument, scope),
+        E::Paren(p) => visit_expr_refs(&p.expression, scope),
+        E::Meta(_) | E::Raw(_) => {}
+        E::Super(_) | E::This(_) => {}
+        E::Literal(_) | E::Class(_) | E::New(_) => {}
+    }
+}
+
+fn visit_property_key_refs(key: &svelte_js_ast::PropertyKey, scope: &ScopePtr) {
+    match key {
+        svelte_js_ast::PropertyKey::Identifier(id) => {
+            Scope::reference_chain(
+                scope,
+                id.name.to_string(),
+                Reference { node: id.clone() },
+            );
+        }
+        svelte_js_ast::PropertyKey::Expression(e) => visit_expr_refs(e, scope),
+        svelte_js_ast::PropertyKey::Literal(_) | svelte_js_ast::PropertyKey::Private(_) => {}
+    }
+}
+
+fn visit_assignment_target_refs(left: &svelte_js_ast::AssignmentTarget, scope: &ScopePtr) {
+    match left {
+        svelte_js_ast::AssignmentTarget::Pattern(p) => visit_pattern_refs(p, scope),
+        svelte_js_ast::AssignmentTarget::Expression(e) => visit_expr_refs(e, scope),
+    }
+}
+
+fn visit_pattern_refs(p: &svelte_js_ast::Pattern, scope: &ScopePtr) {
+    use svelte_js_ast::Pattern as P;
+    match p {
+        P::Identifier(id) => {
+            Scope::reference_chain(
+                scope,
+                id.name.to_string(),
+                Reference { node: id.clone() },
+            );
+        }
+        P::Array(a) => {
+            for el in a.elements.iter().flatten() {
+                visit_pattern_refs(el, scope);
+            }
+        }
+        P::Object(o) => {
+            for m in &o.properties {
+                match m {
+                    svelte_js_ast::ObjectPatternMember::Property(p) => {
+                        visit_pattern_refs(&p.value, scope);
+                    }
+                    svelte_js_ast::ObjectPatternMember::Rest(r) => {
+                        visit_pattern_refs(&r.argument, scope);
+                    }
+                }
+            }
+        }
+        P::Rest(r) => visit_pattern_refs(&r.argument, scope),
+        P::Assignment(a) => visit_pattern_refs(&a.left, scope),
+        P::Member(m) => {
+            visit_expr_refs(&m.object, scope);
+            if m.computed {
+                if let svelte_js_ast::MemberProperty::Expression(e) = &m.property {
+                    visit_expr_refs(e, scope);
+                }
+            }
+        }
+    }
+}
+
+fn visit_arrow_refs(a: &svelte_js_ast::ArrowFunctionExpression, parent: &ScopePtr) {
+    let fn_scope = Scope::child(parent, false);
+    for param in &a.params {
+        declare_pattern(param, &fn_scope, BindingKind::Normal, DeclarationKind::Param);
+    }
+    match &a.body {
+        svelte_js_ast::ArrowBody::Block(b) => {
+            for s in &b.body {
+                visit_stmt(s, &fn_scope);
+            }
+        }
+        svelte_js_ast::ArrowBody::Expression(e) => visit_expr_refs(e, &fn_scope),
+    }
+}
+
+fn visit_function_expr_refs(f: &svelte_js_ast::FunctionExpression, parent: &ScopePtr) {
+    let fn_scope = Scope::child(parent, false);
+    for param in &f.params {
+        declare_pattern(param, &fn_scope, BindingKind::Normal, DeclarationKind::Param);
+    }
+    for s in &f.body.body {
+        visit_stmt(s, &fn_scope);
     }
 }
 
@@ -335,7 +565,7 @@ fn rune_to_binding_kind(rune: &str) -> BindingKind {
 
 /// Returns true if `<svelte:options runes />` (or equivalent) opts the
 /// component into runes mode without walking script bodies.
-pub fn runes_enabled_by_options(root: &Root) -> bool {
+pub fn runes_enabled_by_options(root: &Root<'_>) -> bool {
     // <svelte:options runes /> or <svelte:options runes={true} /> → explicit opt-in.
     if let Some(options) = &root.options {
         if options.runes == Some(true) {

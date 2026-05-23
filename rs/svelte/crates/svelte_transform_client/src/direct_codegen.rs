@@ -9,7 +9,7 @@ use crate::walker::{ScriptInfo, TopLevelMultiIfEmit};
 
 /// Try emitting fully-static client JS from the Svelte AST (no `Program`, no `print_typed`).
 pub fn try_emit_fully_static_client_js(
-    root: &Root,
+    root: &Root<'_>,
     component_name: &str,
     bump: &CompileBump,
 ) -> Option<String> {
@@ -144,7 +144,7 @@ pub fn try_emit_client_program_direct(program: &Program) -> Option<String> {
     Some(out)
 }
 
-pub fn is_fully_static_root(root: &Root) -> bool {
+pub fn is_fully_static_root(root: &Root<'_>) -> bool {
     root.instance.is_none() && root.module.is_none() && root.css.is_none()
 }
 

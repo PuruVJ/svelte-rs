@@ -22,6 +22,14 @@ struct ExpectedDiag {
     code: String,
 }
 
+fn analyze_fixture_warnings(
+    source: &str,
+) -> Result<Vec<svelte_diagnostics::CompileDiagnostic>, svelte_diagnostics::CompileDiagnostic> {
+    let ast = parse(source, false)?;
+    let analysis = analyze_component(ast.root(), None)?;
+    Ok(analysis.warnings)
+}
+
 fn read_expected(path: &PathBuf) -> Vec<ExpectedDiag> {
     let s = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -109,15 +117,11 @@ fn sweep_validator_fixtures() {
             Err(_) => continue,
         };
 
-        let result = std::panic::catch_unwind(|| {
-            let root = parse(&source, false)?;
-            let analysis = analyze_component(&root, None);
-            Ok::<_, svelte_diagnostics::CompileDiagnostic>(analysis)
-        });
+        let result = std::panic::catch_unwind(|| analyze_fixture_warnings(&source));
 
-        let analysis = match result {
-            Ok(Ok(Ok(a))) => a,
-            Ok(Ok(Err(e))) => {
+        let mut analysis_warnings = match result {
+            Ok(Ok(w)) => w,
+            Ok(Err(e)) => {
                 // Compile error path — check it matches expected errors.
                 let got_codes: HashSet<String> = std::iter::once(e.code.to_string()).collect();
                 let expected_codes: HashSet<String> = expected_errors
@@ -136,30 +140,6 @@ fn sweep_validator_fixtures() {
                 }
                 continue;
             }
-            Ok(Err(parse_err)) => {
-                // Parse-level compile error. Match against expected_errors
-                // if present — many CSS / syntax tests put the expected
-                // diagnostic in `errors.json`.
-                let got_codes: HashSet<String> = std::iter::once(parse_err.code.to_string()).collect();
-                let expected_codes: HashSet<String> = expected_errors
-                    .iter()
-                    .map(|d| d.code.clone())
-                    .collect();
-                if got_codes == expected_codes {
-                    match_count += 1;
-                    println!("[MATCH] {name} (parse-error)");
-                } else if expected_codes.is_empty() {
-                    error_count += 1;
-                    println!("[ERR  ] {name}: parse: {parse_err:?}");
-                } else {
-                    diverge_count += 1;
-                    println!(
-                        "[DIFF ] {name}: got parse error {:?}, expected {:?}",
-                        got_codes, expected_codes
-                    );
-                }
-                continue;
-            }
             Err(_) => {
                 error_count += 1;
                 println!("[PANIC] {name}");
@@ -167,8 +147,6 @@ fn sweep_validator_fixtures() {
             }
         };
 
-        let mut analysis_warnings: Vec<svelte_diagnostics::CompileDiagnostic> =
-            analysis.warnings.clone();
         if custom_element_compile_option {
             analysis_warnings.retain(|w| {
                 w.code != "options_missing_custom_element"

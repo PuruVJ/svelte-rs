@@ -48,26 +48,33 @@ fn main() {
 
 fn run_once(source: &str) -> (f64, f64, f64, f64) {
     let t = Instant::now();
-    let root = svelte_parse::parse(source, false).expect("parse");
+    let ast = svelte_parse::parse(source, false).expect("parse");
+    let root = ast.root();
     let p = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
-    let _analysis = svelte_analyze::analyze_component(&root, None).expect("analyze");
+    let _analysis = svelte_analyze::analyze_component(root, None).expect("analyze");
     let a = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = Instant::now();
     let has_script_or_css =
         root.instance.is_some() || root.module.is_some() || root.css.is_some();
     let typed = if has_script_or_css {
-        svelte_transform_server::try_typed_server_component(root, "Index")
+        let bump = svelte_transform_shared::compile_bump::CompileBump::new();
+        let mut arena_root =
+            svelte_parse::parse_in_arena(&bump.template, source, false).expect("parse");
+        svelte_transform_server::try_typed_server_component(arena_root, "Index")
     } else {
-        svelte_transform_server::try_typed_server(&root, "Index")
-            .or_else(|| svelte_transform_server::try_typed_server_component(root, "Index"))
+        svelte_transform_server::try_typed_server(root, "Index").or_else(|| {
+            let bump = svelte_transform_shared::compile_bump::CompileBump::new();
+            let arena_root =
+                svelte_parse::parse_in_arena(&bump.template, source, false).ok()?;
+            svelte_transform_server::try_typed_server_component(arena_root, "Index")
+        })
     }
     .or_else(|| {
-        let root = svelte_parse::parse(source, false).expect("parse");
-        svelte_transform_client::try_typed_client(&root, "Index").or_else(|| {
-            svelte_transform_client::try_typed_client_component(&root, "Index")
+        svelte_transform_client::try_typed_client(root, "Index").or_else(|| {
+            svelte_transform_client::try_typed_client_component(root, "Index")
         })
     })
     .expect("no typed transform handles this fixture yet");

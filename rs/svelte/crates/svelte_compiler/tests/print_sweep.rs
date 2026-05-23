@@ -38,8 +38,8 @@ fn print_matches_all_fixtures() {
         let Ok(expected) = fs::read_to_string(&output_path) else { skipped += 1; continue };
 
         let result = std::panic::catch_unwind(|| {
-            let root = parse(&source, ParseOptions::default()).map_err(|e| format!("{:?}", e))?;
-            let printed = print_root(&root, PrintOptions::default());
+            let ast = parse(&source, ParseOptions::default()).map_err(|e| format!("{:?}", e))?;
+            let printed = print_root(ast.root(), PrintOptions::default());
             Ok::<String, String>(printed.code)
         });
 

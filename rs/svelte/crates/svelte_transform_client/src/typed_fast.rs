@@ -29,7 +29,7 @@ use svelte_ast::fragment::{Fragment, FragmentChild};
 use svelte_js_ast::*;
 use svelte_transform_shared::builders_typed as t;
 
-pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
+pub fn try_typed_client(root: &Root<'_>, component_name: &str) -> Option<Program> {
     if root.instance.is_some() || root.module.is_some() {
         return None;
     }
@@ -89,7 +89,7 @@ pub fn try_typed_client(root: &Root, component_name: &str) -> Option<Program> {
 /// Returns `(var_name, html, top_count)` for a fully-static fragment.
 /// `var_name` is the tag name for single-root templates, `"fragment"` for
 /// multi-root. `top_count` is the number of top-level element-like roots.
-pub(crate) fn static_root_info(fragment: &Fragment) -> Option<(String, String, usize)> {
+pub(crate) fn static_root_info(fragment: &Fragment<'_>) -> Option<(String, String, usize)> {
     let non_ws: Vec<&FragmentChild> = fragment
         .nodes
         .iter()
@@ -236,7 +236,7 @@ pub(crate) fn static_root_info(fragment: &Fragment) -> Option<(String, String, u
     Some(("fragment".to_string(), html, top_count))
 }
 
-fn trim_boundary_whitespace(nodes: &[FragmentChild]) -> &[FragmentChild] {
+fn trim_boundary_whitespace<'a>(nodes: &'a [FragmentChild<'a>]) -> &'a [FragmentChild<'a>] {
     let mut start = 0;
     let mut end = nodes.len();
     while start < end {
@@ -273,7 +273,7 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
-fn append_static_attr(a: &svelte_ast::attributes::Attribute, html: &mut String) -> Option<()> {
+fn append_static_attr(a: &svelte_ast::attributes::Attribute<'_>, html: &mut String) -> Option<()> {
     use svelte_ast::attributes::{AttributeValue, AttributeValuePart};
     // `dir` attribute needs `template_effect(() => el.dir = el.dir)`
     // (Chromium fix). Force typed_fast to bail.
@@ -315,11 +315,11 @@ fn append_static_attr(a: &svelte_ast::attributes::Attribute, html: &mut String) 
     }
 }
 
-fn append_static(child: &FragmentChild, out: &mut String) -> Option<()> {
+fn append_static(child: &FragmentChild<'_>, out: &mut String) -> Option<()> {
     append_static_to_string(child, out)
 }
 
-fn append_static_to_string(child: &FragmentChild, out: &mut String) -> Option<()> {
+fn append_static_to_string(child: &FragmentChild<'_>, out: &mut String) -> Option<()> {
     match child {
         FragmentChild::Text(t) => {
             let collapsed = collapse_ws(&t.data);

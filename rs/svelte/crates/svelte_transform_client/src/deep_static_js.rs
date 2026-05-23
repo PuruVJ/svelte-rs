@@ -15,7 +15,7 @@ use crate::walker::{
 };
 
 /// Returns true when `fragment` matches the deep-static-walker shape.
-pub fn deep_static_walker_eligible(fragment: &Fragment, script: &ScriptInfo) -> bool {
+pub fn deep_static_walker_eligible(fragment: &Fragment<'_>, script: &ScriptInfo) -> bool {
     let nodes = &fragment.nodes;
     if script.async_info.is_some() {
         return false;
@@ -38,7 +38,7 @@ pub fn deep_static_walker_eligible(fragment: &Fragment, script: &ScriptInfo) -> 
 
 /// Emit client JS for deep-static sparse templates.
 pub fn try_emit_deep_static_walker_js(
-    root_fragment: &Fragment,
+    root_fragment: &Fragment<'_>,
     component_name: &str,
     script: &ScriptInfo,
     bump: &CompileBump,
@@ -132,7 +132,7 @@ fn expr_js(e: &Expression) -> String {
     svelte_codegen_js::print_expression_str(e)
 }
 
-fn emit_deep_static_body(root_fragment: &Fragment, script: &ScriptInfo, body: &mut JsBody) -> Option<()> {
+fn emit_deep_static_body(root_fragment: &Fragment<'_>, script: &ScriptInfo, body: &mut JsBody) -> Option<()> {
     let first_is_non_element = root_fragment.nodes.iter().find(|n| match n {
         FragmentChild::Text(t) => !t.data.trim().is_empty(),
         FragmentChild::Comment(_) => true,
@@ -277,7 +277,7 @@ fn alloc_named(prefix: &str, counts: &mut HashMap<String, usize>) -> String {
 }
 
 fn apply_reactive_attrs_js(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     var: &str,
     body: &mut JsBody,
 ) {
@@ -299,11 +299,11 @@ fn apply_reactive_attrs_js(
             }
             continue;
         }
-        match attr.name.as_str() {
+        match attr.name {
             "autofocus" => {
                 body.stmt(format!("$.autofocus({var}, true)"));
             }
-            "muted" if matches!(el.name.as_str(), "source" | "video" | "audio") => {
+            "muted" if matches!(el.name, "source" | "video" | "audio") => {
                 body.stmt(format!("{var}.muted = true"));
             }
             "value" if el.name == "option" => {
@@ -323,7 +323,7 @@ fn apply_reactive_attrs_js(
 }
 
 fn walk_element_interior_js(
-    el: &svelte_ast::elements::RegularElement,
+    el: &svelte_ast::elements::RegularElement<'_>,
     parent_var: &str,
     script: &ScriptInfo,
     body: &mut JsBody,
@@ -331,7 +331,7 @@ fn walk_element_interior_js(
     var_names: &mut HashMap<String, usize>,
 ) -> Option<()> {
     let raw: Vec<&FragmentChild> = el.fragment.nodes.iter().collect();
-    let is_boundary = |n: &&FragmentChild| match n {
+    let is_boundary = |n: &&FragmentChild<'_>| match n {
         FragmentChild::Text(t) => t.data.trim().is_empty(),
         FragmentChild::Comment(_) => true,
         _ => false,
@@ -406,7 +406,7 @@ fn walk_element_interior_js(
                     let mut parts: Vec<TextPart> = Vec::new();
                     for c in &child_el.fragment.nodes {
                         match c {
-                            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.clone())),
+                            FragmentChild::Text(t) => parts.push(TextPart::Static(t.data.to_string())),
                             FragmentChild::ExpressionTag(et) => {
                                 parts.push(TextPart::Expr(&et.expression))
                             }
@@ -444,7 +444,7 @@ fn walk_element_interior_js(
     Some(())
 }
 
-fn is_text_only_element_js(el: &svelte_ast::elements::RegularElement) -> bool {
+fn is_text_only_element_js(el: &svelte_ast::elements::RegularElement<'_>) -> bool {
     el.fragment.nodes.iter().all(|n| {
         matches!(
             n,

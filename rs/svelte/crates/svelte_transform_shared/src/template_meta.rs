@@ -5,7 +5,7 @@ use svelte_ast::fragment::{Fragment, FragmentChild};
 use svelte_ast::root::Root;
 
 /// Mark `fragment.metadata.dynamic` / `element.metadata` for the whole component.
-pub fn mark_template_metadata(root: &mut Root) {
+pub fn mark_template_metadata<'a>(root: &mut Root<'a>) {
     mark_fragment_dynamic(&mut root.fragment);
 }
 
@@ -113,10 +113,10 @@ fn element_has_dynamic_attr(el: &svelte_ast::elements::RegularElement) -> bool {
     for a in &el.attributes {
         match a {
             ElementAttribute::Attribute(attr) => {
-                if matches!(attr.name.as_str(), "autofocus" | "dir") {
+                if matches!(attr.name, "autofocus" | "dir") {
                     return true;
                 }
-                if el.name == "input" && matches!(attr.name.as_str(), "checked" | "value") {
+                if el.name == "input" && matches!(attr.name, "checked" | "value") {
                     return true;
                 }
                 if el.name == "source" || el.name == "video" || el.name == "audio" {
@@ -146,7 +146,7 @@ fn element_has_dynamic_attr(el: &svelte_ast::elements::RegularElement) -> bool {
 }
 
 fn is_static_element_shape(el: &svelte_ast::elements::RegularElement) -> bool {
-    if matches!(el.name.as_str(), "select" | "textarea" | "option") {
+    if matches!(el.name, "select" | "textarea" | "option") {
         return false;
     }
     for n in &el.fragment.nodes {

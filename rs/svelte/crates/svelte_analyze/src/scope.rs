@@ -204,7 +204,7 @@ impl Scope {
         node: Identifier,
     ) -> Rc<RefCellBinding> {
         let binding = Binding {
-            name: name.clone(),
+            name: name.to_string(),
             kind,
             declaration_kind,
             node,
@@ -267,7 +267,7 @@ impl Scope {
             {
                 let mut s = s_ptr.borrow_mut();
                 s.references
-                    .entry(name.clone())
+                    .entry(name.to_string())
                     .or_default()
                     .push(reference.clone());
                 // Step 2: try to attach to a binding here.
@@ -292,7 +292,7 @@ impl Scope {
                         *root_rc
                             .borrow_mut()
                             .conflicts
-                            .entry(name.clone())
+                            .entry(name.to_string())
                             .or_insert(0) += 1;
                     }
                     return;

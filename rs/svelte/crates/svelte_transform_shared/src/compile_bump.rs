@@ -1,25 +1,30 @@
-//! Per-`compile()` bump arena for scratch buffers (HTML slabs, direct JS emission).
-//!
-//! Full arena-owned AST is a follow-up; this scopes allocation to one compile call
-//! and avoids repeated heap growth for large template strings.
+//! Per-`compile()` bump arena: template AST + scratch buffers for direct JS emission.
 
 use bumpalo::Bump;
+pub use svelte_ast::arena::TemplateArena;
 
 /// Bump allocator scoped to a single `compile()` invocation.
+///
+/// Template nodes and direct-codegen scratch strings share one [`Bump`] so the
+/// whole compile frees in one drop.
 pub struct CompileBump {
-    pub bump: Bump,
+    pub template: TemplateArena,
 }
 
 impl CompileBump {
     pub fn new() -> Self {
         Self {
-            bump: Bump::new(),
+            template: TemplateArena::new(),
         }
+    }
+
+    pub fn bump(&self) -> &Bump {
+        &self.template.bump
     }
 
     /// Growable string backed by the arena (finalized with [`BumpString::into_owned`]).
     pub fn string(&self) -> BumpString<'_> {
-        BumpString::new_in(&self.bump)
+        BumpString::new_in(&self.template.bump)
     }
 }
 
