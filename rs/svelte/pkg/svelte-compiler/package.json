@@ -1,0 +1,15 @@
+{
+  "name": "@svelte-rs/compiler",
+  "version": "0.0.0",
+  "description": "Drop-in compile/parse facade over the Rust Svelte compiler (WASM), matching svelte/compiler options",
+  "type": "module",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  }
+}

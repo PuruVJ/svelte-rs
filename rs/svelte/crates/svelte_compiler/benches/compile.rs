@@ -166,7 +166,8 @@ fn bench_end_to_end_client(c: &mut Criterion) {
             b.iter(|| {
                 let mut opts = svelte_compiler::CompileOptions::default();
                 opts.module.generate = Some(svelte_compiler::Generate::Client);
-                svelte_compiler::compile(black_box(src), "Index", opts)
+                opts.name = Some("Index".to_string());
+                svelte_compiler::compile(black_box(src), opts)
             });
         });
     }
@@ -188,7 +189,8 @@ fn bench_end_to_end_server(c: &mut Criterion) {
             b.iter(|| {
                 let mut opts = svelte_compiler::CompileOptions::default();
                 opts.module.generate = Some(svelte_compiler::Generate::Server);
-                svelte_compiler::compile(black_box(src), "Index", opts)
+                opts.name = Some("Index".to_string());
+                svelte_compiler::compile(black_box(src), opts)
             });
         });
     }

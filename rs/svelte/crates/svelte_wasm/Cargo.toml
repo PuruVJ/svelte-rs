@@ -21,3 +21,5 @@ wasm-bindgen = { workspace = true }
 serde-wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+svelte_diagnostics = { workspace = true }

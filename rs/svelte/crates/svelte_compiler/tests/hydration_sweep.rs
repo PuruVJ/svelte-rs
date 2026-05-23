@@ -77,9 +77,10 @@ fn hydration_client_sweep() {
         // is always `Main`.
         let _ = snake_to_pascal(&name);
         let pname = "Main".to_string();
-        let result = std::panic::catch_unwind(|| compile(&source, &pname, opts));
+        opts.name = Some(pname);
+        let result = std::panic::catch_unwind(|| compile(&source, opts));
         match result {
-            Ok(Ok(r)) if r.js.trim() == exp.trim() => {
+            Ok(Ok(r)) if r.js.code.trim() == exp.trim() => {
                 ok += 1;
                 println!("[OK  ] {name}");
             }
@@ -87,7 +88,7 @@ fn hydration_client_sweep() {
                 diff += 1;
                 let first = exp
                     .lines()
-                    .zip(r.js.lines())
+                    .zip(r.js.code.lines())
                     .enumerate()
                     .find(|(_, (a, b))| a != b)
                     .map(|(i, (a, b))| format!("L{i}\n    EXP: {a}\n    GOT: {b}"))

@@ -134,13 +134,16 @@ fn ssr_smoke_all_fixtures() {
             opts.module.generate = Some(Generate::Server);
             opts.module.experimental.async_ = true;
             opts.module.filename = Some(fname.clone());
-            compile(&source, "Main", opts)
+            {
+                opts.name = Some("Main".to_string());
+                compile(&source, opts)
+            }
         });
 
         match result {
             Ok(Ok(r)) => {
                 let exp_imports = collect_imports(&expected);
-                let got_imports = collect_imports(&r.js);
+                let got_imports = collect_imports(&r.js.code);
                 let missing: Vec<_> = exp_imports
                     .difference(&got_imports)
                     .cloned()

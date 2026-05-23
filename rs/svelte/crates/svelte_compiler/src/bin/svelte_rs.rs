@@ -15,7 +15,6 @@
 //!
 //! Errors are written to stderr with a non-zero exit code.
 
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -77,17 +76,20 @@ fn main() -> ExitCode {
         }
     };
 
-    let name = name_override.unwrap_or_else(|| derive_component_name(&path));
     let mut options = CompileOptions::default();
     options.module.generate = Some(if ssr { Generate::Server } else { Generate::Client });
+    options.module.filename = Some(path.clone());
+    if let Some(name) = name_override {
+        options.name = Some(name);
+    }
 
     if bench {
         // Warm-up: one extra compile not included in timing — makes
         // results steadier when iterations is small.
-        let _ = compile(&source, &name, options.clone());
+        let _ = compile(&source, options.clone());
         let started = Instant::now();
         for _ in 0..iterations {
-            match compile(&source, &name, options.clone()) {
+            match compile(&source, options.clone()) {
                 Ok(_) => {}
                 Err(e) => {
                     eprintln!("compile error: {:?}", e);
@@ -106,9 +108,9 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match compile(&source, &name, options) {
+    match compile(&source, options) {
         Ok(result) => {
-            print!("{}", result.js);
+            print!("{}", result.js.code);
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -116,31 +118,4 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-/// Strip the extension from a path and Pascal-case its stem, mirroring how
-/// `vite` derives component names from filenames.
-fn derive_component_name(path: &str) -> String {
-    let stem = Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Component");
-    let mut out = String::with_capacity(stem.len());
-    let mut upper_next = true;
-    for ch in stem.chars() {
-        if ch == '-' || ch == '_' || ch == '.' {
-            upper_next = true;
-        } else if upper_next {
-            for c in ch.to_uppercase() {
-                out.push(c);
-            }
-            upper_next = false;
-        } else {
-            out.push(ch);
-        }
-    }
-    if out.is_empty() {
-        out.push_str("Component");
-    }
-    out
 }

@@ -12,8 +12,9 @@ fn main() {
     });
     opts.module.experimental.async_ = true;
     opts.module.filename = Some(path.clone());
-    match svelte_compiler::compile(&src, &name, opts) {
-        Ok(r) => println!("{}", r.js),
+    opts.name = Some(name);
+    match svelte_compiler::compile(&src, opts) {
+        Ok(r) => println!("{}", r.js.code),
         Err(e) => println!("ERR: {:?}", e),
     }
 }

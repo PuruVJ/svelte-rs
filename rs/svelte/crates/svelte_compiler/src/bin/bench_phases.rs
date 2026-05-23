@@ -114,7 +114,8 @@ fn bench_e2e_compile(fixture: &str, source: &str, iter: usize) {
     let mut total_ms = 0.0;
     for _ in 0..iter {
         let t = Instant::now();
-        let _ = svelte_compiler::compile(source, "Index", opts.clone()).unwrap();
+        opts.name = Some("Index".to_string());
+        let _ = svelte_compiler::compile(source, opts.clone()).unwrap();
         total_ms += t.elapsed().as_secs_f64() * 1000.0;
     }
     println!("fixture={fixture} mode=e2e iter={iter}");

@@ -71,11 +71,11 @@ const fixtures = extra.length > 0 ? extra : DEFAULT_FIXTURES;
 // Load compilers -----------------------------------------------------------
 
 const jsCompilerPath = resolve(repoRoot, 'packages/svelte/src/compiler/index.js');
-const wasmPkgPath = resolve(here, '../crates/svelte_wasm/pkg/svelte_wasm.js');
+const wasmPkgPath = resolve(here, '../pkg/svelte-compiler/index.js');
 const nativeBin = resolve(here, '../target/release/svelte-rs');
 
 const { compile: jsCompile } = await import(pathToFileURL(jsCompilerPath).href);
-const wasm = await import(pathToFileURL(wasmPkgPath).href);
+const { compileSync: wasmCompile } = await import(pathToFileURL(wasmPkgPath).href);
 
 // Sanity check the native binary is reachable.
 try {
@@ -135,12 +135,10 @@ for (const rel of fixtures) {
 		.map((p) => p[0].toUpperCase() + p.slice(1))
 		.join('') || 'Component';
 
-	// JS baseline — keep options identical to what wasm/native pass through
-	// (no filename, default options) so byte-equality checks are apples-to-
-	// apples.
+	const compileOptions = { generate: mode, filename: abs };
 	let js;
 	try {
-		js = timeFn('js', () => jsCompile(source, { generate: mode, filename: `${name}.svelte` }), iter);
+		js = timeFn('js', () => jsCompile(source, compileOptions), iter);
 	} catch (e) {
 		console.error(`JS compile of ${rel} threw: ${e.message}`);
 		continue;
@@ -149,7 +147,7 @@ for (const rel of fixtures) {
 	// WASM
 	let wasmRow;
 	try {
-		wasmRow = timeFn('wasm', () => wasm.compile(source, name, { generate: mode }), iter);
+		wasmRow = timeFn('wasm', () => wasmCompile(source, compileOptions), iter);
 	} catch (e) {
 		wasmRow = { name: 'wasm', iters: iter, totalMs: NaN, perMs: NaN, err: e.message };
 	}
@@ -160,12 +158,9 @@ for (const rel of fixtures) {
 	let checkResult;
 	if (check) {
 		try {
-			const jsOut = jsCompile(source, { generate: mode, filename: `${name}.svelte` }).js.code;
-			const wasmRes = wasm.compile(source, name, { generate: mode });
-			// WASM returns { js: string, warnings: [] }; JS returns
-			// { js: { code, map }, ... } — `.js.code` vs `.js`.
-			const wasmOut = typeof wasmRes.js === 'string' ? wasmRes.js : wasmRes.js?.code;
-			const nativeArgs = [abs, '--name', name];
+			const jsOut = jsCompile(source, compileOptions).js.code;
+			const wasmOut = wasmCompile(source, compileOptions).js.code;
+			const nativeArgs = [abs];
 			if (mode === 'server') nativeArgs.unshift('--ssr');
 			const nativeProc = spawnSync(nativeBin, nativeArgs, { encoding: 'utf8' });
 			const nativeOut = nativeProc.stdout || '';

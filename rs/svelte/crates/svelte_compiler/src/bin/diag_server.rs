@@ -16,8 +16,9 @@ fn main() {
     if path.contains("server-side-rendering") {
         opts.module.experimental.async_ = true;
     }
-    match compile(&source, "Main", opts) {
-        Ok(r) => println!("=== OK ===\n{}", r.js),
+    opts.name = Some("Main".to_string());
+    match compile(&source, opts) {
+        Ok(r) => println!("=== OK ===\n{}", r.js.code),
         Err(e) => println!("=== ERR ===\n{:?}", e),
     }
 }

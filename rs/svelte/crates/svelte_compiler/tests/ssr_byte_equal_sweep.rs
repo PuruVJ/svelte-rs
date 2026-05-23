@@ -65,11 +65,14 @@ fn ssr_byte_equal_all_fixtures() {
             if css_injected {
                 opts.css = svelte_compiler::CssMode::Injected;
             }
-            compile(&source, "Main", opts)
+            {
+                opts.name = Some("Main".to_string());
+                compile(&source, opts)
+            }
         });
 
         match result {
-            Ok(Ok(r)) if r.js.trim() == expected.trim() => {
+            Ok(Ok(r)) if r.js.code.trim() == expected.trim() => {
                 ok += 1;
                 println!("[OK  ] {name}");
             }
@@ -77,13 +80,13 @@ fn ssr_byte_equal_all_fixtures() {
                 diff += 1;
                 let (l_exp, l_got) = expected
                     .lines()
-                    .zip(r.js.lines())
+                    .zip(r.js.code.lines())
                     .enumerate()
                     .find(|(_, (a, b))| a != b)
                     .map(|(i, (a, b))| (format!("L{i}: {a}"), format!("L{i}: {b}")))
                     .unwrap_or_else(|| {
                         let exp_len = expected.lines().count();
-                        let got_len = r.js.lines().count();
+                        let got_len = r.js.code.lines().count();
                         (
                             format!("(len {exp_len})"),
                             format!("(len {got_len})"),

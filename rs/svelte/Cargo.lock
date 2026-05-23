@@ -1852,7 +1852,9 @@ dependencies = [
  "js-sys",
  "serde",
  "serde-wasm-bindgen",
+ "serde_json",
  "svelte_compiler",
+ "svelte_diagnostics",
  "svelte_preprocess",
  "wasm-bindgen",
 ]

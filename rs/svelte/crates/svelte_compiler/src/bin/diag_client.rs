@@ -12,9 +12,10 @@ fn main() {
     eprintln!("=== Fragment ===\n{:#?}", root.fragment);
     let mut opts = CompileOptions::default();
     opts.module.generate = Some(Generate::Client);
-    match compile(&source, "Diag", opts) {
+    opts.name = Some("Diag".to_string());
+    match compile(&source, opts) {
         Ok(r) => {
-            println!("=== OK ===\n{}", r.js);
+            println!("=== OK ===\n{}", r.js.code);
         }
         Err(e) => {
             println!("=== ERR ===\n{:?}", e);

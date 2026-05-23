@@ -34,6 +34,25 @@ cargo run -p svelte_test_harness -- parse packages/svelte/tests/parser-modern/sa
 cargo test -p svelte_ast
 ```
 
+## JS-compatible API (`@svelte-rs/compiler`)
+
+The Rust compiler exposes the same entry shape as `svelte/compiler`:
+
+```js
+import { compile, compileSync } from './pkg/svelte-compiler/index.js';
+
+const result = compileSync(source, {
+  generate: 'client',
+  filename: 'samples/hello-world/index.svelte',
+});
+// result.js.code, result.js.map, result.css, result.warnings, result.metadata, result.ast
+```
+
+WASM is built with `wasm-pack build crates/svelte_wasm --target nodejs --release`.
+The facade normalizes function-valued options (`customElement`, `css`) on the JS
+side before calling into Rust. `parse()` still returns `null` until AST
+serialization lands.
+
 ## Status
 
 **Phase 0** — done. Workspace scaffolded (18 crates), all stubs compile, the

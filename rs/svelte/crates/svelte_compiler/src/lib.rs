@@ -11,6 +11,7 @@
 pub mod options;
 
 pub use options::{
+    derive_component_name, derive_component_name_from_filename, sanitize_export_name,
     CompileOptions, CssMode, ExperimentalOptions, FragmentsStrategy, Generate,
     ModuleCompileOptions, ParseOptions,
 };
@@ -41,25 +42,94 @@ pub fn parse_with_bump<'a>(
     parse_in_arena(&bump.template, source, options.loose)
 }
 
-/// Output of `compile()` — mirrors upstream's `{ js, css, warnings, ast, stats }`.
-/// Pruned to the fields currently produced by the port; the rest land alongside
-/// their producing crate.
+/// JS-shaped `{ code, map }` for compiled JavaScript.
 #[derive(Debug, Clone)]
-pub struct CompileResult {
-    pub js: String,
-    pub warnings: Vec<svelte_diagnostics::CompileDiagnostic>,
+pub struct CompileJsOutput {
+    pub code: String,
+    /// Empty source map until codegen emits mappings.
+    pub map: serde_json::Value,
 }
 
-/// `compile(source, options)` — parse, analyze, transform, codegen.
-///
-/// Status: minimal end-to-end pipeline. Server `generate: 'server'` produces
-/// template + script lowering matching the simplest snapshot fixtures.
-/// Client generation is not yet wired (Phase 6).
+impl CompileJsOutput {
+    pub fn new(code: String) -> Self {
+        Self {
+            code,
+            map: empty_source_map(),
+        }
+    }
+}
+
+/// Metadata returned by upstream `compile()`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompileMetadata {
+    pub runes: bool,
+}
+
+/// Output of `compile()` — mirrors upstream's `{ js, css, warnings, metadata, ast }`.
+#[derive(Debug, Clone)]
+pub struct CompileResult {
+    pub js: CompileJsOutput,
+    pub css: Option<CompileCssOutput>,
+    pub warnings: Vec<svelte_diagnostics::CompileDiagnostic>,
+    pub metadata: CompileMetadata,
+}
+
+/// Compiled CSS when `css: 'external'` and a `<style>` block is present.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompileCssOutput {
+    pub code: String,
+    pub map: serde_json::Value,
+    pub has_global: bool,
+}
+
+fn empty_source_map() -> serde_json::Value {
+    serde_json::json!({
+        "version": 3,
+        "sources": [],
+        "sourcesContent": [],
+        "names": [],
+        "mappings": ""
+    })
+}
+
+fn finish_compile_result(
+    code: String,
+    warnings: Vec<svelte_diagnostics::CompileDiagnostic>,
+    options: &CompileOptions,
+) -> CompileResult {
+    CompileResult {
+        js: CompileJsOutput::new(code),
+        css: None,
+        warnings,
+        metadata: CompileMetadata {
+            runes: options.runes.unwrap_or(true),
+        },
+    }
+}
+
+/// `compile(source, options)` — same entry shape as `svelte/compiler`.
 pub fn compile(
+    source: &str,
+    options: CompileOptions,
+) -> Result<CompileResult, CompileDiagnostic> {
+    let component_name = derive_component_name(&options);
+    compile_with_name(source, &component_name, options)
+}
+
+/// `compile` with an explicit component name (tests, CLI `--name`).
+pub fn compile_with_name(
     source: &str,
     component_name: &str,
     options: CompileOptions,
 ) -> Result<CompileResult, CompileDiagnostic> {
+    if options.module.generate.is_none() {
+        return Err(CompileDiagnostic {
+            code: "options_invalid_value",
+            message: "generate: false (analyze-only) is not supported by the Rust compiler yet"
+                .to_string(),
+            position: None,
+        });
+    }
     let compile_bump = svelte_transform_shared::compile_bump::CompileBump::new();
     let mut root = svelte_parse::parse_in_arena(&compile_bump.template, source, false)?;
     svelte_transform_shared::template_meta::mark_template_metadata(&mut root);
@@ -152,10 +222,7 @@ pub fn compile(
                     component_name,
                     &compile_bump,
                 ) {
-                    return Ok(CompileResult {
-                        js,
-                        warnings: Vec::new(),
-                    });
+                    return Ok(finish_compile_result(js, Vec::new(), &options));
                 }
                 // Fully-static: emit JS directly (no Program, no print_typed).
                 if let Some(js) = svelte_transform_client::try_emit_fully_static_client_js(
@@ -163,10 +230,7 @@ pub fn compile(
                     component_name,
                     &compile_bump,
                 ) {
-                    return Ok(CompileResult {
-                        js,
-                        warnings: Vec::new(),
-                    });
+                    return Ok(finish_compile_result(js, Vec::new(), &options));
                 }
             }
             // In tree mode, skip typed_client (static-only $.from_html path)
@@ -210,10 +274,7 @@ pub fn compile(
         Some(Generate::Client) | None
     ) {
         if let Some(js) = svelte_transform_client::try_emit_client_program_direct(&typed) {
-            return Ok(CompileResult {
-                js,
-                warnings: Vec::new(),
-            });
+            return Ok(finish_compile_result(js, Vec::new(), &options));
         }
     }
 
@@ -238,10 +299,7 @@ pub fn compile(
         svelte_codegen_js::estimate_code_init_capacity(source.len());
     let result = svelte_codegen_js::print_typed(&typed, &typed_opts);
 
-    Ok(CompileResult {
-        js: result.code,
-        warnings: Vec::new(),
-    })
+    Ok(finish_compile_result(result.code, Vec::new(), &options))
 }
 
 /// Unused stub kept during the typed-only migration to silence any old

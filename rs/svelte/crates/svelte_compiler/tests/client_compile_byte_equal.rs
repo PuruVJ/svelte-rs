@@ -82,9 +82,10 @@ fn client_compile_matches_all_fixtures() {
         } else {
             snake_to_pascal(&name)
         };
-        let result = compile(&source, &pname, opts);
+        opts.name = Some(pname);
+        let result = compile(&source, opts);
         match result {
-            Ok(r) if r.js.trim() == expected.trim() => {
+            Ok(r) if r.js.code.trim() == expected.trim() => {
                 ok += 1;
                 println!("[OK  ] {name}");
             }
@@ -92,7 +93,7 @@ fn client_compile_matches_all_fixtures() {
                 bad += 1;
                 let (l_exp, l_got) = expected
                     .lines()
-                    .zip(r.js.lines())
+                    .zip(r.js.code.lines())
                     .enumerate()
                     .find(|(_, (a, b))| a != b)
                     .map(|(i, (a, b))| (format!("L{i}: {a}"), format!("L{i}: {b}")))

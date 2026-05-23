@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 /// `parse(source, options?)` — returns the parsed Svelte AST as a plain JS
@@ -68,29 +69,42 @@ struct JsProcessed {
     dependencies: Option<Vec<String>>,
 }
 
-/// `compile(source, options)` — full pipeline. Returns `{ js, warnings }` for
-/// now; will grow `css`, `ast`, `stats` as those land.
+#[derive(Serialize)]
+struct JsCompileResult<'a> {
+    js: JsCompileJs<'a>,
+    css: Option<&'a svelte_compiler::CompileCssOutput>,
+    warnings: &'a [svelte_diagnostics::CompileDiagnostic],
+    metadata: &'a svelte_compiler::CompileMetadata,
+    ast: Option<()>,
+}
+
+#[derive(Serialize)]
+struct JsCompileJs<'a> {
+    code: &'a str,
+    map: &'a serde_json::Value,
+}
+
+/// `compile(source, options?)` — same signature as `svelte/compiler` `compile()`.
 #[wasm_bindgen]
-pub fn compile(source: &str, component_name: &str, options: JsValue) -> Result<JsValue, JsValue> {
+pub fn compile(source: &str, options: JsValue) -> Result<JsValue, JsValue> {
     let compile_options: svelte_compiler::CompileOptions =
         if options.is_undefined() || options.is_null() {
             svelte_compiler::CompileOptions::default()
         } else {
             serde_wasm_bindgen::from_value(options).map_err(|e| JsValue::from_str(&e.to_string()))?
         };
-    let result = svelte_compiler::compile(source, component_name, compile_options)
+    let result = svelte_compiler::compile(source, compile_options)
         .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
 
-    let obj = js_sys::Object::new();
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("js"),
-        &JsValue::from_str(&result.js),
-    )?;
-    js_sys::Reflect::set(
-        &obj,
-        &JsValue::from_str("warnings"),
-        &js_sys::Array::new().into(),
-    )?;
-    Ok(obj.into())
+    let payload = JsCompileResult {
+        js: JsCompileJs {
+            code: &result.js.code,
+            map: &result.js.map,
+        },
+        css: result.css.as_ref(),
+        warnings: &result.warnings,
+        metadata: &result.metadata,
+        ast: None,
+    };
+    serde_wasm_bindgen::to_value(&payload).map_err(|e| JsValue::from_str(&e.to_string()))
 }

@@ -30,13 +30,15 @@ fn main() {
 
     // Warm up JIT/code layout outside the profile window.
     for _ in 0..200 {
-        let _ = svelte_compiler::compile(&source, "Index", opts.clone());
+        opts.name = Some("Index".to_string());
+        let _ = svelte_compiler::compile(&source, opts.clone());
     }
 
     let guard = pprof::ProfilerGuard::new(1000).expect("profiler");
     let t0 = Instant::now();
     for _ in 0..iter {
-        let _ = svelte_compiler::compile(&source, "Index", opts.clone()).expect("compile");
+        opts.name = Some("Index".to_string());
+        let _ = svelte_compiler::compile(&source, opts.clone()).expect("compile");
     }
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
