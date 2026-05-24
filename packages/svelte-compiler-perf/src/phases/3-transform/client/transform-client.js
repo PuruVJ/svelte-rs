@@ -59,7 +59,6 @@ import { UpdateExpression } from './visitors/UpdateExpression.js';
 import { UseDirective } from './visitors/UseDirective.js';
 import { AttachTag } from './visitors/AttachTag.js';
 import { VariableDeclaration } from './visitors/VariableDeclaration.js';
-import { precompute_static_html_cache } from './precompute-static-html.js';
 
 /** @type {Visitors} */
 const visitors = {
@@ -179,8 +178,6 @@ export function client_component(analysis, options) {
 		template: /** @type {any} */ (null),
 		memoizer: /** @type {any} */ (null)
 	};
-
-	precompute_static_html_cache(analysis, state);
 
 	const module = /** @type {ESTree.Program} */ (
 		walk(/** @type {AST.SvelteNode} */ (analysis.module.ast), state, visitors)

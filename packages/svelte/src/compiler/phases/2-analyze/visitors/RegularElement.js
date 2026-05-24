@@ -16,6 +16,7 @@ import { regex_starts_with_newline } from '../../patterns.js';
 import { check_element } from './shared/a11y/index.js';
 import { validate_element } from './shared/element.js';
 import { mark_subtree_dynamic } from './shared/fragment.js';
+import { mark_element_static_metadata } from '../mark-static-elements.js';
 import { object } from '../../../utils/ast.js';
 import { runes } from '../../../state.js';
 
@@ -224,6 +225,8 @@ export function RegularElement(node, context) {
 	}
 
 	context.next({ ...context.state, parent_element: node.name });
+
+	mark_element_static_metadata(node);
 
 	// Special case: <a> tags are valid in both the SVG and HTML namespace.
 	// If there's no parent, look downwards to see if it's the parent of a SVG or HTML element.

@@ -3,6 +3,7 @@
 /** @import { ComponentContext } from '../../types' */
 import * as b from '#compiler/builders';
 import { build_template_chunk } from './utils.js';
+import { serialize_fully_static_element_for_template } from '../../static-html-serialize.js';
 
 /**
  * Processes an array of template nodes, joining sibling text/expression nodes
@@ -97,11 +98,10 @@ export function process_children(nodes, initial, is_element, context) {
 
 			if (is_static_element(node)) {
 				skipped += 1;
-				const cached =
-					node.type === 'RegularElement' && node.metadata.cached_static_html
-						? node.metadata.cached_static_html
-						: undefined;
-				if (cached) {
+				if (node.type === 'RegularElement' && node.metadata.is_fully_static_subtree) {
+					const cached =
+						node.metadata.cached_static_html ??
+						serialize_fully_static_element_for_template(node, context);
 					context.state.template.push_text([
 						{ type: 'Text', data: cached, raw: cached, start: -1, end: -1 }
 					]);
