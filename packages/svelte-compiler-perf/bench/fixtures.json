@@ -1,0 +1,11 @@
+[
+  "packages/svelte/tests/snapshot/samples/hello-world/index.svelte",
+  "packages/svelte/tests/snapshot/samples/skip-static-subtree/index.svelte",
+  "packages/svelte/tests/snapshot/samples/props-identifier/index.svelte",
+  "packages/svelte/tests/snapshot/samples/function-prop-no-getter/index.svelte",
+  "packages/svelte/tests/snapshot/samples/async-in-derived/index.svelte",
+  "packages/svelte/tests/snapshot/samples/imports-in-modules/index.svelte",
+  "packages/svelte/tests/snapshot/samples/bind-this/index.svelte",
+  "packages/svelte/tests/snapshot/samples/purity/index.svelte",
+  "packages/svelte/tests/snapshot/samples/each-string-template/index.svelte"
+]

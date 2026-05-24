@@ -1,0 +1,42 @@
+{
+  "name": "svelte-compiler-perf",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Experimental Svelte compiler sandbox for perf backports from svelte-rs",
+  "exports": {
+    ".": {
+      "types": "./src/public.d.ts",
+      "default": "./src/index.js"
+    }
+  },
+  "imports": {
+    "#compiler": {
+      "types": "./src/private.d.ts",
+      "default": "./src/index.js"
+    },
+    "#compiler/builders": "./src/utils/builders.js"
+  },
+  "scripts": {
+    "bench": "node bench/bench.mjs",
+    "bench:phases": "node bench/bench-phases.mjs",
+    "bench:baseline": "node bench/run-baseline.mjs"
+  },
+  "dependencies": {
+    "@jridgewell/remapping": "^2.3.4",
+    "@jridgewell/sourcemap-codec": "^1.5.0",
+    "@sveltejs/acorn-typescript": "^1.0.5",
+    "@types/estree": "^1.0.5",
+    "acorn": "^8.12.1",
+    "aria-query": "5.3.1",
+    "axobject-query": "^4.1.0",
+    "clsx": "^2.1.1",
+    "devalue": "^5.8.1",
+    "esm-env": "^1.2.1",
+    "esrap": "^2.2.4",
+    "is-reference": "^3.0.3",
+    "locate-character": "^3.0.0",
+    "magic-string": "^0.30.11",
+    "zimmerframe": "^1.1.2"
+  }
+}
