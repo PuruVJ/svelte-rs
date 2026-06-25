@@ -1,0 +1,99 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/svelte_ast",
+    "crates/svelte_js_ast",
+    "crates/svelte_diagnostics",
+    "crates/svelte_magic_string",
+    "crates/svelte_codegen_js",
+    "crates/svelte_css_parser",
+    "crates/svelte_devalue",
+    "crates/svelte_is_reference",
+    "crates/svelte_aria_data",
+    "crates/svelte_parse",
+    "crates/svelte_analyze",
+    "crates/svelte_transform_shared",
+    "crates/svelte_transform_client",
+    "crates/svelte_transform_server",
+    "crates/svelte_preprocess",
+    "crates/svelte_migrate",
+    "crates/svelte_print",
+    "crates/svelte_compiler",
+    "crates/svelte_wasm",
+    "crates/svelte_test_harness",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+# Internal crates (path deps)
+svelte_ast = { path = "crates/svelte_ast" }
+svelte_js_ast = { path = "crates/svelte_js_ast" }
+svelte_diagnostics = { path = "crates/svelte_diagnostics" }
+svelte_magic_string = { path = "crates/svelte_magic_string" }
+svelte_codegen_js = { path = "crates/svelte_codegen_js" }
+svelte_css_parser = { path = "crates/svelte_css_parser" }
+svelte_devalue = { path = "crates/svelte_devalue" }
+svelte_is_reference = { path = "crates/svelte_is_reference" }
+svelte_aria_data = { path = "crates/svelte_aria_data" }
+svelte_parse = { path = "crates/svelte_parse" }
+svelte_analyze = { path = "crates/svelte_analyze" }
+svelte_transform_shared = { path = "crates/svelte_transform_shared" }
+svelte_transform_client = { path = "crates/svelte_transform_client" }
+svelte_transform_server = { path = "crates/svelte_transform_server" }
+svelte_preprocess = { path = "crates/svelte_preprocess" }
+svelte_migrate = { path = "crates/svelte_migrate" }
+svelte_print = { path = "crates/svelte_print" }
+svelte_compiler = { path = "crates/svelte_compiler" }
+
+# External crates — versions pinned at workspace level for consistency
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+# OXC family (JS/TS parser, AST, semantic). Pinned to 0.130 — the 0.34 line
+# has a broken `serialize` feature (uses removed serde internals). 0.130
+# provides `oxc_estree` with a clean ESTree-shaped JSON output we can post-
+# process into the acorn shape Svelte's AST expects.
+oxc_allocator = "0.130"
+oxc_ast = { version = "0.130", features = ["serialize"] }
+oxc_estree = { version = "0.130", features = ["serialize"] }
+oxc_parser = "0.130"
+oxc_span = "0.130"
+oxc_semantic = "0.130"
+oxc_syntax = "0.130"
+
+# Source maps
+sourcemap = "9"
+
+# WASM
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+
+# Test utilities
+insta = { version = "1", features = ["json"] }
+similar = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+# Profiling: keep symbols + debuginfo for flamegraphs (`bench_profile`).
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = 2
+lto = "thin"
+codegen-units = 16
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"

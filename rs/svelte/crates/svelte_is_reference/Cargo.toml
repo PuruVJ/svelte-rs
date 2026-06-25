@@ -1,0 +1,10 @@
+[package]
+name = "svelte_is_reference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Port of the `is-reference` npm package — determines whether an estree Identifier is a reference."
+
+[dependencies]
+oxc_ast = { workspace = true }
