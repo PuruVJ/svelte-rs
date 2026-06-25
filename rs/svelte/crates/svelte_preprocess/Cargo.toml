@@ -1,0 +1,12 @@
+[package]
+name = "svelte_preprocess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Preprocess pipeline. Mirrors packages/svelte/src/compiler/preprocess/."
+
+[dependencies]
+svelte_diagnostics = { workspace = true }
+svelte_magic_string = { workspace = true }
+sourcemap = { workspace = true }

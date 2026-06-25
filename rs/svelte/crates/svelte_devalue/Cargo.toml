@@ -1,0 +1,11 @@
+[package]
+name = "svelte_devalue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Port of the `devalue` npm package — value serializer used by server-side hydration payloads."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

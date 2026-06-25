@@ -1,0 +1,12 @@
+[package]
+name = "svelte_css_parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Selector + rule parser for Svelte's <style> blocks. Ported from packages/svelte/src/compiler/phases/1-parse/read/style.js."
+
+[dependencies]
+serde = { workspace = true }
+svelte_ast = { path = "../svelte_ast" }
+svelte_diagnostics = { path = "../svelte_diagnostics" }
