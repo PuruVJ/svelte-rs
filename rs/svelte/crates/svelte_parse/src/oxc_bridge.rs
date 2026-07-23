@@ -1,0 +1,355 @@
+//! OXC parser front-end + typed conversion.
+//!
+//! `parse_*` entry points parse a source slice via OXC, then convert the
+//! arena-allocated OXC AST into owned `svelte_js_ast` nodes via
+//! [`crate::oxc_to_typed`]. All node spans are shifted into the original
+//! `.svelte` source's coordinate space.
+//!
+//! Callers pass a reused [`Allocator`] (typically `Parser::oxc_alloc`).
+//! The allocator is reset after each parse once the typed tree is built.
+
+use oxc_allocator::Allocator;
+use oxc_parser::{ParseOptions, Parser as OxcParser};
+use oxc_span::SourceType;
+use svelte_diagnostics::{errors, CompileDiagnostic};
+use svelte_js_ast::{Expression, Pattern, Program};
+
+use crate::oxc_to_typed::{self as walker, Shift};
+use crate::utils::locator::LineMap;
+
+use std::borrow::Cow;
+
+fn is_identifier_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+fn is_identifier_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+fn is_js_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger"
+        | "default" | "delete" | "do" | "else" | "export" | "extends" | "false"
+        | "finally" | "for" | "function" | "if" | "import" | "in" | "instanceof"
+        | "new" | "null" | "return" | "super" | "switch" | "this" | "throw"
+        | "true" | "try" | "typeof" | "var" | "void" | "while" | "with" | "yield"
+        | "enum" | "implements" | "interface" | "package" | "private" | "protected"
+        | "public" | "static" | "let"
+    )
+}
+
+/// Fast path for `{title}`-style mustache expressions: a single identifier
+/// with no member access, calls, or operators.
+fn try_parse_simple_identifier(source: &str, start: usize) -> Option<(Expression, usize)> {
+    let tail = &source[start..];
+    let bytes = tail.as_bytes();
+    if bytes.is_empty() || !is_identifier_start(bytes[0]) {
+        return None;
+    }
+    let mut end = 1usize;
+    while end < bytes.len() && is_identifier_continue(bytes[end]) {
+        end += 1;
+    }
+    let name = &tail[..end];
+    if is_js_keyword(name) {
+        return None;
+    }
+    // Only use the fast path when the mustache is a bare identifier (`{foo}`),
+    // not the start of a member/call chain (`{Math.max(...)}`).
+    let after = tail[end..].trim_start();
+    if !after.is_empty() && !after.starts_with('}') {
+        return None;
+    }
+    Some((
+        Expression::Identifier(svelte_js_ast::Identifier {
+            name: Cow::Owned(name.into()),
+            span: svelte_js_ast::Span::new(start as u32, (start + end) as u32),
+        }),
+        start + end,
+    ))
+}
+
+fn strip_comment_body(value: &str, line: bool) -> String {
+    if line {
+        return value.strip_prefix("//").map(|s| s.into()).unwrap_or_else(|| value.into());
+    }
+    let mut s: String = value.strip_prefix("/*").map(|rest| rest.into()).unwrap_or_else(|| value.into());
+    if s.ends_with("*/") {
+        s.truncate(s.len() - 2);
+    }
+    s
+}
+
+#[derive(Debug, Clone)]
+pub struct RawComment {
+    pub line: bool,
+    pub start: u32,
+    pub end: u32,
+    pub value: String,
+    pub with_character: bool,
+}
+
+fn opts() -> ParseOptions {
+    ParseOptions { preserve_parens: true, ..ParseOptions::default() }
+}
+
+fn js_diag(start: usize, end: usize, msg: String) -> CompileDiagnostic {
+    errors::js_parse_error(Some((start as u32, end as u32)), &msg)
+}
+
+fn collect_comments(
+    allocator_comments: &[oxc_ast::Comment],
+    slice: &str,
+    shift_offset: u32,
+    with_character: bool,
+) -> Vec<RawComment> {
+    allocator_comments
+        .iter()
+        .map(|c| {
+            let span = c.span;
+            let line = matches!(c.kind, oxc_ast::CommentKind::Line);
+            let value = strip_comment_body(
+                &slice[(span.start as usize)..(span.end as usize)],
+                line,
+            );
+            let kind_offset = if matches!(c.kind, oxc_ast::CommentKind::Line) {
+                2
+            } else {
+                2
+            };
+            let start = span.start.saturating_sub(kind_offset) + shift_offset;
+            let end = if matches!(c.kind, oxc_ast::CommentKind::Line) {
+                span.end + shift_offset
+            } else {
+                span.end + 2 + shift_offset
+            };
+            RawComment {
+                line,
+                start,
+                end,
+                value,
+                with_character,
+            }
+        })
+        .collect()
+}
+
+pub fn parse_expression(
+    alloc: &mut Allocator,
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    end: usize,
+    ts: bool,
+) -> Result<Expression, CompileDiagnostic> {
+    let slice = &full_source[start..end];
+    let source_type = SourceType::default().with_typescript(ts);
+    let parser = OxcParser::new(alloc, slice, source_type).with_options(opts());
+    let result = match parser.parse_expression() {
+        Ok(expr) => Ok(walker::expression(&expr, Shift(start as u32))),
+        Err(diags) => {
+            let msg = diags.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+            Err(js_diag(start, end, msg))
+        }
+    };
+    alloc.reset();
+    result
+}
+
+pub fn parse_program<'a>(
+    alloc: &mut Allocator,
+    bump: &'a bumpalo::Bump,
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    end: usize,
+    ts: bool,
+) -> Result<(Program<'a>, Vec<RawComment>), CompileDiagnostic> {
+    let slice = &full_source[start..end];
+    let source_type = SourceType::default().with_typescript(ts).with_module(true);
+    let parser = OxcParser::new(alloc, slice, source_type).with_options(opts());
+    let ret = parser.parse();
+    if !ret.errors.is_empty() {
+        let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
+        return Err(js_diag(start, end, msg));
+    }
+    walker::set_slice(slice);
+    let prog = walker::program(&ret.program, Shift(start as u32), bump);
+    walker::clear_slice();
+    let comments = collect_comments(&ret.program.comments, slice, start as u32, true);
+    alloc.reset();
+    Ok((prog, comments))
+}
+
+pub fn parse_expression_at(
+    alloc: &mut Allocator,
+    full_source: &str,
+    line_map: &LineMap,
+    start: usize,
+    ts: bool,
+) -> Result<(Expression, usize), CompileDiagnostic> {
+    let (e, end, _) = parse_expression_at_with_comments(alloc, full_source, line_map, start, ts)?;
+    Ok((e, end))
+}
+
+pub fn parse_expression_at_with_comments(
+    alloc: &mut Allocator,
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    ts: bool,
+) -> Result<(Expression, usize, Vec<RawComment>), CompileDiagnostic> {
+    let tail = &full_source[start..];
+    if let Some((expression, end)) = try_parse_simple_identifier(full_source, start) {
+        return Ok((expression, end, Vec::new()));
+    }
+    let source_type = SourceType::default().with_typescript(ts);
+    let parser = OxcParser::new(alloc, tail, source_type).with_options(opts());
+    let res = parser.parse_expression();
+    let result = match res {
+        Ok(expr) => {
+            let span_end = oxc_span::GetSpan::span(&expr).end as usize + start;
+            let expression = walker::expression(&expr, Shift(start as u32));
+            Ok((expression, span_end, Vec::new()))
+        }
+        Err(diags) => {
+            let msg = diags.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+            Err(js_diag(start, start + tail.len(), msg))
+        }
+    };
+    alloc.reset();
+    result
+}
+
+pub fn parse_const_decl_at(
+    alloc: &mut Allocator,
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    end: usize,
+    ts: bool,
+) -> Result<svelte_js_ast::VariableDeclaration, CompileDiagnostic> {
+    let body = &full_source[start..end];
+    let synthetic = format!("const {body};");
+    let source_type = SourceType::default().with_typescript(ts).with_module(true);
+    let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
+    let ret = parser.parse();
+    if !ret.errors.is_empty() {
+        let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
+        return Err(js_diag(start, end, msg));
+    }
+    let prefix_len = 6u32;
+    let shift = Shift((start as i64 - prefix_len as i64).max(0) as u32);
+    let js_bump = bumpalo::Bump::new();
+    let prog = walker::program(&ret.program, shift, &js_bump);
+    alloc.reset();
+    for stmt in prog.body.into_iter() {
+        if let svelte_js_ast::Statement::Variable(v) = stmt {
+            return Ok(*v);
+        }
+    }
+    Err(js_diag(start, end, "expected const declaration".into()))
+}
+
+pub fn parse_pattern_at(
+    alloc: &mut Allocator,
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    end: usize,
+    ts: bool,
+) -> Result<(Pattern, usize), CompileDiagnostic> {
+    let pattern_text = &full_source[start..end];
+    let synthetic = format!("let {pattern_text} = 0;");
+    let source_type = SourceType::default().with_typescript(ts).with_module(true);
+    let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
+    let ret = parser.parse();
+    if !ret.errors.is_empty() {
+        let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
+        return Err(js_diag(start, end, msg));
+    }
+    let prefix_len = 4u32;
+    let shift_value = start as i64 - prefix_len as i64;
+    let shift = if shift_value < 0 {
+        Shift(0)
+    } else {
+        Shift(shift_value as u32)
+    };
+    let result = if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
+        if let Some(d) = decl.declarations.first() {
+            Ok((walker::binding_pattern(&d.id, shift), end))
+        } else {
+            Err(js_diag(start, end, "expected pattern".into()))
+        }
+    } else {
+        Err(js_diag(start, end, "expected pattern".into()))
+    };
+    alloc.reset();
+    result
+}
+
+pub fn parse_arrow_params_at(
+    alloc: &mut Allocator,
+    full_source: &str,
+    _line_map: &LineMap,
+    start: usize,
+    end: usize,
+    ts: bool,
+) -> Result<(Vec<Pattern>, usize), CompileDiagnostic> {
+    let params_text = &full_source[start..end];
+    let synthetic = format!("let _f = {params_text} => {{}};");
+    let source_type = SourceType::default().with_typescript(ts).with_module(true);
+    let parser = OxcParser::new(alloc, &synthetic, source_type).with_options(opts());
+    let ret = parser.parse();
+    if !ret.errors.is_empty() {
+        let msg = ret.errors.iter().map(|d| format!("{d}")).collect::<Vec<_>>().join("; ");
+        alloc.reset();
+        return Err(js_diag(start, end, msg));
+    }
+    let prefix_len = "let _f = ".len() as u32;
+    let shift_value = start as i64 - prefix_len as i64;
+    let shift = if shift_value < 0 {
+        Shift(0)
+    } else {
+        Shift(shift_value as u32)
+    };
+    let result = if let Some(oxc_ast::ast::Statement::VariableDeclaration(decl)) = ret.program.body.first() {
+        if let Some(d) = decl.declarations.first() {
+            if let Some(oxc_ast::ast::Expression::ArrowFunctionExpression(arrow)) = &d.init {
+                let mut out: Vec<Pattern> = Vec::with_capacity(
+                    arrow.params.items.len() + usize::from(arrow.params.rest.is_some()),
+                );
+                out.extend(
+                    arrow
+                        .params
+                        .items
+                        .iter()
+                        .map(|p| walker::binding_pattern(&p.pattern, shift)),
+                );
+                if let Some(rest) = &arrow.params.rest {
+                    out.push(Pattern::Rest(Box::new(svelte_js_ast::RestElement {
+                        argument: walker::binding_pattern(&rest.rest.argument, shift),
+                        span: svelte_js_ast::Span::new(
+                            rest.rest.span.start + shift.0,
+                            rest.rest.span.end + shift.0,
+                        ),
+                    })));
+                }
+                Ok((out, end))
+            } else {
+                Ok((Vec::new(), end))
+            }
+        } else {
+            Ok((Vec::new(), end))
+        }
+    } else {
+        Ok((Vec::new(), end))
+    };
+    alloc.reset();
+    result
+}

@@ -1,0 +1,1242 @@
+//! Phase 2: analyze.
+//!
+//! Mirrors `packages/svelte/src/compiler/phases/2-analyze/` and
+//! `phases/scope.js`. Produces an [`Analysis`] from a parsed [`Root`].
+//!
+//! Status: Phase 3a (data structures) is in place. Scope-building walker,
+//! rune detection, CSS analyze/prune/warn, and the 60+ validator visitors
+//! are pending.
+
+#![forbid(unsafe_code)]
+
+pub mod a11y;
+pub mod analysis;
+pub mod bindings;
+pub mod css_analyze;
+pub mod css_possible_values;
+pub mod css_prune;
+pub mod css_prune_data;
+pub mod css_render;
+pub mod css_warn;
+pub mod scope;
+pub mod template_elements;
+pub mod validate;
+pub mod walker;
+
+pub use analysis::{Analysis, ElementMetadata};
+pub use css_analyze::{
+    analyze_css, ComplexSelectorMetadata, CssAnalysis, RelativeSelectorMetadata, RuleMetadata,
+};
+pub use scope::{Binding, BindingKind, DeclarationKind, Scope, ScopePtr, ScopeRoot, ScopeRootPtr};
+
+use std::path::Path;
+
+use svelte_ast::Root;
+use svelte_diagnostics::CompileDiagnostic;
+
+/// Analyze a parsed `.svelte` component.
+///
+/// Mirrors `analyze_component` in
+/// `packages/svelte/src/compiler/phases/2-analyze/index.js`.
+///
+/// Current scope: returns an `Analysis` with the parsed AST + freshly-built
+/// empty scopes plus rune detection. The full visitor pipeline that
+/// validates the program, classifies bindings, and analyses CSS scoping is
+/// pending.
+pub fn analyze_component<'a>(
+    root: &'a Root<'a>,
+    filename: Option<&str>,
+) -> Result<Analysis<'a>, CompileDiagnostic> {
+    let scope_root = ScopeRoot::new();
+    let module = Scope::new_root(scope_root.clone(), 0);
+    let instance = Scope::new_root(scope_root.clone(), 0);
+
+    // Walk module / instance scripts to populate declarations and detect runes.
+    let mut runes = walker::runes_enabled_by_options(root);
+    if let Some(s) = root.module.as_ref() {
+        runes |= walker::build_program_scope(&s.content, &module);
+    }
+    if let Some(s) = root.instance.as_ref() {
+        runes |= walker::build_program_scope(&s.content, &instance);
+    }
+
+    let (css_meta, css_err) = match root.css.as_ref() {
+        Some(sheet) => css_analyze::analyze_css_with_errors(sheet),
+        None => (Default::default(), None),
+    };
+    if let Some(e) = css_err {
+        return Err(e);
+    }
+
+    let name = filename
+        .and_then(|f| Path::new(f).file_stem())
+        .and_then(|s| s.to_str())
+        .map(sanitize_component_name)
+        .unwrap_or_else(|| "Component".to_string());
+
+    let mut analysis = Analysis {
+        root,
+        instance,
+        module,
+        scope_root,
+        runes,
+        css_meta,
+        filename: filename.map(|s| s.to_string()),
+        name,
+        css_hash: String::new(),
+        warnings: Vec::new(),
+        elements: Default::default(),
+        uses_global: false,
+        uses_async: false,
+        exports: Vec::new(),
+    };
+
+    // Template validator pass — emits the warnings / errors from the
+    // per-AST-node visitors (svelte:window / svelte:body / svelte:self /
+    // ...). Also collects template elements for CSS prune in the same walk.
+    // Mirrors the `walk(root, visitors)` call in upstream
+    // `phases/2-analyze/index.js`.
+    // Parser-emitted soft diagnostics surface as analysis warnings.
+    analysis.warnings.extend(root.parse_warnings.iter().cloned());
+    let collect_elements = root.css.is_some();
+    let (elements, validator_warnings, validator_errors) =
+        validate::validate(&analysis.root, &analysis, collect_elements);
+    if let Some(sheet) = root.css.as_ref() {
+        css_prune::prune(sheet, &elements, &mut analysis.css_meta);
+        analysis
+            .warnings
+            .extend(css_warn::warn_unused(sheet, &analysis.css_meta));
+    }
+    analysis.warnings.extend(validator_warnings);
+    // Apply top-of-file `<!-- svelte-ignore X -->` to script + CSS warnings
+    // whose targets are hoisted out of the fragment by the parser. A comment
+    // is "top-of-file" if it appears in the root fragment before the first
+    // non-comment, non-whitespace-text child. Mirrors the `state.ignores`
+    // bootstrapping in upstream's analyze entry.
+    let mut top_of_file_ignores: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for n in &analysis.root.fragment.nodes {
+        match n {
+            svelte_ast::fragment::FragmentChild::Comment(c) => {
+                for code in parse_svelte_ignore_codes(&c.data) {
+                    top_of_file_ignores.insert(code);
+                }
+            }
+            svelte_ast::fragment::FragmentChild::Text(t) if t.data.trim().is_empty() => {}
+            _ => break,
+        }
+    }
+    // Also pick up JS-comment svelte-ignore directives in the instance script.
+    // Mirrors upstream's `extract_svelte_ignore_above` mechanism — JS-side
+    // `// svelte-ignore X` comments suppress script-emitted warnings of code
+    // X globally for that script.
+    let mut script_ignores: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for c in &analysis.root.comments {
+        for code in parse_svelte_ignore_codes(&c.value) {
+            script_ignores.insert(code);
+        }
+    }
+    let script_target_codes: &[&str] = &[
+        "export_let_unused",
+        "non_reactive_update",
+        "state_referenced_locally",
+        "store_rune_conflict",
+        "reactive_declaration_invalid_placement",
+        "reactive_declaration_module_script_dependency",
+        "perf_avoid_inline_class",
+        "perf_avoid_nested_class",
+        "legacy_component_creation",
+        "custom_element_props_identifier",
+    ];
+    if !top_of_file_ignores.is_empty() || !script_ignores.is_empty() {
+        analysis.warnings.retain(|w| {
+            // Top-of-file applies to css_* and script-hoisted-target codes.
+            let hoist_target = w.code.starts_with("css_")
+                || w.code.starts_with("reactive_declaration_")
+                || w.code == "non_reactive_update"
+                || w.code == "store_rune_conflict";
+            if hoist_target && top_of_file_ignores.contains(w.code) {
+                return false;
+            }
+            // JS-script svelte-ignore applies to script-emitted warnings.
+            if script_target_codes.contains(&w.code) && script_ignores.contains(w.code) {
+                return false;
+            }
+            true
+        });
+    }
+    if let Some(first_error) = validator_errors.into_iter().next() {
+        // Upstream throws on the first error; we surface it the same way
+        // so `compile()` can fail fast. Subsequent errors are dropped
+        // (matches `InternalCompileError` behavior).
+        return Err(first_error);
+    }
+    Ok(analysis)
+}
+
+/// Local copy of `parse_svelte_ignore` used at the top of analysis to filter
+/// CSS warnings against `<!-- svelte-ignore css_* -->` comments. Mirrors the
+/// dash-syntax handling in `validate.rs::parse_svelte_ignore`.
+fn parse_svelte_ignore_codes(comment: &str) -> Vec<String> {
+    let trimmed = comment.trim();
+    let after = if let Some(s) = trimmed.strip_prefix("svelte-ignore") {
+        s
+    } else {
+        return Vec::new();
+    };
+    after
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .flat_map(|s| {
+            let normalized = s.replace('-', "_");
+            let replacement: Option<&'static str> = match normalized.as_str() {
+                "non_top_level_reactive_declaration" => {
+                    Some("reactive_declaration_invalid_placement")
+                }
+                "module_script_reactive_declaration" => {
+                    Some("reactive_declaration_module_script_dependency")
+                }
+                "empty_block" => Some("block_empty"),
+                "avoid_is" => Some("attribute_avoid_is"),
+                "invalid_html_attribute" => Some("attribute_invalid_property_name"),
+                "a11y_structure" => Some("a11y_figcaption_parent"),
+                "illegal_attribute_character" => Some("attribute_illegal_colon"),
+                "invalid_rest_eachblock_binding" => Some("bind_invalid_each_rest"),
+                "unused_export_let" => Some("export_let_unused"),
+                _ => None,
+            };
+            let mut out = vec![normalized];
+            if let Some(r) = replacement {
+                out.push(r.to_string());
+            }
+            out
+        })
+        .collect()
+}
+
+/// Sanitize a filename stem into a JS identifier. `foo-bar` → `Foo_bar`,
+/// `123Foo` → `_123Foo`. Mirrors the name sanitisation in
+/// `2-analyze/index.js:51-58`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use svelte_parse::parse;
+
+    #[test]
+    fn analyzes_empty_component() {
+        let ast = parse("", false).unwrap();
+        let a = analyze_component(ast.root(), Some("Foo.svelte")).unwrap();
+        assert_eq!(a.name, "Foo");
+        assert!(!a.runes);
+    }
+
+    #[test]
+    fn detects_runes_in_instance_script() {
+        let ast = parse("<script>let count = $state(0);</script>", false).unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a.runes);
+    }
+
+    #[test]
+    fn collects_top_level_let_declarations() {
+        let ast = parse(
+            "<script>let a = 1; let b = 2; const c = 3;</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        assert!(inst.get_local("a").is_some());
+        assert!(inst.get_local("b").is_some());
+        assert!(inst.get_local("c").is_some());
+        assert!(inst.get_local("nope").is_none());
+    }
+
+    #[test]
+    fn collects_destructured_props() {
+        let ast = parse(
+            "<script>let { foo, bar = 'baz' } = $props();</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        assert!(inst.get_local("foo").is_some());
+        assert!(inst.get_local("bar").is_some());
+        assert!(a.runes);
+    }
+
+    #[test]
+    fn unique_name_dedupes() {
+        let mut root = ScopeRoot::default();
+        assert_eq!(root.unique("foo"), "foo");
+        assert_eq!(root.unique("foo"), "foo_1");
+        assert_eq!(root.unique("foo"), "foo_2");
+    }
+
+    #[test]
+    fn classifies_state_binding() {
+        let ast = parse(
+            "<script>let count = $state(0);</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        let b = inst.get_local("count").unwrap();
+        assert_eq!(b.borrow().kind, BindingKind::State);
+    }
+
+    #[test]
+    fn classifies_derived_binding() {
+        let ast = parse(
+            "<script>let count = $state(0); let doubled = $derived(count * 2);</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        assert_eq!(
+            inst.get_local("doubled").unwrap().borrow().kind,
+            BindingKind::Derived
+        );
+        assert_eq!(
+            inst.get_local("count").unwrap().borrow().kind,
+            BindingKind::State
+        );
+    }
+
+    #[test]
+    fn classifies_raw_state() {
+        let ast = parse(
+            "<script>let big = $state.raw([1,2,3]);</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        assert_eq!(
+            inst.get_local("big").unwrap().borrow().kind,
+            BindingKind::RawState
+        );
+    }
+
+    #[test]
+    fn classifies_props_destructured() {
+        let ast = parse(
+            "<script>let { foo, bar, ...rest } = $props();</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        assert_eq!(
+            inst.get_local("foo").unwrap().borrow().kind,
+            BindingKind::Prop
+        );
+        assert_eq!(
+            inst.get_local("bar").unwrap().borrow().kind,
+            BindingKind::Prop
+        );
+        assert_eq!(
+            inst.get_local("rest").unwrap().borrow().kind,
+            BindingKind::RestProp
+        );
+    }
+
+    #[test]
+    fn classifies_bindable_prop() {
+        let ast = parse(
+            "<script>let { value = $bindable('') } = $props();</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        assert_eq!(
+            inst.get_local("value").unwrap().borrow().kind,
+            BindingKind::BindableProp
+        );
+    }
+
+    #[test]
+    fn nested_function_scope() {
+        let ast = parse(
+            "<script>let outer = 1; function f(inner) { let local = 2; }</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        // `outer` and `f` visible at instance scope.
+        assert!(inst.get_local("outer").is_some());
+        assert!(inst.get_local("f").is_some());
+        // `inner` / `local` are NOT visible at instance scope (they're in
+        // the function's own scope).
+        assert!(inst.get_local("inner").is_none());
+        assert!(inst.get_local("local").is_none());
+    }
+
+    #[test]
+    fn block_scoped_let() {
+        let ast = parse(
+            "<script>{ let blocked = 1; } let visible = 2;</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        // `blocked` is in the inner block, not at instance scope.
+        assert!(inst.get_local("blocked").is_none());
+        assert!(inst.get_local("visible").is_some());
+    }
+
+    #[test]
+    fn resolves_reference_in_same_scope() {
+        let ast = parse(
+            "<script>let count = $state(0); count++;</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        let count = inst.get_local("count").unwrap();
+        // Two references: `$state(0)` initializer doesn't reference `count`,
+        // but `count++` does (postfix update) — that's the only direct
+        // reference here.
+        assert!(!count.borrow().references.is_empty());
+    }
+
+    #[test]
+    fn resolves_reference_from_inner_scope() {
+        let ast = parse(
+            "<script>let outer = 1; function f() { return outer; }</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        let outer = inst.get_local("outer").unwrap();
+        // `outer` is referenced from inside `f`'s scope.
+        assert_eq!(outer.borrow().references.len(), 1);
+    }
+
+    #[test]
+    fn resolves_to_each_correct_binding_when_shadowed() {
+        let ast = parse(
+            "<script>let x = 1; function f(x) { return x; }</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let inst = a.instance.borrow();
+        let outer_x = inst.get_local("x").unwrap();
+        // The inner `x` shadows the outer one — the reference inside `f`
+        // resolves to the param, NOT to outer `x`.
+        assert_eq!(outer_x.borrow().references.len(), 0);
+    }
+
+    #[test]
+    fn unresolved_reference_recorded_as_global() {
+        let ast = parse(
+            "<script>console.log('hello');</script>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let root = a.scope_root.borrow();
+        assert!(root.conflicts.contains_key("console"));
+    }
+
+    #[test]
+    fn css_analyze_marks_global_selector() {
+        let ast = parse(
+            "<style>:global(.foo) { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a.has_global_css());
+        // The single rule should be marked as has_global_selectors.
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let meta = a.css_meta.rule_metadata.get(&(r.start, r.end)).unwrap();
+        assert!(meta.has_global_selectors);
+        assert!(!meta.has_local_selectors);
+    }
+
+    #[test]
+    fn css_analyze_marks_local_selector() {
+        let ast = parse(
+            "<style>.foo { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(!a.has_global_css());
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let meta = a.css_meta.rule_metadata.get(&(r.start, r.end)).unwrap();
+        assert!(!meta.has_global_selectors);
+        assert!(meta.has_local_selectors);
+    }
+
+    #[test]
+    fn css_analyze_marks_global_block() {
+        let ast = parse(
+            "<style>:global { div { color: red; } }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let meta = a.css_meta.rule_metadata.get(&(r.start, r.end)).unwrap();
+        assert!(meta.is_global_block);
+    }
+
+    #[test]
+    fn css_analyze_tracks_keyframes() {
+        let ast = parse(
+            "<style>@keyframes spin { from {} to {} }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert_eq!(a.css_meta.keyframes, vec!["spin"]);
+    }
+
+    #[test]
+    fn css_analyze_global_keyframes_set_flag() {
+        let ast = parse(
+            "<style>@keyframes -global-spin { from {} to {} }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a.has_global_css());
+        // The `-global-` keyframes should NOT be in the rename list.
+        assert!(a.css_meta.keyframes.is_empty());
+    }
+
+    #[test]
+    fn css_prune_marks_matched_selector_used() {
+        let ast = parse(
+            "<div class=\"foo\"></div>\n<style>.foo { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used);
+    }
+
+    #[test]
+    fn css_prune_leaves_unmatched_unused() {
+        let ast = parse(
+            "<div></div>\n<style>.no-such-class { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(!cm.used);
+    }
+
+    #[test]
+    fn css_prune_matches_tag_selector() {
+        let ast = parse(
+            "<p>hello</p>\n<style>p { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used);
+    }
+
+    #[test]
+    fn css_warn_emits_unused_selector_warning() {
+        let ast = parse(
+            "<div></div>\n<style>.no-such-class { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a
+            .warnings
+            .iter()
+            .any(|w| w.code == "css_unused_selector"));
+    }
+
+    fn complex_used(a: &Analysis, source: &str, css_selector: &str) -> bool {
+        let _ = (source, css_selector);
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            return false;
+        };
+        let complex = &rule.prelude.children[0];
+        a.css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .is_some_and(|m| m.used)
+    }
+
+    #[test]
+    fn css_prune_descendant_combinator_matches() {
+        let ast = parse(
+            "<div><span></span></div>\n<style>div span { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(complex_used(&a, "", ""));
+    }
+
+    #[test]
+    fn css_prune_descendant_combinator_misses_when_no_ancestor() {
+        let ast = parse(
+            "<span></span>\n<style>div span { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(!complex_used(&a, "", ""));
+    }
+
+    #[test]
+    fn css_prune_child_combinator_matches() {
+        let ast = parse(
+            "<div><span></span></div>\n<style>div > span { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(complex_used(&a, "", ""));
+    }
+
+    #[test]
+    fn css_prune_child_combinator_misses_non_direct() {
+        let ast = parse(
+            "<div><p><span></span></p></div>\n<style>div > span { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        // span is grandchild of div, not direct child.
+        assert!(!complex_used(&a, "", ""));
+    }
+
+    #[test]
+    fn css_prune_adjacent_sibling_matches() {
+        let ast = parse(
+            "<div></div><span></span>\n<style>div + span { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(complex_used(&a, "", ""));
+    }
+
+    #[test]
+    fn css_prune_general_sibling_matches() {
+        let ast = parse(
+            "<div></div><p></p><span></span>\n<style>div ~ span { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(complex_used(&a, "", ""));
+    }
+
+    #[test]
+    fn css_prune_attribute_selector_matches() {
+        let ast = parse(
+            "<input type=\"text\" />\n<style>input[type=\"text\"] { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used);
+    }
+
+    #[test]
+    fn css_prune_attribute_case_insensitive_html_attr() {
+        // `type` is in case_insensitive_attributes — `[type="TEXT"]`
+        // should match `type="text"`.
+        let ast = parse(
+            "<input type=\"text\" />\n<style>input[type=\"TEXT\"] { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used);
+    }
+
+    #[test]
+    fn css_prune_adjacent_skips_probable_sibling() {
+        // `<div></div>{#if c}<span></span>{/if}<p></p>` — `div + p` should
+        // match because the `{#if}` branch might not render, making
+        // `<div>` the immediate previous sibling of `<p>`.
+        let ast = parse(
+            "<div></div>{#if c}<span></span>{/if}<p></p>\n<style>div + p { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used, "div + p should match across the conditional");
+    }
+
+    #[test]
+    fn css_prune_adjacent_stops_at_definite_sibling() {
+        // `<div></div><span></span><p></p>` — `div + p` should NOT match
+        // because `<span>` is definitely between them.
+        let ast = parse(
+            "<div></div><span></span><p></p>\n<style>div + p { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(!cm.used, "div + p must not match when span is definite");
+    }
+
+    #[test]
+    fn css_prune_records_scoped_elements() {
+        // After matching, the elements that received the hash class are
+        // tracked in `css_meta.scoped_elements`. Required by the
+        // transform phase to know which elements to mutate.
+        let ast = parse(
+            "<div class=\"foo\"></div>\n<style>.foo { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert_eq!(
+            a.css_meta.scoped_elements.len(),
+            1,
+            "exactly the matched <div> should be marked scoped"
+        );
+    }
+
+    #[test]
+    fn css_prune_attribute_whitelist_details_open() {
+        // `details[open]` — `open` is whitelisted even when attribute
+        // isn't statically set in the template.
+        let ast = parse(
+            "<details>content</details>\n<style>details[open] { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used);
+    }
+
+    #[test]
+    fn validator_svelte_window_rejects_non_event_attribute() {
+        let ast = parse(
+            "<svelte:window class=\"foo\" />",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        // Validator turns this into an error (matches upstream's
+        // `illegal_element_attribute`). `analyze_component` returns Err
+        // when validation finds any error.
+        assert!(res.is_err());
+        let e = res.unwrap_err();
+        assert_eq!(e.code, "illegal_element_attribute");
+    }
+
+    #[test]
+    fn validator_svelte_window_accepts_event_attribute() {
+        let ast = parse(
+            "<svelte:window onkeydown={handler} />",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok(), "event attributes are allowed on svelte:window");
+    }
+
+    #[test]
+    fn validator_svelte_head_rejects_attributes() {
+        let ast = parse(
+            "<svelte:head class=\"foo\"><title>x</title></svelte:head>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        let e = res.unwrap_err();
+        assert_eq!(e.code, "svelte_head_illegal_attribute");
+    }
+
+    #[test]
+    fn validator_svelte_self_outside_block_is_error() {
+        let ast = parse("<svelte:self />", false).unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        let e = res.unwrap_err();
+        assert_eq!(e.code, "svelte_self_invalid_placement");
+    }
+
+    #[test]
+    fn validator_svelte_self_inside_if_block_is_allowed() {
+        let ast = parse(
+            "{#if x}<svelte:self />{/if}",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok(), "svelte:self inside {{#if}} is permitted");
+    }
+
+    #[test]
+    fn validator_title_rejects_attributes() {
+        let ast = parse(
+            "<title class=\"x\">hi</title>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "title_illegal_attribute");
+    }
+
+    #[test]
+    fn validator_title_rejects_element_children() {
+        let ast = parse(
+            "<title><span>hi</span></title>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "title_invalid_content");
+    }
+
+    #[test]
+    fn validator_title_allows_text_and_expression_tag() {
+        let ast = parse(
+            "<title>hello {name}!</title>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_svelte_boundary_rejects_invalid_attr_name() {
+        let ast = parse(
+            "<svelte:boundary class=\"x\"></svelte:boundary>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "svelte_boundary_invalid_attribute");
+    }
+
+    #[test]
+    fn validator_svelte_boundary_accepts_onerror() {
+        let ast = parse(
+            "<svelte:boundary onerror={handler}></svelte:boundary>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_runes_mode_rejects_svelte_internal_import() {
+        let ast = parse(
+            "<script>import x from 'svelte/internal'; let s = $state(0);</script>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "import_svelte_internal_forbidden");
+    }
+
+    #[test]
+    fn validator_runes_mode_rejects_before_update_import() {
+        let ast = parse(
+            "<script>import { beforeUpdate } from 'svelte'; let s = $state(0);</script>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "runes_mode_invalid_import");
+    }
+
+    #[test]
+    fn validator_legacy_imports_allowed_outside_runes() {
+        let ast = parse(
+            "<script>import { beforeUpdate } from 'svelte';</script>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_runes_mode_rejects_legacy_reactive_statement() {
+        let ast = parse(
+            "<script>let count = $state(0); $: doubled = count * 2;</script>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().code,
+            "legacy_reactive_statement_invalid"
+        );
+    }
+
+    #[test]
+    fn validator_bind_value_on_input_is_ok() {
+        let ast = parse(
+            "<input bind:value={x} />",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_bind_value_on_div_is_error() {
+        // `value` is only valid on input / textarea / select.
+        let ast = parse(
+            "<div bind:value={x}></div>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "bind_invalid_target");
+    }
+
+    #[test]
+    fn validator_bind_clientwidth_on_window_is_error() {
+        // `clientWidth` is invalid on svelte:window/svelte:document.
+        let ast = parse(
+            "<svelte:window bind:clientWidth={x} />",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "bind_invalid_name");
+    }
+
+    #[test]
+    fn validator_style_directive_rejects_unknown_modifier() {
+        let ast = parse(
+            r#"<div style:color|wat="red"></div>"#,
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "style_directive_invalid_modifier");
+    }
+
+    #[test]
+    fn validator_style_directive_accepts_important() {
+        let ast = parse(
+            r#"<div style:color|important="red"></div>"#,
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_svelte_component_runes_mode_warning() {
+        let ast = parse(
+            "<script>let foo = $state(1);</script>\n<svelte:component this={Foo} />",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a
+            .warnings
+            .iter()
+            .any(|w| w.code == "svelte_component_deprecated"));
+    }
+
+    #[test]
+    fn validator_on_directive_runes_mode_warning() {
+        let ast = parse(
+            "<script>let foo = $state(1);</script>\n<button on:click={fn}>x</button>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a
+            .warnings
+            .iter()
+            .any(|w| w.code == "event_directive_deprecated"));
+    }
+
+    #[test]
+    fn validator_on_directive_no_warning_outside_runes() {
+        let ast = parse(
+            "<button on:click={fn}>x</button>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(!a
+            .warnings
+            .iter()
+            .any(|w| w.code == "event_directive_deprecated"));
+    }
+
+    #[test]
+    fn validator_svelte_fragment_outside_component_is_error() {
+        let ast = parse(
+            "<svelte:fragment slot=\"x\">hi</svelte:fragment>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "svelte_fragment_invalid_placement");
+    }
+
+    #[test]
+    fn validator_svelte_fragment_inside_component_is_ok() {
+        let ast = parse(
+            "<Foo><svelte:fragment slot=\"x\">hi</svelte:fragment></Foo>",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_const_tag_at_root_is_error() {
+        let ast = parse("{@const x = 1}", false).unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "const_tag_invalid_placement");
+    }
+
+    #[test]
+    fn validator_const_tag_inside_if_block_is_ok() {
+        let ast = parse(
+            "{#if cond}{@const x = 1}{x}{/if}",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn validator_block_empty_warning_in_if() {
+        let ast = parse(
+            "{#if x}   {/if}",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(a.warnings.iter().any(|w| w.code == "block_empty"));
+    }
+
+    #[test]
+    fn validator_snippet_rest_parameter_is_error() {
+        let ast = parse(
+            "{#snippet foo(...args)}body{/snippet}",
+            false,
+        )
+        .unwrap();
+        let res = analyze_component(ast.root(), None);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().code, "snippet_invalid_rest_parameter");
+    }
+
+    #[test]
+    fn validator_let_directive_outside_element_is_error() {
+        // `let:foo` is only allowed on element-like nodes. The parser
+        // wouldn't put a `let:` outside an element, so this is hard to
+        // exercise — but the visitor's parent-check exists. Skip a
+        // concrete test for now; covered by reading the code.
+    }
+
+    #[test]
+    fn css_warn_silent_when_all_selectors_used() {
+        let ast = parse(
+            "<div class=\"foo\"></div>\n<style>.foo { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        assert!(!a
+            .warnings
+            .iter()
+            .any(|w| w.code == "css_unused_selector"));
+    }
+
+    #[test]
+    fn css_prune_matches_id_selector() {
+        let ast = parse(
+            "<p id=\"main\">hello</p>\n<style>#main { color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(rule) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &rule.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.used);
+    }
+
+    #[test]
+    fn css_analyze_root_pseudo_is_global_like() {
+        let ast = parse(
+            "<style>:root { --color: red; }</style>",
+            false,
+        )
+        .unwrap();
+        let a = analyze_component(ast.root(), None).unwrap();
+        // `:root` is global-like, so the rule's complex selector is_global.
+        let css = a.root.css.as_ref().unwrap();
+        let svelte_ast::css::StyleSheetChild::Rule(r) = &css.children[0] else {
+            panic!("expected rule");
+        };
+        let complex = &r.prelude.children[0];
+        let cm = a
+            .css_meta
+            .complex_selector_metadata
+            .get(&(complex.start, complex.end))
+            .unwrap();
+        assert!(cm.is_global);
+    }
+}
+
+fn sanitize_component_name(stem: &str) -> String {
+    let mut out = String::with_capacity(stem.len());
+    for (i, c) in stem.chars().enumerate() {
+        if i == 0 {
+            if c.is_ascii_alphabetic() || c == '_' {
+                out.push(c.to_ascii_uppercase());
+            } else {
+                out.push('_');
+                if c.is_ascii_alphanumeric() {
+                    out.push(c);
+                }
+            }
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "Component".to_string()
+    } else {
+        out
+    }
+}

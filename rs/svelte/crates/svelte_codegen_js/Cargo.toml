@@ -1,0 +1,18 @@
+[package]
+name = "svelte_codegen_js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Port of `esrap`: estree (acorn-shaped JSON) → formatted JavaScript string + source map."
+
+[dependencies]
+sourcemap = { workspace = true }
+serde_json = { workspace = true }
+svelte_js_ast = { workspace = true }
+bumpalo = { version = "3", features = ["collections", "boxed"] }
+
+[dev-dependencies]
+svelte_parse = { workspace = true }
+svelte_analyze = { workspace = true }
+svelte_transform_client = { workspace = true }
