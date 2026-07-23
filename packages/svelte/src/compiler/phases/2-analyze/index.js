@@ -20,6 +20,7 @@ import { analyze_css } from './css/css-analyze.js';
 import { prune } from './css/css-prune.js';
 import { hash, is_rune } from '../../../utils.js';
 import { warn_unused } from './css/css-warn.js';
+import { trim_fragment_boundary_text } from './trim-boundary-text.js';
 import { extract_svelte_ignore } from '../../utils/extract_svelte_ignore.js';
 import { ignore_map, get_ignore_snapshot, pop_ignore, push_ignore } from '../../state.js';
 import { ArrowFunctionExpression } from './visitors/ArrowFunctionExpression.js';
@@ -939,6 +940,10 @@ export function analyze_component(root, source, options) {
 
 	// TODO
 	// analysis.stylesheet.warn_on_unused_selectors(analysis);
+
+	if (options.experimental?.compiler?.trimBoundaryText) {
+		trim_fragment_boundary_text(root.fragment);
+	}
 
 	return analysis;
 }

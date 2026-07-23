@@ -139,6 +139,9 @@ export function clean_nodes(
 		nodes = sort_const_tags(nodes, state);
 	}
 
+	const boundary_trimmed =
+		parent.type === 'Fragment' && parent.metadata.boundary_trimmed === true;
+
 	/** @type {AST.SvelteNode[]} */
 	const hoisted = [];
 
@@ -175,30 +178,32 @@ export function clean_nodes(
 
 		let first, last;
 
-		while (
-			(first = regular[0]) &&
-			first.type === 'Text' &&
-			!regex_not_whitespace.test(first.data)
-		) {
-			regular.shift();
-		}
+		if (!boundary_trimmed) {
+			while (
+				(first = regular[0]) &&
+				first.type === 'Text' &&
+				!regex_not_whitespace.test(first.data)
+			) {
+				regular.shift();
+			}
 
-		if (first?.type === 'Text') {
-			first.raw = first.raw.replace(regex_starts_with_whitespaces, '');
-			first.data = first.data.replace(regex_starts_with_whitespaces, '');
-		}
+			if (first?.type === 'Text') {
+				first.raw = first.raw.replace(regex_starts_with_whitespaces, '');
+				first.data = first.data.replace(regex_starts_with_whitespaces, '');
+			}
 
-		while (
-			(last = regular.at(-1)) &&
-			last.type === 'Text' &&
-			!regex_not_whitespace.test(last.data)
-		) {
-			regular.pop();
-		}
+			while (
+				(last = regular.at(-1)) &&
+				last.type === 'Text' &&
+				!regex_not_whitespace.test(last.data)
+			) {
+				regular.pop();
+			}
 
-		if (last?.type === 'Text') {
-			last.raw = last.raw.replace(regex_ends_with_whitespaces, '');
-			last.data = last.data.replace(regex_ends_with_whitespaces, '');
+			if (last?.type === 'Text') {
+				last.raw = last.raw.replace(regex_ends_with_whitespaces, '');
+				last.data = last.data.replace(regex_ends_with_whitespaces, '');
+			}
 		}
 
 		const can_remove_entirely =
